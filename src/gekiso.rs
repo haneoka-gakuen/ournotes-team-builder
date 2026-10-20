@@ -15,7 +15,7 @@ use crate::{
     num::f,
 };
 use rustc_hash::FxHashMap as HashMap;
-use std::{collections::HashSet, sync::Arc};
+use std::{borrow::Cow, collections::HashSet, sync::Arc};
 #[derive(Clone)]
 pub struct MissRule {
     pub value: i32,
@@ -110,7 +110,24 @@ impl Context {
         })
     }
 }
+pub(crate) fn combo_factors(master: &Master, times: &[i32], judgements: &[usize]) -> Vec<f64> {
+    let (mut before, mut pending, mut last) = (0, 0, -1);
+    times.iter().zip(judgements).map(|(&time, &judgement)| {
+        if time != last { before = pending; last = time; }
+        let value = master.live.combo.get(&0).into_iter().flatten()
+            .take_while(|(required, _)| *required <= before).last().map(|(_, value)| *value).unwrap_or(0.0);
+        pending = if judgement <= 2 { 0 } else { pending + 1 };
+        f(value.min(1.0) + 1.0)
+    }).collect()
+}
+
 impl Chart {
+    pub(crate) fn combo<'a>(&'a self, master: &Master, judgements: &[usize]) -> Cow<'a, [f64]> {
+        if self.judgements.iter().zip(judgements).all(|(&a, &b)| (a <= 2) == (b <= 2)) {
+            Cow::Borrowed(&self.combo_factor)
+        } else { Cow::Owned(combo_factors(master, &self.times, judgements)) }
+    }
+
     pub fn new(
         master: &Master,
         source: &Source,
@@ -175,23 +192,7 @@ impl Chart {
                 }
             }
         }
-        let mut combo_factor = vec![0.0; n];
-        let (mut before, mut pending, mut last) = (0, 0, -1);
-        for i in 0..n {
-            if times[i] != last {
-                before = pending;
-                last = times[i];
-            }
-            let mut value = 0.0;
-            for &(required, cumulative) in master.live.combo.get(&0).into_iter().flatten() {
-                if required > before {
-                    break;
-                }
-                value = cumulative;
-            }
-            combo_factor[i] = f(value.min(1.0) + 1.0);
-            pending = if judgements[i] <= 2 { 0 } else { pending + 1 };
-        }
+        let combo_factor = combo_factors(master, &times, &judgements);
         let mut judge_frac = [0.0; 7];
         for kind in 1..=6 {
             judge_frac[7 - kind] = f(master
@@ -820,10 +821,11 @@ pub fn score_orders(
     let mut firing: Vec<_> = (0..event_times.len().min(5)).collect();
     firing.sort_by_key(|&i| (event_times[i], i));
     let note_a: Vec<_> = chart.note_frac.iter().map(|&frac| f(frac * t)).collect();
+    let normal_combo = chart.combo(master, &ctx.judgement);
     let combo: Vec<_> = ctx
         .gk
         .iter()
-        .zip(&chart.combo_factor)
+        .zip(normal_combo.iter())
         .map(|(&g, &c)| f(g * c))
         .collect();
     let mut outcomes = vec![0.0; n * 4];
@@ -842,12 +844,40 @@ pub fn score_orders(
         .enumerate()
         .map(|(i, n)| (n.id, i))
         .collect();
+    let needs_life = ctx.judgement.iter().any(|&j| damage[j] != 0.0)
+        || slots.iter().flat_map(|s| &s.effects).any(|e| e.gate.kind != 0);
+    let mut life_cache = HashMap::<[i32; 5], (Vec<i32>, Vec<i32>)>::default();
     for &order_index in &plan.representatives {
         if generation != crate::cancellation_generation() {
             return Err("cancelled".into());
         }
         let order = &live::orders()[order_index];
-        let mut life = master.live.life_base;
+        let recoveries = order.map(|slot| slots.get(slot).map_or(0, |s| s.recovery));
+        let lives = if needs_life {
+            Some(&*life_cache.entry(recoveries).or_insert_with(|| {
+                let mut life = Life::new(master.live.life_base as i32, *damage, chart.music_length);
+                let mut note = vec![0; n];
+                let mut gate = vec![0; event_times.len()];
+                let (mut i, mut event) = (0, 0);
+                while i < n || event < firing.len() {
+                    let frame = (if i < n { core::frame(chart.times[i]) } else { i32::MAX })
+                        .min(if event < firing.len() { core::frame(event_times[firing[event]]) } else { i32::MAX });
+                    while i < n && core::frame(chart.times[i]) == frame {
+                        life.note_damage(chart.times[i], ctx.judgement[i]);
+                        note[i] = life.at(chart.times[i]);
+                        i += 1;
+                    }
+                    let start = event;
+                    while event < firing.len() && core::frame(event_times[firing[event]]) == frame {
+                        let key = firing[event];
+                        life.recovery(event_times[key], slots[order[key]].recovery, true);
+                        event += 1;
+                    }
+                    for &key in &firing[start..event] { gate[key] = life.at(live::frame_time(event_times[key])); }
+                }
+                (note, gate)
+            }))
+        } else { None };
         let mut factors = Factors {
             channel: [0.0; 7],
             active: Vec::new(),
@@ -871,7 +901,7 @@ pub fn score_orders(
                 factors.expire(start as i64);
                 if let Some(slot) = slots.get(order[event]) {
                     for effect in &slot.effects {
-                        if effect.gate.blocks(life) {
+                        if effect.gate.blocks(lives.map_or(master.live.life_base, |l| l.1[event] as f64)) {
                             continue;
                         }
                         let end = start + crate::num::window_ms(effect.seconds, slot.extension_ms);
@@ -893,9 +923,6 @@ pub fn score_orders(
                                 delta: effect.delta,
                             });
                         }
-                    }
-                    if slot.recovery != 0 {
-                        life = master.live.life_base.min(life + slot.recovery as f64);
                     }
                     if let Some(convert) = &slot.convert {
                         factors.convert_end = Some(
@@ -938,7 +965,7 @@ pub fn score_orders(
                     }) * f(c * up))
                         / count)
                     .floor();
-                    if life <= 0.0 {
+                    if lives.map_or(master.live.life_base as i32, |l| l.0[i]) <= 0 {
                         value = f(onus * value).floor();
                     }
                     outcomes[4 * i + mask] = value;
@@ -947,7 +974,7 @@ pub fn score_orders(
             } else {
                 let up = f(f(ctx.up[i] / ctx.luck[i]) + live);
                 x = f(f(f(ctx.luck[i]) * f(c * up)) / count).floor();
-                if life <= 0.0 {
+                if lives.map_or(master.live.life_base as i32, |l| l.0[i]) <= 0 {
                     x = f(onus * x).floor();
                 }
             }
@@ -955,9 +982,6 @@ pub fn score_orders(
             let range = chart.range_of[i];
             if range >= 0 {
                 range_score[range as usize] += x;
-            }
-            if damage[judgement] != 0.0 {
-                life = (life - damage[judgement]).max(0.0);
             }
         }
         for (range, &value) in range_score.iter().enumerate() {

@@ -795,6 +795,7 @@ impl<'a> Kernel<'a> {
 }
 /// A deck's per-note score weights under its context.
 pub(crate) fn note_weights(master: &Master, chart: &Chart, ctx: &Context) -> Weights {
+    let combo = chart.combo(master, &ctx.judgement);
     {
         let n = chart.notes.len();
         let unit = master.live.adjustment * chart.difficulty_factor;
@@ -817,7 +818,7 @@ pub(crate) fn note_weights(master: &Master, chart: &Chart, ctx: &Context) -> Wei
                 * unit
                 * chart.note_frac[i]
                 * chart.judge_frac[ctx.judgement[i]]
-                * chart.combo_factor[i]
+                * combo[i]
                 * ctx.gk[i];
             base += beta * ctx.up[i];
             if let Some(nominal) = &ctx.nominal {

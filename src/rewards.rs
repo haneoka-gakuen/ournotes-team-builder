@@ -305,7 +305,7 @@ pub fn score_coefficient(
         let mut coefficient = 0.0;
         for (i, note) in chart.notes.iter().enumerate() {
             let frac = chart.note_frac[i];
-            let combo = chart.combo_factor[i];
+            let combo = if chart.accuracy.miss_every > 0 { 2.0 } else { chart.combo_factor[i] };
             if frac == 0.0 {
                 continue;
             }
