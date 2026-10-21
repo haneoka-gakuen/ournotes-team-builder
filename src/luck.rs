@@ -272,7 +272,9 @@ impl<'a> Engine<'a> {
                 };
                 let offset = add as i64 - overflow * maximum;
                 match buff {
-                    Some(buff) if to & 7 != 0 => self.consume_block(to, row, a as usize, b as usize, offset, scale, buff),
+                    Some(buff) if to & 7 != 0 => {
+                        self.consume_block(to, row, a as usize, b as usize, offset, scale, buff)
+                    }
                     _ => self.block(to, row, a as usize, b as usize, offset, scale),
                 }
             }
@@ -377,7 +379,16 @@ impl<'a> Engine<'a> {
     }
     /// Consumes one lot from row `key`, holding `scale ×` values [a, b) of `row` at gauge `g + offset`.
     #[allow(clippy::too_many_arguments)]
-    fn consume_block(&mut self, key: u64, row: &Row, a: usize, b: usize, offset: i64, scale: f64, buff: i32) {
+    fn consume_block(
+        &mut self,
+        key: u64,
+        row: &Row,
+        a: usize,
+        b: usize,
+        offset: i64,
+        scale: f64,
+        buff: i32,
+    ) {
         let list = self.lot_rows(key & HIGH, buff);
         for k in 0..self.transitions.lists[list].len() {
             let (next, chance, after) = self.transitions.lists[list][k];
@@ -402,7 +413,11 @@ impl<'a> Engine<'a> {
                     continue;
                 }
                 let gauge = (g as i64 + offset) as usize;
-                let into = self.rows.at(to - l + (l + (gauge / after) as u64).min(7), self.width, &mut self.pool);
+                let into = self.rows.at(
+                    to - l + (l + (gauge / after) as u64).min(7),
+                    self.width,
+                    &mut self.pool,
+                );
                 let rem = gauge % after;
                 into.values[rem] += value * q;
                 into.low = into.low.min(rem);
@@ -432,7 +447,13 @@ impl<'a> Engine<'a> {
                     return;
                 }
                 let gauge = (e.maximum(rush((row.key & HIGH) << 8)) as i32).wrapping_mul(value);
-                e.shift(row.key, &row, chance, floor_i32(gauge as f32 / 10000.0), None);
+                e.shift(
+                    row.key,
+                    &row,
+                    chance,
+                    floor_i32(gauge as f32 / 10000.0),
+                    None,
+                );
                 e.axpy(row.key, &row, 1.0 - chance, row.low, row.high);
                 release(row, &mut e.pool);
             });
@@ -471,7 +492,13 @@ impl<'a> Engine<'a> {
                 e.axpy(to, &row, a.chance, row.low, row.high);
             } else {
                 let gauge = (e.maximum(rush(s)) as i32).wrapping_mul(a.value);
-                e.shift(row.key, &row, a.chance, floor_i32(gauge as f32 / 10000.0), None);
+                e.shift(
+                    row.key,
+                    &row,
+                    a.chance,
+                    floor_i32(gauge as f32 / 10000.0),
+                    None,
+                );
             }
             e.axpy(row.key, &row, 1.0 - a.chance, row.low, row.high);
             release(row, &mut e.pool);

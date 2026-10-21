@@ -8,8 +8,192 @@ use crate::{
     power::{self, Member, Snap},
     search::{Exact, JointTarget, Objective, Team, Totals},
 };
+use rustc_hash::FxHashMap as HashMap;
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashMap};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    sync::Arc,
+};
+
+struct CurvePoint {
+    x: f64,
+    y: f64,
+    integer: i128,
+}
+pub(crate) struct RewardCurve {
+    points: Vec<CurvePoint>,
+    steps: Vec<(f64, f64)>,
+    error: f64,
+}
+impl RewardCurve {
+    pub(crate) fn new(rows: Vec<(i32, f64)>) -> Option<Self> {
+        let mut values = BTreeMap::<i32, f64>::new();
+        for (x, y) in rows {
+            if x < 0 || !y.is_finite() || y < 0.0 {
+                return None;
+            }
+            values.entry(x).and_modify(|v| *v = v.max(y)).or_insert(y);
+        }
+        let mut high = 0.0_f64;
+        for y in values.values_mut() {
+            high = high.max(*y);
+            *y = high;
+        }
+        let parts = |y: f64| {
+            let bits = y.to_bits();
+            let exponent = ((bits >> 52) & 2047) as i32;
+            let fraction = bits & ((1u64 << 52) - 1);
+            let (mantissa, power) = if exponent == 0 {
+                (fraction, -1074)
+            } else {
+                ((1u64 << 52) | fraction, exponent - 1075)
+            };
+            if mantissa == 0 {
+                (0, 0)
+            } else {
+                let zeros = mantissa.trailing_zeros();
+                (mantissa >> zeros, power + zeros as i32)
+            }
+        };
+        let exponent = values
+            .values()
+            .filter(|&&y| y > 0.0)
+            .map(|&y| parts(y).1)
+            .min()
+            .unwrap_or(0);
+        let steps: Vec<_> = values.iter().map(|(&x, &y)| (x as f64, y)).collect();
+        let mut points = Vec::<CurvePoint>::new();
+        for (x, y) in values {
+            let (mantissa, power) = parts(y);
+            let integer = if mantissa == 0 {
+                0
+            } else {
+                let shift = power - exponent;
+                if !(0..=36).contains(&shift) {
+                    return None;
+                }
+                (mantissa as i128) << shift
+            };
+            let point = CurvePoint {
+                x: x as f64,
+                y,
+                integer,
+            };
+            while points.len() >= 2 {
+                let a = &points[points.len() - 2];
+                let b = &points[points.len() - 1];
+                if (b.integer - a.integer) * (point.x as i128 - b.x as i128)
+                    > (point.integer - b.integer) * (b.x as i128 - a.x as i128)
+                {
+                    break;
+                }
+                points.pop();
+            }
+            points.push(point);
+        }
+        let error = if points.iter().all(|p| p.integer <= (1i128 << 53) / 120) {
+            0.0
+        } else {
+            high * (256.0 * f64::EPSILON) / (1.0 - 256.0 * f64::EPSILON)
+        };
+        (!points.is_empty()).then_some(Self {
+            points,
+            steps,
+            error,
+        })
+    }
+    fn upper(&self, score: f64) -> f64 {
+        let last = self.points.last().unwrap();
+        if !score.is_finite() || score >= last.x {
+            return last.y;
+        }
+        let i = self.points.partition_point(|p| p.x <= score);
+        if i == 0 {
+            return self.points[0].y;
+        }
+        let (a, b) = (&self.points[i - 1], &self.points[i]);
+        let fraction = ((score - a.x).next_up() / (b.x - a.x)).next_up();
+        ((a.y + ((b.y - a.y).next_up() * fraction).next_up()).next_up() + self.error)
+            .next_up()
+            .min(last.y)
+    }
+    fn required(&self, reward: f64) -> f64 {
+        let reward = (reward - self.error).max(0.0);
+        let i = self.points.partition_point(|p| p.y < reward);
+        if i == 0 {
+            return 0.0;
+        }
+        if i == self.points.len() {
+            return f64::INFINITY;
+        }
+        let (a, b) = (&self.points[i - 1], &self.points[i]);
+        let value = (((reward - a.y).next_down() * (b.x - a.x)).next_down()
+            / (b.y - a.y).next_up())
+        .next_down();
+        (a.x + value).next_down().max(0.0)
+    }
+    pub(crate) fn orders(&self, coefficients: &[f64], power: f64) -> f64 {
+        let mut before = 0;
+        let mut total = 0.0;
+        let mut value = self.steps[0].1;
+        for &(required, next) in self.steps.iter().skip(1) {
+            let count = coefficients.partition_point(|&coefficient| power * coefficient < required);
+            total += (count - before) as f64 * value;
+            before = count;
+            value = next;
+        }
+        total += (coefficients.len() - before) as f64 * value;
+        let mean = total / coefficients.len() as f64;
+        if self.error == 0.0 {
+            mean
+        } else {
+            (mean.next_up() + self.error)
+                .next_up()
+                .min(self.steps.last().unwrap().1)
+        }
+    }
+    pub(crate) fn shifted_sum(
+        &self,
+        coefficients: &[f64],
+        power: f64,
+        offset: f64,
+        absolute: f64,
+    ) -> f64 {
+        let mut before = 0;
+        let mut total = 0.0;
+        let mut value = self.steps[0].1;
+        for &(required, next) in self.steps.iter().skip(1) {
+            let count = coefficients.partition_point(|&coefficient| {
+                (((coefficient + offset).next_up() * power).next_up() + absolute).next_up()
+                    < required
+            });
+            total += (count - before) as f64 * value;
+            before = count;
+            value = next;
+        }
+        total + (coefficients.len() - before) as f64 * value
+    }
+    fn scores(&self, scores: &[f64]) -> f64 {
+        let total: f64 = scores
+            .iter()
+            .map(|&score| {
+                let i = self
+                    .steps
+                    .partition_point(|&(required, _)| required <= score)
+                    .saturating_sub(1);
+                self.steps[i].1
+            })
+            .sum();
+        let mean = total / scores.len() as f64;
+        if self.error == 0.0 {
+            mean
+        } else {
+            (mean.next_up() + self.error)
+                .next_up()
+                .min(self.steps.last().unwrap().1)
+        }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum RouteKind {
@@ -152,23 +336,6 @@ fn top_five(values: impl Iterator<Item = f64>) -> f64 {
     rows.sort_by(|a, b| b.total_cmp(a));
     rows.into_iter().take(5).sum()
 }
-fn best_order(rows: &[[f64; 5]]) -> f64 {
-    let mut dp = [f64::NEG_INFINITY; 32];
-    dp[0] = 0.0;
-    for mask in 0usize..31 {
-        if dp[mask] == f64::NEG_INFINITY {
-            continue;
-        }
-        let row = mask.count_ones() as usize;
-        for (column, &weight) in rows[row].iter().enumerate() {
-            let bit = 1 << column;
-            if mask & bit == 0 {
-                dp[mask | bit] = dp[mask | bit].max(dp[mask] + weight);
-            }
-        }
-    }
-    dp[31]
-}
 pub struct EventObjective {
     pub core: Option<LiveCore>,
     pub chart: Option<Chart>,
@@ -188,6 +355,23 @@ pub struct EventObjective {
     suffix: [f64; 6],
     ordered: Vec<usize>,
     targets: HashMap<u64, Vec<JointTarget>>,
+    curves: HashMap<(u64, u64), Option<RewardCurve>>,
+    other_curves: HashMap<u64, Option<RewardCurve>>,
+    profiles: Vec<[f64; 5]>,
+    profile_ids: HashMap<[u64; 5], u32>,
+    slot_profiles: HashMap<usize, u32>,
+    profile_options: Vec<Vec<i32>>,
+    member_profiles: Vec<u32>,
+    assignment_profiles: [u32; 5],
+    coefficients: HashMap<[u32; 5], Arc<Vec<f64>>>,
+    coefficient_order: VecDeque<[u32; 5]>,
+    global_profiles: Vec<Option<u32>>,
+    suffix_profiles: Vec<u32>,
+    snap_power: Arc<Vec<f64>>,
+    snap_width: usize,
+    base_power: f64,
+    frontiers: Vec<[Vec<(f64, f64)>; 5]>,
+    mean_frontiers: Vec<Vec<(f64, f64)>>,
 }
 impl EventObjective {
     #[allow(clippy::too_many_arguments)]
@@ -224,11 +408,8 @@ impl EventObjective {
         let tie = if primary_only { 0.0 } else { 1.0 / 16777216.0 };
         let max_other = top_five(other_member.iter().map(|v| v.max(0.0)))
             + top_five(other_snap.iter().map(|v| v.max(0.0)));
-        let max_bonus = if primary_only {
-            top_five(member_bonus.iter().copied()) + top_five(snap_bonus.iter().copied())
-        } else {
-            1000000.0
-        };
+        let max_bonus =
+            top_five(member_bonus.iter().copied()) + top_five(snap_bonus.iter().copied());
         let played = route.kind != RouteKind::Skip;
         Self {
             core: chart
@@ -250,11 +431,33 @@ impl EventObjective {
             max_bonus,
             suffix: [0.0; 6],
             ordered: Vec::new(),
-            targets: HashMap::new(),
+            targets: HashMap::default(),
+            curves: HashMap::default(),
+            other_curves: HashMap::default(),
+            profiles: Vec::new(),
+            profile_ids: HashMap::default(),
+            slot_profiles: HashMap::default(),
+            profile_options: vec![Vec::new(); members.len()],
+            member_profiles: vec![u32::MAX; members.len()],
+            assignment_profiles: [0; 5],
+            coefficients: HashMap::default(),
+            coefficient_order: VecDeque::new(),
+            global_profiles: vec![None; members.len()],
+            suffix_profiles: Vec::new(),
+            snap_power: Arc::new(Vec::new()),
+            snap_width: snaps.len() + 1,
+            base_power: 0.0,
+            frontiers: (0..members.len())
+                .map(|_| std::array::from_fn(|_| Vec::new()))
+                .collect(),
+            mean_frontiers: vec![Vec::new(); members.len()],
         }
     }
     /// Ranks by `measure + cp·CP + other·(the other reward)`, the weights already divided by the measure's weight.
     pub fn with_weights(mut self, cp: f64, other: f64) -> Self {
+        self.targets.clear();
+        self.curves.clear();
+        self.other_curves.clear();
         self.cp_weight = cp;
         self.exchange = None;
         self.tie = other;
@@ -287,6 +490,340 @@ impl EventObjective {
     }
     fn reward_bound(&self, bonus: f64, rank: i32) -> f64 {
         self.value(bonus, rank) + self.tie * self.other(self.max_other, rank)
+    }
+    fn rank_points(&self) -> Vec<(i32, i32)> {
+        std::iter::once((2, 0))
+            .chain(
+                self.chart
+                    .as_ref()
+                    .unwrap()
+                    .ranks
+                    .iter()
+                    .filter(|r| r.rank > 2 && r.required as f64 <= self.score_cap)
+                    .map(|r| (r.rank, r.required)),
+            )
+            .collect()
+    }
+    fn curve(&mut self, bonus: f64, other: f64) -> Option<&RewardCurve> {
+        let key = (
+            bonus.to_bits(),
+            if self.tie == 0.0 { 0 } else { other.to_bits() },
+        );
+        if !self.curves.contains_key(&key) {
+            let mut curve = RewardCurve::new(
+                self.rank_points()
+                    .into_iter()
+                    .map(|(rank, score)| {
+                        (
+                            score,
+                            self.value(bonus, rank) + self.tie * self.other(other, rank),
+                        )
+                    })
+                    .collect(),
+            );
+            if self.tie != 0.0 {
+                if let Some(curve) = &mut curve {
+                    curve.error = curve.error.max(
+                        curve.points.last().unwrap().y * (256.0 * f64::EPSILON)
+                            / (1.0 - 256.0 * f64::EPSILON),
+                    );
+                }
+            }
+            if self.curves.len() >= 256 {
+                self.curves.clear();
+            }
+            self.curves.insert(key, curve);
+        }
+        self.curves.get(&key).and_then(Option::as_ref)
+    }
+    fn mean_bound(&mut self, bonus: f64, other: f64, score: f64) -> f64 {
+        self.curve(bonus, other)
+            .map_or(f64::INFINITY, |curve| curve.upper(score))
+    }
+    fn other_mean_bound(&mut self, bonus: f64, score: f64) -> f64 {
+        let key = bonus.to_bits();
+        if !self.other_curves.contains_key(&key) {
+            let curve = RewardCurve::new(
+                self.rank_points()
+                    .into_iter()
+                    .map(|(rank, score)| (score, self.other(bonus, rank)))
+                    .collect(),
+            );
+            if self.other_curves.len() >= 256 {
+                self.other_curves.clear();
+            }
+            self.other_curves.insert(key, curve);
+        }
+        self.other_curves
+            .get(&key)
+            .and_then(Option::as_ref)
+            .map_or(f64::INFINITY, |curve| curve.upper(score))
+    }
+    fn intern_profile(&mut self, row: [f64; 5]) -> u32 {
+        let key = row.map(f64::to_bits);
+        let next = self.profiles.len() as u32;
+        *self.profile_ids.entry(key).or_insert_with(|| {
+            self.profiles.push(row);
+            next
+        })
+    }
+    fn slot_profile(&mut self, member: usize, snap: i32) -> u32 {
+        let shape = self.core.as_ref().unwrap().shape(member, snap);
+        if let Some(&id) = self.slot_profiles.get(&shape) {
+            return id;
+        }
+        let row = self
+            .core
+            .as_mut()
+            .unwrap()
+            .weight(member, snap)
+            .high
+            .per_event;
+        let id = self.intern_profile(row);
+        self.slot_profiles.insert(shape, id);
+        id
+    }
+    fn order_coefficients(&mut self, mut ids: [u32; 5]) -> Arc<Vec<f64>> {
+        ids.sort_unstable();
+        if let Some(coefficients) = self.coefficients.get(&ids) {
+            return Arc::clone(coefficients);
+        }
+        let core = self.core.as_ref().unwrap();
+        let mut coefficients: Vec<_> = crate::live::orders()
+            .iter()
+            .map(|order| {
+                let skill = order
+                    .iter()
+                    .enumerate()
+                    .map(|(event, &slot)| self.profiles[ids[slot] as usize][event])
+                    .sum::<f64>();
+                (core.high.total + skill) / core.input.converted_count as f64
+                    * (1.0 + RELATIVE_ERROR)
+                    * (1.0 + 16.0 * f64::EPSILON)
+            })
+            .collect();
+        coefficients.sort_by(f64::total_cmp);
+        let coefficients = Arc::new(coefficients);
+        if self.coefficients.len() >= 2048 {
+            if let Some(key) = self.coefficient_order.pop_front() {
+                self.coefficients.remove(&key);
+            }
+        }
+        self.coefficient_order.push_back(ids);
+        self.coefficients.insert(ids, Arc::clone(&coefficients));
+        coefficients
+    }
+    fn projection(
+        &mut self,
+        members: &[usize],
+        assigned: &[i32],
+        from: usize,
+        t: Totals,
+        other: f64,
+    ) -> Option<(f64, f64)> {
+        if self.core.as_ref()?.input.judgements.is_some() {
+            return None;
+        }
+        let ids = std::array::from_fn(|slot| {
+            if slot < from {
+                self.slot_profile(members[slot], assigned[slot])
+            } else {
+                self.assignment_profiles[slot]
+            }
+        });
+        let coefficients = self.order_coefficients(ids);
+        let primary = self
+            .curve(t.bonus, other)
+            .map_or(f64::INFINITY, |curve| curve.orders(&coefficients, t.power));
+        let key = other.to_bits();
+        self.other_mean_bound(other, f64::INFINITY);
+        let secondary = self
+            .other_curves
+            .get(&key)
+            .and_then(Option::as_ref)
+            .map_or(f64::INFINITY, |curve| curve.orders(&coefficients, t.power));
+        Some((primary, secondary))
+    }
+    fn paired_projection(
+        &mut self,
+        members: &[usize],
+        assigned: &[i32],
+        from: usize,
+        t: Totals,
+        other: f64,
+    ) -> Option<(f64, f64, f64)> {
+        let core = self.core.as_ref()?;
+        if core.input.judgements.is_some() {
+            return None;
+        }
+        let (base, converted) = (core.high.total, core.input.converted_count as f64);
+        let lambda = ((base + t.skill) / t.power).sqrt();
+        if !lambda.is_finite() || lambda <= 0.0 {
+            return None;
+        }
+        let mut rows = [[0.0; 5]; 5];
+        for slot in 0..5 {
+            let member = members[slot];
+            if slot < from {
+                let snap = assigned[slot];
+                let id = self.slot_profile(member, snap);
+                let power = self.snap_power[member * self.snap_width
+                    + if snap < 0 {
+                        self.snap_width - 1
+                    } else {
+                        snap as usize
+                    }];
+                for (event, value) in rows[slot].iter_mut().enumerate() {
+                    *value = ((lambda * power).next_up()
+                        + (self.profiles[id as usize][event] / lambda).next_up())
+                    .next_up();
+                }
+            } else {
+                for (event, value) in rows[slot].iter_mut().enumerate() {
+                    *value = self.frontiers[member][event]
+                        .iter()
+                        .map(|&(power, weight)| {
+                            ((lambda * power).next_up() + (weight / lambda).next_up()).next_up()
+                        })
+                        .fold(0.0, f64::max);
+                }
+            }
+        }
+        let constant = ((lambda * self.base_power).next_up() + (base / lambda).next_up()).next_up();
+        let scores: [f64; 120] = std::array::from_fn(|i| {
+            let sum = crate::live::orders()[i]
+                .iter()
+                .enumerate()
+                .fold(constant, |sum, (event, &slot)| {
+                    (sum + rows[slot][event]).next_up()
+                });
+            (((sum * sum).next_up() / (4.0 * converted)).next_up() * (1.0 + RELATIVE_ERROR))
+                .next_up()
+        });
+        let mut mean_sum = constant;
+        for slot in 0..5 {
+            let member = members[slot];
+            let value = if slot < from {
+                let snap = assigned[slot];
+                let id = self.slot_profile(member, snap);
+                let power = self.snap_power[member * self.snap_width
+                    + if snap < 0 {
+                        self.snap_width - 1
+                    } else {
+                        snap as usize
+                    }];
+                ((lambda * power).next_up()
+                    + (self.profiles[id as usize].iter().sum::<f64>() / 5.0 / lambda).next_up())
+                .next_up()
+            } else {
+                self.mean_frontiers[member]
+                    .iter()
+                    .map(|&(power, weight)| {
+                        ((lambda * power).next_up() + (weight / lambda).next_up()).next_up()
+                    })
+                    .fold(0.0, f64::max)
+            };
+            mean_sum = (mean_sum + value).next_up();
+        }
+        let mean_bound = (((mean_sum * mean_sum).next_up() / (4.0 * converted)).next_up()
+            * (1.0 + RELATIVE_ERROR))
+            .next_up();
+        let mean = self.core.as_ref().unwrap().score_high(t).min(mean_bound);
+        let primary = self
+            .curve(t.bonus, other)
+            .map_or(f64::INFINITY, |curve| curve.scores(&scores));
+        self.other_mean_bound(other, f64::INFINITY);
+        let secondary = self
+            .other_curves
+            .get(&other.to_bits())
+            .and_then(Option::as_ref)
+            .map_or(f64::INFINITY, |curve| curve.scores(&scores));
+        Some((primary, secondary, mean))
+    }
+    fn global_profile(&mut self, member: usize) -> u32 {
+        if let Some(profile) = self.global_profiles[member] {
+            return profile;
+        }
+        let mut row = [0.0_f64; 5];
+        for snap in -1..self.snap_bonus.len() as i32 {
+            let profile = self.slot_profile(member, snap);
+            for (event, value) in row.iter_mut().enumerate() {
+                *value = value.max(self.profiles[profile as usize][event]);
+            }
+        }
+        let profile = self.intern_profile(row);
+        self.global_profiles[member] = Some(profile);
+        profile
+    }
+    fn prepare_profile_members(&mut self, characters: &[Vec<usize>]) {
+        if self
+            .core
+            .as_ref()
+            .is_none_or(|core| core.input.judgements.is_some())
+        {
+            return;
+        }
+        let mut suffix = [0.0_f64; 5];
+        self.suffix_profiles = vec![0; characters.len() + 1];
+        self.suffix_profiles[characters.len()] = self.intern_profile(suffix);
+        for (from, members) in characters.iter().enumerate().rev() {
+            for &member in members {
+                let id = self.global_profile(member);
+                for (event, value) in suffix.iter_mut().enumerate() {
+                    *value = value.max(self.profiles[id as usize][event]);
+                }
+            }
+            self.suffix_profiles[from] = self.intern_profile(suffix);
+        }
+    }
+    fn member_projection(
+        &mut self,
+        members: &[usize],
+        t: Totals,
+        from: usize,
+        other: f64,
+    ) -> Option<(f64, f64)> {
+        if self.core.as_ref()?.input.judgements.is_some() {
+            return None;
+        }
+        let ids = std::array::from_fn(|slot| {
+            if slot < members.len() {
+                self.global_profile(members[slot])
+            } else {
+                self.suffix_profiles[from]
+            }
+        });
+        let coefficients = self.order_coefficients(ids);
+        let primary = self
+            .curve(t.bonus, other)
+            .map_or(f64::INFINITY, |curve| curve.orders(&coefficients, t.power));
+        self.other_mean_bound(other, f64::INFINITY);
+        let secondary = self
+            .other_curves
+            .get(&other.to_bits())
+            .and_then(Option::as_ref)
+            .map_or(f64::INFINITY, |curve| curve.orders(&coefficients, t.power));
+        Some((primary, secondary))
+    }
+    fn mean_targets(&mut self, limit: f64) -> Option<Vec<JointTarget>> {
+        let targets = self.joint_targets(limit)?;
+        let bonus = targets
+            .iter()
+            .map(|target| target.bonus)
+            .fold(f64::INFINITY, f64::min);
+        let scale =
+            self.core.as_ref().unwrap().input.converted_count as f64 / (1.0 + RELATIVE_ERROR);
+        let required = self
+            .curve(self.max_bonus, self.max_other)
+            .map_or(0.0, |curve| curve.required(limit));
+        Some(if targets.is_empty() {
+            Vec::new()
+        } else {
+            vec![JointTarget {
+                bonus,
+                product: (required * scale).next_down().max(0.0),
+            }]
+        })
     }
     fn other_snap(&self, snap: i32) -> f64 {
         if snap < 0 {
@@ -322,6 +859,48 @@ impl EventObjective {
     }
 }
 impl Objective for EventObjective {
+    fn exchange_snap_equivalent(&mut self, member: usize, a: i32, b: i32) -> bool {
+        self.core
+            .as_ref()
+            .is_none_or(|core| core.shape(member, a) == core.shape(member, b))
+    }
+    fn conditional_snap_dominance(&self) -> bool {
+        true
+    }
+    fn canonical_leader(&self) -> bool {
+        true
+    }
+    fn numeric_member_dominance(&mut self, better: usize, worse: usize, power_delta: f64) -> bool {
+        self.other_member[better] >= self.other_member[worse]
+            && self
+                .core
+                .as_mut()
+                .is_some_and(|c| c.numeric_member_dominance(better, worse, power_delta))
+    }
+    fn needs_power_cap(&self) -> bool {
+        self.core
+            .as_ref()
+            .is_some_and(|c| c.input.judgements.is_none())
+    }
+    fn prepare_dominance(&mut self, power_cap: f64) {
+        if let Some(core) = &mut self.core {
+            core.prepare_dominance(power_cap);
+        }
+    }
+    fn numeric_snap_dominance(
+        &mut self,
+        member: usize,
+        better: i32,
+        worse: i32,
+        power_delta: f64,
+    ) -> bool {
+        self.other_snap(better) >= self.other_snap(worse)
+            && self
+                .core
+                .as_mut()
+                .is_some_and(|c| c.numeric_dominance(member, better, worse, power_delta))
+    }
+
     fn skill(&mut self, member: usize, snap: i32) -> (f64, f64) {
         if let Some(core) = &mut self.core {
             let w = core.weight(member, snap);
@@ -341,12 +920,41 @@ impl Objective for EventObjective {
     fn snap_bonus(&self, snap: usize) -> f64 {
         self.snap_bonus[snap]
     }
-    fn snap_dominance(&mut self, _member: usize, snap: i32) -> Vec<f64> {
-        if self.tie != 0.0 {
+    fn snap_dominance(&mut self, member: usize, snap: i32) -> Vec<f64> {
+        let mut values = if self.tie != 0.0 {
             vec![self.other_snap(snap)]
         } else {
             Vec::new()
+        };
+        if let Some(core) = &self.core {
+            let shape = core.shape(member, snap) as f64;
+            values.extend([shape, -shape]);
         }
+        values
+    }
+    fn prepare_power(&mut self, snapshots: Arc<Vec<f64>>, width: usize) {
+        if *self.snap_power != *snapshots {
+            self.member_profiles.fill(u32::MAX);
+        }
+        self.snap_power = snapshots;
+        self.snap_width = width;
+    }
+    fn prepare_assignment_power(&mut self, power: f64) {
+        self.base_power = power;
+    }
+    fn prepare_members(&mut self, characters: &[Vec<usize>]) {
+        self.prepare_profile_members(characters);
+    }
+    fn member_bound_at(
+        &mut self,
+        members: &[usize],
+        t: Totals,
+        _left: usize,
+        from: usize,
+        _limit: f64,
+    ) -> Option<f64> {
+        self.member_projection(members, t, from, self.max_other)
+            .map(|bounds| bounds.0)
     }
     fn product_base(&self) -> Option<f64> {
         self.core.as_ref().map(|c| c.high.total)
@@ -359,39 +967,30 @@ impl Objective for EventObjective {
         }
     }
     fn joint_targets(&mut self, limit: f64) -> Option<Vec<JointTarget>> {
-        let core = self.core.as_ref()?;
-        let scale = core.input.converted_count as f64 / (1.0 + RELATIVE_ERROR);
+        let scale = self.core.as_ref()?.input.converted_count as f64 / (1.0 + RELATIVE_ERROR);
         if let Some(rows) = self.targets.get(&limit.to_bits()) {
             return Some(rows.clone());
         }
-        let chart = self.chart.as_ref().unwrap();
-        let ranks = std::iter::once((2, 0.0)).chain(
-            chart
-                .ranks
-                .iter()
-                .filter(|r| r.rank > 2)
-                .map(|r| (r.rank, r.required as f64)),
-        );
         let mut targets = Vec::new();
-        for (rank, required) in ranks {
-            if required > self.score_cap || self.reward_bound(self.max_bonus, rank) < limit {
+        for (rank, required) in self.rank_points() {
+            if self.reward_bound(self.max_bonus, rank) < limit {
                 continue;
             }
-            let (mut low, mut high) = (0, self.max_bonus as i64);
+            let (mut low, mut high) = (0i64, self.max_bonus as i64);
             while low < high {
                 let mid = (low + high) >> 1;
                 if self.reward_bound(mid as f64, rank) >= limit {
-                    high = mid
+                    high = mid;
                 } else {
-                    low = mid + 1
+                    low = mid + 1;
                 }
             }
             targets.push(JointTarget {
                 bonus: low as f64,
-                product: required * scale,
+                product: (required as f64 * scale).next_down().max(0.0),
             });
         }
-        if self.targets.len() > 64 {
+        if self.targets.len() >= 64 {
             self.targets.clear();
         }
         self.targets.insert(limit.to_bits(), targets.clone());
@@ -406,7 +1005,68 @@ impl Objective for EventObjective {
         })
     }
     fn prepare_assignment(&mut self, _members: &[usize], options: &[Vec<i32>]) {
-        if self.tie == 0.0 || self.core.is_none() { return; }
+        if self.core.is_some() {
+            for (slot, choices) in options.iter().enumerate() {
+                let member = _members[slot];
+                if self.member_profiles[member] == u32::MAX
+                    || self.profile_options[member] != *choices
+                {
+                    let mut row = [0.0_f64; 5];
+                    let mut frontiers: [Vec<(f64, f64)>; 5] = std::array::from_fn(|_| Vec::new());
+                    let mut mean_frontier = Vec::new();
+                    for &snap in choices {
+                        let profile = self.slot_profile(member, snap);
+                        let power = self.snap_power[member * self.snap_width
+                            + if snap < 0 {
+                                self.snap_width - 1
+                            } else {
+                                snap as usize
+                            }];
+                        mean_frontier.push((
+                            power,
+                            self.profiles[profile as usize].iter().sum::<f64>() / 5.0,
+                        ));
+                        for (event, frontier) in frontiers.iter_mut().enumerate() {
+                            frontier.push((power, self.profiles[profile as usize][event]));
+                        }
+                        for (event, value) in row.iter_mut().enumerate() {
+                            *value = value.max(self.profiles[profile as usize][event]);
+                        }
+                    }
+                    for frontier in &mut frontiers {
+                        frontier
+                            .sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| b.1.total_cmp(&a.1)));
+                        let mut high = f64::NEG_INFINITY;
+                        frontier.retain(|&(_, value)| {
+                            if value > high {
+                                high = value;
+                                true
+                            } else {
+                                false
+                            }
+                        });
+                    }
+                    mean_frontier.sort_by(|a, b| b.0.total_cmp(&a.0).then(b.1.total_cmp(&a.1)));
+                    let mut high = f64::NEG_INFINITY;
+                    mean_frontier.retain(|&(_, value)| {
+                        if value > high {
+                            high = value;
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                    self.mean_frontiers[member] = mean_frontier;
+                    self.frontiers[member] = frontiers;
+                    self.member_profiles[member] = self.intern_profile(row);
+                    self.profile_options[member] = choices.clone();
+                }
+                self.assignment_profiles[slot] = self.member_profiles[member];
+            }
+        }
+        if self.tie == 0.0 || self.core.is_none() {
+            return;
+        }
         self.suffix = [0.0; 6];
         for slot in (0..5).rev() {
             self.suffix[slot] = self.suffix[slot + 1]
@@ -436,7 +1096,12 @@ impl Objective for EventObjective {
         if self.tie == 0.0 || self.core.is_none() {
             return None;
         }
-        let rank = self.rank_bound(self.core.as_ref().unwrap().score_high(t));
+        let score = self
+            .core
+            .as_ref()
+            .unwrap()
+            .score_high(t)
+            .min(self.score_cap);
         let distinct = self
             .ordered
             .iter()
@@ -450,27 +1115,44 @@ impl Objective for EventObjective {
                 .iter()
                 .map(|&s| self.other_snap(s))
                 .sum::<f64>();
-        Some(self.value(t.bonus, rank) + self.tie * self.other(bonus, rank))
+        Some(self.mean_bound(t.bonus, bonus, score))
+    }
+    fn assignment_order_bound(
+        &mut self,
+        members: &[usize],
+        t: Totals,
+        assigned: &[i32],
+        from: usize,
+        limit: f64,
+    ) -> Option<f64> {
+        let upper = self
+            .projection(members, assigned, from, t, self.max_other)?
+            .0;
+        if upper <= limit {
+            return Some(upper);
+        }
+        Some(
+            self.paired_projection(members, assigned, from, t, self.max_other)
+                .map_or(upper, |bounds| upper.min(bounds.0)),
+        )
     }
     fn leaf_bound(&mut self, team: &Team, t: Totals) -> Option<f64> {
         let other = self.other_bonus(team);
+        if let Some(bounds) = self.projection(&team.members, &team.snaps, 5, t, other) {
+            return Some(bounds.0);
+        }
+
         if let Some(core) = &mut self.core {
-            let score = if core.input.judgements.is_some() {
-                core.team_high(team, t)
-            } else {
-                let weights: Vec<_> = team
-                    .members
-                    .iter()
-                    .enumerate()
-                    .map(|(slot, &m)| core.weight(m, team.snaps[slot]).high.per_event)
-                    .collect();
-                core.score_high(Totals {
-                    skill: best_order(&weights),
-                    ..t
-                })
-            };
-            let rank = self.rank_bound(score);
-            Some(self.value(t.bonus, rank) + self.tie * self.other(other, rank))
+            let skill = team
+                .members
+                .iter()
+                .enumerate()
+                .map(|(slot, &m)| core.weight(m, team.snaps[slot]).high.mean)
+                .sum();
+            let score = core
+                .team_high(team, Totals { skill, ..t })
+                .min(self.score_cap);
+            Some(self.mean_bound(t.bonus, other, score))
         } else {
             Some(self.value(t.bonus, self.skip_rank) + self.tie * self.other(other, self.skip_rank))
         }
@@ -482,27 +1164,15 @@ impl Objective for EventObjective {
                 self.value(t.bonus, self.skip_rank) + self.tie * self.other(other, self.skip_rank);
             return (key, key);
         };
-        let low_rank = self.rank(core.score_low(t));
-        let high_rank = self.rank_bound(core.score_high(t));
-        if low_rank == high_rank {
-            let key = self.value(t.bonus, low_rank) + self.tie * self.other(other, low_rank);
-            return (key, key);
-        }
-        let (lows, highs) = self.core.as_mut().unwrap().order_bounds(team, t.power);
-        let (mut low, mut high) = (0.0, 0.0);
-        for (&a, &b) in lows.iter().zip(&highs) {
-            let r = self.rank(a);
-            let s = self.rank_bound(b);
-            if r != s {
-                return match self.exact(team, t.power, &[]) {
-                    Ok(result) => (result.key, result.key),
-                    Err(_) => (f64::NEG_INFINITY, f64::INFINITY),
-                };
-            }
-            low += self.value(t.bonus, r) + self.tie * self.other(other, r);
-            high += self.value(t.bonus, s) + self.tie * self.other(other, s);
-        }
-        (low / lows.len() as f64, high / highs.len() as f64)
+        let rank = self.rank(core.score_low(t));
+        let score = core.score_high(t).min(self.score_cap);
+        let low = self
+            .rank_points()
+            .into_iter()
+            .filter(|&(r, _)| r >= rank)
+            .map(|(r, _)| self.value(t.bonus, r) + self.tie * self.other(other, r))
+            .fold(f64::INFINITY, f64::min);
+        (low, self.mean_bound(t.bonus, other, score))
     }
     fn exact(&mut self, team: &Team, power: f64, _slots: &[f64]) -> Result<Exact, String> {
         let bonus = self.team_bonus(team);
@@ -535,10 +1205,27 @@ impl Objective for EventObjective {
             other_sum += self.other(other, rank);
         }
         let count = scores.scores.len() as f64;
-        let mean = total / count;
+        let mean = (total / count).clamp(
+            per_order.iter().copied().fold(f64::INFINITY, f64::min),
+            per_order.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+        );
+        let mut other_min = f64::INFINITY;
+        let mut other_max = f64::NEG_INFINITY;
+        let mut key_min = f64::INFINITY;
+        let mut key_max = f64::NEG_INFINITY;
+        for &score in &scores.scores {
+            let rank = self.rank(score);
+            let other = self.other(other, rank);
+            other_min = other_min.min(other);
+            other_max = other_max.max(other);
+            let key = self.value(bonus, rank) + self.tie * other;
+            key_min = key_min.min(key);
+            key_max = key_max.max(key);
+        }
+        let other_mean = (other_sum / count).clamp(other_min, other_max);
         Ok(Exact {
-            key: mean + self.tie * other_sum / count,
-            detail: json!({"scores":&*scores,"perOrder":per_order,"mean":mean,"bonus":bonus,"ranks":ranks,"rewardSum":reward_sum,"comparisonSum":total,"directMin":direct_min,"directMax":direct_max,"directMean":reward_sum/count,"otherMean":other_sum/count,"challengePoints":cp/count}),
+            key: (mean + self.tie * other_mean).clamp(key_min, key_max),
+            detail: json!({"scores":&*scores,"perOrder":per_order,"mean":mean,"bonus":bonus,"ranks":ranks,"rewardSum":reward_sum,"comparisonSum":total,"directMin":direct_min,"directMax":direct_max,"directMean":reward_sum/count,"otherMean":other_mean,"challengePoints":cp/count}),
         })
     }
 }
@@ -550,6 +1237,7 @@ pub struct ScoreTie {
     pub target: f64,
     pub excluded: Vec<Vec<usize>>,
     pub rank_other: bool,
+    pub allow_dominance: bool,
     pub other_target: Option<f64>,
     other_suffix: [f64; 6],
     member_suffix: Vec<Vec<f64>>,
@@ -558,14 +1246,13 @@ pub struct ScoreTie {
     other_order: Vec<i32>,
     other_allowed: Vec<bool>,
     prepared_options: Vec<Vec<i32>>,
-    weight_options: Vec<Vec<i32>>,
-    cached_weights: Vec<f64>,
-    suffix: [f64; 6],
     floor: Option<Option<f64>>,
+    reward_targets: Option<Vec<JointTarget>>,
+    mean_targets: Option<Vec<JointTarget>>,
 }
 impl ScoreTie {
     pub fn new(
-        event: EventObjective,
+        mut event: EventObjective,
         mean: crate::objectives::LiveObjective,
         target: f64,
         teams: &[Team],
@@ -582,14 +1269,15 @@ impl ScoreTie {
         let mut other_order: Vec<_> = (0..event.other_snap.len()).map(|i| i as i32).collect();
         other_order.sort_by(|&a, &b| event.other_snap(b).total_cmp(&event.other_snap(a)));
         let other_allowed = vec![false; event.other_snap.len()];
-        let weight_options = vec![Vec::new(); event.member_bonus.len()];
-        let cached_weights = vec![f64::NEG_INFINITY; event.member_bonus.len()];
+        let reward_targets = event.joint_targets(target);
+        let mean_targets = event.mean_targets(target);
         Self {
             event,
             mean,
             target,
             excluded,
             rank_other: false,
+            allow_dominance: false,
             other_target: None,
             other_suffix: [0.0; 6],
             member_suffix: Vec::new(),
@@ -598,21 +1286,42 @@ impl ScoreTie {
             other_order,
             other_allowed,
             prepared_options: Vec::new(),
-            weight_options,
-            cached_weights,
-            suffix: [0.0; 6],
             floor: None,
+            reward_targets,
+            mean_targets,
         }
     }
-    fn other_upper(&self, t: Totals, bonus: f64) -> f64 {
-        let rank = if self.rank_other { self.event.rank_bound(self.event.core.as_ref().unwrap().score_high(t)) }
-            else { self.event.rank_bound(f64::INFINITY) };
-        self.event.other(bonus, rank)
+    fn other_upper(&mut self, t: Totals, bonus: f64) -> f64 {
+        let score = self.mean.core.score_high(t).min(self.event.score_cap);
+        if self.rank_other {
+            self.event.other(bonus, self.event.rank_bound(score))
+        } else {
+            self.event.other_mean_bound(bonus, score)
+        }
     }
     fn ranked_upper(&mut self, t: Totals, bonus: f64) -> f64 {
+        if (if self.rank_other {
+            &self.reward_targets
+        } else {
+            &self.mean_targets
+        })
+        .as_ref()
+        .is_some_and(|targets| {
+            let product = t.power * (self.mean.core.high.total + t.skill);
+            !targets
+                .iter()
+                .any(|target| t.bonus >= target.bonus && product >= target.product)
+        }) {
+            return -1.0;
+        }
         let upper = self.other_upper(t, bonus);
-        if self.other_target.is_some_and(|target| upper < target) { -1.0 }
-        else if self.rank_other { upper } else { self.mean.bound(t) }
+        if self.other_target.is_some_and(|target| upper < target) {
+            -1.0
+        } else if self.rank_other {
+            upper
+        } else {
+            self.mean.bound(t)
+        }
     }
     fn eligible(&self, team: &Team) -> bool {
         !self.excludes(&team.members)
@@ -642,11 +1351,51 @@ impl ScoreTie {
     }
 }
 impl Objective for ScoreTie {
-    fn preserve_snap_options(&self) -> bool {
+    fn exchange_snap_equivalent(&mut self, member: usize, a: i32, b: i32) -> bool {
+        self.mean.core.shape(member, a) == self.mean.core.shape(member, b)
+    }
+    fn conditional_snap_dominance(&self) -> bool {
         true
     }
+    fn canonical_leader(&self) -> bool {
+        true
+    }
+    fn numeric_member_dominance(&mut self, better: usize, worse: usize, power_delta: f64) -> bool {
+        self.excluded.is_empty()
+            && self
+                .event
+                .numeric_member_dominance(better, worse, power_delta)
+    }
+    fn needs_power_cap(&self) -> bool {
+        self.event.needs_power_cap()
+    }
+    fn prepare_dominance(&mut self, power_cap: f64) {
+        self.event.prepare_dominance(power_cap);
+    }
+    fn numeric_snap_dominance(
+        &mut self,
+        member: usize,
+        better: i32,
+        worse: i32,
+        power_delta: f64,
+    ) -> bool {
+        self.event
+            .numeric_snap_dominance(member, better, worse, power_delta)
+    }
+
+    fn preserve_snap_options(&self) -> bool {
+        !self.allow_dominance
+    }
+    fn snap_dominance(&mut self, member: usize, snap: i32) -> Vec<f64> {
+        let shape = self.mean.core.shape(member, snap) as f64;
+        vec![self.event.other_snap(snap), shape, -shape]
+    }
     fn skill(&mut self, m: usize, s: i32) -> (f64, f64) {
-        if self.rank_other { self.event.skill(m, s) } else { self.mean.skill(m, s) }
+        if self.rank_other {
+            self.event.skill(m, s)
+        } else {
+            self.mean.skill(m, s)
+        }
     }
     fn member_bonus(&self, m: usize) -> f64 {
         self.event.member_bonus(m)
@@ -657,18 +1406,77 @@ impl Objective for ScoreTie {
     fn bound(&mut self, t: Totals) -> f64 {
         self.ranked_upper(t, self.event.max_other)
     }
-    fn prepare_members(&mut self, characters: &[Vec<usize>]) {
-        self.member_suffix = crate::search::suffix_tops(&characters.iter().map(|members| members.iter().map(|&m| self.event.other_member[m]).fold(f64::NEG_INFINITY, f64::max)).collect::<Vec<_>>());
+    fn prepare_power(&mut self, snapshots: Arc<Vec<f64>>, width: usize) {
+        self.event.prepare_power(snapshots, width);
     }
-    fn member_bound_at(&mut self, members: &[usize], t: Totals, left: usize, from: usize) -> Option<f64> {
-        if self.bonus_floor(f64::NEG_INFINITY).is_some_and(|floor| t.bonus < floor - 1e-6) { return Some(-1.0); }
-        let bonus = members.iter().map(|&m| self.event.other_member[m]).sum::<f64>()
-            + self.member_suffix[from][left] + self.other_snaps;
+    fn prepare_assignment_power(&mut self, power: f64) {
+        self.event.prepare_assignment_power(power);
+    }
+    fn prepare_members(&mut self, characters: &[Vec<usize>]) {
+        self.event.prepare_profile_members(characters);
+        self.member_suffix = crate::search::suffix_tops(
+            &characters
+                .iter()
+                .map(|members| {
+                    members
+                        .iter()
+                        .map(|&m| self.event.other_member[m])
+                        .fold(f64::NEG_INFINITY, f64::max)
+                })
+                .collect::<Vec<_>>(),
+        );
+    }
+    fn member_bound_at(
+        &mut self,
+        members: &[usize],
+        t: Totals,
+        left: usize,
+        from: usize,
+        _limit: f64,
+    ) -> Option<f64> {
+        if self
+            .bonus_floor(f64::NEG_INFINITY)
+            .is_some_and(|floor| t.bonus < floor - 1e-6)
+        {
+            return Some(-1.0);
+        }
+        let bonus = members
+            .iter()
+            .map(|&m| self.event.other_member[m])
+            .sum::<f64>()
+            + self.member_suffix[from][left]
+            + self.other_snaps;
+        if let Some((primary, other)) = self.event.member_projection(members, t, from, bonus) {
+            if primary < self.target || self.other_target.is_some_and(|target| other < target) {
+                return Some(-1.0);
+            }
+            if self.rank_other {
+                return Some(other);
+            }
+        }
         Some(self.ranked_upper(t, bonus))
     }
-    fn product_base(&self) -> Option<f64> { self.mean.product_base() }
-    fn joint_targets(&mut self, _limit: f64) -> Option<Vec<JointTarget>> {
-        if self.rank_other { self.event.joint_targets(self.target) } else { None }
+    fn product_base(&self) -> Option<f64> {
+        self.mean.product_base()
+    }
+    fn joint_targets(&mut self, limit: f64) -> Option<Vec<JointTarget>> {
+        if self.rank_other {
+            self.reward_targets.clone()
+        } else {
+            let score = (limit.max(0.0) * self.mean.core.input.converted_count as f64
+                / (1.0 + RELATIVE_ERROR))
+                .next_down()
+                .max(0.0);
+            self.mean_targets.as_ref().map(|targets| {
+                targets
+                    .iter()
+                    .map(|t| JointTarget {
+                        bonus: t.bonus,
+                        product: t.product.max(score),
+                    })
+                    .collect()
+            })
+        }
     }
     fn bonus_floor(&mut self, _limit: f64) -> Option<f64> {
         let target = self.target;
@@ -683,26 +1491,30 @@ impl Objective for ScoreTie {
         })
     }
     fn prepare_assignment(&mut self, members: &[usize], options: &[Vec<i32>]) {
+        self.event.prepare_assignment(members, options);
         if self.prepared_options != options {
-            self.event.prepare_assignment(members, options);
             self.other_allowed.fill(false);
-            for &s in options.iter().flatten() { if s >= 0 { self.other_allowed[s as usize] = true; } }
+            for &s in options.iter().flatten() {
+                if s >= 0 {
+                    self.other_allowed[s as usize] = true;
+                }
+            }
             self.other_ordered.clear();
-            self.other_ordered.extend(self.other_order.iter().copied().filter(|&s| self.other_allowed[s as usize]));
+            self.other_ordered.extend(
+                self.other_order
+                    .iter()
+                    .copied()
+                    .filter(|&s| self.other_allowed[s as usize]),
+            );
             self.other_suffix = [0.0; 6];
             for slot in (0..5).rev() {
-                self.other_suffix[slot] = self.other_suffix[slot + 1] + options[slot].iter().map(|&s| self.event.other_snap(s)).fold(f64::NEG_INFINITY, f64::max);
+                self.other_suffix[slot] = self.other_suffix[slot + 1]
+                    + options[slot]
+                        .iter()
+                        .map(|&s| self.event.other_snap(s))
+                        .fold(f64::NEG_INFINITY, f64::max);
             }
             self.prepared_options = options.to_vec();
-        }
-        self.suffix = [0.0; 6];
-        for slot in (0..5).rev() {
-            let m = members[slot];
-            if self.weight_options[m] != options[slot] {
-                self.cached_weights[m] = options[slot].iter().map(|&s| self.event.skill(m, s).1).fold(f64::NEG_INFINITY, f64::max);
-                self.weight_options[m] = options[slot].clone();
-            }
-            self.suffix[slot] = self.suffix[slot + 1] + self.cached_weights[m];
         }
     }
     fn assignment_bound(
@@ -715,19 +1527,82 @@ impl Objective for ScoreTie {
         if self.excludes(members) {
             return Some(-1.0);
         }
-        let mut skill = self.suffix[from];
-        for slot in 0..from {
-            skill += self.event.skill(members[slot], assigned[slot]).1;
+        let bound = if self.rank_other {
+            self.event
+                .assignment_bound(members, t, assigned, from)
+                .unwrap_or_else(|| self.event.bound(t))
+        } else {
+            f64::INFINITY
+        };
+        let distinct = self
+            .other_ordered
+            .iter()
+            .filter(|s| !assigned[..from].contains(s))
+            .take(5 - from)
+            .map(|&s| self.event.other_snap(s))
+            .sum::<f64>();
+        let bonus = members
+            .iter()
+            .map(|&m| self.event.other_member[m])
+            .sum::<f64>()
+            + assigned
+                .iter()
+                .take(from)
+                .map(|&s| self.event.other_snap(s))
+                .sum::<f64>()
+            + self.other_suffix[from].min(distinct);
+        Some(if bound < self.target {
+            -1.0
+        } else {
+            self.ranked_upper(t, bonus)
+        })
+    }
+    fn assignment_order_bound(
+        &mut self,
+        members: &[usize],
+        t: Totals,
+        assigned: &[i32],
+        from: usize,
+        limit: f64,
+    ) -> Option<f64> {
+        let distinct = self
+            .other_ordered
+            .iter()
+            .filter(|s| !assigned[..from].contains(s))
+            .take(5 - from)
+            .map(|&s| self.event.other_snap(s))
+            .sum::<f64>();
+        let bonus = members
+            .iter()
+            .map(|&m| self.event.other_member[m])
+            .sum::<f64>()
+            + assigned[..from]
+                .iter()
+                .map(|&s| self.event.other_snap(s))
+                .sum::<f64>()
+            + self.other_suffix[from].min(distinct);
+        let (primary, other) = self.event.projection(members, assigned, from, t, bonus)?;
+        let upper =
+            if primary < self.target || self.other_target.is_some_and(|target| other < target) {
+                -1.0
+            } else if self.rank_other {
+                other
+            } else {
+                self.mean.bound(t)
+            };
+        if upper <= limit {
+            return Some(upper);
         }
-        let optimistic = Totals { skill, ..t };
-        let bound = self
+        if let Some((primary, other, mean)) = self
             .event
-            .assignment_bound(members, optimistic, assigned, from)
-            .unwrap_or_else(|| self.event.bound(optimistic));
-        let distinct = self.other_ordered.iter().filter(|s| !assigned[..from].contains(s)).take(5 - from).map(|&s| self.event.other_snap(s)).sum::<f64>();
-        let bonus = members.iter().map(|&m| self.event.other_member[m]).sum::<f64>()
-            + assigned.iter().take(from).map(|&s| self.event.other_snap(s)).sum::<f64>() + self.other_suffix[from].min(distinct);
-        Some(if bound < self.target { -1.0 } else { self.ranked_upper(t, bonus) })
+            .paired_projection(members, assigned, from, t, bonus)
+        {
+            if primary < self.target || self.other_target.is_some_and(|target| other < target) {
+                return Some(-1.0);
+            }
+            return Some(upper.min(if self.rank_other { other } else { mean }));
+        }
+        Some(upper)
     }
     fn leaf_bound(&mut self, team: &Team, t: Totals) -> Option<f64> {
         if !self.eligible(team) {
@@ -738,7 +1613,11 @@ impl Objective for ScoreTie {
             .event
             .leaf_bound(team, totals)
             .unwrap_or_else(|| self.event.bound(totals));
-        Some(if bound < self.target { -1.0 } else { self.ranked_upper(t, self.event.other_bonus(team)) })
+        Some(if bound < self.target {
+            -1.0
+        } else {
+            self.ranked_upper(t, self.event.other_bonus(team))
+        })
     }
     fn interval(&mut self, team: &Team, t: Totals) -> (f64, f64) {
         if !self.eligible(team) {
@@ -750,14 +1629,46 @@ impl Objective for ScoreTie {
             return (-1.0, -1.0);
         }
         let bonus = self.event.other_bonus(team);
-        let (lows, highs) = self.event.core.as_mut().unwrap().order_bounds(team, t.power);
-        let other_low = lows.iter().map(|&v| self.event.other(bonus, self.event.rank(v))).sum::<f64>() / 120.0;
-        let other_high = highs.iter().map(|&v| self.event.other(bonus, self.event.rank_bound(v))).sum::<f64>() / 120.0;
-        if self.other_target.is_some_and(|target| other_low > target || other_high < target) { return (-1.0, -1.0); }
-        if self.rank_other { return (if low == self.target && high == self.target { other_low } else { -1.0 }, other_high); }
+        let (lows, highs) = self
+            .event
+            .core
+            .as_mut()
+            .unwrap()
+            .order_bounds(team, t.power);
+        let other_low = lows
+            .iter()
+            .map(|&v| self.event.other(bonus, self.event.rank(v)))
+            .sum::<f64>()
+            / 120.0;
+        let other_high = highs
+            .iter()
+            .map(|&v| self.event.other(bonus, self.event.rank_bound(v)))
+            .sum::<f64>()
+            / 120.0;
+        if self
+            .other_target
+            .is_some_and(|target| other_low > target || other_high < target)
+        {
+            return (-1.0, -1.0);
+        }
+        if self.rank_other {
+            return (
+                if low == self.target && high == self.target {
+                    other_low
+                } else {
+                    -1.0
+                },
+                other_high,
+            );
+        }
         let (a, b) = self.mean.interval(team, t);
         (
-            if low == self.target && high == self.target && self.other_target.is_none_or(|target| other_low == target && other_high == target) {
+            if low == self.target
+                && high == self.target
+                && self
+                    .other_target
+                    .is_none_or(|target| other_low == target && other_high == target)
+            {
                 a
             } else {
                 -1.0
@@ -768,8 +1679,15 @@ impl Objective for ScoreTie {
     fn exact(&mut self, team: &Team, power: f64, slots: &[f64]) -> Result<Exact, String> {
         let result = self.event.exact(team, power, slots)?;
         let other = crate::master::number(&result.detail["otherMean"], 0.0);
-        let key = if self.eligible(team) && result.key == self.target && self.other_target.is_none_or(|target| target == other) {
-            if self.rank_other { other } else { crate::master::number(&result.detail["scores"]["mean"], 0.0) }
+        let key = if self.eligible(team)
+            && result.key == self.target
+            && self.other_target.is_none_or(|target| target == other)
+        {
+            if self.rank_other {
+                other
+            } else {
+                crate::master::number(&result.detail["scores"]["mean"], 0.0)
+            }
         } else {
             -1.0
         };
@@ -785,25 +1703,47 @@ pub struct SkipTie {
     pub target: f64,
 }
 impl Objective for SkipTie {
-    fn preserve_snap_options(&self) -> bool { true }
+    fn canonical_leader(&self) -> bool {
+        true
+    }
+    fn preserve_snap_options(&self) -> bool {
+        true
+    }
     fn skill(&mut self, m: usize, s: i32) -> (f64, f64) {
         let bonus = self.event.other_member[m] + self.event.other_snap(s);
         (bonus, bonus)
     }
-    fn member_bonus(&self, m: usize) -> f64 { self.event.member_bonus[m] }
-    fn snap_bonus(&self, s: usize) -> f64 { self.event.snap_bonus[s] }
+    fn member_bonus(&self, m: usize) -> f64 {
+        self.event.member_bonus[m]
+    }
+    fn snap_bonus(&self, s: usize) -> f64 {
+        self.event.snap_bonus[s]
+    }
     fn bound(&mut self, t: Totals) -> f64 {
-        if self.event.reward_bound(t.bonus, self.event.skip_rank) < self.target { -1.0 }
-        else { self.event.other(t.skill, self.event.skip_rank) }
+        if self.event.reward_bound(t.bonus, self.event.skip_rank) < self.target {
+            -1.0
+        } else {
+            self.event.other(t.skill, self.event.skip_rank)
+        }
     }
     fn interval(&mut self, team: &Team, t: Totals) -> (f64, f64) {
-        let primary = self.event.value(t.bonus, self.event.skip_rank) + self.event.tie * self.event.other(t.skill, self.event.skip_rank);
-        let key = if primary == self.target { self.event.other(self.event.other_bonus(team), self.event.skip_rank) } else { -1.0 };
+        let primary = self.event.value(t.bonus, self.event.skip_rank)
+            + self.event.tie * self.event.other(t.skill, self.event.skip_rank);
+        let key = if primary == self.target {
+            self.event
+                .other(self.event.other_bonus(team), self.event.skip_rank)
+        } else {
+            -1.0
+        };
         (key, key)
     }
     fn exact(&mut self, team: &Team, power: f64, slots: &[f64]) -> Result<Exact, String> {
         let mut result = self.event.exact(team, power, slots)?;
-        result.key = if result.key == self.target { crate::master::number(&result.detail["otherMean"], 0.0) } else { -1.0 };
+        result.key = if result.key == self.target {
+            crate::master::number(&result.detail["otherMean"], 0.0)
+        } else {
+            -1.0
+        };
         Ok(result)
     }
 }
@@ -814,6 +1754,18 @@ pub struct BonusSurrogate {
     pub weight: f64,
 }
 impl Objective for BonusSurrogate {
+    fn exchange_snap_equivalent(&mut self, _member: usize, _a: i32, _b: i32) -> bool {
+        true
+    }
+    fn conditional_snap_dominance(&self) -> bool {
+        true
+    }
+    fn canonical_leader(&self) -> bool {
+        true
+    }
+    fn linear_assignment(&self) -> Option<(f64, f64, f64)> {
+        Some((1.0, 0.0, self.weight))
+    }
     fn skill(&mut self, _m: usize, _s: i32) -> (f64, f64) {
         (0.0, 0.0)
     }
@@ -848,8 +1800,34 @@ pub struct ChallengePoints {
     pub mean: crate::objectives::LiveObjective,
     pub chart: Chart,
     pub route: Route,
+    curve: Option<RewardCurve>,
 }
 impl ChallengePoints {
+    pub fn new(mean: crate::objectives::LiveObjective, chart: Chart, route: Route) -> Self {
+        let curve = RewardCurve::new(
+            std::iter::once((2, 0))
+                .chain(
+                    chart
+                        .ranks
+                        .iter()
+                        .filter(|r| r.rank > 2)
+                        .map(|r| (r.rank, r.required)),
+                )
+                .map(|(rank, score)| {
+                    (
+                        score,
+                        *route.challenge_points.get(&rank).unwrap_or(&0) as f64 * route.rate,
+                    )
+                })
+                .collect(),
+        );
+        Self {
+            mean,
+            chart,
+            route,
+            curve,
+        }
+    }
     fn value(&self, score: f64) -> f64 {
         *self
             .route
@@ -860,18 +1838,49 @@ impl ChallengePoints {
     }
 }
 impl Objective for ChallengePoints {
+    fn exchange_snap_equivalent(&mut self, member: usize, a: i32, b: i32) -> bool {
+        self.mean.exchange_snap_equivalent(member, a, b)
+    }
+    fn needs_power_cap(&self) -> bool {
+        self.mean.needs_power_cap()
+    }
+    fn prepare_dominance(&mut self, power: f64) {
+        self.mean.prepare_dominance(power);
+    }
+    fn numeric_snap_dominance(&mut self, m: usize, a: i32, b: i32, power: f64) -> bool {
+        self.mean.numeric_snap_dominance(m, a, b, power)
+    }
+    fn numeric_member_dominance(&mut self, a: usize, b: usize, power: f64) -> bool {
+        self.mean.numeric_member_dominance(a, b, power)
+    }
+    fn snap_dominance(&mut self, m: usize, s: i32) -> Vec<f64> {
+        self.mean.snap_dominance(m, s)
+    }
+
+    fn conditional_snap_dominance(&self) -> bool {
+        true
+    }
+    fn canonical_leader(&self) -> bool {
+        true
+    }
     fn skill(&mut self, m: usize, s: i32) -> (f64, f64) {
         self.mean.skill(m, s)
     }
     fn bound(&mut self, t: Totals) -> f64 {
         let score = self.mean.bound(t);
-        self.value(score) + score / 68719476736.0
+        self.curve
+            .as_ref()
+            .map_or(f64::INFINITY, |curve| curve.upper(score))
+            + score / 68719476736.0
     }
     fn interval(&mut self, team: &Team, t: Totals) -> (f64, f64) {
-        let (a, b) = self.mean.interval(team, t);
+        let (lows, highs) = self.mean.core.order_bounds(team, t.power);
+        let count = lows.len() as f64;
         (
-            self.value(a) + a / 68719476736.0,
-            self.value(b) + b / 68719476736.0,
+            lows.iter().map(|&s| self.value(s)).sum::<f64>() / count
+                + lows.iter().sum::<f64>() / count / 68719476736.0,
+            highs.iter().map(|&s| self.value(s)).sum::<f64>() / count
+                + highs.iter().sum::<f64>() / count / 68719476736.0,
         )
     }
     fn exact(&mut self, team: &Team, power: f64, slots: &[f64]) -> Result<Exact, String> {

@@ -41,20 +41,62 @@ pub struct Slot {
 impl Slot {
     /// Identifies equal skill shapes: the same fields with the same float bits.
     pub fn signature(&self) -> Vec<u64> {
-        let mut out = vec![self.extension_ms.to_bits(), self.recovery as u64, self.effects.len() as u64];
+        let mut out = vec![
+            self.extension_ms.to_bits(),
+            self.recovery as u64,
+            self.effects.len() as u64,
+        ];
         for e in &self.effects {
-            out.extend([e.kind as u64, e.delta as u64, e.seconds.to_bits(), e.gate.kind as u64, e.gate.value.to_bits(), e.gate.positive as u64, e.judgements.len() as u64]);
+            out.extend([
+                e.kind as u64,
+                e.delta as u64,
+                e.seconds.to_bits(),
+                e.gate.kind as u64,
+                e.gate.value.to_bits(),
+                e.gate.positive as u64,
+                e.judgements.len() as u64,
+            ]);
             out.extend(e.judgements.iter().map(|&j| j as u64));
         }
         match &self.convert {
             None => out.push(u64::MAX),
             Some(c) => {
-                out.extend([c.judgements.len() as u64, c.limit.map_or(u64::MAX - 1, f64::to_bits)]);
+                out.extend([
+                    c.judgements.len() as u64,
+                    c.limit.map_or(u64::MAX - 1, f64::to_bits),
+                ]);
                 out.extend(c.judgements.iter().map(|&j| j as u64));
             }
         }
         out
     }
+}
+pub(crate) fn rounding_profile(slot: &Slot, life: Option<f64>) -> (usize, f64) {
+    let mut actions = [0usize; 4];
+    let mut absolute = [0.0_f64; 4];
+    for effect in &slot.effects {
+        if life.is_some_and(|life| effect.gate.blocks(life)) {
+            continue;
+        }
+        let delta = f(effect.delta as f64 / 100000.0).abs();
+        for (channel, judgement) in [3, 4, 5, 6].into_iter().enumerate() {
+            let count = if effect.kind == 2000 {
+                1
+            } else {
+                effect
+                    .judgements
+                    .iter()
+                    .filter(|&&j| j == judgement)
+                    .count()
+            };
+            actions[channel] += count;
+            absolute[channel] = (absolute[channel] + (delta * count as f64).next_up()).next_up();
+        }
+    }
+    (
+        actions.into_iter().max().unwrap(),
+        absolute.into_iter().fold(0.0, f64::max),
+    )
 }
 #[derive(Deserialize)]
 pub struct Input {

@@ -332,7 +332,12 @@ impl<'a> Model<'a> {
                 previous_lots: Vec::new(),
                 previous_lot_ms: 0,
                 rank_bonus: Vec::new(),
-                ranks: setup.ranks.iter().map(|r| r.clamp(&1, &5)).copied().collect(),
+                ranks: setup
+                    .ranks
+                    .iter()
+                    .map(|r| r.clamp(&1, &5))
+                    .copied()
+                    .collect(),
             })
         } else {
             None
@@ -920,7 +925,7 @@ impl<'a> Model<'a> {
                     c.member,
                     if c.skill_type == 4 { 1 } else { 2 },
                     c.skill_type,
-                    Key(1, effect.id, updater.index as u32, 0),
+                    Key(1, effect.id, updater.index as u32, c.member as u32),
                 )
             }
         };

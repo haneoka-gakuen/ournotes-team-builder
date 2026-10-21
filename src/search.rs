@@ -5,12 +5,10 @@ use crate::{
     master::Master,
     power::{self, LeaderProfile, Member, Music, Player, SlotBase, Snap},
 };
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use serde::Serialize;
 use serde_json::Value;
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use std::sync::Arc;
 #[derive(Clone, Copy, Default)]
 pub struct Totals {
     pub power: f64,
@@ -42,6 +40,39 @@ pub struct JointTarget {
     pub product: f64,
 }
 pub trait Objective {
+    fn conditional_snap_dominance(&self) -> bool {
+        false
+    }
+    fn exchange_snap_equivalent(&mut self, _member: usize, _a: i32, _b: i32) -> bool {
+        false
+    }
+    fn canonical_leader(&self) -> bool {
+        false
+    }
+    fn needs_power_cap(&self) -> bool {
+        false
+    }
+    fn prepare_dominance(&mut self, _power_cap: f64) {}
+    fn numeric_member_dominance(
+        &mut self,
+        _better: usize,
+        _worse: usize,
+        _power_delta: f64,
+    ) -> bool {
+        false
+    }
+    fn numeric_snap_dominance(
+        &mut self,
+        _member: usize,
+        _better: i32,
+        _worse: i32,
+        _power_delta: f64,
+    ) -> bool {
+        false
+    }
+    fn linear_assignment(&self) -> Option<(f64, f64, f64)> {
+        None
+    }
     fn skill(&mut self, member: usize, snap: i32) -> (f64, f64);
     fn member_bonus(&self, _member: usize) -> f64 {
         0.0
@@ -56,20 +87,48 @@ pub trait Objective {
         false
     }
     fn bound(&mut self, totals: Totals) -> f64;
+    fn cheap_assignment_bound(
+        &mut self,
+        _members: &[usize],
+        totals: Totals,
+        _assigned: &[i32],
+        _from: usize,
+    ) -> f64 {
+        self.bound(totals)
+    }
     fn member_bound(&mut self, _members: &[usize], _totals: Totals, _left: usize) -> Option<f64> {
         None
     }
     fn prepare_members(&mut self, _characters: &[Vec<usize>]) {}
-    fn member_bound_at(&mut self, members: &[usize], totals: Totals, left: usize, _from: usize) -> Option<f64> {
+    fn member_bound_at(
+        &mut self,
+        members: &[usize],
+        totals: Totals,
+        left: usize,
+        _from: usize,
+        _limit: f64,
+    ) -> Option<f64> {
         self.member_bound(members, totals, left)
     }
     fn prepare_assignment(&mut self, _members: &[usize], _options: &[Vec<i32>]) {}
+    fn prepare_power(&mut self, _snapshots: Arc<Vec<f64>>, _width: usize) {}
+    fn prepare_assignment_power(&mut self, _power: f64) {}
     fn assignment_bound(
         &mut self,
         _members: &[usize],
         _totals: Totals,
         _assigned: &[i32],
         _from: usize,
+    ) -> Option<f64> {
+        None
+    }
+    fn assignment_order_bound(
+        &mut self,
+        _members: &[usize],
+        _totals: Totals,
+        _assigned: &[i32],
+        _from: usize,
+        _limit: f64,
     ) -> Option<f64> {
         None
     }
@@ -117,7 +176,7 @@ pub struct Constraints {
     pub required_snaps: Vec<usize>,
     pub excluded_snaps: Vec<usize>,
     pub leader: Option<i32>,
-    pub bindings: HashMap<usize, i32>,
+    pub bindings: std::collections::HashMap<usize, i32>,
     pub no_snaps: bool,
     pub min_bonus: Option<f64>,
     pub max_bonus: Option<f64>,
@@ -277,12 +336,22 @@ struct Assignment {
     set_key: String,
     base_power: Vec<f64>,
     options: Vec<Vec<i32>>,
+    allowed: Vec<Vec<bool>>,
     used: Vec<bool>,
     assigned: Vec<i32>,
     max_power: Vec<f64>,
     max_weight: Vec<f64>,
+    power_order: Vec<Vec<i32>>,
+    skill_order: Vec<Vec<i32>>,
     max_bonus: Vec<f64>,
     set_low: f64,
+    exact_low: f64,
+}
+struct MemberCut {
+    mu: f64,
+    constant: f64,
+    members: Vec<f64>,
+    suffix: Vec<Vec<f64>>,
 }
 struct Members {
     leader: usize,
@@ -294,15 +363,17 @@ struct Members {
     char_bonus: Vec<Vec<f64>>,
     char_member_bonus: Vec<Vec<f64>>,
     chosen: Vec<usize>,
+    cuts: Vec<MemberCut>,
 }
 const NONE: f64 = -1e15;
 struct Runner<'a, O: Objective + ?Sized> {
     input: Input<'a, O>,
     started: f64,
+    last_notify: f64,
     generation: u64,
     width: usize,
     bases: Vec<SlotBase>,
-    snap_power: Vec<f64>,
+    snap_power: Arc<Vec<f64>>,
     skill: Vec<f64>,
     skill_low: Vec<f64>,
     member_bonus: Vec<f64>,
@@ -312,11 +383,12 @@ struct Runner<'a, O: Objective + ?Sized> {
     snap_bonus_top5: f64,
     required: HashSet<usize>,
     required_snaps: HashSet<usize>,
-    bound_elsewhere: HashSet<usize>,
     excluded_members: HashSet<usize>,
-    excluded_snaps: HashSet<usize>,
     best: Vec<Best>,
     options: Vec<Vec<i32>>,
+    conditional_dominance: bool,
+    dominators: Vec<Vec<Vec<usize>>>,
+    exchange_equivalent: HashMap<(usize, usize, usize), bool>,
     /// The bonus floor the snap options were last restricted to.
     snap_floor: f64,
     profiles: HashMap<usize, Arc<LeaderProfile>>,
@@ -333,7 +405,69 @@ struct Runner<'a, O: Objective + ?Sized> {
     column_of: Vec<usize>,
     column_stamp: Vec<u64>,
     stamp: u64,
+    target_limit: f64,
+    member_targets: Option<Vec<(f64, f64)>>,
 }
+pub(crate) fn valid_seed(members: &[Member], snaps: &[Snap], c: &Constraints, seed: &Team) -> bool {
+    if seed.members.len() != 5
+        || seed.snaps.len() != 5
+        || seed.members.iter().any(|&member| member >= members.len())
+        || seed
+            .snaps
+            .iter()
+            .any(|&snap| snap < -1 || snap >= snaps.len() as i32)
+    {
+        return false;
+    }
+    if seed.members.iter().copied().collect::<HashSet<_>>().len() != 5
+        || seed
+            .members
+            .iter()
+            .any(|member| c.excluded_members.contains(member))
+        || c.leader
+            .is_some_and(|leader| seed.members[0] as i32 != leader)
+        || seed
+            .members
+            .iter()
+            .map(|&member| members[member].card.character_id)
+            .collect::<HashSet<_>>()
+            .len()
+            != 5
+        || c.required_members
+            .iter()
+            .chain(c.bindings.keys())
+            .any(|member| !seed.members.contains(member))
+        || c.member_floor.as_ref().is_some_and(|floor| {
+            seed.members
+                .iter()
+                .map(|&member| floor.values[member])
+                .sum::<f64>()
+                < floor.minimum
+        })
+    {
+        return false;
+    }
+    let used: Vec<_> = seed
+        .snaps
+        .iter()
+        .filter(|&&snap| snap >= 0)
+        .map(|&snap| snap as usize)
+        .collect();
+    if used.iter().copied().collect::<HashSet<_>>().len() != used.len()
+        || c.no_snaps && !used.is_empty()
+        || used.iter().any(|snap| c.excluded_snaps.contains(snap))
+        || c.required_snaps.iter().any(|snap| !used.contains(snap))
+    {
+        return false;
+    }
+    seed.members.iter().enumerate().all(|(slot, member)| {
+        c.bindings.get(member).map_or_else(
+            || seed.snaps[slot] < 0 || !c.bindings.values().any(|&snap| snap == seed.snaps[slot]),
+            |&snap| snap == seed.snaps[slot],
+        )
+    })
+}
+
 pub(crate) fn suffix_tops(values: &[f64]) -> Vec<Vec<f64>> {
     let mut tops = vec![vec![0.0; 5]; values.len() + 1];
     let mut best = vec![f64::NEG_INFINITY; 4];
@@ -446,7 +580,13 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                     .constraints
                     .bindings
                     .get(&i)
-                    .map(|&b| if b < 0 || allowed.contains(&(b as usize)) { vec![b] } else { Vec::new() })
+                    .map(|&b| {
+                        if b < 0 || allowed.contains(&(b as usize)) {
+                            vec![b]
+                        } else {
+                            Vec::new()
+                        }
+                    })
                     .unwrap_or_else(|| {
                         allowed
                             .iter()
@@ -469,10 +609,41 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                 best
             })
             .collect();
+        let mut profiles = HashMap::default();
+        if input.objective.needs_power_cap() {
+            let mut maximum = 0.0_f64;
+            for leader in 0..n {
+                let profile = Arc::new(power::leader_profile(input.master, &input.members[leader]));
+                for member in 0..n {
+                    maximum = maximum.max(
+                        bases[member].fixed_points as f64
+                            + power::leader_points(
+                                &bases[member],
+                                &power::leader_percent_bound(
+                                    input.master,
+                                    &profile,
+                                    &input.members[member],
+                                ),
+                            ) as f64
+                            + best[member].power,
+                    );
+                }
+                profiles.insert(leader, profile);
+            }
+            input.objective.prepare_dominance(5.0 * maximum);
+        }
+        let conditional_dominance = input.objective.conditional_snap_dominance()
+            && !input.disable_snap_dominance
+            && !input.objective.preserve_snap_options();
+        let mut dominators = vec![vec![Vec::new(); width]; n];
         let options = (0..n)
             .map(|i| {
                 if let Some(&bound) = input.constraints.bindings.get(&i) {
-                    return if bound < 0 || allowed.contains(&(bound as usize)) { vec![bound] } else { Vec::new() };
+                    return if bound < 0 || allowed.contains(&(bound as usize)) {
+                        vec![bound]
+                    } else {
+                        Vec::new()
+                    };
                 }
                 let list: Vec<i32> = allowed
                     .iter()
@@ -501,8 +672,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                     .filter(|&(a, &j)| {
                         if input.disable_snap_dominance
                             || input.objective.preserve_snap_options()
-                            || j < 0
-                            || required_snaps.contains(&(j as usize))
+                            || (j >= 0 && required_snaps.contains(&(j as usize)))
                         {
                             return true;
                         }
@@ -512,9 +682,21 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                                 continue;
                             }
                             let (x, y) = (&values[a], &values[b]);
-                            if y.iter().zip(x).all(|(y, x)| y >= x) {
+                            if (input.constraints.max_bonus.is_none() || y[3] == x[3])
+                                && y[..4].iter().zip(&x[..4]).all(|(y, x)| y >= x)
+                                && (y[4..].iter().zip(&x[4..]).all(|(y, x)| y >= x)
+                                    || input.objective.numeric_snap_dominance(
+                                        i,
+                                        other,
+                                        j,
+                                        y[0] - x[0],
+                                    ))
+                            {
                                 let equal = y == x;
                                 if !equal || b < a {
+                                    if conditional_dominance && j >= 0 {
+                                        dominators[i][j as usize].push(other as usize);
+                                    }
                                     dominated += 1;
                                     if dominated >= 5 {
                                         break;
@@ -526,6 +708,14 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                     })
                     .map(|(_, &j)| j)
                     .collect();
+                if conditional_dominance {
+                    for &snap in &kept {
+                        if snap >= 0 {
+                            dominators[i][snap as usize]
+                                .retain(|&other| kept.contains(&(other as i32)));
+                        }
+                    }
+                }
                 kept.sort_by(|&a, &b| {
                     let preference =
                         input.objective.prefer_snap(i, b) - input.objective.prefer_snap(i, a);
@@ -540,9 +730,14 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             })
             .collect();
         let k = input.k;
+        let snap_power = Arc::new(snap_power);
+        input
+            .objective
+            .prepare_power(Arc::clone(&snap_power), width);
         Self {
             input,
             started,
+            last_notify: started,
             generation,
             width,
             bases,
@@ -556,21 +751,22 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             snap_bonus_top5,
             required,
             required_snaps,
-            bound_elsewhere,
             excluded_members,
-            excluded_snaps,
             best,
             options,
+            conditional_dominance,
+            dominators,
+            exchange_equivalent: HashMap::default(),
             snap_floor: f64::NEG_INFINITY,
-            profiles: HashMap::new(),
+            profiles,
             frontier: Frontier {
                 k,
-                best: HashMap::new(),
+                best: HashMap::default(),
                 sorted: Vec::new(),
             },
             candidates: Vec::new(),
             hits: Vec::new(),
-            retained: HashMap::new(),
+            retained: HashMap::default(),
             compact_at: 4096,
             timed_out: false,
             unexplored: f64::NEG_INFINITY,
@@ -580,14 +776,44 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             column_of: vec![0; s],
             column_stamp: vec![0; s],
             stamp: 0,
+            target_limit: f64::NAN,
+            member_targets: None,
         }
     }
     fn expired(&self) -> bool {
         (self.input.now)() > self.input.deadline
             || self.generation != crate::cancellation_generation()
     }
+    fn report_pending(&mut self) {
+        if self.input.on_candidate.is_none() || self.hits.is_empty() {
+            return;
+        }
+        let now = (self.input.now)();
+        if now - self.last_notify < 250.0 {
+            return;
+        }
+        self.last_notify = now;
+        if let Some(callback) = self.input.on_candidate.as_deref_mut() {
+            callback(&self.hits);
+        }
+    }
     fn limit(&self) -> f64 {
         self.frontier.threshold().max(self.input.floor)
+    }
+    fn necessary_limit(&self, limit: f64) -> f64 {
+        if self.cannot_improve(limit) {
+            limit.next_up()
+        } else {
+            limit
+        }
+    }
+    fn assignment_necessary_limit(&self, a: &Assignment) -> f64 {
+        let limit = self.assignment_limit(a);
+        if self.cannot_improve_set(a, limit) {
+            limit.next_up()
+        } else {
+            limit
+        }
     }
     fn cannot_improve(&self, upper: f64) -> bool {
         (self.input.floor_exclusive && upper <= self.input.floor)
@@ -703,58 +929,12 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         Ok(())
     }
     fn seed_valid(&self, seed: &Team) -> bool {
-        let n = self.input.members.len();
-        let s = self.input.snaps.len();
-        let c = &self.input.constraints;
-        if seed.members.len() != 5
-            || seed.snaps.len() != 5
-            || seed.members.iter().any(|&i| i >= n)
-            || seed.snaps.iter().any(|&j| j < -1 || j >= s as i32)
-        {
-            return false;
-        }
-        if seed.members.iter().copied().collect::<HashSet<_>>().len() != 5
-            || seed
-                .members
-                .iter()
-                .any(|i| self.excluded_members.contains(i))
-            || c.leader.is_some_and(|i| seed.members[0] as i32 != i)
-            || seed
-                .members
-                .iter()
-                .map(|&i| self.input.members[i].card.character_id)
-                .collect::<HashSet<_>>()
-                .len()
-                != 5
-            || self.required.iter().any(|i| !seed.members.contains(i))
-        {
-            return false;
-        }
-        if !self.member_floor_possible(&seed.members, 0) { return false; }
-        let used: Vec<_> = seed
-            .snaps
-            .iter()
-            .filter(|&&j| j >= 0)
-            .map(|&j| j as usize)
-            .collect();
-        if used.iter().copied().collect::<HashSet<_>>().len() != used.len()
-            || (c.no_snaps && !used.is_empty())
-            || used.iter().any(|j| self.excluded_snaps.contains(j))
-            || self.required_snaps.iter().any(|j| !used.contains(j))
-        {
-            return false;
-        }
-        for slot in 0..5 {
-            let bound = c.bindings.get(&seed.members[slot]);
-            if bound.is_some_and(|&b| b != seed.snaps[slot])
-                || (bound.is_none()
-                    && seed.snaps[slot] >= 0
-                    && self.bound_elsewhere.contains(&(seed.snaps[slot] as usize)))
-            {
-                return false;
-            }
-        }
-        true
+        valid_seed(
+            self.input.members,
+            self.input.snaps,
+            &self.input.constraints,
+            seed,
+        )
     }
     fn evaluate_seed(&mut self, seed: Team) -> Result<(), String> {
         let profile = self.profile(seed.members[0]);
@@ -828,18 +1008,154 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         )
     }
     fn member_floor_possible(&self, chosen: &[usize], left: usize) -> bool {
-        let Some(floor) = &self.input.constraints.member_floor else { return true; };
+        let Some(floor) = &self.input.constraints.member_floor else {
+            return true;
+        };
         let current: f64 = chosen.iter().map(|&i| floor.values[i]).sum();
         current + floor.maximum * left as f64 >= floor.minimum
     }
-    fn member_set_bound(&mut self, members: &[usize], totals: Totals, left: usize, from: usize) -> f64 {
+    fn member_cuts(
+        &mut self,
+        slot_power: &[f64],
+        characters: &[Vec<usize>],
+        power: f64,
+        skill: f64,
+        bonus: f64,
+    ) -> Vec<MemberCut> {
+        let Some(base) = self.input.objective.product_base() else {
+            return Vec::new();
+        };
+        if self
+            .input
+            .objective
+            .joint_targets(self.necessary_limit(self.limit()).max(0.0))
+            .is_none()
+        {
+            return Vec::new();
+        }
+        let lambda = ((base + skill) / power).sqrt();
+        if !lambda.is_finite() || lambda <= 0.0 || base < 0.0 {
+            return Vec::new();
+        }
+        let spread = (lambda * power + (base + skill) / lambda) / bonus.abs().max(1.0);
+        let with_bonus = self.any_snap_bonus || self.member_bonus.iter().any(|&b| b != 0.0);
+        let mus: &[f64] = if with_bonus {
+            &[0.0, 0.25, 1.0, 4.0]
+        } else {
+            &[0.0]
+        };
+        let mut cuts = Vec::new();
+        for scale in [1.0, 0.75, 1.5] {
+            let l = lambda * scale;
+            for &factor in mus {
+                let mu = factor * spread;
+                let values: Vec<_> = (0..self.input.members.len())
+                    .map(|m| {
+                        self.options[m]
+                            .iter()
+                            .map(|&s| {
+                                let c = if s < 0 { self.width - 1 } else { s as usize };
+                                let p =
+                                    (slot_power[m] + self.snap_power[m * self.width + c]).next_up();
+                                let b = self.member_bonus[m]
+                                    + if s < 0 {
+                                        0.0
+                                    } else {
+                                        self.snap_bonus[s as usize]
+                                    };
+                                (((l * p).next_up()
+                                    + (self.skill[m * self.width + c] / l).next_up())
+                                .next_up()
+                                    + (mu * b).next_up())
+                                .next_up()
+                            })
+                            .fold(f64::NEG_INFINITY, f64::max)
+                    })
+                    .collect();
+                let mut suffix = vec![vec![0.0; 5]; characters.len() + 1];
+                let mut top = Vec::new();
+                for from in (0..characters.len()).rev() {
+                    top.push(
+                        characters[from]
+                            .iter()
+                            .map(|&m| values[m])
+                            .fold(f64::NEG_INFINITY, f64::max),
+                    );
+                    top.sort_by(|a, b| b.total_cmp(a));
+                    top.truncate(4);
+                    for count in 1..=4 {
+                        suffix[from][count] = (suffix[from][count - 1]
+                            + top.get(count - 1).copied().unwrap_or(0.0))
+                        .next_up();
+                    }
+                }
+                cuts.push(MemberCut {
+                    mu,
+                    constant: (base / l).next_up(),
+                    members: values,
+                    suffix,
+                });
+            }
+        }
+        cuts
+    }
+    fn member_joint_possible(&mut self, m: &Members, from: usize, left: usize) -> bool {
+        if m.cuts.is_empty() || !self.limit().is_finite() {
+            return true;
+        }
+        let limit = self.necessary_limit(self.limit());
+        if limit != self.target_limit {
+            self.target_limit = limit;
+            self.member_targets = self.input.objective.joint_targets(limit).map(|targets| {
+                targets
+                    .into_iter()
+                    .map(|t| {
+                        (
+                            (2.0 * t.product.max(0.0).sqrt()).next_down(),
+                            t.bonus.max(
+                                self.input
+                                    .constraints
+                                    .min_bonus
+                                    .unwrap_or(f64::NEG_INFINITY),
+                            ),
+                        )
+                    })
+                    .collect()
+            });
+        }
+        let Some(targets) = &self.member_targets else {
+            return true;
+        };
+        let mut upper = [0.0; 12];
+        for (i, cut) in m.cuts.iter().enumerate() {
+            let sum = m.chosen.iter().fold(
+                (cut.constant + cut.members[m.leader]).next_up(),
+                |sum, &member| (sum + cut.members[member]).next_up(),
+            );
+            upper[i] = (sum + cut.suffix[from.min(cut.suffix.len() - 1)][left]).next_up();
+        }
+        targets.iter().any(|&(root, bonus)| {
+            m.cuts
+                .iter()
+                .enumerate()
+                .all(|(i, cut)| upper[i] >= (root + (cut.mu * bonus).next_down()).next_down())
+        })
+    }
+    fn member_set_bound(
+        &mut self,
+        members: &[usize],
+        totals: Totals,
+        left: usize,
+        from: usize,
+    ) -> f64 {
         let plain = self.input.objective.bound(totals);
         if plain < self.limit() {
             return plain;
         }
+        let limit = self.necessary_limit(self.limit());
         self.input
             .objective
-            .member_bound_at(members, totals, left, from)
+            .member_bound_at(members, totals, left, from, limit)
             .map(|bound| plain.min(bound))
             .unwrap_or(plain)
     }
@@ -854,8 +1170,12 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
     ) -> Result<(), String> {
         let left = 4 - m.chosen.len();
         if self.input.constraints.member_floor.is_some() {
-            let chosen: Vec<_> = std::iter::once(m.leader).chain(m.chosen.iter().copied()).collect();
-            if !self.member_floor_possible(&chosen, left) { return Ok(()); }
+            let chosen: Vec<_> = std::iter::once(m.leader)
+                .chain(m.chosen.iter().copied())
+                .collect();
+            if !self.member_floor_possible(&chosen, left) {
+                return Ok(());
+            }
         }
         if self.timed_out {
             let totals = Totals {
@@ -869,7 +1189,14 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             return Ok(());
         }
         self.stats.member_nodes += 1;
+        if self.stats.member_nodes & 1023 == 0 {
+            self.report_pending();
+        }
         if left == 0 {
+            if !self.member_joint_possible(m, index, 0) {
+                return Ok(());
+            }
+
             let team: Vec<_> = std::iter::once(m.leader)
                 .chain(m.chosen.iter().copied())
                 .collect();
@@ -899,6 +1226,9 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         let chosen: Vec<_> = std::iter::once(m.leader)
             .chain(m.chosen.iter().copied())
             .collect();
+        if !self.member_joint_possible(m, index, left) {
+            return Ok(());
+        }
         let bound = self.member_set_bound(
             &chosen,
             Totals {
@@ -954,17 +1284,10 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         self.member_visit(m, index + 1, power, weight, bonus, member_part)
     }
     fn assignment_limit(&self, a: &Assignment) -> f64 {
-        self.limit().max(a.set_low)
+        self.limit().max(a.set_low).max(a.exact_low)
     }
     fn cannot_improve_set(&self, a: &Assignment, upper: f64) -> bool {
-        self.cannot_improve(upper)
-            || (self.input.streaming
-                && self
-                    .retained
-                    .get(&a.set_key)
-                    .copied()
-                    .unwrap_or(f64::NEG_INFINITY)
-                    >= upper)
+        self.cannot_improve(upper) || self.input.streaming && a.exact_low >= upper
     }
     fn assignment_bound(&mut self, a: &Assignment, totals: Totals, from: usize) -> f64 {
         self.input
@@ -1097,11 +1420,35 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             if power <= NONE / 2.0 || skill <= NONE / 2.0 {
                 return f64::NEG_INFINITY;
             }
+            let order_limit = self.assignment_necessary_limit(a);
+            if self
+                .input
+                .objective
+                .assignment_order_bound(
+                    &a.team,
+                    Totals {
+                        power: totals.power + power,
+                        skill: totals.skill + skill,
+                        skill_low: 0.0,
+                        bonus: totals.bonus + bonus,
+                    },
+                    &a.assigned,
+                    from,
+                    order_limit,
+                )
+                .is_some_and(|bound| {
+                    bound < self.assignment_limit(a) || self.cannot_improve_set(a, bound)
+                })
+            {
+                return f64::NEG_INFINITY;
+            }
             let base = self.input.objective.product_base();
             if self.any_snap_bonus {
                 if let Some(base) = base {
-                    if let Some(targets) =
-                        self.input.objective.joint_targets(self.assignment_limit(a))
+                    if let Some(targets) = self
+                        .input
+                        .objective
+                        .joint_targets(self.assignment_necessary_limit(a))
                     {
                         if !targets.iter().any(|&target| {
                             self.joint_feasible(
@@ -1153,19 +1500,6 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                 );
             }
             let mut product = (x + power) * (y + skill);
-            if self.assignment_bound(
-                a,
-                Totals {
-                    power: product / (y + skill),
-                    skill: totals.skill + skill,
-                    skill_low: 0.0,
-                    bonus: totals.bonus + bonus,
-                },
-                from,
-            ) < self.assignment_limit(a)
-            {
-                return f64::NEG_INFINITY;
-            }
             let lambda = ((y + skill) / (x + power).max(1e-9)).sqrt();
             for scale in [1.0, 1.02, 1.0 / 1.02] {
                 let l = lambda * scale;
@@ -1173,16 +1507,25 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                 let m = self.matching.maximum(&table.blended, table.columns, None);
                 product = product.min((l * x + y / l + m).powi(2) / 4.0);
             }
-            self.assignment_bound(
+            let upper = self.input.objective.bound(Totals {
+                power: product / (y + skill),
+                skill: totals.skill + skill,
+                skill_low: 0.0,
+                bonus: totals.bonus + bonus,
+            });
+            if upper < self.assignment_limit(a) || self.cannot_improve_set(a, upper) {
+                return f64::NEG_INFINITY;
+            }
+            upper.min(self.assignment_bound(
                 a,
                 Totals {
-                    power: product / (y + skill),
+                    power: x + power,
                     skill: totals.skill + skill,
                     skill_low: 0.0,
                     bonus: totals.bonus + bonus,
                 },
                 from,
-            )
+            ))
         })();
         self.pools[from] = table;
         result
@@ -1201,7 +1544,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             .input
             .objective
             .leaf_bound(&team, totals)
-            .is_some_and(|v| v < self.assignment_limit(a))
+            .is_some_and(|v| v < self.assignment_limit(a) || self.cannot_improve_set(a, v))
         {
             return Ok(());
         }
@@ -1240,10 +1583,22 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                 high,
             },
             None,
-        )
+        )?;
+        a.exact_low = a.exact_low.max(
+            self.retained
+                .get(&a.set_key)
+                .copied()
+                .unwrap_or(f64::NEG_INFINITY),
+        );
+        Ok(())
     }
     fn assign(&mut self, team: Vec<usize>) -> Result<(), String> {
         let set_key = self.set_key(&team);
+        let exact_low = self
+            .retained
+            .get(&set_key)
+            .copied()
+            .unwrap_or(f64::NEG_INFINITY);
         let profile = self.profile(team[0]);
         let percents = if profile.simple {
             None
@@ -1277,7 +1632,54 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                     ) as f64
             })
             .collect();
-        let options: Vec<_> = team.iter().map(|&i| self.options[i].clone()).collect();
+        let member_bonus = team.iter().fold(0.0, |sum, &i| sum + self.member_bonus[i]);
+        let necessary = self.necessary_limit(self.limit());
+        let floor = self
+            .input
+            .objective
+            .bonus_floor(necessary)
+            .into_iter()
+            .chain(self.input.constraints.min_bonus)
+            .fold(f64::NEG_INFINITY, f64::max);
+        if floor == f64::INFINITY {
+            return Ok(());
+        }
+        let mut options: Vec<_> = team.iter().map(|&i| self.options[i].clone()).collect();
+        if self.any_snap_bonus && floor.is_finite() {
+            let maxima: Vec<_> = options
+                .iter()
+                .map(|list| {
+                    list.iter()
+                        .map(|&s| {
+                            if s < 0 {
+                                0.0
+                            } else {
+                                self.snap_bonus[s as usize]
+                            }
+                        })
+                        .fold(f64::NEG_INFINITY, f64::max)
+                })
+                .collect();
+            for (slot, list) in options.iter_mut().enumerate() {
+                let rest = member_bonus
+                    + maxima
+                        .iter()
+                        .enumerate()
+                        .filter(|&(i, _)| i != slot)
+                        .map(|(_, value)| value)
+                        .sum::<f64>();
+                list.retain(|&s| {
+                    rest + if s < 0 {
+                        0.0
+                    } else {
+                        self.snap_bonus[s as usize]
+                    } >= floor - 1e-6
+                });
+                if list.is_empty() {
+                    return Ok(());
+                }
+            }
+        }
         self.input.objective.prepare_assignment(&team, &options);
         let mut used = vec![false; self.input.snaps.len()];
         for (&member, &snap) in &self.input.constraints.bindings {
@@ -1285,38 +1687,70 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                 used[snap as usize] = true;
             }
         }
-        let max_power = team.iter().map(|&i| self.best[i].power).collect();
-        let max_weight = team.iter().map(|&i| self.best[i].weight).collect();
-        let max_bonus = team.iter().map(|&i| self.best[i].bonus).collect();
-        let member_bonus = team.iter().fold(0.0, |sum, &i| sum + self.member_bonus[i]);
+        let maxima = |values: &[f64]| {
+            team.iter()
+                .zip(&options)
+                .map(|(&member, list)| {
+                    list.iter()
+                        .map(|&s| {
+                            values[member * self.width
+                                + if s < 0 { self.width - 1 } else { s as usize }]
+                        })
+                        .fold(f64::NEG_INFINITY, f64::max)
+                })
+                .collect()
+        };
+        let max_power = maxima(&self.snap_power);
+        let max_weight = maxima(&self.skill);
+        let max_bonus = options
+            .iter()
+            .map(|list| {
+                list.iter()
+                    .map(|&s| {
+                        if s < 0 {
+                            0.0
+                        } else {
+                            self.snap_bonus[s as usize]
+                        }
+                    })
+                    .fold(f64::NEG_INFINITY, f64::max)
+            })
+            .collect();
+        let allowed = options
+            .iter()
+            .map(|list| {
+                let mut mask = vec![false; self.width];
+                for &snap in list {
+                    if snap >= 0 {
+                        mask[snap as usize] = true;
+                    }
+                }
+                mask
+            })
+            .collect();
         let mut a = Assignment {
             team,
             set_key,
             base_power,
             options,
+            allowed,
             used,
             assigned: vec![-1; 5],
             max_power,
             max_weight,
+            power_order: Vec::new(),
+            skill_order: Vec::new(),
             max_bonus,
             set_low: f64::NEG_INFINITY,
+            exact_low,
         };
         let base_total = a.base_power.iter().fold(0.0, |sum, v| sum + v);
-        if self.assignment_bound(
-            &a,
-            Totals {
-                power: base_total + suffix(&a.max_power, 0),
-                skill: suffix(&a.max_weight, 0),
-                skill_low: 0.0,
-                bonus: member_bonus + suffix(&a.max_bonus, 0),
-            },
-            0,
-        ) < self.assignment_limit(&a)
-            || self
-                .input
-                .constraints
-                .max_bonus
-                .is_some_and(|b| member_bonus > b)
+        self.input.objective.prepare_assignment_power(base_total);
+        if self
+            .input
+            .constraints
+            .max_bonus
+            .is_some_and(|b| member_bonus > b)
         {
             return Ok(());
         }
@@ -1345,6 +1779,65 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         );
         if upper < self.assignment_limit(&a) || self.cannot_improve_set(&a, upper) {
             return Ok(());
+        }
+        if self.input.objective.linear_assignment().is_some()
+            && self.required_snaps.is_empty()
+            && self.input.constraints.min_bonus.is_none()
+            && self.input.constraints.max_bonus.is_none()
+        {
+            let mut table = std::mem::take(&mut self.pools[0]);
+            self.tables(&mut table, &a, 0);
+            let (p, s, b) = self.input.objective.linear_assignment().unwrap();
+            for row in 0..table.power.len() {
+                for col in 0..table.columns {
+                    table.blended[row][col] = if table.power[row][col] <= NONE / 2.0 {
+                        NONE
+                    } else {
+                        p * table.power[row][col]
+                            + s * table.weight[row][col]
+                            + b * table.bonus[row][col]
+                    };
+                }
+            }
+            let mut columns = vec![0; 5];
+            let upper = self
+                .matching
+                .maximum(&table.blended, table.columns, Some(&mut columns));
+            let picks: Vec<_> = columns
+                .iter()
+                .map(|&c| {
+                    if c < table.count {
+                        table.column_snap[c] as i32
+                    } else {
+                        -1
+                    }
+                })
+                .collect();
+            self.pools[0] = table;
+            if upper > NONE / 2.0 {
+                let mut totals = Totals {
+                    power: base_total,
+                    bonus: member_bonus,
+                    ..Totals::default()
+                };
+                for (slot, &member) in a.team.iter().enumerate() {
+                    let col = if picks[slot] < 0 {
+                        self.width - 1
+                    } else {
+                        picks[slot] as usize
+                    };
+                    totals.power += self.snap_power[member * self.width + col];
+                    totals.skill += self.skill[member * self.width + col];
+                    totals.skill_low += self.skill_low[member * self.width + col];
+                    totals.bonus += if picks[slot] < 0 {
+                        0.0
+                    } else {
+                        self.snap_bonus[picks[slot] as usize]
+                    };
+                }
+                self.candidate(&mut a, picks, totals)?;
+                return Ok(());
+            }
         }
         if let Some(base) = self.input.objective.product_base() {
             if self.required_snaps.is_empty() {
@@ -1406,6 +1899,29 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                 }
             }
         }
+        let ordered = |values: &[f64]| {
+            a.team
+                .iter()
+                .zip(&a.options)
+                .map(|(&member, list)| {
+                    let mut list = list.clone();
+                    list.sort_unstable_by(|&x, &y| {
+                        let index = |snap: i32| {
+                            member * self.width
+                                + if snap < 0 {
+                                    self.width - 1
+                                } else {
+                                    snap as usize
+                                }
+                        };
+                        values[index(y)].total_cmp(&values[index(x)])
+                    });
+                    list
+                })
+                .collect()
+        };
+        a.power_order = ordered(&self.snap_power);
+        a.skill_order = ordered(&self.skill);
         self.snap_walk(
             &mut a,
             0,
@@ -1419,8 +1935,11 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
     fn snap_walk(&mut self, a: &mut Assignment, slot: usize, totals: Totals) -> Result<(), String> {
         if !self.timed_out {
             self.stats.snap_nodes += 1;
-            if self.stats.snap_nodes & 1023 == 0 && self.expired() {
-                self.timed_out = true;
+            if self.stats.snap_nodes & 1023 == 0 {
+                self.report_pending();
+                if self.expired() {
+                    self.timed_out = true;
+                }
             }
         }
         if self.timed_out {
@@ -1468,27 +1987,54 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             unused_bonus += self.snap_bonus[j];
             count -= 1;
         }
-        let optimistic = self.assignment_bound(
-            a,
+        let mut power = totals.power;
+        let mut skill = totals.skill;
+        for at in slot..5 {
+            let available = |order: &[i32]| {
+                order
+                    .iter()
+                    .copied()
+                    .find(|&s| s < 0 || !a.used[s as usize])
+            };
+            let Some(p) = available(&a.power_order[at]) else {
+                return Ok(());
+            };
+            let Some(s) = available(&a.skill_order[at]) else {
+                return Ok(());
+            };
+            let index = |snap: i32| {
+                a.team[at] * self.width
+                    + if snap < 0 {
+                        self.width - 1
+                    } else {
+                        snap as usize
+                    }
+            };
+            power = (power + self.snap_power[index(p)]).next_up();
+            skill = (skill + self.skill[index(s)]).next_up();
+        }
+        let optimistic = self.input.objective.cheap_assignment_bound(
+            &a.team,
             Totals {
-                power: totals.power + suffix(&a.max_power, slot),
-                skill: totals.skill + suffix(&a.max_weight, slot),
+                power,
+                skill,
                 skill_low: 0.0,
                 bonus: totals.bonus + suffix(&a.max_bonus, slot).min(unused_bonus),
             },
+            &a.assigned,
             slot,
         );
         if optimistic < self.assignment_limit(a)
             || self.cannot_improve_set(a, optimistic)
             || (slot > 0
-                && slot < 4
+                && slot < 5
                 && self.remaining_bound(a, slot, totals) < self.assignment_limit(a))
             || 5 - slot < required_left
         {
             return Ok(());
         }
         let floor = if self.any_snap_bonus {
-            let limit = self.assignment_limit(a);
+            let limit = self.assignment_necessary_limit(a);
             self.input.objective.bonus_floor(limit)
         } else {
             None
@@ -1508,33 +2054,118 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         }
         let member = a.team[slot];
         let mut options = a.options[slot].clone();
-        if slot == 4 && self.input.objective.product_base().is_some() {
-            let bar = self.assignment_limit(a);
-            options.retain(|&j| {
-                if j >= 0 && a.used[j as usize] {
+        if self.conditional_dominance {
+            let remaining = 5 - slot;
+            options.retain(|&snap| {
+                if snap < 0 || self.required_snaps.contains(&(snap as usize)) {
+                    return true;
+                }
+                let dominators = &self.dominators[member][snap as usize];
+                let available = |other: usize| !a.used[other] && a.allowed[slot][other];
+                if dominators
+                    .iter()
+                    .filter(|&&other| available(other))
+                    .take(remaining)
+                    .count()
+                    >= remaining
+                {
                     return false;
                 }
-                let col = if j < 0 { self.width - 1 } else { j as usize };
-                self.assignment_bound(
-                    a,
-                    Totals {
-                        power: totals.power + self.snap_power[member * self.width + col],
-                        skill: totals.skill + self.skill[member * self.width + col],
-                        skill_low: 0.0,
-                        bonus: totals.bonus
-                            + if j < 0 {
-                                0.0
-                            } else {
-                                self.snap_bonus[j as usize]
-                            },
-                    },
-                    0,
-                ) >= bar
+                for &other in dominators {
+                    if !available(other) {
+                        continue;
+                    }
+                    let delta = self.snap_power[member * self.width + other]
+                        - self.snap_power[member * self.width + snap as usize];
+                    let mut interchangeable = true;
+                    for next in slot..5 {
+                        if !a.allowed[next][other] {
+                            continue;
+                        }
+                        let owner = a.team[next];
+                        if !a.allowed[next][snap as usize]
+                            || self.snap_power[owner * self.width + other]
+                                - self.snap_power[owner * self.width + snap as usize]
+                                > delta
+                        {
+                            interchangeable = false;
+                            break;
+                        }
+                        let key = (owner, other, snap as usize);
+                        let equivalent = if let Some(&answer) = self.exchange_equivalent.get(&key) {
+                            answer
+                        } else {
+                            let answer = self.input.objective.exchange_snap_equivalent(
+                                owner,
+                                other as i32,
+                                snap,
+                            );
+                            self.exchange_equivalent.insert(key, answer);
+                            answer
+                        };
+                        if !equivalent {
+                            interchangeable = false;
+                            break;
+                        }
+                    }
+                    if interchangeable {
+                        return false;
+                    }
+                }
+                true
             });
         }
+
         for j in options {
             if j >= 0 && a.used[j as usize] {
                 continue;
+            }
+            if j >= 0
+                && self.conditional_dominance
+                && !self.input.disable_snap_dominance
+                && !self.input.objective.preserve_snap_options()
+            {
+                let mut swapped = false;
+                for previous in 0..slot {
+                    let other = a.assigned[previous];
+                    if other < 0
+                        || !a.allowed[previous][j as usize]
+                        || !a.allowed[slot][other as usize]
+                    {
+                        continue;
+                    }
+                    let owner = a.team[previous];
+                    let delta = self.snap_power[owner * self.width + j as usize]
+                        + self.snap_power[member * self.width + other as usize]
+                        - self.snap_power[owner * self.width + other as usize]
+                        - self.snap_power[member * self.width + j as usize];
+                    if delta < 0.0 || delta == 0.0 && other < j {
+                        continue;
+                    }
+                    let mut equivalent = true;
+                    for who in [owner, member] {
+                        let key = (who, j as usize, other as usize);
+                        let same = if let Some(&value) = self.exchange_equivalent.get(&key) {
+                            value
+                        } else {
+                            let value =
+                                self.input.objective.exchange_snap_equivalent(who, j, other);
+                            self.exchange_equivalent.insert(key, value);
+                            value
+                        };
+                        if !same {
+                            equivalent = false;
+                            break;
+                        }
+                    }
+                    if equivalent {
+                        swapped = true;
+                        break;
+                    }
+                }
+                if swapped {
+                    continue;
+                }
             }
             if let Some(floor) = floor {
                 let own = if j < 0 {
@@ -1575,7 +2206,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
     }
     fn compact(&mut self) {
         let threshold = self.limit();
-        let mut lows: HashMap<String, f64> = HashMap::new();
+        let mut lows: HashMap<String, f64> = HashMap::default();
         for c in &self.candidates {
             lows.entry(c.set_key.clone())
                 .and_modify(|v| *v = v.max(c.low))
@@ -1623,7 +2254,11 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             if self.input.constraints.bindings.contains_key(&i) {
                 continue;
             }
-            let kept: Vec<i32> = self.options[i].iter().copied().filter(|&j| fits(j)).collect();
+            let kept: Vec<i32> = self.options[i]
+                .iter()
+                .copied()
+                .filter(|&j| fits(j))
+                .collect();
             if kept.len() == self.options[i].len() {
                 continue;
             }
@@ -1632,16 +2267,27 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                 let col = if j < 0 { width - 1 } else { j as usize };
                 best.power = best.power.max(self.snap_power[i * width + col]);
                 best.weight = best.weight.max(self.skill[i * width + col]);
-                best.bonus = best.bonus.max(if j < 0 { 0.0 } else { snap_bonus[j as usize] });
+                best.bonus = best
+                    .bonus
+                    .max(if j < 0 { 0.0 } else { snap_bonus[j as usize] });
             }
             if kept.is_empty() {
-                best = Best { power: NONE, weight: NONE, bonus: NONE };
+                best = Best {
+                    power: NONE,
+                    weight: NONE,
+                    bonus: NONE,
+                };
             }
             self.best[i] = best;
             self.options[i] = kept;
         }
         self.bonus_order.retain(|&j| fits(j as i32));
-        self.snap_bonus_top5 = self.bonus_order.iter().take(5).map(|&j| self.snap_bonus[j]).sum();
+        self.snap_bonus_top5 = self
+            .bonus_order
+            .iter()
+            .take(5)
+            .map(|&j| self.snap_bonus[j])
+            .sum();
     }
     fn run(mut self) -> Result<Output, String> {
         let n = self.input.members.len();
@@ -1661,6 +2307,22 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                     .total_cmp(&(self.bases[a].fixed_points as f64 + self.best[a].power))
             }
         });
+        let mut leader_group = vec![usize::MAX; n];
+        let mut leader_rank = vec![usize::MAX; n];
+        if self.input.objective.canonical_leader() {
+            let mut groups = HashMap::default();
+            for (rank, &leader) in leaders.iter().enumerate() {
+                let profile = self.profile(leader);
+                let identity = power::leader_identity(
+                    self.input.master,
+                    &profile,
+                    &self.input.members[leader],
+                );
+                let next = groups.len();
+                leader_group[leader] = *groups.entry(identity).or_insert(next);
+                leader_rank[leader] = rank;
+            }
+        }
         if let Some((index, count)) = self.input.shard {
             if count > 1 {
                 leaders = leaders
@@ -1679,7 +2341,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                 stats: self.stats,
             });
         }
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
         for seed in self.input.seeds.clone() {
             if self.expired() {
                 break;
@@ -1700,13 +2362,29 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             }
             self.stats.leaders += 1;
             if self.any_snap_bonus {
-                let limit = self.limit();
+                let limit = self.necessary_limit(self.limit());
                 if let Some(floor) = self.input.objective.bonus_floor(limit) {
+                    if floor == f64::INFINITY {
+                        break;
+                    }
                     self.restrict_snaps(floor);
                 }
             }
             let profile = self.profile(leader);
             let character = self.input.members[leader].card.character_id;
+            let equivalent = |member: usize| {
+                leader_group[leader] != usize::MAX
+                    && leader_group[member] == leader_group[leader]
+                    && leader_rank[member] < leader_rank[leader]
+            };
+            if self
+                .required
+                .iter()
+                .any(|&member| member < n && equivalent(member))
+            {
+                continue;
+            }
+
             if self.required.iter().any(|&i| {
                 i != leader && (i >= n || self.input.members[i].card.character_id == character)
             }) {
@@ -1728,6 +2406,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             let mut groups: Vec<(i32, Vec<usize>)> = Vec::new();
             for i in 0..n {
                 if i == leader
+                    || equivalent(i)
                     || self.excluded_members.contains(&i)
                     || self.input.members[i].card.character_id == character
                 {
@@ -1738,6 +2417,79 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                     list.push(i);
                 } else {
                     groups.push((ch, vec![i]));
+                }
+            }
+            if self.input.objective.needs_power_cap()
+                && !self.input.objective.preserve_snap_options()
+            {
+                for (_, list) in &mut groups {
+                    let original = list.clone();
+                    list.retain(|&worse| {
+                        if self.required.contains(&worse)
+                            || self.input.constraints.bindings.contains_key(&worse)
+                        {
+                            return true;
+                        }
+                        let mut witnesses = 0;
+                        for &better in &original {
+                            if better == worse
+                                || self.input.constraints.bindings.contains_key(&better)
+                                || self.member_bonus[better] < self.member_bonus[worse]
+                                || self.input.constraints.max_bonus.is_some()
+                                    && self.member_bonus[better] != self.member_bonus[worse]
+                                || self
+                                    .input
+                                    .constraints
+                                    .member_floor
+                                    .as_ref()
+                                    .is_some_and(|f| f.values[better] < f.values[worse])
+                            {
+                                continue;
+                            }
+                            let same_deck = profile.simple
+                                || power::leader_replacement_equivalent(
+                                    self.input.master,
+                                    &profile,
+                                    &self.input.members[better],
+                                    &self.input.members[worse],
+                                );
+                            if !same_deck {
+                                continue;
+                            }
+                            let base_delta = if profile.simple {
+                                slot_power[better] - slot_power[worse]
+                            } else {
+                                if self.bases[better]
+                                    .common
+                                    .iter()
+                                    .zip(self.bases[worse].common)
+                                    .any(|(&a, b)| a < b)
+                                    || profile.effects.iter().any(|e| e.value < 0)
+                                {
+                                    continue;
+                                }
+                                (self.bases[better].fixed_points - self.bases[worse].fixed_points)
+                                    as f64
+                            };
+                            let snap_delta = (0..self.width)
+                                .map(|snap| {
+                                    self.snap_power[better * self.width + snap]
+                                        - self.snap_power[worse * self.width + snap]
+                                })
+                                .fold(f64::INFINITY, f64::min);
+                            if self.input.objective.numeric_member_dominance(
+                                better,
+                                worse,
+                                base_delta + snap_delta,
+                            ) {
+                                witnesses += 1;
+                                if witnesses >= self.input.k {
+                                    return false;
+                                }
+                            }
+                        }
+                        true
+                    });
                 }
             }
             let (mut forced, mut free) = (Vec::new(), Vec::new());
@@ -1865,6 +2617,13 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             {
                 continue;
             }
+            let cuts = self.member_cuts(
+                &slot_power,
+                &characters,
+                leader_totals.power + top_sum(&char_power, 0, 4),
+                leader_totals.skill + top_sum(&char_skill, 0, 4),
+                leader_totals.bonus + top_sum(&char_bonus, 0, 4),
+            );
             let mut members = Members {
                 leader,
                 characters,
@@ -1875,6 +2634,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                 char_bonus,
                 char_member_bonus,
                 chosen: Vec::with_capacity(4),
+                cuts,
             };
             self.member_visit(
                 &mut members,
@@ -1890,7 +2650,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             let mut pool = std::mem::take(&mut self.candidates);
             pool.retain(|c| c.high >= threshold);
             pool.sort_by(|a, b| b.high.total_cmp(&a.high));
-            let mut known: HashMap<String, f64> = HashMap::new();
+            let mut known: HashMap<String, f64> = HashMap::default();
             for c in pool {
                 let kth = if self.hits.len() < self.input.k {
                     f64::NEG_INFINITY

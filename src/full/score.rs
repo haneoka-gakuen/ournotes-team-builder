@@ -280,6 +280,14 @@ impl<'a> Incremental<'a> {
             rank_bonus: 0,
         }
     }
+    pub(crate) fn note_factor_commands(&self) -> Vec<(i32, i32)> {
+        self.factors
+            .iter()
+            .flatten()
+            .filter(|c| c.note != 0)
+            .map(|c| (c.time, c.note))
+            .collect()
+    }
     fn file(&mut self, time: i32) -> usize {
         let frame = (core::frame(time) as usize).min(self.max_frame - 1);
         self.added = if self.added < 0 {

@@ -11,6 +11,7 @@ use std::{
     ffi::{c_char, CString},
 };
 pub type Callback = extern "C" fn(*const c_char);
+type HitIdentity = (Vec<usize>, Vec<i32>, u64, u64);
 #[derive(Default)]
 struct State {
     callback: Option<Callback>,
@@ -21,6 +22,7 @@ struct State {
     ranks: Vec<ScoreRank>,
     battle: bool,
     last: f64,
+    last_hits: Vec<HitIdentity>,
 }
 thread_local! {static STATE:RefCell<State>=RefCell::new(State::default());}
 pub fn with_callback<T>(callback: Option<Callback>, run: impl FnOnce() -> T) -> T {
@@ -56,6 +58,7 @@ pub fn song(song: &Value) {
         let mut s = s.borrow_mut();
         s.song = song.clone();
         s.last = f64::NEG_INFINITY;
+        s.last_hits.clear();
     })
 }
 pub fn mode(goal: &Value) {
@@ -71,7 +74,9 @@ pub fn chart(chart: Option<&Chart>, battle: bool) {
 fn hit_json(state: &State, hit: &Hit) -> Value {
     let mut value = json!({"song":state.song,"members":hit.team.members.iter().map(|&i|&state.members[i]).collect::<Vec<_>>(),"snaps":hit.team.snaps.iter().map(|&j|if j<0{None}else{Some(&state.snaps[j as usize])}).collect::<Vec<_>>(),"power":hit.power,"slotPowers":hit.slot_powers,"key":hit.key});
     let detail = &hit.detail;
-    if !detail["comboBonus"].is_null() { value["comboBonus"] = detail["comboBonus"].clone(); }
+    if !detail["comboBonus"].is_null() {
+        value["comboBonus"] = detail["comboBonus"].clone();
+    }
     let scores = &detail["scores"];
     if !scores.is_null() {
         let values: Vec<_> = master::rows(&scores["scores"])
@@ -159,7 +164,22 @@ pub fn emit(hits: &[Hit]) {
         if hits.is_empty() || now - state.last < 250.0 {
             return;
         }
+        let identity: Vec<_> = hits
+            .iter()
+            .map(|hit| {
+                (
+                    hit.team.members.clone(),
+                    hit.team.snaps.clone(),
+                    hit.key.to_bits(),
+                    hit.power.to_bits(),
+                )
+            })
+            .collect();
+        if identity == state.last_hits {
+            return;
+        }
         state.last = now;
+        state.last_hits = identity;
         if hits.iter().any(|h| {
             h.team.members.iter().any(|&i| i >= state.members.len())
                 || h.team.snaps.iter().any(|&j| j >= state.snaps.len() as i32)

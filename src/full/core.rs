@@ -250,7 +250,8 @@ pub struct Life {
     reduction_counter: i32,
     limits: BTreeMap<i32, i32>,
     limit_counter: i32,
-    commands: Vec<Vec<Command>>,
+    frames: usize,
+    commands: BTreeMap<usize, Vec<Command>>,
     cached_frame: i32,
     cached: [i32; 3],
 }
@@ -268,7 +269,8 @@ impl Life {
             reduction_counter: 0,
             limits: BTreeMap::new(),
             limit_counter: 0,
-            commands: vec![Vec::new(); length],
+            frames: length,
+            commands: BTreeMap::new(),
             cached_frame: -1,
             cached: [0; 3],
         }
@@ -277,12 +279,13 @@ impl Life {
         self.maximum
     }
     fn frame_of(&self, time: i32) -> usize {
-        (frame(time) as usize).min(self.commands.len() - 1)
+        (frame(time) as usize).min(self.frames - 1)
     }
     fn add(&mut self, command: Command) {
         let frame = self.frame_of(command.time);
-        let at = self.commands[frame].partition_point(|c| c.time <= command.time);
-        self.commands[frame].insert(at, command);
+        let commands = self.commands.entry(frame).or_default();
+        let at = commands.partition_point(|c| c.time <= command.time);
+        commands.insert(at, command);
         if frame as i32 <= self.cached_frame {
             self.cached_frame = -1;
             self.cached = [0; 3];
@@ -433,8 +436,8 @@ impl Life {
         } else {
             (self.cached, (c + 1) as usize)
         };
-        for k in start..frame.max(start) {
-            for command in &self.commands[k] {
+        for commands in self.commands.range(start..frame.max(start)).map(|(_, v)| v) {
+            for command in commands {
                 self.step(&mut state, command);
             }
         }
@@ -442,7 +445,7 @@ impl Life {
             self.cached_frame = frame as i32 - 1;
             self.cached = state;
         }
-        for command in &self.commands[frame] {
+        for command in self.commands.get(&frame).into_iter().flatten() {
             if command.time > time {
                 break;
             }

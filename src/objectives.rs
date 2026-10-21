@@ -46,6 +46,7 @@ pub struct LiveCore {
     pub high: Linear,
     pub low: Linear,
     pub factor_cap: f64,
+    pub score_cap: f64,
     pub max_recovery: i32,
     pub drains: bool,
     pub slots: Vec<Slot>,
@@ -56,6 +57,14 @@ pub struct LiveCore {
     play_bounds: Option<PlayBounds>,
     scores: HashMap<(i32, [usize; 5]), Arc<Scores>>,
     score_order: VecDeque<(i32, [usize; 5])>,
+    snap_power: Arc<Vec<f64>>,
+    power_width: usize,
+    base_power: f64,
+    max_frontiers: Vec<[Vec<(f64, f64)>; 5]>,
+    member_profiles: HashMap<usize, [f64; 5]>,
+    suffix_profiles: Vec<[f64; 5]>,
+    dominance_margin: f64,
+    member_dominance: HashMap<(usize, usize), bool>,
 }
 /// Resolved skills of every member × snap pair and their shape ids, shared by the objectives of one engine call.
 type SlotTable = Arc<(Vec<Slot>, Vec<usize>, usize)>;
@@ -77,7 +86,12 @@ fn slot_table(master: &Master, members: &[Member], snaps: &[Snap]) -> SlotTable 
         snaps.as_ptr() as usize,
         snaps.len(),
     );
-    if let Some(table) = SLOT_TABLE.with(|t| t.borrow().as_ref().filter(|(k, _)| *k == key).map(|(_, v)| Arc::clone(v))) {
+    if let Some(table) = SLOT_TABLE.with(|t| {
+        t.borrow()
+            .as_ref()
+            .filter(|(k, _)| *k == key)
+            .map(|(_, v)| Arc::clone(v))
+    }) {
         return table;
     }
     let width = snaps.len() + 1;
@@ -107,7 +121,7 @@ impl LiveCore {
     ) -> Self {
         let width = snaps.len() + 1;
         let table = slot_table(master, members, snaps);
-        let (slots, ids, intern_len) = (table.0.clone(), table.1.clone(), table.2);
+        let (mut slots, mut ids, mut intern_len) = (table.0.clone(), table.1.clone(), table.2);
         let judgements = live::judgements(chart.times.len(), play);
         let input = chart::prepare(master, chart, 0, Vec::new(), judgements, 1.0, 100.0);
         let mut raise = 0.0_f64;
@@ -136,6 +150,34 @@ impl LiveCore {
                     .count(),
             );
         }
+        let isolated =
+            input.skill_times.iter().enumerate().all(|(i, &time)| {
+                input.skill_times.iter().enumerate().all(|(j, &other)| {
+                    i == j || (time as i64 - other as i64).abs() > longest as i64
+                })
+            });
+        if input.judgements.is_none() && isolated {
+            let mut intern = HashMap::<Vec<u64>, usize>::new();
+            for (slot, id) in slots.iter_mut().zip(&mut ids) {
+                slot.recovery = 0;
+                slot.convert = None;
+                slot.effects
+                    .retain(|effect| !effect.gate.blocks(input.life_base));
+                for effect in &mut slot.effects {
+                    effect.gate = crate::live::Gate {
+                        kind: 0,
+                        value: 0.0,
+                        positive: true,
+                    };
+                }
+                if slot.effects.is_empty() {
+                    slot.extension_ms = 0.0;
+                }
+                let next = intern.len();
+                *id = *intern.entry(slot.signature()).or_insert(next);
+            }
+            intern_len = intern.len();
+        }
         let factor_cap = 1.0 + overlap as f64 * raise;
         let high = if let Some(j) = &input.judgements {
             model::linear_play(&input, j, true, 0, 1.0, recovery)
@@ -159,6 +201,7 @@ impl LiveCore {
             high,
             low,
             factor_cap,
+            score_cap: f64::INFINITY,
             max_recovery: recovery,
             drains,
             slots,
@@ -169,6 +212,14 @@ impl LiveCore {
             play_bounds,
             scores: HashMap::new(),
             score_order: VecDeque::new(),
+            snap_power: Arc::new(Vec::new()),
+            power_width: 0,
+            base_power: 0.0,
+            max_frontiers: Vec::new(),
+            member_profiles: HashMap::new(),
+            suffix_profiles: Vec::new(),
+            dominance_margin: f64::INFINITY,
+            member_dominance: HashMap::new(),
         }
     }
     fn at(&self, member: usize, snap: i32) -> usize {
@@ -212,6 +263,9 @@ impl LiveCore {
         };
         self.weights[id] = Some(pair.clone());
         pair
+    }
+    pub(crate) fn shape(&self, member: usize, snap: i32) -> usize {
+        self.ids[self.at(member, snap)]
     }
     pub fn score_high(&self, t: Totals) -> f64 {
         t.power * (self.high.total + t.skill) / self.input.converted_count as f64
@@ -297,6 +351,222 @@ impl LiveCore {
         }
         (lows, highs)
     }
+    pub(crate) fn prepare_dominance(&mut self, power_cap: f64) {
+        if self.input.judgements.is_none()
+            && self
+                .slots
+                .iter()
+                .all(|s| s.effects.iter().all(|e| e.delta >= 0))
+            && self.high.total > 0.0
+        {
+            let base = self.high.total / self.input.converted_count as f64;
+            self.dominance_margin = ((2.0 * RELATIVE_ERROR * power_cap
+                + self.low.absolute_error / base)
+                / (1.0 - RELATIVE_ERROR))
+                .next_up()
+                + 1.0;
+        }
+    }
+    pub(crate) fn numeric_member_dominance(
+        &mut self,
+        better: usize,
+        worse: usize,
+        power_delta: f64,
+    ) -> bool {
+        if power_delta <= self.dominance_margin {
+            return false;
+        }
+        if let Some(&answer) = self.member_dominance.get(&(better, worse)) {
+            return answer;
+        }
+        let answer = (-1..self.width as i32 - 1).all(|snap| {
+            let a = self.weight(better, snap).low.per_event;
+            let b = self.weight(worse, snap).high.per_event;
+            a.iter().zip(b).all(|(&a, b)| a >= b)
+        });
+        self.member_dominance.insert((better, worse), answer);
+        answer
+    }
+    pub(crate) fn numeric_dominance(
+        &mut self,
+        member: usize,
+        better: i32,
+        worse: i32,
+        power_delta: f64,
+    ) -> bool {
+        if power_delta <= self.dominance_margin {
+            return false;
+        }
+        let a = self.weight(member, better).low.per_event;
+        let b = self.weight(member, worse).high.per_event;
+        a.iter().zip(b).all(|(&a, b)| a >= b)
+    }
+    fn global_profile(&mut self, member: usize) -> [f64; 5] {
+        if let Some(&row) = self.member_profiles.get(&member) {
+            return row;
+        }
+        let mut row = [0.0_f64; 5];
+        for snap in -1..self.width as i32 - 1 {
+            let weights = self.weight(member, snap).high.per_event;
+            for event in 0..5 {
+                row[event] = row[event].max(weights[event]);
+            }
+        }
+        self.member_profiles.insert(member, row);
+        row
+    }
+    fn prepare_max_members(&mut self, characters: &[Vec<usize>]) {
+        self.suffix_profiles = vec![[0.0; 5]; characters.len() + 1];
+        for i in (0..characters.len()).rev() {
+            let mut row = self.suffix_profiles[i + 1];
+            for &member in &characters[i] {
+                let profile = self.global_profile(member);
+                for event in 0..5 {
+                    row[event] = row[event].max(profile[event]);
+                }
+            }
+            self.suffix_profiles[i] = row;
+        }
+    }
+    fn member_max_bound(&mut self, members: &[usize], totals: Totals, from: usize) -> Option<f64> {
+        let suffix = *self.suffix_profiles.get(from)?;
+        let matrix: [[f64; 5]; 5] = std::array::from_fn(|slot| {
+            if slot < members.len() {
+                self.global_profile(members[slot])
+            } else {
+                suffix
+            }
+        });
+        let mut dp = [f64::NEG_INFINITY; 32];
+        dp[0] = 0.0;
+        for mask in 1usize..32 {
+            let slot = mask.count_ones() as usize - 1;
+            for event in 0..5 {
+                if mask & (1 << event) != 0 {
+                    dp[mask] =
+                        dp[mask].max((dp[mask ^ (1 << event)] + matrix[slot][event]).next_up());
+                }
+            }
+        }
+        Some(self.score_high(Totals {
+            skill: dp[31],
+            ..totals
+        }))
+    }
+    fn prepare_max(&mut self, members: &[usize], options: &[Vec<i32>]) {
+        self.max_frontiers.clear();
+        for (slot, &member) in members.iter().enumerate() {
+            let mut frontiers: [Vec<(f64, f64)>; 5] = std::array::from_fn(|_| Vec::new());
+            for &snap in &options[slot] {
+                let power = self.snap_power[member * self.power_width
+                    + if snap < 0 {
+                        self.power_width - 1
+                    } else {
+                        snap as usize
+                    }];
+                let weights = self.weight(member, snap).high.per_event;
+                for event in 0..5 {
+                    frontiers[event].push((power, weights[event]));
+                }
+            }
+            for frontier in &mut frontiers {
+                frontier.sort_by(|a, b| b.0.total_cmp(&a.0).then(b.1.total_cmp(&a.1)));
+                let mut high = f64::NEG_INFINITY;
+                frontier.retain(|&(_, weight)| {
+                    if weight > high {
+                        high = weight;
+                        true
+                    } else {
+                        false
+                    }
+                });
+            }
+            self.max_frontiers.push(frontiers);
+        }
+    }
+    fn maximum_bound(
+        &mut self,
+        members: &[usize],
+        assigned: &[i32],
+        from: usize,
+        totals: Totals,
+    ) -> Option<f64> {
+        if self.max_frontiers.len() != 5 {
+            return None;
+        }
+        let lambda = ((self.high.total + totals.skill) / totals.power.max(1.0)).sqrt();
+        if !lambda.is_finite() || lambda <= 0.0 {
+            return None;
+        }
+        let mut matrix = [[0.0; 5]; 5];
+        for slot in 0..5 {
+            if slot < from {
+                let member = members[slot];
+                let snap = assigned[slot];
+                let power = self.snap_power[member * self.power_width
+                    + if snap < 0 {
+                        self.power_width - 1
+                    } else {
+                        snap as usize
+                    }];
+                let weights = self.weight(member, snap).high.per_event;
+                for (event, &weight) in weights.iter().enumerate() {
+                    matrix[slot][event] = (lambda * power).next_up() + (weight / lambda).next_up();
+                }
+            } else {
+                for (event, value) in matrix[slot].iter_mut().enumerate() {
+                    *value = self.max_frontiers[slot][event]
+                        .iter()
+                        .map(|&(power, weight)| {
+                            ((lambda * power).next_up() + (weight / lambda).next_up()).next_up()
+                        })
+                        .fold(f64::NEG_INFINITY, f64::max);
+                }
+            }
+        }
+        let mut dp = [f64::NEG_INFINITY; 32];
+        dp[0] = 0.0;
+        for mask in 1usize..32 {
+            let slot = mask.count_ones() as usize - 1;
+            for event in 0..5 {
+                if mask & (1 << event) != 0 {
+                    dp[mask] =
+                        dp[mask].max((dp[mask ^ (1 << event)] + matrix[slot][event]).next_up());
+                }
+            }
+        }
+        let sum =
+            ((lambda * self.base_power).next_up() + (self.high.total / lambda).next_up() + dp[31])
+                .next_up();
+        Some(
+            ((sum * sum).next_up() / (4.0 * self.input.converted_count as f64)).next_up()
+                * (1.0 + RELATIVE_ERROR),
+        )
+    }
+    fn order_high(&mut self, team: &Team, power: f64) -> f64 {
+        let rows: Vec<_> = team
+            .members
+            .iter()
+            .enumerate()
+            .map(|(slot, &m)| self.weight(m, team.snaps[slot]).high.per_event)
+            .collect();
+        let mut dp = [f64::NEG_INFINITY; 32];
+        dp[0] = 0.0;
+        for mask in 1usize..32 {
+            let slot = mask.count_ones() as usize - 1;
+            for event in 0..5 {
+                if mask & (1 << event) != 0 {
+                    dp[mask] =
+                        dp[mask].max((dp[mask ^ (1 << event)] + rows[slot][event]).next_up());
+                }
+            }
+        }
+        self.score_high(Totals {
+            power,
+            skill: dp[31],
+            ..Totals::default()
+        })
+    }
     pub fn team_high(&mut self, team: &Team, t: Totals) -> f64 {
         let Some(j) = &self.input.judgements else {
             return self.score_high(t);
@@ -349,8 +619,90 @@ pub struct LiveObjective {
     pub target: Option<Target>,
 }
 impl Objective for LiveObjective {
+    fn exchange_snap_equivalent(&mut self, member: usize, a: i32, b: i32) -> bool {
+        self.core.shape(member, a) == self.core.shape(member, b)
+    }
+    fn conditional_snap_dominance(&self) -> bool {
+        true
+    }
+    fn canonical_leader(&self) -> bool {
+        true
+    }
+    fn numeric_member_dominance(&mut self, better: usize, worse: usize, power_delta: f64) -> bool {
+        self.core
+            .numeric_member_dominance(better, worse, power_delta)
+    }
+    fn needs_power_cap(&self) -> bool {
+        self.core.input.judgements.is_none()
+    }
+    fn prepare_dominance(&mut self, power_cap: f64) {
+        self.core.prepare_dominance(power_cap);
+    }
+    fn numeric_snap_dominance(
+        &mut self,
+        member: usize,
+        better: i32,
+        worse: i32,
+        power_delta: f64,
+    ) -> bool {
+        self.core
+            .numeric_dominance(member, better, worse, power_delta)
+    }
+
+    fn prepare_members(&mut self, characters: &[Vec<usize>]) {
+        if self.criterion == Criterion::Max && self.target.is_none() {
+            self.core.prepare_max_members(characters);
+        }
+    }
+    fn member_bound_at(
+        &mut self,
+        members: &[usize],
+        totals: Totals,
+        _left: usize,
+        from: usize,
+        _limit: f64,
+    ) -> Option<f64> {
+        if self.criterion == Criterion::Max && self.target.is_none() {
+            self.core.member_max_bound(members, totals, from)
+        } else {
+            None
+        }
+    }
+    fn prepare_power(&mut self, power: Arc<Vec<f64>>, width: usize) {
+        self.core.snap_power = power;
+        self.core.power_width = width;
+    }
+    fn prepare_assignment_power(&mut self, power: f64) {
+        self.core.base_power = power;
+    }
+    fn prepare_assignment(&mut self, members: &[usize], options: &[Vec<i32>]) {
+        if self.criterion == Criterion::Max && self.target.is_none() {
+            self.core.prepare_max(members, options);
+        }
+    }
+    fn assignment_order_bound(
+        &mut self,
+        members: &[usize],
+        totals: Totals,
+        assigned: &[i32],
+        from: usize,
+        _limit: f64,
+    ) -> Option<f64> {
+        if self.criterion == Criterion::Max && self.target.is_none() {
+            self.core.maximum_bound(members, assigned, from, totals)
+        } else {
+            None
+        }
+    }
+    fn snap_dominance(&mut self, member: usize, snap: i32) -> Vec<f64> {
+        let shape = self.core.shape(member, snap) as f64;
+        vec![shape, -shape]
+    }
     fn skill(&mut self, member: usize, snap: i32) -> (f64, f64) {
         let w = self.core.weight(member, snap);
+        if self.target.is_some_and(|t| self.core.score_cap < t.score) {
+            return (w.low.mean, w.high.mean);
+        }
         if self.target.is_some() {
             // Every order's score stays below the best-order weights.
             return (w.low.worst, w.high.best);
@@ -363,7 +715,32 @@ impl Objective for LiveObjective {
     }
     fn bound(&mut self, t: Totals) -> f64 {
         let high = self.core.score_high(t);
-        self.target.map_or(high, |target| target.ceiling(high))
+        self.target
+            .map_or(high, |target| target.ceiling(high.min(self.core.score_cap)))
+    }
+    fn joint_targets(&mut self, limit: f64) -> Option<Vec<crate::search::JointTarget>> {
+        let mut score = limit;
+        if let Some(target) = self.target {
+            if self.core.score_cap >= target.score {
+                return None;
+            }
+            let scale = if target.capped {
+                (1.0 + TIE).next_up()
+            } else {
+                TIE.next_up()
+            };
+            score = (limit / scale).next_down();
+        }
+        if !score.is_finite() {
+            return None;
+        }
+        Some(vec![crate::search::JointTarget {
+            bonus: 0.0,
+            product: (score.max(0.0) * self.core.input.converted_count as f64
+                / (1.0 + RELATIVE_ERROR))
+                .next_down()
+                .max(0.0),
+        }])
     }
     fn product_base(&self) -> Option<f64> {
         Some(self.core.high.total)
@@ -371,7 +748,10 @@ impl Objective for LiveObjective {
     fn leaf_bound(&mut self, team: &Team, t: Totals) -> Option<f64> {
         if self.core.input.judgements.is_some() {
             let high = self.core.team_high(team, t);
-            Some(self.target.map_or(high, |target| target.ceiling(high)))
+            Some(
+                self.target
+                    .map_or(high, |target| target.ceiling(high.min(self.core.score_cap))),
+            )
         } else {
             None
         }
@@ -385,6 +765,19 @@ impl Objective for LiveObjective {
     }
     fn interval(&mut self, team: &Team, t: Totals) -> (f64, f64) {
         if let Some(target) = self.target {
+            if self.core.score_cap < target.score {
+                let low = self.core.score_low(t);
+                let high = self.core.score_high(t).min(self.core.score_cap);
+                let value = |mean: f64| {
+                    if target.capped {
+                        mean + TIE * mean
+                    } else {
+                        TIE * mean
+                    }
+                };
+                return (value(low), value(high));
+            }
+
             let (lows, highs) = self.core.order_bounds(team, t.power);
             return (target.value(&lows), target.value(&highs));
         }
@@ -410,9 +803,10 @@ impl Objective for LiveObjective {
     fn exact(&mut self, team: &Team, power: f64, _slots: &[f64]) -> Result<Exact, String> {
         let scores = self.core.evaluate(team, power as i32)?;
         Ok(Exact {
-            key: self
-                .target
-                .map_or_else(|| self.criterion.key(&scores), |target| target.value(&scores.scores)),
+            key: self.target.map_or_else(
+                || self.criterion.key(&scores),
+                |target| target.value(&scores.scores),
+            ),
             detail: json!({"scores":&*scores}),
         })
     }
@@ -456,6 +850,12 @@ impl Potential {
     }
 }
 impl Objective for Potential {
+    fn conditional_snap_dominance(&self) -> bool {
+        true
+    }
+    fn canonical_leader(&self) -> bool {
+        true
+    }
     fn skill(&mut self, member: usize, snap: i32) -> (f64, f64) {
         let area = self.area(member, snap);
         (area, area)
@@ -484,6 +884,64 @@ pub struct ScoreCap {
     pub core: LiveCore,
 }
 impl Objective for ScoreCap {
+    fn exchange_snap_equivalent(&mut self, member: usize, a: i32, b: i32) -> bool {
+        self.core.shape(member, a) == self.core.shape(member, b)
+    }
+    fn conditional_snap_dominance(&self) -> bool {
+        true
+    }
+    fn canonical_leader(&self) -> bool {
+        true
+    }
+    fn needs_power_cap(&self) -> bool {
+        self.core.input.judgements.is_none()
+    }
+    fn prepare_dominance(&mut self, power_cap: f64) {
+        self.core.prepare_dominance(power_cap);
+    }
+    fn numeric_snap_dominance(&mut self, m: usize, a: i32, b: i32, delta: f64) -> bool {
+        self.core.numeric_dominance(m, a, b, delta)
+    }
+    fn numeric_member_dominance(&mut self, a: usize, b: usize, delta: f64) -> bool {
+        self.core.numeric_member_dominance(a, b, delta)
+    }
+    fn snap_dominance(&mut self, m: usize, s: i32) -> Vec<f64> {
+        let shape = self.core.shape(m, s) as f64;
+        vec![shape, -shape]
+    }
+    fn prepare_power(&mut self, power: Arc<Vec<f64>>, width: usize) {
+        self.core.snap_power = power;
+        self.core.power_width = width;
+    }
+    fn prepare_assignment_power(&mut self, power: f64) {
+        self.core.base_power = power;
+    }
+    fn prepare_members(&mut self, characters: &[Vec<usize>]) {
+        self.core.prepare_max_members(characters);
+    }
+    fn member_bound_at(
+        &mut self,
+        members: &[usize],
+        t: Totals,
+        _left: usize,
+        from: usize,
+        _limit: f64,
+    ) -> Option<f64> {
+        self.core.member_max_bound(members, t, from)
+    }
+    fn prepare_assignment(&mut self, members: &[usize], options: &[Vec<i32>]) {
+        self.core.prepare_max(members, options);
+    }
+    fn assignment_order_bound(
+        &mut self,
+        members: &[usize],
+        t: Totals,
+        assigned: &[i32],
+        from: usize,
+        _limit: f64,
+    ) -> Option<f64> {
+        self.core.maximum_bound(members, assigned, from, t)
+    }
     fn skill(&mut self, m: usize, s: i32) -> (f64, f64) {
         let best = self.core.weight(m, s).high.best;
         (best, best)
@@ -491,26 +949,25 @@ impl Objective for ScoreCap {
     fn bound(&mut self, t: Totals) -> f64 {
         self.core.score_high(t)
     }
+    fn joint_targets(&mut self, limit: f64) -> Option<Vec<crate::search::JointTarget>> {
+        Some(vec![crate::search::JointTarget {
+            bonus: 0.0,
+            product: (limit.max(0.0) * self.core.input.converted_count as f64
+                / (1.0 + RELATIVE_ERROR))
+                .next_down()
+                .max(0.0),
+        }])
+    }
     fn product_base(&self) -> Option<f64> {
         Some(self.core.high.total)
     }
-    fn interval(&mut self, _team: &Team, t: Totals) -> (f64, f64) {
-        let value = self.core.score_high(t);
+    fn interval(&mut self, team: &Team, t: Totals) -> (f64, f64) {
+        let value = self.core.order_high(team, t.power);
         (value, value)
     }
     fn exact(&mut self, team: &Team, power: f64, _slots: &[f64]) -> Result<Exact, String> {
-        let skill = team
-            .members
-            .iter()
-            .enumerate()
-            .map(|(slot, &m)| self.core.weight(m, team.snaps[slot]).high.best)
-            .sum();
         Ok(Exact {
-            key: self.core.score_high(Totals {
-                power,
-                skill,
-                ..Totals::default()
-            }),
+            key: self.core.order_high(team, power),
             detail: Value::Null,
         })
     }
@@ -528,8 +985,14 @@ impl Target {
     pub fn from_value(v: &Value) -> Option<Self> {
         let score = v["score"].as_f64().filter(|s| s.is_finite() && *s > 0.0)?;
         match v["kind"].as_str() {
-            Some("at-least") => Some(Self { score, capped: false }),
-            Some("capped") => Some(Self { score, capped: true }),
+            Some("at-least") => Some(Self {
+                score,
+                capped: false,
+            }),
+            Some("capped") => Some(Self {
+                score,
+                capped: true,
+            }),
             _ => None,
         }
     }

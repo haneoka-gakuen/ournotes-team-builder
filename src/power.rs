@@ -189,7 +189,10 @@ pub fn member_growth(
 ) -> MemberGrowth {
     let max = max_member_growth(master, card);
     let maximum = maximum || input.maximize;
-    let pick = |v: Option<i32>, high: i32| v.filter(|_| !input.maximize).unwrap_or(if maximum { high } else { 1 });
+    let pick = |v: Option<i32>, high: i32| {
+        v.filter(|_| !input.maximize)
+            .unwrap_or(if maximum { high } else { 1 })
+    };
     let awake = pick(input.awake, max.awake).min(max.awake);
     let cap = member_level_cap(master, card, awake);
     MemberGrowth {
@@ -506,6 +509,95 @@ pub fn leader_profile(master: &Master, member: &Member) -> LeaderProfile {
         .iter()
         .all(|r| r.condition_group <= 0 && !cumulative(r.kind));
     LeaderProfile { effects, simple }
+}
+pub(crate) fn leader_identity(
+    master: &Master,
+    profile: &LeaderProfile,
+    leader: &Member,
+) -> Vec<Vec<i64>> {
+    let mut rows: Vec<_> = profile
+        .effects
+        .iter()
+        .map(|row| {
+            let mut targets = row.targets.clone();
+            targets.sort_unstable();
+            let mut key = vec![
+                row.kind as i64,
+                row.value as i64,
+                row.condition_group as i64,
+                row.cumulative_id as i64,
+                0,
+                0,
+                targets.len() as i64,
+            ];
+            if cumulative(row.kind) {
+                if let Some(c) = master.cumulative.get(&row.cumulative_id) {
+                    match c.kind {
+                        3001 => key[4] = matches_targets(master, leader, &c.targets) as i64,
+                        3002 | 3003 => key[5] = leader.card.band_id as i64,
+                        _ => {}
+                    }
+                }
+            }
+            key.extend(targets.into_iter().map(|id| id as i64));
+            key
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+pub(crate) fn leader_replacement_equivalent(
+    master: &Master,
+    profile: &LeaderProfile,
+    a: &Member,
+    b: &Member,
+) -> bool {
+    profile.effects.iter().all(|row| {
+        if matches_targets(master, a, &row.targets) != matches_targets(master, b, &row.targets) {
+            return false;
+        }
+        for set in master
+            .condition_sets
+            .get(&row.condition_group)
+            .into_iter()
+            .flatten()
+        {
+            for id in set {
+                if let Some(c) = master
+                    .conditions
+                    .get(id)
+                    .filter(|c| c.kind == 3000 || c.kind == 3001)
+                {
+                    if matches_targets(master, a, &c.targets)
+                        != matches_targets(master, b, &c.targets)
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+        if cumulative(row.kind) {
+            if let Some(c) = master.cumulative.get(&row.cumulative_id) {
+                match c.kind {
+                    3000 | 3001 => {
+                        if matches_targets(master, a, &c.targets)
+                            != matches_targets(master, b, &c.targets)
+                        {
+                            return false;
+                        }
+                    }
+                    3002..=3004 => {
+                        if a.card.band_id != b.card.band_id {
+                            return false;
+                        }
+                    }
+                    3005 if a.card.card_type != b.card.card_type => return false,
+                    _ => {}
+                }
+            }
+        }
+        true
+    })
 }
 pub fn leader_percents(
     master: &Master,

@@ -741,6 +741,9 @@ impl Performer {
         let mut p = self.clone();
         p.live_skill = None;
         p.support_skills.clear();
+        if p.gekisou_skill.is_none() && p.mission_only.unwrap_or(0) == 0 {
+            p.gekisou_support_skills.clear();
+        }
         p
     }
     pub fn support_only(&self) -> Self {

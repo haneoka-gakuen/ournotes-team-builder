@@ -5,7 +5,7 @@ use crate::{
     num::{f, i32},
 };
 use serde::{Deserialize, Serialize};
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Note {
     pub time_ms: i32,
@@ -13,7 +13,7 @@ pub struct Note {
     pub judgement_type: i32,
     pub judged: bool,
 }
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct EnumerationNote {
     pub time_ms: i32,
@@ -21,7 +21,7 @@ pub struct EnumerationNote {
     #[serde(default)]
     pub judgement_type: i32,
 }
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Source {
     pub duration_ms: i32,
