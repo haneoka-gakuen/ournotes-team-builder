@@ -2530,13 +2530,16 @@ impl Kernel<'_> {
         s: i32,
         pick: Criterion,
     ) -> f64 {
+        let mut data = base.lock().unwrap_or_else(|e| e.into_inner());
+        self.luck_slot_locked(&mut data, m, s, pick)
+    }
+    fn luck_slot_locked(&mut self, base: &mut Base, m: usize, s: i32, pick: Criterion) -> f64 {
         let index = self.slot_index(m, s) * 3
             + match pick {
                 Criterion::Mean => 0,
                 Criterion::Max => 1,
                 Criterion::Min => 2,
             };
-        let mut base = base.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(&value) = base.lives.get(&index) {
             return value;
         }
@@ -2561,9 +2564,8 @@ impl Kernel<'_> {
         base.lives.insert(index, value);
         value
     }
-    fn luck_events(&mut self, base: &SharedBase, m: usize, s: i32) -> [f64; 5] {
+    fn luck_events(&mut self, base: &mut Base, m: usize, s: i32) -> [f64; 5] {
         let index = self.slot_index(m, s);
-        let mut base = base.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(&row) = base.events.get(&index) {
             return row;
         }
@@ -2779,7 +2781,8 @@ impl Kernel<'_> {
     ) -> f64 {
         let maximum = self.criterion == Criterion::Max;
         let width = self.snaps.len() + 1;
-        let constant = base.lock().unwrap_or_else(|e| e.into_inner()).weights.base;
+        let mut data = base.lock().unwrap_or_else(|e| e.into_inner());
+        let constant = data.weights.base;
         let mut coefficient = constant;
         let mut rows = Vec::with_capacity(5);
         for slot in 0..5 {
@@ -2805,9 +2808,9 @@ impl Kernel<'_> {
                     continue;
                 }
                 let weights = if maximum {
-                    self.luck_events(base, member, snap)
+                    self.luck_events(&mut data, member, snap)
                 } else {
-                    [self.luck_slot(base, member, snap, Criterion::Mean); 5]
+                    [self.luck_slot_locked(&mut data, member, snap, Criterion::Mean); 5]
                 };
                 let power = prefix.snapshot_power
                     [member * width + if snap < 0 { width - 1 } else { snap as usize }];
@@ -2820,6 +2823,7 @@ impl Kernel<'_> {
             coefficient += high;
             rows.push(row);
         }
+        drop(data);
         let lambda = (coefficient / prefix.power_bound.max(1.0)).sqrt();
         if !lambda.is_finite() || lambda <= 0.0 {
             return f64::INFINITY;
