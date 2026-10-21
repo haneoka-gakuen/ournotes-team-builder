@@ -361,13 +361,30 @@ impl Compiler {
                     converter.gekisou_support_skills.push((id, level));
                 }
             }
-            if converter.gekisou_support_skills.is_empty() {
-                converter = Performer {
-                    mission_only: Some(1),
-                    ..Performer::default()
-                };
+            if !converter.gekisou_support_skills.is_empty() {
+                for &(id, level) in &converter.gekisou_support_skills {
+                    for row in master.gekiso_support_skills[&id]
+                        .effects
+                        .iter()
+                        .filter(|r| r.level == level && r.kind == 13005)
+                    {
+                        if row.cumulative_id != 0
+                            || [row.trigger_group, row.release_group, row.reset_group]
+                                .iter()
+                                .flat_map(|g| {
+                                    master.condition_sets.get(g).into_iter().flatten().flatten()
+                                })
+                                .any(|id| {
+                                    ![0, 1030, 7010, 7013, 7020]
+                                        .contains(&master.conditions[id].kind)
+                                })
+                        {
+                            return Ok(None);
+                        }
+                    }
+                }
+                converters.push(converter);
             }
-            converters.push(converter);
             modifiers.push(modifier);
         }
         if self.bytes > 16 * 1024 * 1024 {

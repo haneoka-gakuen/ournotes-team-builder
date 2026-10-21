@@ -942,9 +942,18 @@ impl CumulativeWindows {
                                             .is_some_and(|t| [1, 3, 4].contains(&t.mission_type))
                                     })
                             });
-                        let range_position = sets[0]
-                            .iter()
-                            .position(|id| master.conditions[id].kind == 7020);
+                        let range_position = sets[0].iter().position(|id| {
+                            let c = &master.conditions[id];
+                            c.kind == 7020
+                                && c.positive
+                                && !c.targets.is_empty()
+                                && c.targets.iter().all(|id| {
+                                    master
+                                        .targets
+                                        .get(id)
+                                        .is_some_and(|t| [1, 3, 4].contains(&t.mission_type))
+                                })
+                        });
                         let count_position = sets[0]
                             .iter()
                             .position(|id| master.conditions[id].kind == 1030);
