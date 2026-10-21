@@ -330,6 +330,7 @@ pub struct Kernel<'a> {
     bound_shape_ids: Vec<u32>,
     bound_actors: Vec<Option<Performer>>,
     bound_converters: Vec<bool>,
+    raw_actor_keys: Vec<u32>,
     pub bonuses: Vec<i32>,
     opening_bonuses: Vec<i32>,
     pub maximum_level: i32,
@@ -369,7 +370,7 @@ pub struct Kernel<'a> {
     gain_probe: Option<Performer>,
     luck_envelopes: HashMap<Vec<u32>, Arc<Weights>>,
     order_bounds: HashMap<[u32; 5], f64>,
-    order_estimates: HashMap<(bool, [u32; 5]), f64>,
+    order_estimates: HashMap<([u32; 5], [u32; 5]), f64>,
     just_bounds: crate::just_bound::Compiler,
 }
 impl Drop for Kernel<'_> {
@@ -763,6 +764,7 @@ impl<'a> Kernel<'a> {
             bound_shape_ids: vec![u32::MAX; members.len() * (snaps.len() + 1)],
             bound_actors: vec![None; members.len() * (snaps.len() + 1)],
             bound_converters: vec![false; members.len() * (snaps.len() + 1)],
+            raw_actor_keys: vec![u32::MAX; members.len() * (snaps.len() + 1)],
             bonuses,
             opening_bonuses,
             maximum_level,
@@ -2010,15 +2012,31 @@ impl Kernel<'_> {
             let mut estimate_key = std::array::from_fn(|slot| {
                 self.bound_shape_id(team.members[slot], team.snaps[slot])
             });
-            let ordered = (0..5).any(|slot| {
-                self.bound_converters[self.slot_index(team.members[slot], team.snaps[slot])]
-            });
-            if ordered {
-                estimate_key = key;
-            } else {
-                estimate_key.sort_unstable();
+            let mut converters = [(u32::MAX, u32::MAX); 5];
+            let mut count = 0;
+            for (slot, &shape) in estimate_key.iter().enumerate() {
+                let index = self.slot_index(team.members[slot], team.snaps[slot]);
+                if !self.bound_converters[index] {
+                    continue;
+                }
+                if self.raw_actor_keys[index] == u32::MAX {
+                    let actor = self.actor_of(team.members[slot], team.snaps[slot]);
+                    self.raw_actor_keys[index] = self.performer_key(&actor);
+                }
+                converters[count] = (self.raw_actor_keys[index], shape);
+                count += 1;
             }
-            let estimate_key = (ordered, estimate_key);
+            converters[..count].sort_by(|a, b| {
+                self.chart.performer_json[a.0 as usize]
+                    .cmp(&self.chart.performer_json[b.0 as usize])
+            });
+            let mut conversion_order = [u32::MAX; 5];
+            for (slot, &(_, id)) in converters[..count].iter().enumerate() {
+                conversion_order[slot] = id;
+            }
+            // The additive score bound is unordered; judgement conversion is not.
+            estimate_key.sort_unstable();
+            let estimate_key = (estimate_key, conversion_order);
             let coefficient = if let Some(&value) = self.order_estimates.get(&estimate_key) {
                 Some(value)
             } else {

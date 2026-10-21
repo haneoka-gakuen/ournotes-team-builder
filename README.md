@@ -14,6 +14,8 @@ within each mission and its activation limit. Mean and extreme bounds use
 five-event matching directly. Scoring-equivalent snapshots share dominance
 classes; power-neutral exchanges retain one canonical placement. Rounding
 bounds account for the independent judgement channels and the selected roster.
+Bounds reuse coefficients for equivalent slot programs while preserving the
+order of active judgement converters.
 
 Event recommendations maximize the selected reward, then the other direct
 reward, then mean score. Each later search stays in the exact equality group
