@@ -47,6 +47,9 @@ queued draws. Multi-seed warm searches use isolated proposal charts and
 accept candidates only after evaluating every requested seed.
 Regional bounds preserve sampled Rush and support joint frequencies and
 condition their envelopes on the number of physical random-effect snapshots.
+Fixed-seed assignment bounds match activation events with the number of
+random-effect snapshots. Growing support domains extend cached native lottery
+envelopes.
 Positive-seed member bounds price contested physical snapshots once per leader;
 nonnegative column prices prevent one snapshot from being assigned to several
 members in the relaxed bound.
@@ -79,7 +82,10 @@ across support values.
 Reward bounds compile identical skill templates once and retain the original
 member and snapshot slots for matching. Bonus-based snapshot filtering keeps
 a reward upper bound for every excluded branch. Pure COMBO roster bounds reject
-impossible member sets before snapshot preparation. Necessary reward-bonus floors
+impossible member sets before snapshot preparation. Reward dual bounds reuse
+valid event assignments before building matrices, and try their most recent
+pruning parameter first. Primary-only bounds prepare the secondary reward when
+its tie phase needs it. Necessary reward-bonus floors
 also constrain physical snapshot matching; unvisited skill orders retain infinite
 upper bounds when the reward curve already proves the roster cannot improve.
 Pure LUCK recommendations partition snapshot choices by random-effect programs.

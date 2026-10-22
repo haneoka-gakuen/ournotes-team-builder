@@ -1841,13 +1841,57 @@ impl<'a> Kernel<'a> {
             self.fixed_luck_count_order.push_back(key);
             return value.clone();
         }
+        let previous = (0..support_limit).rev().find_map(|count| {
+            self.fixed_luck_counts
+                .get(&(key.0.clone(), count))
+                .and_then(|value| value.as_ref())
+                .map(|value| (count, Arc::clone(value)))
+        });
         let supports = self.fixed_luck_supports()?;
         let supports = supports
             .iter()
-            .filter(|family| family.len() <= support_limit)
+            .filter(|family| {
+                family.len() <= support_limit
+                    && previous
+                        .as_ref()
+                        .is_none_or(|(count, _)| family.len() > *count)
+            })
             .cloned()
             .collect::<Vec<_>>();
-        let value = self.collect_fixed_luck(lottery_member_orders(self.master, members), &supports);
+        let value = self
+            .collect_fixed_luck(lottery_member_orders(self.master, members), &supports)
+            .map(|current| {
+                let Some((_, previous)) = previous else {
+                    return current;
+                };
+                let (a, b) = (
+                    previous.moments.as_ref().unwrap(),
+                    current.moments.as_ref().unwrap(),
+                );
+                let maxima =
+                    |a: &[usize], b: &[usize]| a.iter().zip(b).map(|(&a, &b)| a.max(b)).collect();
+                Arc::new(crate::rewards::LuckEnvelope {
+                    changes: previous.changes.max(current.changes),
+                    rush: previous
+                        .rush
+                        .iter()
+                        .zip(&current.rush)
+                        .map(|(&a, &b)| a || b)
+                        .collect(),
+                    support: previous
+                        .support
+                        .iter()
+                        .zip(&current.support)
+                        .map(|(&a, &b)| a || b)
+                        .collect(),
+                    moments: Some(Arc::new(crate::rewards::LuckMoments {
+                        samples: a.samples,
+                        rush: maxima(&a.rush, &b.rush),
+                        support: maxima(&a.support, &b.support),
+                        joint: maxima(&a.joint, &b.joint),
+                    })),
+                })
+            });
 
         if self.fixed_luck_counts.len() >= 32 {
             if let Some(old) = self.fixed_luck_count_order.pop_front() {
