@@ -2277,6 +2277,31 @@ impl DeterministicBound {
             bound
         })
     }
+    pub(crate) fn with_luck_preparation(
+        master: &Master,
+        chart: &gekiso::Chart,
+        members: &[Member],
+        snaps: &[Snap],
+        combo_multiplier: f64,
+        source: (Option<Arc<crate::reward_trace::ComboTrace>>, &LuckEnvelope),
+        prepared: &mut Option<Arc<BoundPreparation>>,
+    ) -> Option<Self> {
+        let script = match prepared.as_ref() {
+            Some(prepared) => ComboSource::Prepared(source.0, Arc::clone(prepared)),
+            None => source.0.map_or(ComboSource::None, ComboSource::Trace),
+        };
+        let mut bound = Self::with_envelope(
+            master,
+            chart,
+            members,
+            snaps,
+            combo_multiplier,
+            script,
+            Some(source.1),
+        )?;
+        *prepared = bound.preparation.take();
+        Some(bound)
+    }
     fn with_envelope(
         master: &Master,
         chart: &gekiso::Chart,
@@ -2563,6 +2588,14 @@ impl DeterministicBound {
             )?),
         };
         let mut profiles = Vec::new();
+        if let Some(trace) = &windows.trace {
+            let programs: Vec<_> = prepared
+                .slots
+                .iter()
+                .map(|slot| slot.score_rows.as_slice())
+                .collect();
+            trace.prepare_supports(chart, &programs);
+        }
         let mut template_commands = Vec::new();
         let mut max_actions = 0;
         let mut max_absolute = 0.0_f64;
@@ -4109,6 +4142,7 @@ pub struct RewardObjective<'a> {
     witness_candidate_order: VecDeque<WitnessTeamKey>,
     witness_seeds: Vec<i32>,
     combo_models: HashMap<ComboModelKey, DeterministicBound>,
+    combo_scripts: Option<crate::reward_trace::Scripts>,
     combo_traces: HashMap<String, Arc<crate::reward_trace::ComboTrace>>,
     combo_trace_order: VecDeque<String>,
     combo_model_order: VecDeque<ComboModelKey>,
@@ -4412,6 +4446,7 @@ impl<'a> RewardObjective<'a> {
             witness_candidate_order: VecDeque::new(),
             witness_seeds: Vec::new(),
             combo_models: HashMap::default(),
+            combo_scripts: None,
             combo_traces: HashMap::default(),
             combo_trace_order: VecDeque::new(),
             combo_model_order: VecDeque::new(),
@@ -7700,9 +7735,15 @@ impl Objective for RewardObjective<'_> {
             let combo = formation.as_ref().map_or(1.0, |formation| {
                 maximum_combo(self.master, formation, &self.gekiso.setup.missions)
             });
-            let script = scripted
-                .then(|| crate::reward_trace::script(self.master, formation.as_ref().unwrap()))
-                .flatten();
+            let script = if scripted {
+                self.combo_scripts
+                    .get_or_insert_with(|| {
+                        crate::reward_trace::Scripts::new(self.master, self.members)
+                    })
+                    .select(_members)
+            } else {
+                None
+            };
             let key = if let Some(actors) = &script {
                 Some(ComboModelKey::Script(
                     crate::reward_trace::combo_key(self.master, actors),

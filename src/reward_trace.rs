@@ -9,8 +9,29 @@ use crate::{
 use rustc_hash::FxHashMap as HashMap;
 use std::sync::{Arc, Mutex};
 
-pub(crate) fn script(master: &Master, members: &[Member]) -> Option<Vec<Performer>> {
-    let fields = crate::gekiso_objective::read_attributes(master, false);
+pub(crate) struct Scripts {
+    members: Vec<Option<Vec<Performer>>>,
+}
+impl Scripts {
+    pub(crate) fn new(master: &Master, members: &[Member]) -> Self {
+        let fields = crate::gekiso_objective::read_attributes(master, false);
+        Self {
+            members: members
+                .iter()
+                .map(|member| script(master, std::slice::from_ref(member), &fields))
+                .collect(),
+        }
+    }
+    pub(crate) fn select(&self, members: &[usize]) -> Option<Vec<Performer>> {
+        let mut out = Vec::new();
+        for &member in members {
+            out.extend(self.members[member].as_ref()?.iter().cloned());
+        }
+        out.sort_by_cached_key(|p| serde_json::to_string(p).unwrap());
+        Some(out)
+    }
+}
+fn script(master: &Master, members: &[Member], fields: &[&str]) -> Option<Vec<Performer>> {
     let mut out = Vec::new();
     for member in members {
         let mut p = Performer::from_member(master, member, None).gekiso_only();
@@ -274,6 +295,52 @@ impl ComboTrace {
     pub(crate) fn cache_combo_supports(&mut self) {
         self.support_cache = Some(Mutex::new(HashMap::default()));
     }
+    pub(crate) fn prepare_supports(&self, chart: &gekiso::Chart, programs: &[&[[i32; 5]]]) {
+        let Some(cache) = &self.support_cache else {
+            return;
+        };
+        let mission = if chart.setup.missions.iter().all(|&m| m == 3) {
+            3
+        } else {
+            1
+        };
+        let mut wanted: Vec<_> = programs
+            .iter()
+            .copied()
+            .filter(|rows| {
+                !rows.is_empty()
+                    && rows
+                        .iter()
+                        .all(|row| row[3] == 7001 && (row[4] == 4 || row[4] == mission))
+            })
+            .collect();
+        wanted.sort_unstable();
+        wanted.dedup();
+        if wanted.len() > 64 {
+            return;
+        }
+        let missing: Vec<_> = {
+            let cache = cache.lock().unwrap_or_else(|error| error.into_inner());
+            wanted
+                .iter()
+                .copied()
+                .filter(|rows| !cache.contains_key(*rows))
+                .collect()
+        };
+        if missing.len() < 2 {
+            return;
+        }
+        let Some(values) = self.support_programs(chart, &missing) else {
+            return;
+        };
+        let mut cache = cache.lock().unwrap_or_else(|error| error.into_inner());
+        if cache.len() + missing.len() > 64 {
+            cache.retain(|key, _| wanted.binary_search(&key.as_slice()).is_ok());
+        }
+        for (rows, value) in missing.into_iter().zip(values) {
+            cache.insert(rows.to_vec(), value);
+        }
+    }
     pub fn support(&self, chart: &gekiso::Chart, rows: &[[i32; 5]]) -> Option<Vec<f64>> {
         let cache = self
             .support_cache
@@ -299,12 +366,23 @@ impl ComboTrace {
         Some(value)
     }
     fn support_uncached(&self, chart: &gekiso::Chart, rows: &[[i32; 5]]) -> Option<Vec<f64>> {
+        self.support_programs(chart, &[rows])?.pop()
+    }
+    fn support_programs(
+        &self,
+        chart: &gekiso::Chart,
+        programs: &[&[[i32; 5]]],
+    ) -> Option<Vec<Vec<f64>>> {
         let mission = if chart.setup.missions.iter().all(|&m| m == 3) {
             3
         } else {
             1
         };
-        if rows.iter().any(|r| r[4] != 4 && r[4] != mission) {
+        if programs
+            .iter()
+            .flat_map(|rows| rows.iter())
+            .any(|r| r[4] != 4 && r[4] != mission)
+        {
             return None;
         }
         let mut master = self.master.clone();
@@ -326,57 +404,62 @@ impl ComboTrace {
         master.conditions = Arc::new(conditions);
         master.condition_sets = Arc::new(sets);
         let mut cumulative = (*master.cumulative).clone();
-        let mut effects = Vec::new();
-        for (index, &[value, maximum, n, kind, _]) in rows.iter().enumerate() {
-            let id = -2000 - index as i32;
-            cumulative.insert(
-                id,
-                Cumulative {
+        let mut skills = (*master.gekiso_support_skills).clone();
+        let mut deck = self.actors.clone();
+        let mut next = -2000;
+        for (program, rows) in programs.iter().enumerate() {
+            let mut effects = Vec::new();
+            for (index, &[value, maximum, n, kind, _]) in rows.iter().enumerate() {
+                let id = next;
+                next -= 1;
+                cumulative.insert(
                     id,
-                    kind,
-                    targets: if kind == 1000 {
-                        vec![master.targets.values().find(|t| t.judgement == 6)?.id]
-                    } else {
-                        Vec::new()
+                    Cumulative {
+                        id,
+                        kind,
+                        targets: if kind == 1000 {
+                            vec![master.targets.values().find(|t| t.judgement == 6)?.id]
+                        } else {
+                            Vec::new()
+                        },
+                        values: vec![n as f64],
+                        cap: 0,
                     },
-                    values: vec![n as f64],
-                    cap: 0,
+                );
+                effects.push(SkillEffect {
+                    id: index as i32 + 1,
+                    level: 1,
+                    trigger_type: 1,
+                    execute_limit: 0,
+                    reset_group: 0,
+                    kind: if n > 0 { 2001 } else { 2000 },
+                    value: if n > 0 { value } else { maximum },
+                    seconds: 0.0,
+                    condition_group: 0,
+                    trigger_group: -1001,
+                    release_group: -1002,
+                    cumulative_id: if n > 0 { id } else { 0 },
+                    targets: Vec::new(),
+                    limit_count: 0,
+                    max_value: maximum,
+                });
+            }
+            let skill = -1 - program as i32;
+            skills.insert(
+                skill,
+                GekisoSkill {
+                    mission_type: mission,
+                    effects,
                 },
             );
-            effects.push(SkillEffect {
-                id: index as i32 + 1,
-                level: 1,
-                trigger_type: 1,
-                execute_limit: 0,
-                reset_group: 0,
-                kind: if n > 0 { 2001 } else { 2000 },
-                value: if n > 0 { value } else { maximum },
-                seconds: 0.0,
-                condition_group: 0,
-                trigger_group: -1001,
-                release_group: -1002,
-                cumulative_id: if n > 0 { id } else { 0 },
-                targets: Vec::new(),
-                limit_count: 0,
-                max_value: maximum,
+            deck.push(Performer {
+                mission_only: Some(mission),
+                gekisou_support_skills: vec![(skill, 1)],
+                ..Performer::default()
             });
         }
         master.cumulative = Arc::new(cumulative);
-        let mut skills = (*master.gekiso_support_skills).clone();
-        skills.insert(
-            -1,
-            GekisoSkill {
-                mission_type: mission,
-                effects,
-            },
-        );
         master.gekiso_support_skills = Arc::new(skills);
-        let mut deck = self.actors.clone();
-        deck.push(Performer {
-            mission_only: Some(mission),
-            gekisou_support_skills: vec![(-1, 1)],
-            ..Performer::default()
-        });
         let mut model = Model::new(
             &master,
             &deck,
@@ -393,19 +476,30 @@ impl ComboTrace {
                 .frame(frame.time_ms, &frame.judged, chart.play.dt[k])
                 .ok()?;
         }
-        let mut commands = model.score.score.note_factor_commands();
-        commands.sort_by_key(|c| c.0);
-        let (mut at, mut current) = (0, 0.0);
+        let mut commands = vec![Vec::new(); programs.len()];
+        for (owner, time, value) in model.score.score.note_factor_commands_with_owner() {
+            let member = owner / 100;
+            if member >= self.actors.len() as i32 {
+                commands[member as usize - self.actors.len()].push((time, value));
+            }
+        }
         Some(
-            chart
-                .times
-                .iter()
-                .map(|&time| {
-                    while at < commands.len() && commands[at].0 <= time {
-                        current += f(f(commands[at].1 as f64) / 100000.0);
-                        at += 1;
-                    }
-                    current.max(0.0)
+            commands
+                .into_iter()
+                .map(|mut commands| {
+                    commands.sort_by_key(|c| c.0);
+                    let (mut at, mut current) = (0, 0.0);
+                    chart
+                        .times
+                        .iter()
+                        .map(|&time| {
+                            while at < commands.len() && commands[at].0 <= time {
+                                current += f(f(commands[at].1 as f64) / 100000.0);
+                                at += 1;
+                            }
+                            current.max(0.0)
+                        })
+                        .collect()
                 })
                 .collect(),
         )

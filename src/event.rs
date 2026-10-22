@@ -137,7 +137,12 @@ impl RewardCurve {
         let mut total = 0.0;
         let mut value = self.steps[0].1;
         for &(required, next) in self.steps.iter().skip(1) {
-            let count = coefficients.partition_point(|&coefficient| power * coefficient < required);
+            if before == coefficients.len() {
+                break;
+            }
+            let count = before
+                + coefficients[before..]
+                    .partition_point(|&coefficient| power * coefficient < required);
             total += (count - before) as f64 * value;
             before = count;
             value = next;

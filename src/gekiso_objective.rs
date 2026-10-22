@@ -876,6 +876,8 @@ pub struct Kernel<'a> {
     converted_master: Option<Master>,
     fixed_choices: Vec<Option<FixedChoice>>,
     fixed_combo_traces: HashMap<String, Arc<crate::reward_trace::ComboTrace>>,
+    combo_scripts: Option<crate::reward_trace::Scripts>,
+    fixed_preparations: HashMap<(Option<usize>, usize), Arc<crate::rewards::BoundPreparation>>,
     fixed_combo_trace_order: VecDeque<String>,
     fixed_luck_counts: HashMap<(String, usize), Option<Arc<crate::rewards::LuckEnvelope>>>,
     fixed_luck_count_order: VecDeque<(String, usize)>,
@@ -1607,6 +1609,8 @@ impl<'a> Kernel<'a> {
             converted_master: None,
             fixed_choices: vec![None; members.len() * (snaps.len() + 1)],
             fixed_combo_traces: HashMap::default(),
+            combo_scripts: None,
+            fixed_preparations: HashMap::default(),
             fixed_combo_trace_order: VecDeque::new(),
             fixed_luck_counts: HashMap::default(),
             fixed_luck_count_order: VecDeque::new(),
@@ -2578,26 +2582,30 @@ impl<'a> Kernel<'a> {
             self.converted_master = Some(master);
         }
         let master = self.converted_master.as_ref().unwrap();
-        let model = if let Some(combo) = combo {
-            crate::rewards::DeterministicBound::with_luck_trace(
-                master,
-                &chart,
-                self.members,
-                self.snaps,
-                1.0 + self.maximum_level as f64,
-                combo,
-                &luck,
-            )?
-        } else {
-            crate::rewards::DeterministicBound::with_luck_cap(
-                master,
-                &chart,
-                self.members,
-                self.snaps,
-                1.0 + self.maximum_level as f64,
-                None,
-                Some(&luck),
-            )?
+        let preparation_key = (
+            match source {
+                FixedRegionKey::Just(id) => Some(*id),
+                _ => None,
+            },
+            luck.changes,
+        );
+        let mut preparation = self.fixed_preparations.get(&preparation_key).cloned();
+        let model = crate::rewards::DeterministicBound::with_luck_preparation(
+            master,
+            &chart,
+            self.members,
+            self.snaps,
+            1.0 + self.maximum_level as f64,
+            (combo, &luck),
+            &mut preparation,
+        )?;
+        if let Some(preparation) = preparation {
+            if self.fixed_preparations.len() >= 16
+                && !self.fixed_preparations.contains_key(&preparation_key)
+            {
+                self.fixed_preparations.clear();
+            }
+            self.fixed_preparations.insert(preparation_key, preparation);
         };
         let value = Arc::new(model.fixed_component()?);
         let bytes = value.rows.capacity() * std::mem::size_of::<[f64; 5]>() + 128;
@@ -2649,6 +2657,11 @@ impl<'a> Kernel<'a> {
         self.fixed_region_row_order.push_back(key.clone());
         self.fixed_region_rows.insert(key, Arc::clone(&value));
         Some(value)
+    }
+    fn combo_script(&mut self, members: &[usize]) -> Option<Vec<Performer>> {
+        self.combo_scripts
+            .get_or_insert_with(|| crate::reward_trace::Scripts::new(self.master, self.members))
+            .select(members)
     }
     fn fixed_combo_trace(
         &mut self,
@@ -6152,11 +6165,7 @@ impl<'k, 'a> Adapter<'k, 'a> {
             if !self.kernel.healthy {
                 return None;
             }
-            let formation: Vec<_> = members
-                .iter()
-                .map(|&member| self.kernel.members[member].clone())
-                .collect();
-            let script = crate::reward_trace::script(self.kernel.master, &formation)?;
+            let script = self.kernel.combo_script(members)?;
             let fixed_luck = self.kernel.chart.luck && !self.kernel.seeds.is_empty();
             let bound = if fixed_luck {
                 let programs = self.kernel.fixed_luck_members(members)?;
@@ -6362,12 +6371,7 @@ impl<'k, 'a> Adapter<'k, 'a> {
             {
                 return None;
             }
-            let formation = team
-                .members
-                .iter()
-                .map(|&member| self.kernel.members[member].clone())
-                .collect::<Vec<_>>();
-            let script = crate::reward_trace::script(self.kernel.master, &formation)?;
+            let script = self.kernel.combo_script(&team.members)?;
             let luck = if let Some(supports) = supports {
                 let programs = self.kernel.fixed_luck_members(&team.members)?;
                 self.kernel.fixed_luck_changes_limit(&programs, supports)?
@@ -6450,7 +6454,7 @@ impl<'k, 'a> Adapter<'k, 'a> {
                 .iter()
                 .map(|&m| self.kernel.members[m].clone())
                 .collect::<Vec<_>>();
-            let script = crate::reward_trace::script(self.kernel.master, &formation)?;
+            let script = self.kernel.combo_script(&team.members)?;
             let chart = self.kernel.chart.converted_judgements(&trace.judgement)?;
             if self.kernel.converted_master.is_none() {
                 let mut master = self.kernel.master.clone();
@@ -6859,12 +6863,7 @@ impl<'k, 'a> Adapter<'k, 'a> {
         if !self.fixed_no_rng_attempted {
             self.fixed_no_rng_attempted = true;
             let programs = self.kernel.fixed_luck_members(&team.members)?;
-            let formation = team
-                .members
-                .iter()
-                .map(|&m| self.kernel.members[m].clone())
-                .collect::<Vec<_>>();
-            let script = crate::reward_trace::script(self.kernel.master, &formation)?;
+            let script = self.kernel.combo_script(&team.members)?;
             let key = FixedLuckKey {
                 members: lottery_member_key(self.kernel.master, &programs),
                 combo: crate::reward_trace::combo_key(self.kernel.master, &script),

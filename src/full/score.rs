@@ -288,6 +288,15 @@ impl<'a> Incremental<'a> {
             .map(|c| (c.time, c.note))
             .collect()
     }
+    pub(crate) fn note_factor_commands_with_owner(
+        &self,
+    ) -> impl Iterator<Item = (i32, i32, i32)> + '_ {
+        self.factors
+            .iter()
+            .flatten()
+            .filter(|c| c.note != 0)
+            .map(|c| (c.owner, c.time, c.note))
+    }
     pub(crate) fn rush_factor_commands(&self) -> Vec<(i32, i32)> {
         let mut commands: Vec<_> = self
             .factors

@@ -136,6 +136,11 @@ within an 8 MiB trace cache; the complete model cache retains 32 entries.
 Their owner conditions, ordinary skill windows and cumulative-counter layout
 are prepared once for the same chart and inventory; each trace still computes
 its native score weights separately.
+COMBO scripts normalize each inventory member once per search. Independent
+cumulative COMBO supports share a native replay and retain their owner-specific
+commands within the existing 64-program cache. Fixed-seed regional components
+share up to 16 skill/window preparations by conversion trace and lottery-command
+count; their note weights and lottery envelopes remain specific to each component.
 Pure JUST reward bounds share whole-inventory coefficient rows by converter
 trace and price power and score together before snapshot enumeration. Necessary
 badge-bonus floors also constrain the member bounds; excluded snapshot branches
