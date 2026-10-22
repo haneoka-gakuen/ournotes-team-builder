@@ -119,29 +119,38 @@ pub(crate) fn rush_windows(
     let mut traces = Vec::with_capacity(seeds.len());
     let mut judged = Vec::new();
     let mut due = Vec::new();
-    for &seed in seeds {
+    let mut params = chart.params();
+    let length = params.music_length;
+    // Score buckets only retain Rush commands; their timestamps stay intact.
+    params.music_length = 0;
+    let mut model = Model::new(
+        master,
+        &reduced,
+        &chart.full.notes,
+        &chart.full.events,
+        params,
+        Some(&chart.setup),
+        (seeds[0], false),
+    )?;
+    model.params.music_length = length;
+    if model
+        .rows
+        .iter()
+        .any(|row| !(11000..=11005).contains(&row.kind) && ![2000, 3004, 4004].contains(&row.kind))
+    {
+        return Ok(None);
+    }
+    let mut initial = Some(model);
+    for (index, &seed) in seeds.iter().enumerate() {
         if generation != crate::cancellation_generation() {
             return Err("cancelled".into());
         }
-        let mut params = chart.params();
-        let length = params.music_length;
-        // Score buckets only retain Rush commands; their timestamps stay intact.
-        params.music_length = 0;
-        let mut model = Model::new(
-            master,
-            &reduced,
-            &chart.full.notes,
-            &chart.full.events,
-            params,
-            Some(&chart.setup),
-            (seed, false),
-        )?;
-        model.params.music_length = length;
-        if model.rows.iter().any(|row| {
-            !(11000..=11005).contains(&row.kind) && ![2000, 3004, 4004].contains(&row.kind)
-        }) {
-            return Ok(None);
-        }
+        let mut model = if index + 1 == seeds.len() {
+            initial.take().unwrap()
+        } else {
+            initial.as_ref().unwrap().clone()
+        };
+        model.random = Random::new(seed);
         for k in chart.span.0..chart.span.1 {
             if k & 63 == 0 && generation != crate::cancellation_generation() {
                 return Err("cancelled".into());
@@ -268,7 +277,9 @@ fn frame(
                 .updater
                 .update(phase, &input, &mut ctx, &mut updated)?;
             for &u in &updated {
-                if condition.updater.updaters[u].state.state != effects::STAY {
+                let updater = &condition.updater.updaters[u];
+                let effect = &condition.updater.effects[updater.effect];
+                if model.rows[effect.row].applies(updater.state.state) {
                     listed.push(Listed::Condition(i, u));
                 }
             }

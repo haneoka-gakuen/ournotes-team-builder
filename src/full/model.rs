@@ -59,10 +59,16 @@ pub struct LuckRecord {
 struct Row {
     id: i32,
     kind: i32,
+    while_executing: bool,
     value: i32,
     maximum: i32,
     limit: i32,
     targets: Vec<i32>,
+}
+impl Row {
+    fn applies(&self, state: i32) -> bool {
+        state != effects::STAY && (state != effects::EXECUTING || self.while_executing)
+    }
 }
 #[derive(Clone)]
 struct LiveEffect {
@@ -83,11 +89,13 @@ struct LiveSkill {
     trigger: Trigger,
     effects: Vec<LiveEffect>,
 }
+#[derive(Clone)]
 struct LivePool {
     key: i32,
     member: usize,
     available: Vec<usize>,
 }
+#[derive(Clone)]
 struct CondSkill {
     member: usize,
     skill_type: i32,
@@ -98,6 +106,7 @@ enum Listed {
     Live(usize, usize),
     Condition(usize, usize),
 }
+#[derive(Clone)]
 pub struct ScoreControl<'a> {
     pub score: Incremental<'a>,
     counter: i32,
@@ -191,7 +200,7 @@ impl LuckHandle for ScoreControl<'_> {
         Ok(())
     }
 }
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Appliers {
     ids: HashMap<Key, i32>,
     exhausted: HashSet<Key>,
@@ -224,6 +233,7 @@ pub struct RankBonus {
     pub bonus: i32,
     pub percent: i32,
 }
+#[derive(Clone)]
 pub struct GekisoLive {
     pub controller: Controller,
     fever: FeverUpdater,
@@ -234,9 +244,10 @@ pub struct GekisoLive {
     previous_lot_ms: i32,
     pub rank_bonus: Vec<RankBonus>,
 }
+#[derive(Clone)]
 pub struct Model<'a> {
     pub master: &'a Master,
-    notes: HashMap<i32, LiveNote>,
+    notes: Rc<HashMap<i32, LiveNote>>,
     events: Vec<(usize, i32)>,
     by_time: Vec<usize>,
     pub random: Random,
@@ -355,7 +366,7 @@ impl<'a> Model<'a> {
         let life_length = notes.iter().map(|n| n.time_ms).max().unwrap_or(0).max(0) + 1000;
         let mut model = Self {
             master,
-            notes: notes.iter().map(|n| (n.id, n.clone())).collect(),
+            notes: Rc::new(notes.iter().map(|n| (n.id, n.clone())).collect()),
             events: events.to_vec(),
             by_time,
             random: Random::new(seed),
@@ -586,6 +597,30 @@ impl<'a> Model<'a> {
         self.rows.push(Rc::new(Row {
             id: row.id,
             kind: row.kind,
+            while_executing: !matches!(
+                row.kind,
+                2000 | 2002
+                    | 2004
+                    | 2005
+                    | 3000
+                    | 3001
+                    | 3002
+                    | 3003
+                    | 3004
+                    | 15000
+                    | 11000
+                    | 11001
+                    | 11002
+                    | 11003
+                    | 11004
+                    | 12000
+                    | 12002
+                    | 12003
+                    | 13000
+                    | 13002
+                    | 13003
+                    | 13004
+            ),
             value: row.value,
             maximum: row.max_value,
             limit: row.limit_count,
@@ -638,6 +673,11 @@ impl<'a> Model<'a> {
             updater: ConditionUpdater::new(effects, gate)?,
         });
         Ok(())
+    }
+    pub(crate) fn set_event_members(&mut self, events: &[(usize, i32)]) {
+        for (target, source) in self.events.iter_mut().zip(events) {
+            target.0 = source.0;
+        }
     }
     pub fn frame(&mut self, time: i32, judged: &[JudgedNote], dt: f64) -> Result<(), String> {
         self.frame_time = time;
@@ -797,7 +837,9 @@ impl<'a> Model<'a> {
                         skill.parent = aggregate(&skill.effects);
                     }
                     for (e, effect) in skill.effects.iter().enumerate() {
-                        if effect.state.state != effects::STAY && effect.phase == phase {
+                        if effect.phase == phase
+                            && self.rows[effect.row].applies(effect.state.state)
+                        {
                             listed.push(Listed::Live(index, e));
                         }
                     }
@@ -807,9 +849,19 @@ impl<'a> Model<'a> {
                     updated.clear();
                     updater.update(phase, &input, &mut ctx, &mut updated)?;
                     for &u in &updated {
-                        if updater.updaters[u].state.state != effects::STAY {
-                            listed.push(Listed::Condition(i, u));
+                        let current = &updater.updaters[u];
+                        let effect = &updater.effects[current.effect];
+                        if !self.rows[effect.row].applies(current.state.state) {
+                            continue;
                         }
+                        if current.state.state == effects::EXECUTING
+                            && effect.trigger_type == effects::ONE_SHOT
+                            && !current.cumulative_changed
+                            && [2001, 2003].contains(&self.rows[effect.row].kind)
+                        {
+                            continue;
+                        }
+                        listed.push(Listed::Condition(i, u));
                     }
                 }
                 for observer in &mut self.rush_observers {

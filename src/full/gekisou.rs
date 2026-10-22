@@ -969,7 +969,8 @@ impl Controller {
         if self.weighted {
             return Ok(());
         }
-        for index in self.playing.clone() {
+        for position in 0..self.playing.len() {
+            let index = self.playing[position];
             if self.ranges[index].mission == MISSION_LUCK
                 && self.states[index].state == PLAYING
                 && self.states[index].luck.lots != 0
@@ -1076,7 +1077,8 @@ impl Controller {
             state.time_to = self.ranges[i].start.wrapping_sub(time);
         }
         let mut remove = Vec::new();
-        for index in self.playing.clone() {
+        for position in 0..self.playing.len() {
+            let index = self.playing[position];
             let state = self.states[index].state;
             if state < END {
                 if state == START {

@@ -548,9 +548,22 @@ pub fn context_fixed(
 ) -> Result<Context, String> {
     let n = chart.notes.len();
     if chart.luck && seeds.len() > 1 {
+        let reduced: Vec<_> = deck.iter().map(Performer::gekiso_only).collect();
+        let initial = Model::new(
+            master,
+            &reduced,
+            &chart.full.notes,
+            &chart.full.events,
+            chart.params(),
+            Some(&chart.setup),
+            (seeds[0], false),
+        )?;
         let draws: Vec<_> = seeds
             .iter()
-            .map(|&seed| context_fixed(master, chart, deck, &[seed]).map(Arc::new))
+            .map(|&seed| {
+                context_fixed_observed(master, chart, deck, &[seed], false, Some(&initial))
+                    .map(|(context, _)| Arc::new(context))
+            })
             .collect::<Result<_, _>>()?;
         let last = draws.last().unwrap();
         let average = |select: fn(&Context) -> &[f64]| {
@@ -578,7 +591,7 @@ pub fn context_fixed(
             nominal: None,
         });
     }
-    context_fixed_observed(master, chart, deck, seeds, false).map(|(context, _)| context)
+    context_fixed_observed(master, chart, deck, seeds, false, None).map(|(context, _)| context)
 }
 pub(crate) fn context_fixed_rush(
     master: &Master,
@@ -586,14 +599,15 @@ pub(crate) fn context_fixed_rush(
     deck: &[Performer],
     seed: i32,
 ) -> Result<(Context, Vec<bool>), String> {
-    context_fixed_observed(master, chart, deck, &[seed], true)
+    context_fixed_observed(master, chart, deck, &[seed], true, None)
 }
-fn context_fixed_observed(
-    master: &Master,
+fn context_fixed_observed<'a>(
+    master: &'a Master,
     chart: &Chart,
     deck: &[Performer],
     seeds: &[i32],
     observe_rush: bool,
+    template: Option<&Model<'a>>,
 ) -> Result<(Context, Vec<bool>), String> {
     let n = chart.notes.len();
     let mut rush_support = vec![false; if observe_rush { n } else { 0 }];
@@ -616,7 +630,7 @@ fn context_fixed_observed(
     let mut factor_commands = 0;
     let mut factor_peak = 0.0_f64;
     let mut rush_changes = 0;
-    for &seed in &runs {
+    let make_model = |seed| -> Result<Model<'a>, String> {
         let mut model = Model::new(
             master,
             &reduced,
@@ -629,6 +643,22 @@ fn context_fixed_observed(
         if observe_rush {
             model.observe_rush_support()?;
         }
+        Ok(model)
+    };
+    let initial = if template.is_none() && runs.len() > 1 {
+        Some(make_model(runs[0])?)
+    } else {
+        None
+    };
+    let template = template.or(initial.as_ref());
+    for &seed in &runs {
+        let mut model = if let Some(template) = template {
+            let mut model = template.clone();
+            model.random = Random::new(seed);
+            model
+        } else {
+            make_model(seed)?
+        };
         model.score.score.calculator.observe = true;
         for k in chart.span.0..chart.span.1 {
             let frame = &chart.play.frames[k];
@@ -1535,6 +1565,85 @@ pub(crate) fn replay_order(
     }
     Ok((model.score.score.score as f64, ranges))
 }
+type ReplayValue = (f64, [f64; 3]);
+struct ReplayTree<'a> {
+    chart: &'a Chart,
+    events: &'a [Vec<(usize, i32)>],
+    chronological: Vec<usize>,
+    generation: u64,
+}
+impl ReplayTree<'_> {
+    fn advance(&self, model: &mut Model<'_>, from: usize, to: usize) -> Result<(), String> {
+        for k in from..to {
+            if self.generation != crate::cancellation_generation() {
+                return Err("cancelled".into());
+            }
+            let frame = &self.chart.play.frames[k];
+            model.frame(frame.time_ms, &frame.judged, self.chart.play.dt[k])?;
+        }
+        Ok(())
+    }
+    fn visit(
+        &self,
+        mut model: Model<'_>,
+        orders: &[usize],
+        from: usize,
+        fixed: usize,
+        values: &mut [ReplayValue],
+    ) -> Result<(), String> {
+        let representative = &self.events[orders[0]];
+        let split = (fixed..self.chronological.len()).find(|&at| {
+            let event = self.chronological[at];
+            orders
+                .iter()
+                .any(|&order| self.events[order][event].0 != representative[event].0)
+        });
+        let until = split.map_or(self.chart.play.frames.len(), |at| {
+            let time = representative[self.chronological[at]].1;
+            self.chart
+                .play
+                .frames
+                .partition_point(|frame| frame.time_ms < time)
+        });
+        self.advance(&mut model, from, until)?;
+        if until == self.chart.play.frames.len() {
+            let mut ranges = [0.0; 3];
+            if let Some(g) = &model.gk {
+                for (score, state) in ranges.iter_mut().zip(&g.controller.states) {
+                    *score = state.score() as f64;
+                }
+            }
+            for &order in orders {
+                values[order] = (model.score.score.score as f64, ranges);
+            }
+            return Ok(());
+        }
+        let at = split.unwrap();
+        let time = self.chart.play.frames[until].time_ms;
+        let end = self
+            .chronological
+            .partition_point(|&event| representative[event].1 <= time);
+        let mut groups = std::collections::BTreeMap::<Vec<usize>, Vec<usize>>::new();
+        for &order in orders {
+            let key = self.chronological[at..end]
+                .iter()
+                .map(|&event| self.events[order][event].0)
+                .collect();
+            groups.entry(key).or_default().push(order);
+        }
+        let mut groups = groups.into_values().peekable();
+        while let Some(orders) = groups.next() {
+            if groups.peek().is_none() {
+                model.set_event_members(&self.events[orders[0]]);
+                return self.visit(model, &orders, until, end, values);
+            }
+            let mut branch = model.clone();
+            branch.set_event_members(&self.events[orders[0]]);
+            self.visit(branch, &orders, until, end, values)?;
+        }
+        Ok(())
+    }
+}
 /// Replay complete skill, conversion and LIFE state for each ordinary order
 /// and requested lottery seed, retaining each note's original LIFE snapshot.
 pub fn replay_orders(
@@ -1622,40 +1731,72 @@ pub fn replay_orders(
         });
         indices.push(index);
     }
-    let replays = crate::parallel::map(&event_orders, |events| -> Result<_, String> {
-        let mut total = 0.0;
-        let mut ranges = [0.0; 3];
+    let mut chronological: Vec<_> = (0..chart.full.events.len()).collect();
+    chronological.sort_by_key(|&event| (chart.full.events[event].1, event));
+    let tree = ReplayTree {
+        chart,
+        events: &event_orders,
+        chronological,
+        generation,
+    };
+    #[cfg(target_arch = "wasm32")]
+    let jobs = vec![(0..event_orders.len()).collect::<Vec<_>>()];
+    #[cfg(not(target_arch = "wasm32"))]
+    let jobs = {
+        let mut jobs = std::collections::BTreeMap::<usize, Vec<usize>>::new();
+        for (order, events) in event_orders.iter().enumerate() {
+            let member = tree
+                .chronological
+                .first()
+                .map_or(0, |&event| events[event].0);
+            jobs.entry(member).or_default().push(order);
+        }
+        jobs.into_values().collect::<Vec<_>>()
+    };
+    let batches = crate::parallel::map(&jobs, |orders| -> Result<_, String> {
+        let mut totals = vec![(0.0, [0.0; 3]); event_orders.len()];
         for &seed in &runs {
             let mut params = chart.params();
             params.power = power;
             params.music_type = chart.music_type;
-            let mut model = Model::new(
+            let model = Model::new(
                 master,
                 deck,
                 &chart.full.notes,
-                events,
+                &event_orders[orders[0]],
                 params,
                 Some(&chart.setup),
                 (seed, false),
             )?;
-            for (k, frame) in chart.play.frames.iter().enumerate() {
-                if generation != crate::cancellation_generation() {
-                    return Err("cancelled".into());
-                }
-                model.frame(frame.time_ms, &frame.judged, chart.play.dt[k])?;
-            }
-            total += model.score.score.score as f64;
-            if let Some(g) = &model.gk {
-                for (score, state) in ranges.iter_mut().zip(&g.controller.states) {
-                    *score += state.score() as f64;
+            let mut values = vec![(0.0, [0.0; 3]); event_orders.len()];
+            tree.visit(model, orders, 0, 0, &mut values)?;
+            for &order in orders {
+                totals[order].0 += values[order].0;
+                for (total, value) in totals[order].1.iter_mut().zip(values[order].1) {
+                    *total += value;
                 }
             }
         }
-        for score in &mut ranges {
-            *score /= runs.len() as f64;
-        }
-        Ok((total / runs.len() as f64, ranges))
+        Ok(orders
+            .iter()
+            .map(|&order| {
+                let (score, ranges) = totals[order];
+                (
+                    order,
+                    (
+                        score / runs.len() as f64,
+                        ranges.map(|v| v / runs.len() as f64),
+                    ),
+                )
+            })
+            .collect::<Vec<_>>())
     })?;
+    let mut replays = vec![(0.0, [0.0; 3]); event_orders.len()];
+    for batch in batches {
+        for (order, value) in batch {
+            replays[order] = value;
+        }
+    }
     let scores = indices.iter().map(|&i| replays[i].0).collect();
     let range_scores = std::array::from_fn(|range| {
         indices.iter().map(|&i| replays[i].1[range]).sum::<f64>() / indices.len() as f64

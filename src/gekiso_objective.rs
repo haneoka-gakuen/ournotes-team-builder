@@ -838,6 +838,7 @@ pub struct Kernel<'a> {
     luck_deck: Vec<Performer>,
     luck_members: Vec<Performer>,
     member_gain: Vec<f64>,
+    calibrated: bool,
     luck_supports: Vec<Performer>,
     cache: HashMap<(i32, Vec<u32>), Cached>,
     cache_order: VecDeque<(i32, Vec<u32>)>,
@@ -877,7 +878,9 @@ pub struct Kernel<'a> {
     fixed_choices: Vec<Option<FixedChoice>>,
     fixed_combo_traces: HashMap<String, Arc<crate::reward_trace::ComboTrace>>,
     combo_scripts: Option<crate::reward_trace::Scripts>,
-    fixed_preparations: HashMap<(Option<usize>, usize), Arc<crate::rewards::BoundPreparation>>,
+    last_combo_key: Option<(Vec<Performer>, String)>,
+    fixed_preparations: HashMap<Option<usize>, Arc<crate::rewards::BoundPreparation>>,
+    global_fixed_preparation: Option<Arc<crate::rewards::BoundPreparation>>,
     fixed_combo_trace_order: VecDeque<String>,
     fixed_luck_counts: HashMap<(String, usize), Option<Arc<crate::rewards::LuckEnvelope>>>,
     fixed_luck_count_order: VecDeque<(String, usize)>,
@@ -1069,6 +1072,7 @@ fn collect_luck_envelope(
     let generation = crate::cancellation_generation();
     let value = (|| {
         let mut value = crate::rewards::LuckEnvelope {
+            fingerprint: OnceLock::new(),
             moments: None,
             changes: 0,
             rush: vec![false; chart.notes.len()],
@@ -1093,31 +1097,23 @@ fn collect_luck_envelope(
                 let mut support = vec![0usize; chart.notes.len()];
                 let mut joint = vec![0usize; chart.notes.len()];
                 for trace in traces {
-                    let commands = trace.rush;
-                    let mut active = vec![false; chart.notes.len()];
-
-                    value.changes = value.changes.max(commands.len());
-                    let mut level = 0;
-                    let mut index = 0;
+                    value.changes = value.changes.max(trace.rush.len());
+                    let (mut rush_level, mut support_level, mut r, mut s) = (0, 0, 0, 0);
                     for (i, &time) in chart.times.iter().enumerate() {
-                        while index < commands.len() && commands[index].0 <= time {
-                            level += commands[index].1;
-                            index += 1;
+                        while r < trace.rush.len() && trace.rush[r].0 <= time {
+                            rush_level += trace.rush[r].1;
+                            r += 1;
                         }
-                        value.rush[i] |= level > 0;
-                        active[i] = level > 0;
-                        rush[i] += usize::from(active[i]);
-                    }
-                    let mut level = 0;
-                    let mut index = 0;
-                    for (i, &time) in chart.times.iter().enumerate() {
-                        while index < trace.support.len() && trace.support[index].0 <= time {
-                            level += trace.support[index].1;
-                            index += 1;
+                        while s < trace.support.len() && trace.support[s].0 <= time {
+                            support_level += trace.support[s].1;
+                            s += 1;
                         }
-                        value.support[i] |= level > 0;
-                        support[i] += usize::from(level > 0);
-                        joint[i] += usize::from(level > 0 && active[i]);
+                        let (active_rush, active_support) = (rush_level > 0, support_level > 0);
+                        value.rush[i] |= active_rush;
+                        value.support[i] |= active_support;
+                        rush[i] += usize::from(active_rush);
+                        support[i] += usize::from(active_support);
+                        joint[i] += usize::from(active_rush && active_support);
                     }
                 }
                 for i in 0..chart.notes.len() {
@@ -1572,6 +1568,7 @@ impl<'a> Kernel<'a> {
             luck_deck: Vec::new(),
             luck_members: Vec::new(),
             member_gain: vec![0.0; members.len()],
+            calibrated: false,
             luck_supports: Vec::new(),
             cache,
             cache_order,
@@ -1610,7 +1607,9 @@ impl<'a> Kernel<'a> {
             fixed_choices: vec![None; members.len() * (snaps.len() + 1)],
             fixed_combo_traces: HashMap::default(),
             combo_scripts: None,
+            last_combo_key: None,
             fixed_preparations: HashMap::default(),
+            global_fixed_preparation: None,
             fixed_combo_trace_order: VecDeque::new(),
             fixed_luck_counts: HashMap::default(),
             fixed_luck_count_order: VecDeque::new(),
@@ -1875,6 +1874,7 @@ impl<'a> Kernel<'a> {
                 let maxima =
                     |a: &[usize], b: &[usize]| a.iter().zip(b).map(|(&a, &b)| a.max(b)).collect();
                 Arc::new(crate::rewards::LuckEnvelope {
+                    fingerprint: OnceLock::new(),
                     changes: previous.changes.max(current.changes),
                     rush: previous
                         .rush
@@ -2116,6 +2116,7 @@ impl<'a> Kernel<'a> {
             })
             .collect::<Vec<_>>();
         let value = Arc::new(crate::rewards::LuckEnvelope {
+            fingerprint: OnceLock::new(),
             moments: None,
             changes,
             rush: mask.clone(),
@@ -2557,6 +2558,7 @@ impl<'a> Kernel<'a> {
                 let global = self.global_fixed_luck()?;
                 if let Some(changes) = command_cap {
                     Arc::new(crate::rewards::LuckEnvelope {
+                        fingerprint: OnceLock::new(),
                         moments: None,
                         changes,
                         rush: global.rush.clone(),
@@ -2582,13 +2584,10 @@ impl<'a> Kernel<'a> {
             self.converted_master = Some(master);
         }
         let master = self.converted_master.as_ref().unwrap();
-        let preparation_key = (
-            match source {
-                FixedRegionKey::Just(id) => Some(*id),
-                _ => None,
-            },
-            luck.changes,
-        );
+        let preparation_key = match source {
+            FixedRegionKey::Just(id) => Some(*id),
+            _ => None,
+        };
         let mut preparation = self.fixed_preparations.get(&preparation_key).cloned();
         let model = crate::rewards::DeterministicBound::with_luck_preparation(
             master,
@@ -2596,7 +2595,7 @@ impl<'a> Kernel<'a> {
             self.members,
             self.snaps,
             1.0 + self.maximum_level as f64,
-            (combo, &luck),
+            (combo, Some(&luck)),
             &mut preparation,
         )?;
         if let Some(preparation) = preparation {
@@ -2663,11 +2662,21 @@ impl<'a> Kernel<'a> {
             .get_or_insert_with(|| crate::reward_trace::Scripts::new(self.master, self.members))
             .select(members)
     }
+    fn combo_key(&mut self, script: &[Performer]) -> String {
+        if let Some((old, key)) = &self.last_combo_key {
+            if old == script {
+                return key.clone();
+            }
+        }
+        let key = crate::reward_trace::combo_key(self.master, script);
+        self.last_combo_key = Some((script.to_vec(), key.clone()));
+        key
+    }
     fn fixed_combo_trace(
         &mut self,
         script: &[Performer],
     ) -> Option<Arc<crate::reward_trace::ComboTrace>> {
-        let key = crate::reward_trace::combo_key(self.master, script);
+        let key = self.combo_key(script);
         if !self.fixed_combo_traces.contains_key(&key) {
             let mut trace = crate::reward_trace::ComboTrace::new(self.master, self.chart, script)?;
             trace.cache_combo_supports();
@@ -4454,7 +4463,7 @@ impl Kernel<'_> {
 }
 impl Kernel<'_> {
     pub fn calibrate(&mut self, deadline: f64, now: &dyn Fn() -> f64) -> bool {
-        if !self.chart.luck {
+        if self.calibrated || !self.chart.luck {
             return true;
         }
         let mut values = Vec::new();
@@ -4528,6 +4537,7 @@ impl Kernel<'_> {
                 self.luck_supports.push(other);
             }
         }
+        self.calibrated = true;
         true
     }
     fn level(&mut self, level: i32) -> Arc<Level> {
@@ -6020,7 +6030,7 @@ pub struct Adapter<'k, 'a> {
     level: i32,
     surrogate: bool,
     estimate: bool,
-    data: Arc<Level>,
+    data: Option<Arc<Level>>,
     ranges: HashMap<usize, (f64, f64)>,
     assignment: Option<Assignment>,
     event_rows: HashMap<usize, [f64; 5]>,
@@ -6058,8 +6068,14 @@ pub struct Adapter<'k, 'a> {
     reuse_assignment: bool,
 }
 impl<'k, 'a> Adapter<'k, 'a> {
-    fn new(kernel: &'k mut Kernel<'a>, level: i32, surrogate: bool, estimate: bool) -> Self {
-        let data = kernel.level(level);
+    fn new(
+        kernel: &'k mut Kernel<'a>,
+        level: i32,
+        surrogate: bool,
+        estimate: bool,
+        deadline: f64,
+        now: &dyn Fn() -> f64,
+    ) -> Option<Self> {
         let n = kernel.members.len();
         let global_luck =
             (!surrogate && !estimate && kernel.chart.luck && !kernel.seeds.is_empty())
@@ -6067,14 +6083,14 @@ impl<'k, 'a> Adapter<'k, 'a> {
                 .flatten();
         let deterministic =
             if !surrogate && !estimate && kernel.chart.luck && !kernel.seeds.is_empty() {
-                crate::rewards::DeterministicBound::with_luck_cap(
+                crate::rewards::DeterministicBound::with_luck_preparation(
                     kernel.master,
                     kernel.chart,
                     kernel.members,
                     kernel.snaps,
                     1.0 + level as f64,
-                    None,
-                    global_luck.as_deref(),
+                    (None, global_luck.as_deref()),
+                    &mut kernel.global_fixed_preparation,
                 )
             } else if !surrogate && !estimate && !kernel.chart.luck {
                 if kernel.maximum_level > 0 {
@@ -6097,6 +6113,14 @@ impl<'k, 'a> Adapter<'k, 'a> {
             } else {
                 None
             };
+        let data = if deterministic.is_none() {
+            if !kernel.calibrate(deadline, now) {
+                return None;
+            }
+            Some(kernel.level(level))
+        } else {
+            None
+        };
         if kernel.healthy && kernel.owner_local && kernel.just_context.is_some() {
             if let Some(bound) = &deterministic {
                 kernel
@@ -6107,7 +6131,7 @@ impl<'k, 'a> Adapter<'k, 'a> {
                 kernel.bound_actors.fill(None);
             }
         }
-        Self {
+        Some(Self {
             kernel,
             level,
             surrogate,
@@ -6150,7 +6174,7 @@ impl<'k, 'a> Adapter<'k, 'a> {
             fixed_box_complete: false,
             fixed_root_checked: false,
             reuse_assignment: false,
-        }
+        })
     }
     fn scripted_combo_bound(
         &mut self,
@@ -6192,7 +6216,7 @@ impl<'k, 'a> Adapter<'k, 'a> {
                     });
                 let key = FixedLuckKey {
                     members: lottery_member_key(self.kernel.master, &programs),
-                    combo: crate::reward_trace::combo_key(self.kernel.master, &script),
+                    combo: self.kernel.combo_key(&script),
                     supports,
                     level: self.level,
                 };
@@ -6378,7 +6402,7 @@ impl<'k, 'a> Adapter<'k, 'a> {
             } else {
                 self.kernel.global_fixed_luck()?
             };
-            let combo_key = crate::reward_trace::combo_key(self.kernel.master, &script);
+            let combo_key = self.kernel.combo_key(&script);
             let shared_key = FixedRegionalKey {
                 conversion,
                 combo: combo_key.clone(),
@@ -6866,7 +6890,7 @@ impl<'k, 'a> Adapter<'k, 'a> {
             let script = self.kernel.combo_script(&team.members)?;
             let key = FixedLuckKey {
                 members: lottery_member_key(self.kernel.master, &programs),
-                combo: crate::reward_trace::combo_key(self.kernel.master, &script),
+                combo: self.kernel.combo_key(&script),
                 supports: false,
                 level: self.level,
             };
@@ -7663,7 +7687,8 @@ impl<'k, 'a> Adapter<'k, 'a> {
         row
     }
     fn max_score(&self, power: f64, weight: f64) -> f64 {
-        power * (self.data.weights.base + weight) / self.kernel.chart.full.converted as f64
+        power * (self.data.as_ref().unwrap().weights.base + weight)
+            / self.kernel.chart.full.converted as f64
             * (1.0 + RELATIVE)
             + (self.kernel.chart.notes.len() + 4) as f64
     }
@@ -7695,7 +7720,8 @@ impl<'k, 'a> Adapter<'k, 'a> {
         {
             return f64::INFINITY;
         }
-        t.power * (self.data.weights.base + t.skill) / self.kernel.chart.full.converted as f64
+        t.power * (self.data.as_ref().unwrap().weights.base + t.skill)
+            / self.kernel.chart.full.converted as f64
             * (1.0 + RELATIVE)
             + (self.kernel.chart.notes.len() + 4) as f64
     }
@@ -7859,7 +7885,7 @@ impl Objective for Adapter<'_, '_> {
         let top = if maximum || self.bounded_minimum() {
             let mut row = self
                 .kernel
-                .event_weights(self.kernel.slot(m, s), &self.data.weights);
+                .event_weights(self.kernel.slot(m, s), &self.data.as_ref().unwrap().weights);
             let mean = if maximum {
                 0.0
             } else {
@@ -7876,9 +7902,11 @@ impl Objective for Adapter<'_, '_> {
             self.event_rows.insert(index, row);
             top
         } else {
-            self.kernel
-                .live_weight(self.kernel.slot(m, s), &self.data.weights, Criterion::Mean)
-                + gain
+            self.kernel.live_weight(
+                self.kernel.slot(m, s),
+                &self.data.as_ref().unwrap().weights,
+                Criterion::Mean,
+            ) + gain
         };
         let value = (
             if self.surrogate {
@@ -8124,7 +8152,7 @@ impl Objective for Adapter<'_, '_> {
         if self.kernel.criterion != Criterion::Max {
             return deterministic;
         }
-        let base = self.data.weights.base;
+        let base = self.data.as_ref().unwrap().weights.base;
         let lambda = ((base + t.skill) / t.power.max(1.0)).sqrt();
         if !lambda.is_finite() || lambda <= 0.0 {
             return None;
@@ -8166,6 +8194,14 @@ impl Objective for Adapter<'_, '_> {
         Some(deterministic.map_or(upper, |bound| upper.min(bound)))
     }
     fn roster_bound(&mut self, members: &[usize], totals: Totals, limit: f64) -> Option<f64> {
+        if let Some(bound) = &mut self.deterministic {
+            return Some(bound.member_score_ceiling(
+                members,
+                0,
+                totals.power,
+                self.kernel.criterion,
+            ));
+        }
         if !self.kernel.chart.luck
             || self.kernel.criterion != Criterion::Max && !self.bounded_minimum()
             || !self.kernel.seeds.is_empty()
@@ -8257,7 +8293,7 @@ impl Objective for Adapter<'_, '_> {
         if self.preserve_snap_options() {
             return None;
         }
-        Some(self.data.weights.base)
+        Some(self.data.as_ref().unwrap().weights.base)
     }
     fn leaf_bound(&mut self, team: &Team, t: Totals) -> Option<f64> {
         if let Some(bound) = &mut self.deterministic {
@@ -8290,7 +8326,7 @@ impl Objective for Adapter<'_, '_> {
         let rows = std::array::from_fn(|slot| {
             self.kernel.event_weights(
                 self.kernel.slot(team.members[slot], team.snaps[slot]),
-                &self.data.weights,
+                &self.data.as_ref().unwrap().weights,
             )
         });
         let separate = rows.iter().fold(0.0, |sum, row| {
@@ -9583,6 +9619,7 @@ pub struct Input<'a> {
     pub deadline: f64,
     pub initial: Vec<Team>,
     pub seed_only: bool,
+    pub seed_variant: Option<bool>,
     pub defer_scores: bool,
     pub min_combo_bonus: i32,
     pub seeded: bool,
@@ -10007,7 +10044,7 @@ fn warm_pool(
     env: &Environment<'_>,
     kernel: &mut Kernel<'_>,
     minimum: i32,
-    k: usize,
+    candidates: usize,
     deadline: f64,
     reference_power: f64,
     late: &dyn Fn() -> bool,
@@ -10027,7 +10064,9 @@ fn warm_pool(
         let maximum = kernel.maximum_level;
         let luck = kernel.chart.luck;
         let constraints = level_constraints(&env.constraints, level, maximum);
-        let mut adapter = Adapter::new(kernel, level, true, true);
+        let Some(mut adapter) = Adapter::new(kernel, level, true, true, deadline, env.now) else {
+            break;
+        };
         if !warm(&mut adapter, env, deadline) {
             break;
         }
@@ -10038,11 +10077,7 @@ fn warm_pool(
         };
         let run = Run {
             constraints,
-            k: if luck && criterion == Criterion::Max {
-                k.max(5)
-            } else {
-                k
-            },
+            k: candidates,
             deadline: end,
             seeds: Vec::new(),
             shard: None,
@@ -10070,7 +10105,7 @@ fn warm_pool(
                         .map(|&(_, high)| high)
                         .fold(0.0, f64::max)
                 };
-                let coefficient = adapter.data.weights.base + 5.0 * skill;
+                let coefficient = adapter.data.as_ref().unwrap().weights.base + 5.0 * skill;
                 let lambda = (coefficient.max(1.0) / power).sqrt();
                 let mut projection = WarmProjection {
                     adapter: &mut adapter,
@@ -10119,6 +10154,7 @@ pub fn search(input: Input<'_>) -> Result<search::Output, String> {
         deadline,
         initial,
         seed_only,
+        seed_variant,
         defer_scores,
         min_combo_bonus,
         seeded,
@@ -10406,7 +10442,7 @@ pub fn search(input: Input<'_>) -> Result<search::Output, String> {
             publish(&hits, &mut on_candidate);
         }
     }
-    if (env.now)() >= deadline || !kernel.calibrate(deadline, env.now) {
+    if (env.now)() >= deadline {
         let final_hits = kernel.complete_hits(&hits, k)?;
         stats.exact = kernel.exact_calls;
         stats.elapsed_ms = (env.now)() - started;
@@ -10417,7 +10453,10 @@ pub fn search(input: Input<'_>) -> Result<search::Output, String> {
             stats,
         });
     }
-    let seed_key = format!("{}:{minimum}", seed_key(&env, criterion, k, &kernel.seeds));
+    let seed_key = format!(
+        "{}:{minimum}:{seed_variant:?}",
+        seed_key(&env, criterion, k, &kernel.seeds)
+    );
     let fixed_assignment = kernel.fixed_forced_members.as_ref().is_some_and(|members| {
         env.constraints.no_snaps
             || members
@@ -10437,61 +10476,77 @@ pub fn search(input: Input<'_>) -> Result<search::Output, String> {
         }
     } else {
         let reference_power = hits.first().map_or(1.0, |hit| hit.power);
+        let warm_k = if kernel.chart.luck && criterion == Criterion::Max {
+            k.max(5)
+        } else {
+            k
+        };
         let mut pool = if kernel.chart.luck && kernel.seeds.len() > 1 {
             let make_chart = || kernel.chart.converted_judgements(&kernel.chart.judgements);
             let mut single_chart = make_chart();
             let mut quiet_chart = make_chart();
             if let (Some(single), Some(quiet)) = (&mut single_chart, &mut quiet_chart) {
-                let mut proposal = Kernel::new(
-                    kernel.master,
-                    kernel.members,
-                    kernel.snaps,
-                    single,
-                    vec![kernel.seeds[0]],
-                    criterion,
-                );
-                proposal.calibrate(deadline, env.now);
-                let mut pool = warm_pool(
-                    &env,
-                    &mut proposal,
-                    minimum,
-                    k,
-                    deadline,
-                    reference_power,
-                    &late,
-                )?;
-                let mut master = kernel.master.clone();
-                Arc::make_mut(&mut master.live).gekiso.rush_percent = 0;
-                let mut skills = (*master.gekiso_support_skills).clone();
-                for skill in skills.values_mut().filter(|skill| skill.mission_type == 2) {
-                    skill.effects.retain(|row| row.kind != 2000);
+                let mut pool = Vec::new();
+                if seed_variant != Some(true) {
+                    let mut proposal = Kernel::new(
+                        kernel.master,
+                        kernel.members,
+                        kernel.snaps,
+                        single,
+                        vec![kernel.seeds[0]],
+                        criterion,
+                    );
+                    proposal.calibrate(deadline, env.now);
+                    let mut sample = warm_pool(
+                        &env,
+                        &mut proposal,
+                        minimum,
+                        k,
+                        deadline,
+                        reference_power,
+                        &late,
+                    )?;
+                    sample.sort_by(|a, b| b.1.total_cmp(&a.1));
+                    sample.truncate(k);
+                    pool.extend(sample);
                 }
-                master.gekiso_support_skills = Arc::new(skills);
-                let mut stable = Kernel::new(
-                    &master,
-                    kernel.members,
-                    kernel.snaps,
-                    quiet,
-                    vec![kernel.seeds[0]],
-                    criterion,
-                );
-                stable.calibrate(deadline, env.now);
-                pool.extend(warm_pool(
-                    &env,
-                    &mut stable,
-                    minimum,
-                    k,
-                    deadline,
-                    reference_power,
-                    &late,
-                )?);
+                if seed_variant != Some(false) {
+                    let mut master = kernel.master.clone();
+                    Arc::make_mut(&mut master.live).gekiso.rush_percent = 0;
+                    let mut skills = (*master.gekiso_support_skills).clone();
+                    for skill in skills.values_mut().filter(|skill| skill.mission_type == 2) {
+                        skill.effects.retain(|row| row.kind != 2000);
+                    }
+                    master.gekiso_support_skills = Arc::new(skills);
+                    let mut stable = Kernel::new(
+                        &master,
+                        kernel.members,
+                        kernel.snaps,
+                        quiet,
+                        vec![kernel.seeds[0]],
+                        criterion,
+                    );
+                    stable.calibrate(deadline, env.now);
+                    let mut quiet = warm_pool(
+                        &env,
+                        &mut stable,
+                        minimum,
+                        k,
+                        deadline,
+                        reference_power,
+                        &late,
+                    )?;
+                    quiet.sort_by(|a, b| b.1.total_cmp(&a.1));
+                    quiet.truncate(k);
+                    pool.extend(quiet);
+                }
                 pool
             } else {
                 warm_pool(
                     &env,
                     &mut kernel,
                     minimum,
-                    k,
+                    warm_k,
                     deadline,
                     reference_power,
                     &late,
@@ -10502,7 +10557,7 @@ pub fn search(input: Input<'_>) -> Result<search::Output, String> {
                 &env,
                 &mut kernel,
                 minimum,
-                k,
+                warm_k,
                 deadline,
                 reference_power,
                 &late,
@@ -10647,7 +10702,11 @@ pub fn search(input: Input<'_>) -> Result<search::Output, String> {
         } else {
             f64::NEG_INFINITY
         });
-        let mut adapter = Adapter::new(&mut kernel, level, false, false);
+        let Some(mut adapter) = Adapter::new(&mut kernel, level, false, false, deadline, env.now)
+        else {
+            proven = false;
+            break;
+        };
         if !luck {
             adapter.seed_scores = best.clone();
         }

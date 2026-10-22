@@ -425,6 +425,44 @@ struct MemberCut {
     members: Vec<f64>,
     suffix: Vec<Vec<f64>>,
 }
+struct BonusSuffix {
+    width: usize,
+    values: Vec<f64>,
+}
+impl BonusSuffix {
+    fn get(&self, from: usize, left: usize, bonus: usize) -> f64 {
+        self.values[(from * 5 + left) * self.width + bonus]
+    }
+    fn new(characters: &[Vec<usize>], bonuses: &[f64], weights: &[f64], target: usize) -> Self {
+        let width = target + 1;
+        let stride = 5 * width;
+        let mut values = vec![f64::NEG_INFINITY; (characters.len() + 1) * stride];
+        values[characters.len() * stride] = 0.0;
+        for from in (0..characters.len()).rev() {
+            let (at, next) = (from * stride, (from + 1) * stride);
+            values.copy_within(next..next + stride, at);
+            for &member in &characters[from] {
+                let bonus = bonuses[member] as usize;
+                for left in 1..=4 {
+                    for total in bonus..=target {
+                        let remaining = values[next + (left - 1) * width + total - bonus];
+                        if remaining == f64::NEG_INFINITY {
+                            continue;
+                        }
+                        let value = (weights[member] + remaining).next_up();
+                        let cell = &mut values[at + left * width + total];
+                        *cell = cell.max(value);
+                    }
+                }
+            }
+        }
+        Self { width, values }
+    }
+}
+struct BonusBounds {
+    target: usize,
+    power: BonusSuffix,
+}
 struct Members {
     leader: usize,
     characters: Vec<Vec<usize>>,
@@ -436,6 +474,23 @@ struct Members {
     char_member_bonus: Vec<Vec<f64>>,
     chosen: Vec<usize>,
     cuts: Vec<MemberCut>,
+    cut_sums: [[f64; 12]; 5],
+    column_sums: [[f64; 12]; 5],
+    bonus_bounds: Option<BonusBounds>,
+}
+impl Members {
+    fn choose(&mut self, member: usize) {
+        let depth = self.chosen.len();
+        for (index, cut) in self.cuts.iter().enumerate() {
+            self.cut_sums[depth + 1][index] =
+                (self.cut_sums[depth][index] + cut.members[member]).next_up();
+            if let Some(column) = &cut.column {
+                self.column_sums[depth + 1][index] =
+                    (self.column_sums[depth][index] + column.members[member]).next_up();
+            }
+        }
+        self.chosen.push(member);
+    }
 }
 const NONE: f64 = -1e15;
 struct Runner<'a, O: Objective + ?Sized> {
@@ -853,8 +908,8 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         }
     }
     fn expired(&self) -> bool {
-        (self.input.now)() > self.input.deadline
-            || self.generation != crate::cancellation_generation()
+        self.generation != crate::cancellation_generation()
+            || self.input.deadline != f64::INFINITY && (self.input.now)() > self.input.deadline
     }
     fn report_pending(&mut self) {
         if self.input.on_candidate.is_none() || self.hits.is_empty() {
@@ -1789,6 +1844,32 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         }
         cuts
     }
+    fn member_bonus_bounds(
+        &self,
+        slot_power: &[f64],
+        characters: &[Vec<usize>],
+    ) -> Option<BonusBounds> {
+        let target = self.input.constraints.max_bonus?;
+        if self.any_snap_bonus
+            || self.input.constraints.min_bonus != Some(target)
+            || !(0.0..=128.0).contains(&target)
+            || target.fract() != 0.0
+            || self
+                .member_bonus
+                .iter()
+                .any(|bonus| *bonus < 0.0 || bonus.fract() != 0.0)
+        {
+            return None;
+        }
+        let target = target as usize;
+        let weights: Vec<_> = slot_power
+            .iter()
+            .enumerate()
+            .map(|(member, value)| value + self.best[member].power)
+            .collect();
+        let power = BonusSuffix::new(characters, &self.member_bonus, &weights, target);
+        Some(BonusBounds { target, power })
+    }
     fn member_joint_possible(&mut self, m: &Members, from: usize, left: usize) -> bool {
         if m.cuts.is_empty() || !self.limit().is_finite() {
             return true;
@@ -1818,16 +1899,10 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         };
         let mut upper = [0.0; 12];
         for (i, cut) in m.cuts.iter().enumerate() {
-            let sum = m.chosen.iter().fold(
-                (cut.constant + cut.members[m.leader]).next_up(),
-                |sum, &member| (sum + cut.members[member]).next_up(),
-            );
+            let sum = m.cut_sums[m.chosen.len()][i];
             upper[i] = (sum + cut.suffix[from.min(cut.suffix.len() - 1)][left]).next_up();
             if let Some(column) = &cut.column {
-                let sum = m.chosen.iter().fold(
-                    (column.constant + column.members[m.leader]).next_up(),
-                    |sum, &member| (sum + column.members[member]).next_up(),
-                );
+                let sum = m.column_sums[m.chosen.len()][i];
                 upper[i] = upper[i]
                     .min((sum + column.suffix[from.min(column.suffix.len() - 1)][left]).next_up());
             }
@@ -1867,17 +1942,31 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         member_part: f64,
     ) -> Result<(), String> {
         let left = 4 - m.chosen.len();
-        if self.input.constraints.member_floor.is_some() {
-            let chosen: Vec<_> = std::iter::once(m.leader)
-                .chain(m.chosen.iter().copied())
-                .collect();
-            if !self.member_floor_possible(&chosen, left) {
+        let mut selected = [0; 5];
+        selected[0] = m.leader;
+        selected[1..=m.chosen.len()].copy_from_slice(&m.chosen);
+        let chosen = &selected[..m.chosen.len() + 1];
+        let bonus_power = if let Some(table) = &m.bonus_bounds {
+            if member_part > table.target as f64 {
                 return Ok(());
             }
+            let bonus = table.target - member_part as usize;
+            let value = table.power.get(index, left, bonus);
+            if value == f64::NEG_INFINITY {
+                return Ok(());
+            }
+            Some((power + value).next_up())
+        } else {
+            None
+        };
+        if self.input.constraints.member_floor.is_some()
+            && !self.member_floor_possible(chosen, left)
+        {
+            return Ok(());
         }
         if self.timed_out {
             let totals = Totals {
-                power: power + top_sum(&m.char_power, index, left),
+                power: bonus_power.unwrap_or_else(|| power + top_sum(&m.char_power, index, left)),
                 skill: weight + top_sum(&m.char_skill, index, left),
                 skill_low: 0.0,
                 bonus: bonus + top_sum(&m.char_bonus, index, left),
@@ -1907,8 +1996,9 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             return Ok(());
         }
         if index < m.forced {
-            for i in m.characters[index].clone() {
-                m.chosen.push(i);
+            for option in 0..m.characters[index].len() {
+                let i = m.characters[index][option];
+                m.choose(i);
                 self.member_visit(
                     m,
                     index + 1,
@@ -1921,16 +2011,13 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             }
             return Ok(());
         }
-        let chosen: Vec<_> = std::iter::once(m.leader)
-            .chain(m.chosen.iter().copied())
-            .collect();
         if !self.member_joint_possible(m, index, left) {
             return Ok(());
         }
         let bound = self.member_set_bound(
-            &chosen,
+            chosen,
             Totals {
-                power: power + top_sum(&m.char_power, index, left),
+                power: bonus_power.unwrap_or_else(|| power + top_sum(&m.char_power, index, left)),
                 skill: weight + top_sum(&m.char_skill, index, left),
                 skill_low: 0.0,
                 bonus: (bonus + top_sum(&m.char_bonus, index, left)).min(
@@ -1967,8 +2054,9 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             self.unexplored = self.unexplored.max(bound);
             return Ok(());
         }
-        for i in m.characters[index].clone() {
-            m.chosen.push(i);
+        for option in 0..m.characters[index].len() {
+            let i = m.characters[index][option];
+            m.choose(i);
             self.member_visit(
                 m,
                 index + 1,
@@ -3561,6 +3649,15 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                 leader_totals.skill + top_sum(&char_skill, 0, 4),
                 leader_totals.bonus + top_sum(&char_bonus, 0, 4),
             );
+            let mut cut_sums = [[0.0; 12]; 5];
+            let mut column_sums = [[0.0; 12]; 5];
+            for (index, cut) in cuts.iter().enumerate() {
+                cut_sums[0][index] = (cut.constant + cut.members[leader]).next_up();
+                if let Some(column) = &cut.column {
+                    column_sums[0][index] = (column.constant + column.members[leader]).next_up();
+                }
+            }
+            let bonus_bounds = self.member_bonus_bounds(&slot_power, &characters);
             let mut members = Members {
                 leader,
                 characters,
@@ -3572,6 +3669,9 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                 char_member_bonus,
                 chosen: Vec::with_capacity(4),
                 cuts,
+                cut_sums,
+                column_sums,
+                bonus_bounds,
             };
             self.member_visit(
                 &mut members,

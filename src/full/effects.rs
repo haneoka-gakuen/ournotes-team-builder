@@ -164,6 +164,7 @@ fn inactive(effect: &Effect) -> bool {
 #[derive(Clone)]
 pub struct Updater {
     pub state: State,
+    pub cumulative_changed: bool,
     pub effect: usize,
     pub index: usize,
     pub release: Option<Checker>,
@@ -186,6 +187,7 @@ impl Updater {
         }
         Self {
             state,
+            cumulative_changed: false,
             effect,
             index,
             release,
@@ -212,6 +214,7 @@ impl Updater {
             ctx,
         )?;
         if let Some(c) = &mut self.cumulative {
+            let count = self.state.cumulative_count;
             let after = self.state.state;
             if (before == STAY && after == EXECUTE)
                 || before == EXECUTE
@@ -221,6 +224,7 @@ impl Updater {
             } else if before == END {
                 c.reset();
             }
+            self.cumulative_changed = count != self.state.cumulative_count;
         }
         Ok(changed)
     }

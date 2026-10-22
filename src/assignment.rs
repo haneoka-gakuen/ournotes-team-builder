@@ -191,6 +191,26 @@ impl Scratch {
             if upper <= *best {
                 return;
             }
+            if r + 2 == n {
+                let two = |row: usize| {
+                    let mut choices = (0..n).filter_map(|k| {
+                        let at = row * 5 + k;
+                        let column = s.small_columns[at];
+                        (column >= 0 && !s.small_used[column as usize])
+                            .then_some((column, s.small_values[at]))
+                    });
+                    [choices.next().unwrap(), choices.next().unwrap()]
+                };
+                let (a, b) = (two(r), two(r + 1));
+                let value = if a[0].0 != b[0].0 {
+                    sum::<UPPER>(sum::<UPPER>(total, a[0].1), b[0].1)
+                } else {
+                    sum::<UPPER>(sum::<UPPER>(total, a[0].1), b[1].1)
+                        .max(sum::<UPPER>(sum::<UPPER>(total, a[1].1), b[0].1))
+                };
+                *best = best.max(value);
+                return;
+            }
             let base = r * 5;
             for k in 0..n {
                 let c = s.small_columns[base + k];

@@ -855,12 +855,34 @@ pub(crate) struct LuckMoments {
     pub support: Vec<usize>,
     pub joint: Vec<usize>,
 }
-#[derive(PartialEq, Eq, Hash)]
 pub(crate) struct LuckEnvelope {
+    pub(crate) fingerprint: OnceLock<u64>,
     pub moments: Option<Arc<LuckMoments>>,
     pub changes: usize,
     pub rush: Vec<bool>,
     pub support: Vec<bool>,
+}
+impl PartialEq for LuckEnvelope {
+    fn eq(&self, other: &Self) -> bool {
+        self.changes == other.changes
+            && self.moments == other.moments
+            && self.rush == other.rush
+            && self.support == other.support
+    }
+}
+impl Eq for LuckEnvelope {}
+impl std::hash::Hash for LuckEnvelope {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write_u64(*self.fingerprint.get_or_init(|| {
+            use std::hash::Hasher;
+            let mut hasher = rustc_hash::FxHasher::default();
+            self.changes.hash(&mut hasher);
+            self.moments.hash(&mut hasher);
+            self.rush.hash(&mut hasher);
+            self.support.hash(&mut hasher);
+            hasher.finish()
+        }));
+    }
 }
 pub(crate) struct FixedComponent {
     pub(crate) base: f64,
@@ -1255,7 +1277,6 @@ impl BoundPreparation {
         snaps: &[Snap],
         ranges: &[(i32, i32)],
         layout: Arc<CumulativeLayout>,
-        luck_commands: usize,
     ) -> Option<Self> {
         let luck_cap = chart.luck;
         let judged_count = chart
@@ -1313,13 +1334,7 @@ impl BoundPreparation {
                                         return None;
                                     }
                                     if row.value > 0 && static_group(row.condition_group, &p)? {
-                                        score_rows.push([
-                                            row.value,
-                                            row.value,
-                                            -(luck_commands.max(1) as i32),
-                                            1000,
-                                            2,
-                                        ]);
+                                        score_rows.push([row.value, row.value, -1, 1000, 2]);
                                         positive =
                                             add(positive, up(f(f(row.value as f64) / 10000.0)));
                                     }
@@ -1579,6 +1594,7 @@ struct ComboEnvelope {
     rush: Option<Vec<bool>>,
     rush_weights: Option<Vec<f64>>,
     prepared: Option<Arc<BoundPreparation>>,
+    rush_commands: usize,
 }
 pub(crate) fn range_reset_only(master: &Master, group: i32) -> bool {
     group == 0
@@ -1890,6 +1906,7 @@ struct CumulativeWindows {
     rush_weights: Option<Vec<f64>>,
     weights: Vec<f64>,
     gains: HashMap<Vec<[i32; 5]>, [f64; 6]>,
+    rush_commands: usize,
 }
 impl CumulativeWindows {
     fn new(
@@ -1933,6 +1950,7 @@ impl CumulativeWindows {
             rush_weights: envelope.rush_weights,
             weights,
             gains: HashMap::default(),
+            rush_commands: envelope.rush_commands,
         })
     }
     fn commands(&self, rows: &[[i32; 5]]) -> [usize; 6] {
@@ -1952,7 +1970,7 @@ impl CumulativeWindows {
                     let changes = if n > 0 {
                         (raw / n as f64).ceil().min(cap as f64) as usize
                     } else if n < 0 {
-                        (-n) as usize
+                        self.rush_commands
                     } else {
                         cap
                     };
@@ -2283,7 +2301,10 @@ impl DeterministicBound {
         members: &[Member],
         snaps: &[Snap],
         combo_multiplier: f64,
-        source: (Option<Arc<crate::reward_trace::ComboTrace>>, &LuckEnvelope),
+        source: (
+            Option<Arc<crate::reward_trace::ComboTrace>>,
+            Option<&LuckEnvelope>,
+        ),
         prepared: &mut Option<Arc<BoundPreparation>>,
     ) -> Option<Self> {
         let script = match prepared.as_ref() {
@@ -2297,7 +2318,7 @@ impl DeterministicBound {
             snaps,
             combo_multiplier,
             script,
-            Some(source.1),
+            source.1,
         )?;
         *prepared = bound.preparation.take();
         Some(bound)
@@ -2572,6 +2593,7 @@ impl DeterministicBound {
                 rush: luck.map(|trace| trace.support.clone()),
                 rush_weights,
                 prepared: shared_preparation.as_ref().map(Arc::clone),
+                rush_commands: luck_commands.max(1),
             },
         )?;
         let mut support_gains = Vec::new();
@@ -2584,7 +2606,6 @@ impl DeterministicBound {
                 snaps,
                 ranges,
                 Arc::clone(&windows.layout),
-                luck_commands,
             )?),
         };
         let mut profiles = Vec::new();
@@ -4057,6 +4078,12 @@ enum GaugeCoreKey {
     Phases(String),
 }
 type SettlementKey = (Vec<usize>, Vec<i32>, i32, Option<(u64, u64)>);
+#[derive(Default)]
+pub(crate) struct SettlementCache {
+    values: HashMap<SettlementKey, (f64, serde_json::Value)>,
+    order: VecDeque<SettlementKey>,
+}
+
 struct RewardContext {
     simulation: Context,
     projection_totals: OnceLock<(f64, f64)>,
@@ -4538,6 +4565,10 @@ impl<'a> RewardObjective<'a> {
             conditioned_cuts: HashMap::default(),
             member_dominance: HashMap::default(),
         }
+    }
+    pub(crate) fn swap_settlements(&mut self, cache: &mut SettlementCache) {
+        std::mem::swap(&mut self.exact_cache, &mut cache.values);
+        std::mem::swap(&mut self.exact_order, &mut cache.order);
     }
     /// Shares replay state between reward passes with the same inventory and chart.
     pub(crate) fn swap_context_cache(&mut self, other: &mut Self) {
@@ -6707,7 +6738,7 @@ impl<'a> RewardObjective<'a> {
         }
         let result = self.settle(team, power, cutoff, score_cutoff)?;
         if let Some(exact) = &result {
-            if self.exact_cache.len() >= 16 {
+            if self.exact_cache.len() >= 128 {
                 if let Some(old) = self.exact_order.pop_front() {
                     self.exact_cache.remove(&old);
                 }

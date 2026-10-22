@@ -131,6 +131,7 @@ pub struct Observation {
     pub luck: f64,
     pub judge: f64,
 }
+#[derive(Clone)]
 pub struct Calculator<'a> {
     pub tables: &'a LiveTables,
     pub power: i32,
@@ -250,6 +251,7 @@ pub struct NoteCommand {
     pub score_type: i32,
     pub added: i32,
 }
+#[derive(Clone)]
 pub struct Incremental<'a> {
     pub calculator: Calculator<'a>,
     pub max_frame: usize,
