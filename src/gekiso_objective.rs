@@ -1093,33 +1093,45 @@ fn collect_luck_envelope(
                 deck.extend_from_slice(support);
                 let traces = crate::full::model::lottery::rush_windows(master, chart, &deck, seeds)
                     .ok()??;
-                let mut rush = vec![0usize; chart.notes.len()];
-                let mut support = vec![0usize; chart.notes.len()];
-                let mut joint = vec![0usize; chart.notes.len()];
+                let mut rush = vec![0i32; chart.times.len() + 1];
+                let mut support = vec![0i32; chart.times.len() + 1];
+                let mut joint = vec![0i32; chart.times.len() + 1];
                 for trace in traces {
                     value.changes = value.changes.max(trace.rush.len());
                     let (mut rush_level, mut support_level, mut r, mut s) = (0, 0, 0, 0);
-                    for (i, &time) in chart.times.iter().enumerate() {
-                        while r < trace.rush.len() && trace.rush[r].0 <= time {
+                    while r < trace.rush.len() || s < trace.support.len() {
+                        let time = trace
+                            .rush
+                            .get(r)
+                            .map_or(i32::MAX, |v| v.0)
+                            .min(trace.support.get(s).map_or(i32::MAX, |v| v.0));
+                        let previous = (rush_level > 0, support_level > 0);
+                        while r < trace.rush.len() && trace.rush[r].0 == time {
                             rush_level += trace.rush[r].1;
                             r += 1;
                         }
-                        while s < trace.support.len() && trace.support[s].0 <= time {
+                        while s < trace.support.len() && trace.support[s].0 == time {
                             support_level += trace.support[s].1;
                             s += 1;
                         }
-                        let (active_rush, active_support) = (rush_level > 0, support_level > 0);
-                        value.rush[i] |= active_rush;
-                        value.support[i] |= active_support;
-                        rush[i] += usize::from(active_rush);
-                        support[i] += usize::from(active_support);
-                        joint[i] += usize::from(active_rush && active_support);
+                        let current = (rush_level > 0, support_level > 0);
+                        let at = chart.times.partition_point(|&note| note < time);
+                        rush[at] += i32::from(current.0) - i32::from(previous.0);
+                        support[at] += i32::from(current.1) - i32::from(previous.1);
+                        joint[at] +=
+                            i32::from(current.0 && current.1) - i32::from(previous.0 && previous.1);
                     }
                 }
-                for i in 0..chart.notes.len() {
-                    moments.rush[i] = moments.rush[i].max(rush[i]);
-                    moments.support[i] = moments.support[i].max(support[i]);
-                    moments.joint[i] = moments.joint[i].max(joint[i]);
+                let (mut r, mut s, mut j) = (0, 0, 0);
+                for at in 0..chart.times.len() {
+                    r += rush[at];
+                    s += support[at];
+                    j += joint[at];
+                    value.rush[at] |= r > 0;
+                    value.support[at] |= s > 0;
+                    moments.rush[at] = moments.rush[at].max(r as usize);
+                    moments.support[at] = moments.support[at].max(s as usize);
+                    moments.joint[at] = moments.joint[at].max(j as usize);
                 }
             }
         }
@@ -6579,10 +6591,7 @@ impl<'k, 'a> Adapter<'k, 'a> {
             .min(totals.power);
         if supports == Some(true) {
             let flags = required.as_deref()?;
-            let capacity = flags
-                .iter()
-                .filter(|row| row.iter().any(|&yes| yes))
-                .count();
+            let capacity = crate::assignment::flagged_capacity(flags);
             let coarse = self.fixed_region_bound(team, None, hull)?;
             let mut upper = f64::NEG_INFINITY;
             for count in 1..=capacity {

@@ -157,8 +157,10 @@ cumulative COMBO supports share a native replay and retain their owner-specific
 commands within the existing 64-program cache. Fixed-seed replays clone an initialized model and reset each seed's RNG before
 advancing its own state. Native effects with edge-only handlers apply at
 activation and finish; one-shot cumulative factors update when their count changes.
-Lottery envelopes share a cached fingerprint and aggregate Rush and support
-frequencies in one note pass. Fixed-seed regional components
+Lottery envelopes share a cached fingerprint. Rush and support changes accumulate
+at their first affected notes, then one prefix pass combines all requested seeds.
+Random-support bounds cap the active count by a matching of slots to distinct
+physical snapshots. Fixed-seed regional components
 share up to 16 skill/window preparations by conversion trace. Lottery-command
 counts and note weights are priced from the current envelope. Physical snapshot
 matching resolves its final two rows directly with distinct available columns.

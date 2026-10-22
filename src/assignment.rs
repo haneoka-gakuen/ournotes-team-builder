@@ -1,5 +1,36 @@
 //! Reusable maximum-weight matching scratch, including the small top-column
 //! search used by the website for up to five remaining snap slots.
+pub(crate) fn flagged_capacity(flags: &[Vec<bool>]) -> usize {
+    let mut reachable = 1u32;
+    for column in 0..flags[0].len() {
+        let edges = flags.iter().enumerate().fold(0usize, |mask, (slot, row)| {
+            mask | (usize::from(row[column]) << slot)
+        });
+        if edges == 0 {
+            continue;
+        }
+        let mut previous = reachable;
+        while previous != 0 {
+            let slots = previous.trailing_zeros() as usize;
+            previous &= previous - 1;
+            let mut available = edges & !slots;
+            while available != 0 {
+                let slot = available.trailing_zeros();
+                available &= available - 1;
+                reachable |= 1 << (slots | (1 << slot));
+            }
+        }
+        if reachable & (1 << 31) != 0 {
+            return 5;
+        }
+    }
+    (0u32..32)
+        .filter(|&slots| reachable & (1 << slots) != 0)
+        .map(u32::count_ones)
+        .max()
+        .unwrap_or(0) as usize
+}
+
 #[derive(Default)]
 pub struct Scratch {
     u: Vec<f64>,
