@@ -2458,7 +2458,7 @@ impl DeterministicBound {
                             && !(luck_cap
                                 && skill.mission_type == 2
                                 && (11000..=11005).contains(&r.kind)))
-                            || r.kind == 12000 && (r.seconds != 0.0 || r.value < 0)
+                            || r.kind == 12000 && r.value < 0
                     })
                 {
                     return None;

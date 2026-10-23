@@ -156,9 +156,12 @@ within an 8 MiB trace cache; the complete model cache retains 32 entries.
 Their owner conditions, ordinary skill windows and cumulative-counter layout
 are prepared once for the same chart and inventory; each trace still computes
 its native score weights separately.
-COMBO scripts normalize each inventory member once per search. Independent
-cumulative COMBO supports share a native replay and retain their owner-specific
-commands within the existing 64-program cache. Fixed-seed replays clone an initialized model and reset each seed's RNG before
+COMBO scripts normalize each inventory member once per search.
+Timed nonnegative COMBO gains retain finite search bounds by remaining active
+in the upper envelope; exact replay preserves their activation and expiry.
+Independent cumulative COMBO supports share a native replay and retain their
+owner-specific commands within the existing 64-program cache. Fixed-seed replays
+clone an initialized model and reset each seed's RNG before
 advancing its own state. Native effects with edge-only handlers apply at
 activation and finish; one-shot cumulative factors update when their count changes.
 Lottery envelopes share a cached fingerprint. Rush and support changes accumulate
