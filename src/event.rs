@@ -70,7 +70,32 @@ impl RewardCurve {
             } else {
                 let shift = power - exponent;
                 if !(0..=36).contains(&shift) {
-                    return None;
+                    // Between adjacent rank thresholds the upper envelope is linear.
+                    // Round its values outward once, rather than scanning pairs per bound.
+                    let mut envelope = Vec::with_capacity(steps.len());
+                    let mut previous = 0.0_f64;
+                    for (i, &(x, y)) in steps.iter().enumerate() {
+                        let mut upper = y;
+                        for &(ax, ay) in &steps[..i] {
+                            for &(bx, by) in &steps[i + 1..] {
+                                let fraction = ((x - ax).next_up() / (bx - ax)).next_up();
+                                let value =
+                                    (ay + ((by - ay).next_up() * fraction).next_up()).next_up();
+                                upper = upper.max(value);
+                            }
+                        }
+                        previous = previous.max(upper).min(high);
+                        envelope.push(CurvePoint {
+                            x,
+                            y: previous,
+                            integer: 0,
+                        });
+                    }
+                    return Some(Self {
+                        points: envelope,
+                        steps,
+                        error: high * (256.0 * f64::EPSILON) / (1.0 - 256.0 * f64::EPSILON),
+                    });
                 }
                 (mantissa as i128) << shift
             };
@@ -135,8 +160,13 @@ impl RewardCurve {
     pub(crate) fn orders(&self, coefficients: &[f64], power: f64) -> f64 {
         let mut before = 0;
         let mut total = 0.0;
-        let mut value = self.steps[0].1;
-        for &(required, next) in self.steps.iter().skip(1) {
+        let lowest = power * coefficients[0];
+        let rank = self
+            .steps
+            .partition_point(|&(required, _)| required <= lowest)
+            .saturating_sub(1);
+        let mut value = self.steps[rank].1;
+        for &(required, next) in self.steps.iter().skip(rank + 1) {
             if before == coefficients.len() {
                 break;
             }

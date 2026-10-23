@@ -1654,6 +1654,16 @@ impl Engine {
             };
             let cp_measure =
                 goal["measure"] == "challenge-points" && chart.is_some() && kind != RouteKind::Skip;
+            let phase = request["rewardPhase"]["kind"].as_str();
+            if phase.is_some_and(|phase| !["primary", "other", "score"].contains(&phase))
+                || phase.is_some()
+                    && (k != 1
+                        || kind == RouteKind::Skip
+                        || cp_measure
+                        || master::rows(&goal["songs"]).len() != 1)
+            {
+                return Err("event-reward-phase".into());
+            }
             let mut objective: Box<dyn Objective> = if cp_measure {
                 Box::new(ChallengePoints::new(
                     LiveObjective {
@@ -1723,11 +1733,69 @@ impl Engine {
             };
             let mut seeds = seed_teams(request, &song, &cards.members, &cards.snaps);
             seeds.extend(cap_seeds);
-            let mut output = run(objective.as_mut(), k, seeds, f64::NEG_INFINITY, None, true)?;
+            let mut output = if phase.is_some_and(|phase| phase != "primary") {
+                let target = request["rewardPhase"]["reward"]
+                    .as_f64()
+                    .filter(|value| value.is_finite())
+                    .ok_or("missing-reward-target")?;
+                let mut tie = ScoreTie::new(
+                    make_event(),
+                    LiveObjective {
+                        core: LiveCore::new(
+                            &self.master,
+                            chart.unwrap(),
+                            &cards.members,
+                            &cards.snaps,
+                            &goal["play"],
+                        ),
+                        criterion: Criterion::Mean,
+                        target: None,
+                    },
+                    target,
+                    &[],
+                );
+                tie.allow_dominance = true;
+                tie.rank_other = phase == Some("other");
+                if !tie.rank_other {
+                    tie.other_target = Some(
+                        request["rewardPhase"]["other"]
+                            .as_f64()
+                            .filter(|value| value.is_finite())
+                            .ok_or("missing-other-reward-target")?,
+                    );
+                }
+                let mut output = run(
+                    &mut tie,
+                    1,
+                    seeds,
+                    master::number(&request["rewardPhase"]["floor"], 0.0),
+                    Some((&[], target)),
+                    true,
+                )?;
+                output.hits.retain(|hit| hit.key >= 0.0);
+                for hit in &mut output.hits {
+                    hit.key = target;
+                }
+                output.bound = (!output.proven).then_some(target);
+                output
+            } else {
+                let floor = if phase == Some("primary") {
+                    request["floors"][format!(
+                        "{}:{}",
+                        master::int(&song["songId"]),
+                        master::int(&song["difficulty"])
+                    )]
+                    .as_f64()
+                    .unwrap_or(f64::NEG_INFINITY)
+                } else {
+                    f64::NEG_INFINITY
+                };
+                run(objective.as_mut(), k, seeds, floor, None, true)?
+            };
             output.stats.add(&cap_stats);
-            if let Some(tie_chart) =
-                chart.filter(|_| !cp_measure && kind != RouteKind::Skip && !output.hits.is_empty())
-            {
+            if let Some(tie_chart) = chart.filter(|_| {
+                phase.is_none() && !cp_measure && kind != RouteKind::Skip && !output.hits.is_empty()
+            }) {
                 let mut keys: Vec<_> = output.hits.iter().map(|h| h.key).collect();
                 keys.sort_by(|a, b| b.total_cmp(a));
                 keys.dedup();
@@ -1868,7 +1936,11 @@ impl Engine {
                 }value
             }).collect();
             overall.extend(hits.iter().cloned());
-            results.push(json!({"song":song,"hits":hits,"proven":output.proven,"bound":output.bound,"stats":output.stats}));
+            let mut part = json!({"song":song,"hits":hits,"proven":output.proven,"bound":output.bound,"stats":output.stats});
+            if let Some(phase) = phase {
+                part["rewardPhase"] = json!(phase);
+            }
+            results.push(part);
         }
         overall.sort_by(compare_hits);
         overall.truncate(k);

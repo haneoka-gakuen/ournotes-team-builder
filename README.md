@@ -56,7 +56,11 @@ members in the relaxed bound.
 
 Event recommendations maximize the selected reward, then the other direct
 reward, then mean score.
-The private `rewardPhase` request separates pure COMBO Top 1 proofs into
+Fractional reward weights retain finite mean-reward bounds. When their binary
+exponents exceed the integer hull's range, bounds compare all rank pairs with
+outward rounding to obtain the same upper concave envelope.
+The private `rewardPhase` request separates pure COMBO and weighted ordinary
+Live Top 1 proofs into
 `primary`, `other` and `score`. Later phases take the globally proven reward
 values and a legal incumbent floor. Their results carry the stage name;
 callers report a complete recommendation only after every stage is proven.
