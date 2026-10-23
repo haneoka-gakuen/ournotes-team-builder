@@ -932,9 +932,9 @@ impl FixedRegionRows {
     pub(crate) fn take_reference(&self) -> bool {
         self.referenced.swap(false, Ordering::Relaxed)
     }
-    fn row(&self, index: usize) -> [f64; 5] {
-        self.values[index / self.width].get_or_init(|| {
-            let start = index / self.width * self.width;
+    fn member_rows(&self, member: usize) -> &[[f64; 5]] {
+        self.values[member].get_or_init(|| {
+            let start = member * self.width;
             let rows = (start..start + self.width)
                 .map(|index| {
                     std::array::from_fn(|event| {
@@ -948,7 +948,7 @@ impl FixedRegionRows {
             self.bytes.fetch_add(bytes, Ordering::Relaxed);
             self.allocated.fetch_add(bytes, Ordering::Relaxed);
             rows
-        })[index % self.width]
+        })
     }
 }
 impl Drop for FixedRegionRows {
@@ -989,8 +989,7 @@ impl FixedRegionBound {
         })
     }
     fn row(&self, slot: usize, snap: i32) -> [f64; 5] {
-        self.rows
-            .row(self.members[slot] * self.width + (snap + 1) as usize)
+        self.rows.member_rows(self.members[slot])[(snap + 1) as usize]
     }
     pub(crate) fn prepare(&mut self, options: &[Vec<i32>]) {
         for (slot, choices) in options.iter().enumerate() {
@@ -998,8 +997,9 @@ impl FixedRegionBound {
                 continue;
             }
             let mut row = [0.0_f64; 5];
+            let profiles = self.rows.member_rows(self.members[slot]);
             for &snap in choices {
-                let values = self.row(slot, snap);
+                let values = profiles[(snap + 1) as usize];
                 for (value, high) in row.iter_mut().zip(values) {
                     *value = value.max(high);
                 }
@@ -1077,8 +1077,30 @@ impl FixedRegionBound {
         required: Option<(&[Vec<bool>], usize, usize)>,
         cutoff: f64,
     ) -> f64 {
-        let value = |row: [f64; 5]| {
-            if criterion == crate::objectives::Criterion::Max {
+        let initial = if criterion == crate::objectives::Criterion::Min {
+            let mean = self.physical_score_ceiling_count(
+                base_power,
+                totals,
+                crate::objectives::Criterion::Mean,
+                required,
+                cutoff,
+            );
+            if mean < cutoff {
+                return mean;
+            }
+            mean
+        } else {
+            f64::INFINITY
+        };
+        let order = if criterion == crate::objectives::Criterion::Min {
+            Some(crate::assignment::minimum_order(&self.envelopes))
+        } else {
+            None
+        };
+        let value = |slot: usize, row: [f64; 5]| {
+            if let Some(order) = order {
+                row[order[slot]]
+            } else if criterion == crate::objectives::Criterion::Max {
                 row.into_iter().fold(f64::NEG_INFINITY, f64::max)
             } else {
                 up(row.into_iter().fold(0.0, add) / 5.0)
@@ -1087,7 +1109,8 @@ impl FixedRegionBound {
         let coefficient = self
             .envelopes
             .iter()
-            .fold(self.base, |sum, &row| add(sum, value(row)));
+            .enumerate()
+            .fold(self.base, |sum, (slot, &row)| add(sum, value(slot, row)));
         let ratio = (coefficient / totals.power.max(1.0)).sqrt();
         if !ratio.is_finite() || ratio <= 0.0 {
             return f64::INFINITY;
@@ -1097,12 +1120,13 @@ impl FixedRegionBound {
         for row in &mut self.matrix {
             row.resize(columns, -1e100);
         }
-        let mut upper = f64::INFINITY;
+        let mut upper = initial;
         for scale in [1.0, 0.75, 1.5] {
             let lambda = ratio * scale;
             let mut event_rows = [[[f64::NEG_INFINITY; 2]; 5]; 5];
             for (slot, row) in self.matrix.iter_mut().enumerate() {
                 row.fill(-1e100);
+                let profiles = self.rows.member_rows(self.members[slot]);
                 for &snap in &self.options[slot] {
                     let power = self.powers[slot * self.width
                         + if snap < 0 {
@@ -1110,9 +1134,7 @@ impl FixedRegionBound {
                         } else {
                             snap as usize
                         }];
-                    let coefficients = self
-                        .rows
-                        .row(self.members[slot] * self.width + (snap + 1) as usize);
+                    let coefficients = profiles[(snap + 1) as usize];
                     if criterion == crate::objectives::Criterion::Max {
                         let column = if snap < 0 {
                             self.width - 1 + slot
@@ -1126,7 +1148,7 @@ impl FixedRegionBound {
                                 .max(add(mul(lambda, power), up(coefficient / lambda)));
                         }
                     }
-                    let weight = value(coefficients);
+                    let weight = value(slot, coefficients);
                     row[if snap < 0 {
                         self.width - 1 + slot
                     } else {

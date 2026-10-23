@@ -302,7 +302,7 @@ fn frame(
             handle: &mut model.score,
         },
     )?;
-    g.previous_lots = g.controller.lot_results.clone();
+    g.previous_lots.clone_from(&g.controller.lot_results);
     g.previous_lot_ms = if g.previous_lots.is_empty() { 0 } else { time };
     if let Some(&i) = g
         .controller

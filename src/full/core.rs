@@ -428,6 +428,9 @@ impl Life {
         *state = [life, guard, reduction];
     }
     pub fn at(&mut self, time: i32) -> i32 {
+        if self.commands.is_empty() {
+            return self.initial;
+        }
         let frame = self.frame_of(time);
         let c = self.cached_frame;
         let full = c >= 0 && frame as i32 <= c;

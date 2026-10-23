@@ -31,6 +31,72 @@ pub(crate) fn flagged_capacity(flags: &[Vec<bool>]) -> usize {
         .unwrap_or(0) as usize
 }
 
+pub(crate) fn event_prices(weights: &[[f64; 5]; 5]) -> [f64; 5] {
+    let mut dp = [f64::NEG_INFINITY; 32];
+    let mut previous = [0usize; 32];
+    dp[0] = 0.0;
+    for mask in 0usize..31 {
+        let slot = mask.count_ones() as usize;
+        for (event, &weight) in weights[slot].iter().enumerate() {
+            if mask & (1 << event) != 0 {
+                continue;
+            }
+            let next = mask | (1 << event);
+            let value = dp[mask] + weight;
+            if value > dp[next] {
+                dp[next] = value;
+                previous[next] = event;
+            }
+        }
+    }
+    if !dp[31].is_finite() {
+        return [0.0; 5];
+    }
+    let mut order = [0usize; 5];
+    let mut mask = 31;
+    for slot in (0..5).rev() {
+        order[slot] = previous[mask];
+        mask ^= 1 << order[slot];
+    }
+    let mut prices = [0.0_f64; 5];
+    for _ in 0..5 {
+        for slot in 0..5 {
+            let assigned = order[slot];
+            for event in 0..5 {
+                let value = prices[assigned] + weights[slot][event] - weights[slot][assigned];
+                prices[event] = prices[event].max(value);
+            }
+        }
+    }
+    prices
+}
+
+pub(crate) fn minimum_order(weights: &[[f64; 5]; 5]) -> [usize; 5] {
+    let mut dp = [f64::INFINITY; 32];
+    let mut previous = [0; 32];
+    dp[0] = 0.0;
+    for mask in 0usize..31 {
+        let slot = mask.count_ones() as usize;
+        for (event, &weight) in weights[slot].iter().enumerate() {
+            if mask & (1 << event) == 0 {
+                let next = mask | (1 << event);
+                let value = (dp[mask] + weight).next_up();
+                if value < dp[next] {
+                    dp[next] = value;
+                    previous[next] = event;
+                }
+            }
+        }
+    }
+    let mut order = [0; 5];
+    let mut mask = 31;
+    for slot in (0..5).rev() {
+        order[slot] = previous[mask];
+        mask ^= 1 << order[slot];
+    }
+    order
+}
+
 #[derive(Default)]
 pub struct Scratch {
     u: Vec<f64>,

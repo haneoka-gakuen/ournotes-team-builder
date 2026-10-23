@@ -119,12 +119,41 @@ pub enum Test {
 pub struct Checker {
     pub test: Test,
     pub override_time: Option<i32>,
+    idle: Option<IdleInput>,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IdleInput {
+    Never,
+    Member(usize),
+    Range,
+    Lottery,
+    Judgement,
+    JudgementRange,
+    Rank,
+}
+impl IdleInput {
+    pub(crate) fn active(self, ctx: &Context<'_>) -> bool {
+        match self {
+            Self::Never => false,
+            Self::Member(member) => ctx.events.iter().any(|event| event.0 == member),
+            Self::Range => ctx
+                .gk
+                .as_ref()
+                .is_none_or(|g| !g.controller.updates.is_empty()),
+            Self::Lottery => ctx.gk.as_ref().is_none_or(|g| !g.previous_lots.is_empty()),
+            Self::Judgement => !ctx.judged.is_empty(),
+            Self::JudgementRange => !ctx.judged.is_empty() || Self::Range.active(ctx),
+            Self::Rank => ctx.previous_rank.is_some(),
+        }
+    }
 }
 impl Checker {
     pub fn new(test: Test) -> Self {
+        let idle = Self::classify_input(&test);
         Self {
             test,
             override_time: None,
+            idle,
         }
     }
     pub fn override_time(&self) -> Option<i32> {
@@ -143,14 +172,39 @@ impl Checker {
                 | Test::JudgementCount { .. }
         )
     }
-    pub fn idle_member(&self) -> Option<i32> {
-        match self.test {
-            Test::Fixed(false) => Some(-1),
-            Test::SameMember(member) => Some(member as i32),
+    pub(crate) fn idle_input(&self) -> Option<IdleInput> {
+        self.idle
+    }
+    fn classify_input(test: &Test) -> Option<IdleInput> {
+        match test {
+            Test::Fixed(false) => Some(IdleInput::Never),
+            Test::SameMember(member) => Some(IdleInput::Member(*member)),
+            Test::RangeStart { .. } | Test::RangeComplete => Some(IdleInput::Range),
+            Test::LotResult(_) => Some(IdleInput::Lottery),
+            Test::JudgementMatch { .. } | Test::JudgementCount { .. } => Some(IdleInput::Judgement),
+            Test::And(items)
+                if items.len() == 2
+                    && items
+                        .iter()
+                        .any(|item| matches!(item.test, Test::RangePlaying { .. }))
+                    && items.iter().any(|item| {
+                        matches!(
+                            item.test,
+                            Test::JudgementMatch { .. } | Test::JudgementCount { .. }
+                        )
+                    }) =>
+            {
+                Some(IdleInput::JudgementRange)
+            }
+            Test::Once { rank: Some(_), .. } => Some(IdleInput::Rank),
             _ => None,
         }
     }
     pub fn check(&mut self, ctx: &mut Context<'_>) -> Result<(bool, i32), String> {
+        if self.idle.is_some_and(|input| !input.active(ctx)) {
+            self.override_time = None;
+            return Ok((false, 0));
+        }
         let result = match &mut self.test {
             Test::Fixed(ok) => (*ok, i32::from(*ok)),
             Test::And(items) => {

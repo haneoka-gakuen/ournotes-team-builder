@@ -1,6 +1,6 @@
 //! Skill effect state machines and pooled condition-skill activations.
 use super::{
-    conditions::{Checker, Context, Cumulative, Test},
+    conditions::{Checker, Context, Cumulative, IdleInput, Test},
     core, gekisou,
 };
 use crate::num::f;
@@ -237,6 +237,7 @@ struct Sustained {
     timed: bool,
     executing: Vec<usize>,
 }
+#[inline(always)]
 pub fn mission_gate(gate: Option<i32>, ctx: &Context<'_>) -> Result<bool, String> {
     let Some(gate) = gate else {
         return Ok(true);
@@ -259,6 +260,44 @@ pub fn mission_gate(gate: Option<i32>, ctx: &Context<'_>) -> Result<bool, String
     let i = controller.current_playing;
     Ok(i >= 0 && controller.ranges[i as usize].mission == gate)
 }
+#[derive(Clone, Default)]
+struct IdleInputs {
+    members: Vec<usize>,
+    ranges: bool,
+    lottery: bool,
+    judgements: bool,
+    rank: bool,
+}
+impl IdleInputs {
+    fn insert(&mut self, input: IdleInput) {
+        match input {
+            IdleInput::Never => {}
+            IdleInput::Member(member) => {
+                if !self.members.contains(&member) {
+                    self.members.push(member);
+                }
+            }
+            IdleInput::Range => self.ranges = true,
+            IdleInput::Lottery => self.lottery = true,
+            IdleInput::Judgement => self.judgements = true,
+            IdleInput::JudgementRange => {
+                self.judgements = true;
+                self.ranges = true;
+            }
+            IdleInput::Rank => self.rank = true,
+        }
+    }
+    fn active(&self, ctx: &Context<'_>) -> bool {
+        (self.ranges && IdleInput::Range.active(ctx))
+            || (self.lottery && IdleInput::Lottery.active(ctx))
+            || (self.judgements && IdleInput::Judgement.active(ctx))
+            || (self.rank && IdleInput::Rank.active(ctx))
+            || ctx
+                .events
+                .iter()
+                .any(|event| self.members.contains(&event.0))
+    }
+}
 #[derive(Clone)]
 pub struct ConditionUpdater {
     pub effects: Vec<Effect>,
@@ -272,7 +311,7 @@ pub struct ConditionUpdater {
     execute_count: HashMap<i32, i32>,
     trigger_checked: bool,
     cache: Vec<Option<Trigger>>,
-    idle_members: Option<Vec<usize>>,
+    idle_inputs: Option<IdleInputs>,
     quiet: bool,
 }
 impl ConditionUpdater {
@@ -329,25 +368,19 @@ impl ConditionUpdater {
         let mut idle = if effects.is_empty() {
             None
         } else {
-            Some(Vec::new())
+            Some(IdleInputs::default())
         };
         for effect in &effects {
-            let member = effect.trigger.as_ref().and_then(Checker::idle_member);
+            let input = effect.trigger.as_ref().and_then(Checker::idle_input);
             if idle.is_none()
                 || effect.trigger_type != ONE_SHOT
                 || effect.reset.is_some()
-                || member.is_none()
+                || input.is_none()
             {
                 idle = None;
                 break;
             }
-            let member = member.unwrap();
-            if member >= 0 {
-                let members = idle.as_mut().unwrap();
-                if !members.contains(&(member as usize)) {
-                    members.push(member as usize);
-                }
-            }
+            idle.as_mut().unwrap().insert(input.unwrap());
         }
         let count = effects.len();
         Ok(Self {
@@ -362,7 +395,7 @@ impl ConditionUpdater {
             execute_count: HashMap::default(),
             trigger_checked: false,
             cache: vec![None; count],
-            idle_members: idle,
+            idle_inputs: idle,
             quiet: false,
         })
     }
@@ -396,14 +429,19 @@ impl ConditionUpdater {
         ctx: &mut Context<'_>,
         updated: &mut Vec<usize>,
     ) -> Result<(), String> {
+        let mut checked_gate = None;
         if !self.trigger_checked
             && self.executing.is_empty()
             && (self
-                .idle_members
+                .idle_inputs
                 .as_ref()
-                .is_some_and(|members| !ctx.events.iter().any(|event| members.contains(&event.0)))
+                .is_some_and(|inputs| !inputs.active(ctx))
                 || input.finished
-                || !mission_gate(self.gate, ctx)?)
+                || !{
+                    let active = mission_gate(self.gate, ctx)?;
+                    checked_gate = Some(active);
+                    active
+                })
         {
             self.trigger_checked = true;
             self.quiet = true;
@@ -426,7 +464,7 @@ impl ConditionUpdater {
         if !self.trigger_checked {
             self.trigger_checked = true;
             self.cache.fill(None);
-            if input.finished || !mission_gate(self.gate, ctx)? {
+            if input.finished || !checked_gate.map_or_else(|| mission_gate(self.gate, ctx), Ok)? {
                 self.finish(&done);
                 return Ok(());
             }
@@ -516,6 +554,28 @@ impl ConditionUpdater {
         ctx: &mut Context<'_>,
         updated: &mut Vec<usize>,
     ) -> Result<(), String> {
+        if let Some(state) = &self.sustained[e] {
+            if !trigger.hit
+                && !state.enabled
+                && state.current.is_none()
+                && state.executing.is_empty()
+            {
+                return Ok(());
+            }
+            if !state.timed
+                && trigger.hit
+                && state.enabled
+                && state
+                    .current
+                    .is_some_and(|index| self.updaters[index].state.state == EXECUTING)
+                && self.effects[e]
+                    .condition
+                    .as_ref()
+                    .is_none_or(|condition| matches!(condition.test, Test::Fixed(true)))
+            {
+                return Ok(());
+            }
+        }
         let mut state = self.sustained[e].take().ok_or("missing sustained state")?;
         let result = if state.timed {
             self.timed_step(&mut state, e, input, trigger, ctx, updated)

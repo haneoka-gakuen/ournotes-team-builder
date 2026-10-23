@@ -63,8 +63,8 @@ pub struct Chart {
     pub(crate) context_bytes: usize,
     /// Cached contexts per shared lottery record (by address), whose bytes count once.
     pub(crate) context_records: HashMap<usize, usize>,
-    /// Note weights by deck key, kept longer than whole contexts, oldest first out.
-    pub(crate) weights: HashMap<(i32, Vec<u32>), Arc<crate::gekiso_objective::Weights>>,
+    /// Note weights by deck key, retained in a bounded second-chance cache.
+    pub(crate) weights: HashMap<(i32, Vec<u32>), (Arc<crate::gekiso_objective::Weights>, bool)>,
     pub(crate) weight_order: std::collections::VecDeque<((i32, Vec<u32>), usize)>,
     pub(crate) weight_bytes: usize,
 }
@@ -470,7 +470,7 @@ fn frame_stream(record: &LuckRecord, frames: &[play::Frame]) -> Vec<luck::Frame>
         .enumerate()
         .map(|(i, frame)| luck::Frame {
             time: frames[i].time_ms,
-            states: frame.states.clone(),
+            states: frame.states.to_vec(),
             updates: frame.updates.clone(),
             playing: frame.playing,
             judged: frames[i]
@@ -659,7 +659,7 @@ fn context_fixed_observed<'a>(
         } else {
             make_model(seed)?
         };
-        model.score.score.calculator.observe = true;
+        model.score.score.calculator.factors_only = true;
         for k in chart.span.0..chart.span.1 {
             let frame = &chart.play.frames[k];
             model.frame(frame.time_ms, &frame.judged, chart.play.dt[k])?;
@@ -744,7 +744,7 @@ fn expected(master: &Master, chart: &mut Chart, deck: &[Performer]) -> Result<Co
         Some(&chart.setup),
         (0, true),
     )?;
-    model.score.score.calculator.observe = true;
+    model.score.score.calculator.factors_only = true;
     let simulated = &chart.play.frames[chart.span.0..chart.span.1];
     for (k, frame) in simulated.iter().enumerate() {
         model.frame(

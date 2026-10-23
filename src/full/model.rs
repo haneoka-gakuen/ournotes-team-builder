@@ -14,7 +14,7 @@ use crate::{
     num::f,
 };
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
-use std::rc::Rc;
+use std::{rc::Rc, sync::Arc};
 #[derive(Clone)]
 pub struct Params {
     pub music_type: i32,
@@ -35,7 +35,7 @@ pub struct LuckAction {
 }
 #[derive(Clone)]
 pub struct LuckFrame {
-    pub states: Vec<i32>,
+    pub states: Arc<[i32]>,
     pub updates: Vec<usize>,
     pub playing: i32,
 }
@@ -266,6 +266,7 @@ pub struct Model<'a> {
     frame_events: Vec<(usize, i32)>,
     judged: Vec<(i32, i32, i32)>,
     results: Vec<(LiveNote, i32)>,
+    gk_judged: Vec<gekisou::GkNote>,
     fired: usize,
     pub trace: Vec<(i32, i32)>,
     frame_time: i32,
@@ -391,6 +392,7 @@ impl<'a> Model<'a> {
             frame_events: Vec::new(),
             judged: Vec::new(),
             results: Vec::new(),
+            gk_judged: Vec::new(),
             fired: 0,
             trace: Vec::new(),
             frame_time: 0,
@@ -692,8 +694,23 @@ impl<'a> Model<'a> {
             g.controller
                 .before_update(dt, time, &g.fever_updates, current_score, &mut env)?;
             if let Some(record) = &mut self.record {
+                let states = if let Some(previous) = record.frames.last().filter(|previous| {
+                    previous.states.iter().copied().eq(g
+                        .controller
+                        .states
+                        .iter()
+                        .map(|state| state.state))
+                }) {
+                    Arc::clone(&previous.states)
+                } else {
+                    g.controller
+                        .states
+                        .iter()
+                        .map(|state| state.state)
+                        .collect()
+                };
                 record.frames.push(LuckFrame {
-                    states: g.controller.states.iter().map(|s| s.state).collect(),
+                    states,
                     updates: g.controller.updates.clone(),
                     playing: g.controller.current_playing,
                 });
@@ -914,18 +931,19 @@ impl<'a> Model<'a> {
     }
     fn after(&mut self, time: i32) -> Result<(), String> {
         let g = self.gk.as_mut().unwrap();
-        let judged: Vec<_> = self
-            .results
-            .iter()
-            .map(|(n, j)| (n.id, n.op, n.time_ms, *j))
-            .collect();
+        self.gk_judged.clear();
+        self.gk_judged.extend(
+            self.results
+                .iter()
+                .map(|(n, j)| (n.id, n.op, n.time_ms, *j)),
+        );
         if let Some(record) = &mut self.record {
             let frame = record.frames.len() - 1;
             for (r, range) in g.controller.ranges.iter().enumerate() {
                 if range.mission != 2 {
                     continue;
                 }
-                for &(id, op, time, judgement) in &judged {
+                for &(id, op, time, judgement) in &self.gk_judged {
                     if range.targets.contains(&id) && judgement != 0 && judgement != 7 {
                         record.notes.push(LuckNote {
                             frame,
@@ -946,8 +964,8 @@ impl<'a> Model<'a> {
             handle: &mut self.score,
         };
         g.controller
-            .update(time, &judged, &g.fever_updates, current, &mut env)?;
-        g.previous_lots = g.controller.lot_results.clone();
+            .update(time, &self.gk_judged, &g.fever_updates, current, &mut env)?;
+        g.previous_lots.clone_from(&g.controller.lot_results);
         g.previous_lot_ms = if g.previous_lots.is_empty() { 0 } else { time };
         let Some(index) = g
             .controller

@@ -164,6 +164,21 @@ physical snapshots. Fixed-seed regional components
 share up to 16 skill/window preparations by conversion trace. Lottery-command
 counts and note weights are priced from the current envelope. Physical snapshot
 matching resolves its final two rows directly with distinct available columns.
+Regional bounds read each member's cached row slice once for its snapshot offers.
+Nominal Max and Min assignments reuse the current roster's base in their scalar
+and joint power/skill cuts. Each assignment domain refreshes that base. Fixed-seed
+Min also bounds physical snapshots in a fixed ordinary-skill order and retains
+the mean bound: a team's worst-order score is at most its score in any fixed order.
+
+Member programs are interned before search; the 32 MiB note-weight cache gives
+recently used rows a second eviction chance. Trigger dependencies are classified
+once, and unchanged input frames skip their corresponding checks. Settled
+sustained states return directly, and update calls reuse their mission-gate result.
+Context preparation records factors in replay order and keeps each note's latest
+observation after history rewinds. It omits unused integer note totals. Frame
+buffers are reused, recorded frames share unchanged range-state slices, and LIFE
+without commands returns its initial value.
+
 Pure JUST reward bounds share whole-inventory coefficient rows by converter
 trace and price power and score together before snapshot enumeration. Necessary
 badge-bonus floors also constrain the member bounds; excluded snapshot branches
