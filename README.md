@@ -45,6 +45,12 @@ compare a relaxed worst-order pricing plane.
 Fixed-seed initialization bounds draws from total gauge input, including
 queued draws. Multi-seed warm searches use isolated proposal charts and
 accept candidates only after evaluating every requested seed.
+Search preparation excludes forbidden cards and, when snapshots are disabled,
+all snapshots. Required members, the leader and member bindings also exclude
+alternative cards of their characters before skill bounds are compiled. Five
+fixed members leave only those members in the preparation domain. Conflicting
+constraints still return no legal formation; manual evaluations retain the full
+inventory.
 Regional bounds preserve sampled Rush and support joint frequencies and
 condition their envelopes on the number of physical random-effect snapshots.
 Fixed-seed assignment bounds match activation events with the number of

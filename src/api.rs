@@ -484,6 +484,44 @@ fn constraints(
         member_floor: None,
     }
 }
+fn search_box(master: &Master, request: &Value) -> Result<power::BoxCards, String> {
+    let members: Vec<MemberInput> =
+        serde_json::from_value(request["members"].clone()).map_err(|e| e.to_string())?;
+    let snaps: Vec<SnapInput> =
+        serde_json::from_value(request["snaps"].clone()).map_err(|e| e.to_string())?;
+    let mut cards = power::resolve_box(master, &members, &snaps, request["unknownPolicy"] != "min");
+    let c = &request["constraints"];
+    fn keys(rows: &Value) -> std::collections::BTreeSet<&str> {
+        master::rows(rows)
+            .into_iter()
+            .filter_map(Value::as_str)
+            .collect::<std::collections::BTreeSet<_>>()
+    }
+    let excluded = keys(&c["excludedMembers"]);
+    let mut fixed = keys(&c["requiredMembers"]);
+    fixed.extend(c["leader"].as_str());
+    fixed.extend(
+        master::rows(&c["bindings"])
+            .into_iter()
+            .filter_map(|pair| pair[0].as_str()),
+    );
+    let characters: std::collections::BTreeSet<_> = cards
+        .members
+        .iter()
+        .filter(|m| fixed.contains(m.key.as_str()))
+        .map(|m| m.card.character_id)
+        .collect();
+    cards.members.retain(|m| {
+        !excluded.contains(m.key.as_str())
+            && (fixed.contains(m.key.as_str())
+                || fixed.len() < 5 && !characters.contains(&m.card.character_id))
+    });
+    let excluded = keys(&c["excludedSnaps"]);
+    cards
+        .snaps
+        .retain(|s| c["noSnaps"] != true && !excluded.contains(s.key.as_str()));
+    Ok(cards)
+}
 impl Engine {
     pub fn search_power(
         &self,
@@ -491,16 +529,7 @@ impl Engine {
         started: f64,
         now: &dyn Fn() -> f64,
     ) -> Result<Value, String> {
-        let member_inputs: Vec<MemberInput> =
-            serde_json::from_value(request["members"].clone()).map_err(|e| e.to_string())?;
-        let snap_inputs: Vec<SnapInput> =
-            serde_json::from_value(request["snaps"].clone()).map_err(|e| e.to_string())?;
-        let cards = power::resolve_box(
-            &self.master,
-            &member_inputs,
-            &snap_inputs,
-            request["unknownPolicy"] != "min",
-        );
+        let cards = search_box(&self.master, request)?;
         crate::progress::keys(&cards.members, &cards.snaps);
         let player = power::player_state(&self.master, &request["player"]);
         let song = &request["goal"]["song"];
@@ -592,16 +621,7 @@ impl Engine {
             objectives::{Criterion, LiveCore, LiveObjective},
             search,
         };
-        let members: Vec<MemberInput> =
-            serde_json::from_value(request["members"].clone()).map_err(|e| e.to_string())?;
-        let snaps: Vec<SnapInput> =
-            serde_json::from_value(request["snaps"].clone()).map_err(|e| e.to_string())?;
-        let cards = power::resolve_box(
-            &self.master,
-            &members,
-            &snaps,
-            request["unknownPolicy"] != "min",
-        );
+        let cards = search_box(&self.master, request)?;
         crate::progress::keys(&cards.members, &cards.snaps);
         let player = power::player_state(&self.master, &request["player"]);
         let constraints = constraints(&request["constraints"], &cards.members, &cards.snaps);
@@ -1305,16 +1325,7 @@ impl Engine {
         generation: u64,
     ) -> Result<Value, String> {
         use crate::{full::play::Accuracy, gekiso, gekiso_objective, objectives::Criterion};
-        let inputs: Vec<MemberInput> =
-            serde_json::from_value(request["members"].clone()).map_err(|e| e.to_string())?;
-        let snap_inputs: Vec<SnapInput> =
-            serde_json::from_value(request["snaps"].clone()).map_err(|e| e.to_string())?;
-        let cards = power::resolve_box(
-            &self.master,
-            &inputs,
-            &snap_inputs,
-            request["unknownPolicy"] != "min",
-        );
+        let cards = search_box(&self.master, request)?;
         crate::progress::keys(&cards.members, &cards.snaps);
         let player = power::player_state(&self.master, &request["player"]);
         let goal = &request["goal"];
@@ -1462,16 +1473,7 @@ impl Engine {
                 return Err(format!("pt-input:{}", issues.join(",")));
             }
         }
-        let inputs: Vec<MemberInput> =
-            serde_json::from_value(request["members"].clone()).map_err(|e| e.to_string())?;
-        let snap_inputs: Vec<SnapInput> =
-            serde_json::from_value(request["snaps"].clone()).map_err(|e| e.to_string())?;
-        let cards = power::resolve_box(
-            &self.master,
-            &inputs,
-            &snap_inputs,
-            request["unknownPolicy"] != "min",
-        );
+        let cards = search_box(&self.master, request)?;
         crate::progress::keys(&cards.members, &cards.snaps);
         let player = power::player_state(&self.master, &request["player"]);
         let kind = match goal["route"].as_str() {
@@ -2368,16 +2370,7 @@ impl Engine {
         if !issues.is_empty() {
             return Err(format!("pt-input:{}", issues.join(",")));
         }
-        let inputs: Vec<MemberInput> =
-            serde_json::from_value(request["members"].clone()).map_err(|e| e.to_string())?;
-        let snap_inputs: Vec<SnapInput> =
-            serde_json::from_value(request["snaps"].clone()).map_err(|e| e.to_string())?;
-        let cards = power::resolve_box(
-            &self.master,
-            &inputs,
-            &snap_inputs,
-            request["unknownPolicy"] != "min",
-        );
+        let cards = search_box(&self.master, request)?;
         let player = power::player_state(&self.master, &request["player"]);
         let mut constraints = constraints(&request["constraints"], &cards.members, &cards.snaps);
         crate::progress::keys(&cards.members, &cards.snaps);
@@ -3132,16 +3125,7 @@ impl Engine {
             master::number(&best_challenge["event"]["mean"], 0.0),
         );
         let cp_cost = master::int(&goal["challengePointsPerLive"]) as i64;
-        let members: Vec<MemberInput> =
-            serde_json::from_value(request["members"].clone()).map_err(|e| e.to_string())?;
-        let snaps: Vec<SnapInput> =
-            serde_json::from_value(request["snaps"].clone()).map_err(|e| e.to_string())?;
-        let cards = power::resolve_box(
-            &self.master,
-            &members,
-            &snaps,
-            request["unknownPolicy"] != "min",
-        );
+        let cards = search_box(&self.master, request)?;
         let player = power::player_state(&self.master, &request["player"]);
         let constraints = constraints(&request["constraints"], &cards.members, &cards.snaps);
         let route = Route::new(
