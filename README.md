@@ -121,6 +121,26 @@ matching scratch is reused, and reward floors examine weaker skill orders first.
 Pricing rows retain five distinct witnesses before omitting a snapshot that is
 no better in power, event coefficient and reward bonus. Sparse matching keeps
 the original physical column identities; search options remain complete.
+COMBO roster bounds jointly price power, skill events and reward bonuses.
+Suffix matching keeps characters distinct, and nonnegative snapshot column
+prices charge each physical snapshot once. Mean-score bounds use the reward
+curve's upper concave envelope before checking individual skill orders.
+Snapshot prefixes reuse mean pricing planes and their five best available
+columns. Integer reward sums exclude unattainable reward equality groups.
+Bonus tables retain at most 4,096 sums; high-bonus proofs enumerate at most
+4,096 complete four- or five-positive-snapshot sets when three cannot reach
+the required snapshot bonus. A fifth zero-bonus slot remains relaxed. Larger domains
+keep the general bounds. Mean-target caches retain at most 16,384 entries and
+reset with the reward phase. Dual offer rows are prepared on first use.
+Five required, unbound snapshots restrict assignment choices without reindexing
+the native preparation domain; linear objectives solve that fixed set directly.
+Fixed member-bonus searches condition power, skill and joint-pricing suffixes
+on the same reachable bonus sum. Large unsharded native LUCK maximum searches
+partition complete COMBO levels across at most four workers. They share
+scored seeds and immutable preparation, claim levels from a common queue,
+and suppress nested replay threads. The caller retains progress callbacks,
+the deadline and cancellation generation; completion still requires every
+level. Explicit client shards retain their original partition.
 Pure LUCK recommendations partition snapshot choices by random-effect programs.
 For domains with up to two random-effect snapshots, native traces preserve each
 program and actor order. Previously weak seeds tighten the physical score bounds;

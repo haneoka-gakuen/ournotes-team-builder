@@ -10240,7 +10240,256 @@ fn warm_pool(
     Ok(pool)
 }
 
+struct SharedLevelBounds {
+    preparation: Option<Arc<crate::rewards::BoundPreparation>>,
+    luck: Option<Option<Arc<crate::rewards::LuckEnvelope>>>,
+}
+struct LevelSchedule {
+    levels: Vec<i32>,
+    queue: Option<Arc<std::sync::Mutex<VecDeque<i32>>>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct NativeLevelSeed {
+    seeds: Vec<i32>,
+    k: usize,
+    deadline: f64,
+    min_combo_bonus: i32,
+    floor: f64,
+    hits: Vec<Hit>,
+    bounds: SharedLevelBounds,
+    queue: Arc<std::sync::Mutex<VecDeque<i32>>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+enum NativeLevelUpdate {
+    Candidates(Vec<Hit>),
+    Progress(usize, usize),
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn native_levels(
+    env: &Environment<'_>,
+    jobs: Vec<(Vec<i32>, Chart)>,
+    seed: NativeLevelSeed,
+    mut update: impl FnMut(NativeLevelUpdate) -> Result<(), String>,
+) -> Result<Vec<search::Output>, String> {
+    use std::{
+        sync::{atomic::AtomicU64, mpsc},
+        time::{Duration, Instant},
+    };
+    enum Message {
+        Update(NativeLevelUpdate),
+        Done(usize, usize, Result<search::Output, String>),
+    }
+    let total = jobs.len();
+    let (send, receive) = mpsc::sync_channel(32);
+    let origin = Instant::now();
+    let clock = Arc::new(AtomicU64::new(
+        ((env.now)() - origin.elapsed().as_secs_f64() * 1000.0).to_bits(),
+    ));
+    let cancellation = crate::local_cancellation();
+    let (master, player, members, snaps, music, generation) = (
+        env.master,
+        env.player,
+        env.members,
+        env.snaps,
+        env.music,
+        env.generation,
+    );
+    std::thread::scope(|scope| {
+        for (worker, (levels, mut chart)) in jobs.into_iter().enumerate() {
+            let send = send.clone();
+            let clock = Arc::clone(&clock);
+            let constraints = env.constraints.clone();
+            let cancellation = cancellation.clone();
+            let seed = &seed;
+            scope.spawn(move || {
+                let mut completed = 0;
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let run = || {
+                        crate::parallel::serial(|| {
+                            let now = || {
+                                f64::from_bits(clock.load(Ordering::Relaxed))
+                                    + origin.elapsed().as_secs_f64() * 1000.0
+                            };
+                            if now() >= seed.deadline
+                                || generation != crate::cancellation_generation()
+                            {
+                                return Ok(search::Output {
+                                    hits: seed.hits.clone(),
+                                    proven: false,
+                                    bound: None,
+                                    stats: search::Stats::default(),
+                                });
+                            }
+                            let mut candidate = |hits: &[Hit]| {
+                                let _ = send.send(Message::Update(NativeLevelUpdate::Candidates(
+                                    hits.to_vec(),
+                                )));
+                            };
+                            let mut progress = |done, _total| {
+                                completed = done;
+                                let _ = send.send(Message::Update(NativeLevelUpdate::Progress(
+                                    worker, done,
+                                )));
+                            };
+                            search_levels(
+                                Input {
+                                    env: Environment {
+                                        master,
+                                        player,
+                                        members,
+                                        snaps,
+                                        music,
+                                        constraints,
+                                        now: &now,
+                                        generation,
+                                    },
+                                    chart: &mut chart,
+                                    seeds: seed.seeds.clone(),
+                                    criterion: Criterion::Max,
+                                    k: seed.k,
+                                    deadline: seed.deadline,
+                                    initial: Vec::new(),
+                                    seed_only: false,
+                                    seed_variant: None,
+                                    defer_scores: false,
+                                    min_combo_bonus: seed.min_combo_bonus,
+                                    seeded: true,
+                                    shard: None,
+                                    floor: seed.floor,
+                                    on_candidate: Some(&mut candidate),
+                                    progress: Some(&mut progress),
+                                },
+                                Some(LevelSchedule {
+                                    levels,
+                                    queue: Some(Arc::clone(&seed.queue)),
+                                }),
+                                &seed.hits,
+                                Some(&seed.bounds),
+                            )
+                        })
+                    };
+                    if let Some(cancellation) = cancellation {
+                        crate::with_cancellation(cancellation, run)
+                    } else {
+                        run()
+                    }
+                }))
+                .unwrap_or_else(|_| Err("native-level-worker-panic".to_owned()));
+                if result.is_err() {
+                    seed.queue.lock().unwrap().clear();
+                }
+                let _ = send.send(Message::Done(worker, completed, result));
+            });
+        }
+        drop(send);
+        let mut outputs = Vec::with_capacity(total);
+        let mut finished = 0;
+        let mut error = None;
+        while finished < total {
+            clock.store(
+                ((env.now)() - origin.elapsed().as_secs_f64() * 1000.0).to_bits(),
+                Ordering::Relaxed,
+            );
+            match receive.recv_timeout(Duration::from_millis(10)) {
+                Ok(Message::Update(value)) => {
+                    if error.is_none() {
+                        if let Err(problem) = update(value) {
+                            error = Some(problem);
+                        }
+                    }
+                }
+                Ok(Message::Done(worker, count, result)) => {
+                    finished += 1;
+                    match result {
+                        Ok(output) => {
+                            if output.proven && error.is_none() {
+                                if let Err(problem) =
+                                    update(NativeLevelUpdate::Progress(worker, count))
+                                {
+                                    error = Some(problem);
+                                }
+                            }
+                            outputs.push(output);
+                        }
+                        Err(problem) => {
+                            if error.is_none() {
+                                error = Some(problem);
+                            }
+                        }
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    error = Some("native-level-worker-disconnected".to_owned());
+                    break;
+                }
+            }
+        }
+        if let Some(error) = error {
+            Err(error)
+        } else {
+            Ok(outputs)
+        }
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn native_level_order(env: &Environment<'_>, bonuses: &[i32], levels: &[i32]) -> Vec<i32> {
+    let maximum = levels.iter().copied().max().unwrap_or(0) as usize;
+    let mut order = levels.to_vec();
+    if maximum > 128 {
+        return order;
+    }
+    let mut groups = std::collections::BTreeMap::<i32, Vec<usize>>::new();
+    for (member, &bonus) in env.members.iter().zip(bonuses) {
+        if bonus >= 0 && bonus as usize <= maximum {
+            groups
+                .entry(member.card.character_id)
+                .or_default()
+                .push(bonus as usize);
+        }
+    }
+    let mut counts = vec![vec![0u64; maximum + 1]; 6];
+    counts[0][0] = 1;
+    for group in groups.values() {
+        for count in (0..5).rev() {
+            for sum in 0..=maximum {
+                let previous = counts[count][sum];
+                if previous == 0 {
+                    continue;
+                }
+                for &bonus in group {
+                    if sum + bonus <= maximum {
+                        counts[count + 1][sum + bonus] =
+                            counts[count + 1][sum + bonus].saturating_add(previous);
+                    }
+                }
+            }
+        }
+    }
+    order.sort_by(|&a, &b| {
+        counts[5][b as usize]
+            .cmp(&counts[5][a as usize])
+            .then(b.cmp(&a))
+    });
+    order
+}
+
 pub fn search(input: Input<'_>) -> Result<search::Output, String> {
+    search_levels(input, None, &[], None)
+}
+
+fn search_levels(
+    input: Input<'_>,
+    selected_levels: Option<LevelSchedule>,
+    initial_scores: &[Hit],
+    shared_bounds: Option<&SharedLevelBounds>,
+) -> Result<search::Output, String> {
+    #[cfg(not(target_arch = "wasm32"))]
+    let whole = selected_levels.is_none();
     let Input {
         mut env,
         chart,
@@ -10332,6 +10581,10 @@ pub fn search(input: Input<'_>) -> Result<search::Output, String> {
     let started = (env.now)();
     let generation = env.generation;
     let mut kernel = Kernel::new(env.master, env.members, env.snaps, chart, seeds, criterion);
+    if let Some(bounds) = shared_bounds {
+        kernel.global_fixed_preparation = bounds.preparation.clone();
+        kernel.global_fixed_luck = bounds.luck.clone();
+    }
     kernel.defer_scores = defer_scores
         && k > 1
         && !kernel.chart.luck
@@ -10380,7 +10633,14 @@ pub fn search(input: Input<'_>) -> Result<search::Output, String> {
             maximum,
         });
     }
-    let levels = reachable_levels(&env, &kernel.bonuses, minimum, kernel.maximum_level);
+    let (levels, work_queue) = if let Some(schedule) = selected_levels {
+        (schedule.levels, schedule.queue)
+    } else {
+        (
+            reachable_levels(&env, &kernel.bonuses, minimum, kernel.maximum_level),
+            None,
+        )
+    };
     let mut stats = search::Stats::default();
     if levels.is_empty() {
         return Ok(search::Output {
@@ -10390,7 +10650,7 @@ pub fn search(input: Input<'_>) -> Result<search::Output, String> {
             stats,
         });
     }
-    let mut hits = Vec::new();
+    let mut hits = initial_scores.to_vec();
     let mut proven = true;
     let mut bound: Option<f64> = None;
     let late = || (env.now)() > deadline || generation != crate::cancellation_generation();
@@ -10786,9 +11046,127 @@ pub fn search(input: Input<'_>) -> Result<search::Output, String> {
             stats,
         });
     }
-    for (index, level) in levels.iter().copied().enumerate() {
+    #[cfg(not(target_arch = "wasm32"))]
+    if whole
+        && shard.is_none()
+        && k == 1
+        && criterion == Criterion::Max
+        && kernel.chart.luck
+        && kernel.seeds.len() >= 16
+        && env.members.len() >= 20
+        && env.constraints.leader.is_none()
+        && levels.len() >= 8
+        && !late()
+    {
+        let workers = std::thread::available_parallelism()
+            .map_or(1, |count| count.get())
+            .min(4);
+        if workers > 1 {
+            let queue = Arc::new(std::sync::Mutex::new(
+                native_level_order(&env, &kernel.bonuses, &levels)
+                    .into_iter()
+                    .collect(),
+            ));
+            let jobs = (0..workers)
+                .map(|_| {
+                    let levels = levels.clone();
+                    kernel
+                        .chart
+                        .converted_judgements(&kernel.chart.judgements)
+                        .map(|chart| (levels, chart))
+                })
+                .collect::<Option<Vec<_>>>();
+            if let Some(jobs) = jobs {
+                hits = kernel.complete_hits(&hits, k)?;
+                let inherited = hits.clone();
+                let _ = Adapter::new(&mut kernel, levels[0], false, false, deadline, env.now);
+                let seed = NativeLevelSeed {
+                    seeds: kernel.seeds.clone(),
+                    k,
+                    deadline,
+                    min_combo_bonus,
+                    floor,
+                    hits: hits.clone(),
+                    queue,
+                    bounds: SharedLevelBounds {
+                        preparation: kernel.global_fixed_preparation.clone(),
+                        luck: kernel.global_fixed_luck.clone(),
+                    },
+                };
+                let mut finished = vec![0; jobs.len()];
+                let outputs = native_levels(&env, jobs, seed, |update| {
+                    match update {
+                        NativeLevelUpdate::Candidates(candidates) => {
+                            for hit in candidates {
+                                offer_scored(&mut kernel, &mut hits, env.members, hit)?;
+                            }
+                            publish(&hits, &mut on_candidate);
+                        }
+                        NativeLevelUpdate::Progress(worker, done) => {
+                            finished[worker] = done;
+                            if let Some(progress) = progress.as_deref_mut() {
+                                progress(finished.iter().sum(), levels.len());
+                            }
+                        }
+                    }
+                    Ok(())
+                })?;
+                let mut candidates = Vec::new();
+                for output in outputs {
+                    stats.add(&output.stats);
+                    if !output.proven {
+                        proven = false;
+                        bound = Some(
+                            bound
+                                .unwrap_or(f64::NEG_INFINITY)
+                                .max(output.bound.unwrap_or(f64::NEG_INFINITY)),
+                        );
+                    }
+                    candidates.extend(output.hits);
+                }
+                candidates.sort_by_key(|hit| {
+                    std::cmp::Reverse(
+                        hit.team
+                            .members
+                            .iter()
+                            .map(|&member| kernel.bonuses[member])
+                            .sum::<i32>(),
+                    )
+                });
+                hits = inherited;
+                for hit in candidates {
+                    offer_scored(&mut kernel, &mut hits, env.members, hit)?;
+                }
+                stats.exact += kernel.exact_calls;
+                stats.elapsed_ms = (env.now)() - started;
+                return Ok(search::Output {
+                    hits: kernel.complete_hits(&hits, k)?,
+                    proven,
+                    bound,
+                    stats,
+                });
+            }
+        }
+    }
+    let mut fixed = levels.iter().copied();
+    let mut completed_levels = 0;
+    let work = std::iter::from_fn(|| {
+        if let Some(queue) = &work_queue {
+            queue.lock().unwrap().pop_front()
+        } else {
+            fixed.next()
+        }
+    });
+    for (index, level) in work.enumerate() {
         if let Some(progress) = progress.as_deref_mut() {
-            progress(index, levels.len());
+            progress(
+                if work_queue.is_some() {
+                    completed_levels
+                } else {
+                    index
+                },
+                levels.len(),
+            );
         }
         if late() {
             proven = false;
@@ -10852,6 +11230,31 @@ pub fn search(input: Input<'_>) -> Result<search::Output, String> {
                 offer_scored(&mut kernel, &mut hits, env.members, hit)?;
             }
         }
+        if out.proven {
+            completed_levels += 1;
+        }
+        if work_queue.is_some() {
+            if let Some(progress) = progress.as_deref_mut() {
+                progress(completed_levels, levels.len());
+            }
+        }
+    }
+    if work_queue.is_some() {
+        hits.sort_by_key(|hit| {
+            let initial = initial_scores.iter().any(|seed| {
+                seed.team.members == hit.team.members && seed.team.snaps == hit.team.snaps
+            });
+            (
+                std::cmp::Reverse(initial),
+                std::cmp::Reverse(
+                    hit.team
+                        .members
+                        .iter()
+                        .map(|&member| kernel.bonuses[member])
+                        .sum::<i32>(),
+                ),
+            )
+        });
     }
     let final_hits = kernel.complete_hits(&hits, k)?;
     stats.exact = kernel.exact_calls;

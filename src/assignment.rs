@@ -110,6 +110,12 @@ pub struct Scratch {
     small_used: Vec<bool>,
 }
 impl Scratch {
+    pub(crate) fn column_prices(&self, columns: usize) -> Vec<f64> {
+        self.v[1..=columns]
+            .iter()
+            .map(|value| (-value).max(0.0))
+            .collect()
+    }
     pub fn maximum(
         &mut self,
         weights: &[Vec<f64>],
@@ -213,6 +219,36 @@ impl Scratch {
         }
         if columns < weights.len() {
             return f64::NEG_INFINITY;
+        }
+        if columns == 5 && weights.len() == 5 {
+            if weights
+                .iter()
+                .any(|row| row[..5].iter().any(|value| !value.is_finite()))
+            {
+                return f64::INFINITY;
+            }
+            let mut dp = [f64::NEG_INFINITY; 32];
+            dp[0] = 0.0;
+            const ROWS: [u8; 32] = {
+                let mut rows = [0; 32];
+                let mut mask = 1usize;
+                while mask < 32 {
+                    rows[mask] = (mask.count_ones() - 1) as u8;
+                    mask += 1;
+                }
+                rows
+            };
+            for mask in 1usize..32 {
+                let row = ROWS[mask] as usize;
+                let mut available = mask;
+                while available != 0 {
+                    let column = available.trailing_zeros() as usize;
+                    available &= available - 1;
+                    dp[mask] =
+                        dp[mask].max((dp[mask ^ (1 << column)] + weights[row][column]).next_up());
+                }
+            }
+            return dp[31];
         }
         if weights.len() <= 5 && columns <= 4096 {
             return self.small::<true>(weights, columns);

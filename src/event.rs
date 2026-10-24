@@ -15,11 +15,13 @@ use std::{
     sync::Arc,
 };
 
+#[derive(Clone)]
 struct CurvePoint {
     x: f64,
     y: f64,
     integer: i128,
 }
+#[derive(Clone)]
 pub(crate) struct RewardCurve {
     points: Vec<CurvePoint>,
     steps: Vec<(f64, f64)>,
@@ -127,7 +129,7 @@ impl RewardCurve {
             error,
         })
     }
-    fn upper(&self, score: f64) -> f64 {
+    pub(crate) fn upper(&self, score: f64) -> f64 {
         let last = self.points.last().unwrap();
         if !score.is_finite() || score >= last.x {
             return last.y;
@@ -142,7 +144,7 @@ impl RewardCurve {
             .next_up()
             .min(last.y)
     }
-    fn required(&self, reward: f64) -> f64 {
+    pub(crate) fn required(&self, reward: f64) -> f64 {
         let reward = (reward - self.error).max(0.0);
         let i = self.points.partition_point(|p| p.y < reward);
         if i == 0 {

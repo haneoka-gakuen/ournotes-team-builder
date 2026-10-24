@@ -134,6 +134,7 @@ pub trait Objective {
         None
     }
     fn prepare_members(&mut self, _characters: &[Vec<usize>]) {}
+    fn prepare_member_domains(&mut self, _power: &[f64], _options: &[Vec<i32>]) {}
     fn member_bound_at(
         &mut self,
         members: &[usize],
@@ -203,6 +204,9 @@ pub trait Objective {
         _limit: f64,
     ) -> Option<f64> {
         None
+    }
+    fn generic_assignment_product(&self) -> bool {
+        true
     }
     fn member_snapshot_prices(&self) -> bool {
         false
@@ -472,6 +476,9 @@ impl BonusSuffix {
 struct BonusBounds {
     target: usize,
     power: BonusSuffix,
+    skill: BonusSuffix,
+    cuts: Vec<BonusSuffix>,
+    columns: Vec<Option<BonusSuffix>>,
 }
 struct Members {
     leader: usize,
@@ -1686,9 +1693,10 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         slot_power: &[f64],
         characters: &[Vec<usize>],
         unpriced: &[f64],
-        lambda: f64,
+        parameters: (f64, f64),
         constant: f64,
     ) -> Option<ColumnCut> {
+        let (lambda, mu) = parameters;
         let mut representatives: Vec<_> = characters
             .iter()
             .filter_map(|group| {
@@ -1701,37 +1709,27 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         representatives.sort_by(|&a, &b| unpriced[b].total_cmp(&unpriced[a]));
         representatives.truncate(4);
         representatives.push(leader);
-        let mut gaps = vec![Vec::new(); self.width - 1];
-        for &member in &representatives {
-            let mut options: Vec<_> = self.options[member]
-                .iter()
-                .map(|&snap| {
-                    (
-                        snap,
-                        self.member_price(member, snap, slot_power, lambda, 0.0),
-                    )
-                })
-                .collect();
-            options.sort_by(|a, b| b.1.total_cmp(&a.1));
-            let Some(&(snap, first)) = options.first() else {
-                continue;
-            };
-            if snap < 0 {
-                continue;
-            }
-            let second = options.get(1).map_or(f64::NEG_INFINITY, |v| v.1);
-            let gap = first - second;
-            if gap.is_finite() && gap > 0.0 {
-                gaps[snap as usize].push(gap);
-            }
-        }
-        let mut prices = vec![0.0; self.width];
-        for (index, values) in gaps.iter_mut().enumerate() {
-            values.sort_by(|a, b| b.total_cmp(a));
-            if let Some(&second) = values.get(1) {
-                prices[index] = second.next_up();
-            }
-        }
+        let columns = self.width - 1 + 5;
+        let matrix: Vec<_> = representatives
+            .iter()
+            .map(|&member| {
+                let mut row = vec![-1e100; columns];
+                for &snap in &self.options[member] {
+                    let value = self.member_price(member, snap, slot_power, lambda, mu);
+                    if snap < 0 {
+                        row[self.width - 1..].fill(value);
+                    } else {
+                        row[snap as usize] = value;
+                    }
+                }
+                row
+            })
+            .collect();
+        let mut matching = Scratch::default();
+        let mut selected = [0; 5];
+        matching.maximum(&matrix, columns, Some(&mut selected));
+        let mut prices = matching.column_prices(columns);
+        prices[self.width - 1..].fill(0.0);
         let price_sum = prices
             .iter()
             .filter(|&&value| value > 0.0)
@@ -1749,7 +1747,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                         } else {
                             snap as usize
                         };
-                        (self.member_price(member, snap, slot_power, lambda, 0.0) - prices[col])
+                        (self.member_price(member, snap, slot_power, lambda, mu) - prices[col])
                             .next_up()
                     })
                     .fold(f64::NEG_INFINITY, f64::max)
@@ -1805,13 +1803,18 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         }
         let spread = (lambda * power + (base + skill) / lambda) / bonus.abs().max(1.0);
         let with_bonus = self.any_snap_bonus || self.member_bonus.iter().any(|&b| b != 0.0);
-        let mus: &[f64] = if with_bonus {
+        let mus: &[f64] = if with_bonus && self.member_bonus_target().is_none() {
             &[0.0, 0.25, 1.0, 4.0]
         } else {
             &[0.0]
         };
         let mut cuts = Vec::new();
-        for scale in [1.0, 0.75, 1.5] {
+        let scales: &[f64] = if self.input.objective.generic_assignment_product() {
+            &[1.0, 0.75, 1.5]
+        } else {
+            &[1.0, 0.75]
+        };
+        for &scale in scales {
             let l = lambda * scale;
             for &factor in mus {
                 let mu = factor * spread;
@@ -1824,8 +1827,8 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                     })
                     .collect();
                 let constant = (base / l).next_up();
-                let column = if mu == 0.0 && self.input.objective.member_snapshot_prices() {
-                    self.column_cut(leader, slot_power, characters, &values, l, constant)
+                let column = if self.input.objective.member_snapshot_prices() {
+                    self.column_cut(leader, slot_power, characters, &values, (l, mu), constant)
                 } else {
                     None
                 };
@@ -1857,11 +1860,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         }
         cuts
     }
-    fn member_bonus_bounds(
-        &self,
-        slot_power: &[f64],
-        characters: &[Vec<usize>],
-    ) -> Option<BonusBounds> {
+    fn member_bonus_target(&self) -> Option<usize> {
         let target = self.input.constraints.max_bonus?;
         if self.any_snap_bonus
             || self.input.constraints.min_bonus != Some(target)
@@ -1874,16 +1873,50 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         {
             return None;
         }
-        let target = target as usize;
+        Some(target as usize)
+    }
+    fn member_bonus_bounds(
+        &self,
+        slot_power: &[f64],
+        characters: &[Vec<usize>],
+        cuts: &[MemberCut],
+    ) -> Option<BonusBounds> {
+        let target = self.member_bonus_target()?;
         let weights: Vec<_> = slot_power
             .iter()
             .enumerate()
             .map(|(member, value)| value + self.best[member].power)
             .collect();
         let power = BonusSuffix::new(characters, &self.member_bonus, &weights, target);
-        Some(BonusBounds { target, power })
+        let weights: Vec<_> = self.best.iter().map(|best| best.weight).collect();
+        let skill = BonusSuffix::new(characters, &self.member_bonus, &weights, target);
+        let tables = cuts
+            .iter()
+            .map(|cut| BonusSuffix::new(characters, &self.member_bonus, &cut.members, target))
+            .collect();
+        let columns = cuts
+            .iter()
+            .map(|cut| {
+                cut.column.as_ref().map(|column| {
+                    BonusSuffix::new(characters, &self.member_bonus, &column.members, target)
+                })
+            })
+            .collect();
+        Some(BonusBounds {
+            target,
+            power,
+            skill,
+            cuts: tables,
+            columns,
+        })
     }
-    fn member_joint_possible(&mut self, m: &Members, from: usize, left: usize) -> bool {
+    fn member_joint_possible(
+        &mut self,
+        m: &Members,
+        from: usize,
+        left: usize,
+        member_bonus: f64,
+    ) -> bool {
         if m.cuts.is_empty() || !self.limit().is_finite() {
             return true;
         }
@@ -1911,13 +1944,29 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             return true;
         };
         let mut upper = [0.0; 12];
+        let remaining = m
+            .bonus_bounds
+            .as_ref()
+            .map(|table| table.target - member_bonus as usize);
         for (i, cut) in m.cuts.iter().enumerate() {
             let sum = m.cut_sums[m.chosen.len()][i];
-            upper[i] = (sum + cut.suffix[from.min(cut.suffix.len() - 1)][left]).next_up();
+            let suffix = if let Some(bonus) = remaining {
+                m.bonus_bounds.as_ref().unwrap().cuts[i].get(from, left, bonus)
+            } else {
+                cut.suffix[from.min(cut.suffix.len() - 1)][left]
+            };
+            upper[i] = (sum + suffix).next_up();
             if let Some(column) = &cut.column {
                 let sum = m.column_sums[m.chosen.len()][i];
-                upper[i] = upper[i]
-                    .min((sum + column.suffix[from.min(column.suffix.len() - 1)][left]).next_up());
+                let suffix = if let Some(bonus) = remaining {
+                    m.bonus_bounds.as_ref().unwrap().columns[i]
+                        .as_ref()
+                        .unwrap()
+                        .get(from, left, bonus)
+                } else {
+                    column.suffix[from.min(column.suffix.len() - 1)][left]
+                };
+                upper[i] = upper[i].min((sum + suffix).next_up());
             }
         }
         targets.iter().any(|&(root, bonus)| {
@@ -1959,7 +2008,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         selected[0] = m.leader;
         selected[1..=m.chosen.len()].copy_from_slice(&m.chosen);
         let chosen = &selected[..m.chosen.len() + 1];
-        let bonus_power = if let Some(table) = &m.bonus_bounds {
+        let (bonus_power, bonus_skill) = if let Some(table) = &m.bonus_bounds {
             if member_part > table.target as f64 {
                 return Ok(());
             }
@@ -1968,9 +2017,15 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             if value == f64::NEG_INFINITY {
                 return Ok(());
             }
-            Some((power + value).next_up())
+            let selected_skill = chosen.iter().fold(0.0, |sum, &member| {
+                (sum + self.best[member].weight).next_up()
+            });
+            (
+                Some((power + value).next_up()),
+                Some((selected_skill + table.skill.get(index, left, bonus)).next_up()),
+            )
         } else {
-            None
+            (None, None)
         };
         if self.input.constraints.member_floor.is_some()
             && !self.member_floor_possible(chosen, left)
@@ -1980,7 +2035,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         if self.timed_out {
             let totals = Totals {
                 power: bonus_power.unwrap_or_else(|| power + top_sum(&m.char_power, index, left)),
-                skill: weight + top_sum(&m.char_skill, index, left),
+                skill: bonus_skill.unwrap_or_else(|| weight + top_sum(&m.char_skill, index, left)),
                 skill_low: 0.0,
                 bonus: bonus + top_sum(&m.char_bonus, index, left),
             };
@@ -1993,7 +2048,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             self.report_pending();
         }
         if left == 0 {
-            if !self.member_joint_possible(m, index, 0) {
+            if !self.member_joint_possible(m, index, 0, member_part) {
                 return Ok(());
             }
 
@@ -2024,14 +2079,14 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             }
             return Ok(());
         }
-        if !self.member_joint_possible(m, index, left) {
+        if !self.member_joint_possible(m, index, left, member_part) {
             return Ok(());
         }
         let bound = self.member_set_bound(
             chosen,
             Totals {
                 power: bonus_power.unwrap_or_else(|| power + top_sum(&m.char_power, index, left)),
-                skill: weight + top_sum(&m.char_skill, index, left),
+                skill: bonus_skill.unwrap_or_else(|| weight + top_sum(&m.char_skill, index, left)),
                 skill_low: 0.0,
                 bonus: (bonus + top_sum(&m.char_bonus, index, left)).min(
                     member_part + top_sum(&m.char_member_bonus, index, left) + self.snap_bonus_top5,
@@ -2212,7 +2267,17 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         let mut table = std::mem::take(&mut self.pools[from]);
         self.tables(&mut table, a, from);
         let power = self.matching.maximum(&table.power, table.columns, None);
-        let skill = self.matching.maximum(&table.weight, table.columns, None);
+        let skill = if self.input.objective.generic_assignment_product() {
+            self.matching.maximum(&table.weight, table.columns, None)
+        } else {
+            table.weight.iter().fold(0.0, |sum, row| {
+                (sum + row[..table.columns]
+                    .iter()
+                    .copied()
+                    .fold(f64::NEG_INFINITY, f64::max))
+                .next_up()
+            })
+        };
         let bonus = if self.any_snap_bonus {
             self.matching.maximum(&table.bonus, table.columns, None)
         } else {
@@ -2223,26 +2288,36 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                 return f64::NEG_INFINITY;
             }
             let order_limit = self.assignment_necessary_limit(a);
-            if self
-                .input
-                .objective
-                .assignment_order_bound(
-                    &a.team,
-                    Totals {
-                        power: totals.power + power,
-                        skill: totals.skill + skill,
-                        skill_low: 0.0,
-                        bonus: totals.bonus + bonus,
-                    },
-                    &a.assigned,
-                    from,
-                    order_limit,
-                )
-                .is_some_and(|bound| {
-                    bound < self.assignment_limit(a) || self.cannot_improve_set(a, bound)
-                })
-            {
+            let objective_bound = self.input.objective.assignment_order_bound(
+                &a.team,
+                Totals {
+                    power: totals.power + power,
+                    skill: totals.skill + skill,
+                    skill_low: 0.0,
+                    bonus: totals.bonus + bonus,
+                },
+                &a.assigned,
+                from,
+                order_limit,
+            );
+            if objective_bound.is_some_and(|bound| {
+                bound < self.assignment_limit(a) || self.cannot_improve_set(a, bound)
+            }) {
                 return f64::NEG_INFINITY;
+            }
+            if !self.input.objective.generic_assignment_product() {
+                return objective_bound.unwrap_or_else(|| {
+                    self.assignment_bound(
+                        a,
+                        Totals {
+                            power: totals.power + power,
+                            skill: totals.skill + skill,
+                            bonus: totals.bonus + bonus,
+                            skill_low: 0.0,
+                        },
+                        from,
+                    )
+                });
             }
             let base = self.input.objective.product_base();
             if self.any_snap_bonus {
@@ -2472,6 +2547,14 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             return Ok(());
         }
         let mut options: Vec<_> = team.iter().map(|&i| self.options[i].clone()).collect();
+        if self.required_snaps.len() == 5 {
+            for list in &mut options {
+                list.retain(|snap| *snap >= 0 && self.required_snaps.contains(&(*snap as usize)));
+                if list.is_empty() {
+                    return Ok(());
+                }
+            }
+        }
         if self.any_snap_bonus && floor.is_finite() {
             let maxima: Vec<_> = options
                 .iter()
@@ -2641,7 +2724,13 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             return Ok(());
         }
         if self.input.objective.linear_assignment().is_some()
-            && a.required_snaps.is_empty()
+            && (a.required_snaps.is_empty()
+                || a.required_snaps.len() == 5
+                    && a.options.iter().all(|choices| {
+                        choices
+                            .iter()
+                            .all(|&snap| snap >= 0 && a.required_snaps.contains(&(snap as usize)))
+                    }))
             && (!self.any_snap_bonus
                 || self.input.constraints.min_bonus.is_none()
                     && self.input.constraints.max_bonus.is_none())
@@ -3635,6 +3724,9 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                     })
                     .collect::<Vec<_>>(),
             );
+            self.input
+                .objective
+                .prepare_member_domains(&slot_power, &self.options);
             self.input.objective.prepare_members(&characters);
             let leader_totals = Totals {
                 power: slot_power[leader] + self.best[leader].power,
@@ -3688,7 +3780,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                     column_sums[0][index] = (column.constant + column.members[leader]).next_up();
                 }
             }
-            let bonus_bounds = self.member_bonus_bounds(&slot_power, &characters);
+            let bonus_bounds = self.member_bonus_bounds(&slot_power, &characters, &cuts);
             let mut members = Members {
                 leader,
                 characters,
