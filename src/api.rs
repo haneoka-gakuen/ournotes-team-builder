@@ -710,6 +710,7 @@ impl Engine {
                 request["members"],
                 request["snaps"],
                 request["unknownPolicy"],
+                request["constraints"],
                 goal["play"]
             ])
             .to_string();
@@ -2508,6 +2509,7 @@ impl Engine {
                 request["snaps"],
                 request["player"],
                 request["unknownPolicy"],
+                request["constraints"],
                 goal
             ])
         });

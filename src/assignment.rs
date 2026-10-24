@@ -262,6 +262,13 @@ impl Scratch {
                     .max(sum::<UPPER>(self.small_values[1], self.small_values[5]))
             };
         }
+        if (1..n).all(|row| {
+            (0..row).all(|previous| self.small_columns[row * 5] != self.small_columns[previous * 5])
+        }) {
+            return (0..n).fold(0.0, |total, row| {
+                sum::<UPPER>(total, self.small_values[row * 5])
+            });
+        }
         fn sum<const UPPER: bool>(a: f64, b: f64) -> f64 {
             if UPPER {
                 (a + b).next_up()

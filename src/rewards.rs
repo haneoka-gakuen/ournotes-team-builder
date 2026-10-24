@@ -2128,7 +2128,6 @@ pub(crate) struct DeterministicBound {
     snapshot_power: Arc<Vec<f64>>,
     snapshot_bonus: Arc<Vec<f64>>,
     converted: f64,
-    profiles: Vec<[f64; 5]>,
     baseline_gains: Vec<f64>,
     width: usize,
     ids: Vec<[u32; 6]>,
@@ -2843,7 +2842,6 @@ impl DeterministicBound {
                 rounding,
             ),
             converted: chart.full.converted as f64,
-            profiles: Vec::new(),
             baseline_gains: Vec::new(),
             width: snaps.len() + 1,
             ids: Vec::new(),
@@ -2929,9 +2927,6 @@ impl DeterministicBound {
                     mul(add(add(add(row[event], gains[c]), extra), pad), rounding)
                 });
                 ids[c] = result.intern(profile);
-                if c == 5 {
-                    result.profiles.push(profile);
-                }
             }
             result.ids.push(ids);
             result.converters.push(converts > 0.0);
@@ -2940,13 +2935,11 @@ impl DeterministicBound {
         let template_converters = std::mem::take(&mut result.converters);
         let template_gains = std::mem::take(&mut result.baseline_gains);
         let template_extras = std::mem::take(&mut result.conversion_extras);
-        result.profiles.clear();
         let physical_rows = prepared.row_ids.len();
         result.ids.reserve(physical_rows);
         result.converters.reserve(physical_rows);
         result.baseline_gains.reserve(physical_rows);
         result.conversion_extras.reserve(physical_rows);
-        result.profiles.reserve(physical_rows);
         for &id in &prepared.row_ids {
             let id = id as usize;
             let rows = template_ids[id];
@@ -2954,7 +2947,6 @@ impl DeterministicBound {
             result.converters.push(template_converters[id]);
             result.baseline_gains.push(template_gains[id]);
             result.conversion_extras.push(template_extras[id]);
-            result.profiles.push(result.shared[rows[capacity] as usize]);
         }
         for templates in &prepared.member_rows {
             let mut ids = [0; 6];
@@ -3391,19 +3383,16 @@ impl DeterministicBound {
             }
         }
         let count = self.width - 1;
-        let columns = count + 5;
         let bad = -1e30;
-        let mut powers = vec![vec![bad; columns]; 5];
-        let mut coefficients = vec![vec![bad; columns]; 5];
-        let mut blended = vec![vec![bad; columns]; 5];
         let mut allowed = Vec::new();
+        let mut active = vec![false; count + 5];
         let c = self
             .assignment_converters
             .iter()
             .filter(|&&yes| yes)
             .count()
             .min(self.capacity);
-        for (slot, &member) in members.iter().enumerate() {
+        for &member in members {
             let mut cells = Vec::new();
             for &snap in self.option_cache[member].as_ref().unwrap() {
                 let p = snapshot_power
@@ -3411,16 +3400,39 @@ impl DeterministicBound {
                 let row =
                     self.shared[self.ids[member * self.width + (snap + 1) as usize][c] as usize];
                 if snap < 0 {
-                    for (column, value) in powers[slot].iter_mut().enumerate().skip(count) {
-                        *value = p;
-                        cells.push((column, p, row));
+                    for (column, used) in active.iter_mut().enumerate().skip(count) {
+                        *used = true;
+                        cells.push((column, p, row, 0.0));
                     }
                 } else {
-                    powers[slot][snap as usize] = p;
-                    cells.push((snap as usize, p, row));
+                    active[snap as usize] = true;
+                    cells.push((snap as usize, p, row, self.snapshot_bonus[snap as usize]));
                 }
             }
             allowed.push(cells);
+        }
+        let mut columns = 0;
+        let column_of: Vec<_> = active
+            .into_iter()
+            .map(|used| {
+                if used {
+                    let column = columns;
+                    columns += 1;
+                    column
+                } else {
+                    usize::MAX
+                }
+            })
+            .collect();
+        let columns = columns.max(5);
+        let mut powers = vec![vec![bad; columns]; 5];
+        let mut coefficients = vec![vec![bad; columns]; 5];
+        let mut blended = vec![vec![bad; columns]; 5];
+        for (slot, cells) in allowed.iter_mut().enumerate() {
+            for (column, power, _, _) in cells {
+                *column = column_of[*column];
+                powers[slot][*column] = *power;
+            }
         }
         let mut matching = crate::assignment::Scratch::default();
         let pcap = add(base_power, matching.maximum_upper(&powers, columns));
@@ -3431,7 +3443,7 @@ impl DeterministicBound {
                 events[slot] = event;
             }
             for slot in 0..5 {
-                for &(column, _, row) in &allowed[slot] {
+                for &(column, _, row, _) in &allowed[slot] {
                     coefficients[slot][column] = row[events[slot]];
                 }
             }
@@ -3445,7 +3457,7 @@ impl DeterministicBound {
             for scale in [1.0, 0.85, 1.15] {
                 let lambda = ratio * scale;
                 for slot in 0..5 {
-                    for &(column, p, row) in &allowed[slot] {
+                    for &(column, p, row, _) in &allowed[slot] {
                         blended[slot][column] = add(mul(lambda, p), up(row[events[slot]] / lambda));
                     }
                 }
@@ -3463,12 +3475,7 @@ impl DeterministicBound {
                     for factor in [0.1, 0.4] {
                         let mu = factor * spread;
                         for slot in 0..5 {
-                            for &(column, p, row) in &allowed[slot] {
-                                let bonus = if column < count {
-                                    self.snapshot_bonus[column]
-                                } else {
-                                    0.0
-                                };
+                            for &(column, p, row, bonus) in &allowed[slot] {
                                 blended[slot][column] = add(
                                     add(mul(lambda, p), up(row[events[slot]] / lambda)),
                                     mul(mu, bonus),
@@ -4067,7 +4074,8 @@ impl DeterministicBound {
         }))
     }
     pub(crate) fn weight(&self, member: usize, snap: i32, mean: bool) -> f64 {
-        let row = &self.profiles[member * self.width + (snap + 1) as usize];
+        let id = self.ids[member * self.width + (snap + 1) as usize][self.capacity];
+        let row = &self.shared[id as usize];
         if mean {
             row.iter().copied().fold(0.0, add) / 5.0
         } else {
@@ -4201,6 +4209,7 @@ pub struct RewardObjective<'a> {
     power_estimate: f64,
     snapshot_power: Arc<Vec<f64>>,
     primary_snap_bonus: Arc<Vec<f64>>,
+    primary_member_bonus: Vec<f64>,
     reward_target: Option<f64>,
     single_lex: bool,
     lex_incumbent: Option<[f64; 3]>,
@@ -4213,7 +4222,7 @@ pub struct RewardObjective<'a> {
     snapshot_bonus_frontier: Vec<Vec<(f64, f64)>>,
     other_members: Vec<f64>,
     other_snaps: Vec<f64>,
-    other_top: Vec<f64>,
+    other_member_top: f64,
     member_suffix: Vec<Vec<f64>>,
     member_combo_caps: Option<Vec<f64>>,
     combo_characters: Vec<Vec<usize>>,
@@ -4232,7 +4241,7 @@ pub struct RewardObjective<'a> {
     combo_bonuses: Option<Vec<i32>>,
     other_suffix: [f64; 6],
     other_ordered: Vec<i32>,
-    contexts: HashMap<RewardContextKey, Arc<RewardContext>>,
+    contexts: HashMap<RewardContextKey, (Arc<RewardContext>, bool)>,
     context_order: VecDeque<(RewardContextKey, usize)>,
     rush_aliases: HashMap<u32, (u32, f64, usize)>,
     projections: HashMap<ProjectionKey, Arc<OrderProjection>>,
@@ -4323,29 +4332,28 @@ impl<'a> RewardObjective<'a> {
                     as f64
             })
             .collect();
-        let mut other_top = other_members.clone();
-        other_top.sort_by(|a, b| b.total_cmp(a));
+        let other_member_top = crate::event::top_character_bonus(members, &other_members);
         let mut snap_top = other_snaps.clone();
         snap_top.sort_by(|a, b| b.total_cmp(a));
         let other_snap_top = snap_top.iter().take(5).sum();
-        let mut member_bonus: Vec<_> = members
+        let primary_member_bonus: Vec<_> = members
             .iter()
             .map(|m| {
                 crate::power::member_event_percent(&route.effects, m, if points { 0 } else { 1 })
                     as f64
             })
             .collect();
-        let mut snap_bonus: Vec<_> = snaps
+        let primary_snap_bonus: Vec<_> = snaps
             .iter()
             .map(|s| {
                 crate::power::snap_event_percent(&route.effects, s, if points { 0 } else { 1 })
                     as f64
             })
             .collect();
-        member_bonus.sort_by(|a, b| b.total_cmp(a));
+        let mut snap_bonus = primary_snap_bonus.clone();
         snap_bonus.sort_by(|a, b| b.total_cmp(a));
-        let bonus_max =
-            member_bonus.iter().take(5).sum::<f64>() + snap_bonus.iter().take(5).sum::<f64>();
+        let bonus_max = crate::event::top_character_bonus(members, &primary_member_bonus)
+            + snap_bonus.iter().take(5).sum::<f64>();
         let combo_bonuses = gekiso
             .setup
             .missions
@@ -4443,18 +4451,7 @@ impl<'a> RewardObjective<'a> {
                 .collect()
         });
         let context_fields = crate::support_aliases::ContextFields::new(master);
-        let primary_snap_bonus = Arc::new(
-            snaps
-                .iter()
-                .map(|snap| {
-                    crate::power::snap_event_percent(
-                        &route.effects,
-                        snap,
-                        if points { 0 } else { 1 },
-                    ) as f64
-                })
-                .collect(),
-        );
+        let primary_snap_bonus = Arc::new(primary_snap_bonus);
         let support_aliases = crate::support_aliases::SupportAliases::new(
             &gekiso.setup.missions,
             snaps,
@@ -4505,6 +4502,7 @@ impl<'a> RewardObjective<'a> {
             power_estimate: 1.0,
             snapshot_power: Arc::new(Vec::new()),
             primary_snap_bonus,
+            primary_member_bonus,
             bound_profiles: HashMap::default(),
             bound_ids: vec![u32::MAX; members.len() * (snaps.len() + 1)],
             reward_target: None,
@@ -4519,7 +4517,7 @@ impl<'a> RewardObjective<'a> {
             snapshot_bonus_frontier: Vec::new(),
             other_members,
             other_snaps,
-            other_top,
+            other_member_top,
             member_suffix: Vec::new(),
             member_combo_caps,
             combo_characters: Vec::new(),
@@ -4636,7 +4634,7 @@ impl<'a> RewardObjective<'a> {
         self.prepare_bonus_ceilings();
     }
     fn prepare_bonus_ceilings(&mut self) {
-        let other_max = self.other_top.iter().take(5).sum::<f64>() + self.other_snap_top;
+        let other_max = self.other_member_top + self.other_snap_top;
         let mut possible = self.ranks.clone();
         let observations = 120.0
             * if self.gekiso.luck {
@@ -4767,7 +4765,7 @@ impl<'a> RewardObjective<'a> {
                 bonus_frontier(available.clone())
             })
             .collect();
-        let maximum = self.other_top.iter().take(5).sum::<f64>() + self.other_snap_top;
+        let maximum = self.other_member_top + self.other_snap_top;
         let (mut low, mut high) = (0i64, maximum as i64);
         while low < high {
             let mid = (low + high) >> 1;
@@ -4788,7 +4786,7 @@ impl<'a> RewardObjective<'a> {
         if let Some(&floor) = self.other_bonus_floors.get(&required.to_bits()) {
             return floor;
         }
-        let maximum = self.other_top.iter().take(5).sum::<f64>() + self.other_snap_top;
+        let maximum = self.other_member_top + self.other_snap_top;
         let value = |bonus| {
             self.ranks
                 .iter()
@@ -6201,11 +6199,9 @@ impl<'a> RewardObjective<'a> {
     fn context_ids(&mut self, ids: [u32; 5], seed: i32) -> Result<Arc<RewardContext>, String> {
         let ids = self.canonical_context_ids(ids);
         let key = (false, seed, ids);
-        if let Some(context) = self.contexts.get(&key).cloned() {
-            let bytes = context.simulation.retained_bytes() + context.rush_support.capacity() + 256;
-            self.context_order.retain(|(previous, _)| previous != &key);
-            self.context_order.push_back((key, bytes));
-            return Ok(context);
+        if let Some((context, used)) = self.contexts.get_mut(&key) {
+            *used = true;
+            return Ok(Arc::clone(context));
         }
         let deck: Vec<_> = ids
             .iter()
@@ -6250,12 +6246,19 @@ impl<'a> RewardObjective<'a> {
                 let Some((old, bytes)) = self.context_order.pop_front() else {
                     break;
                 };
+                if let Some((_, used)) = self.contexts.get_mut(&old) {
+                    if *used {
+                        *used = false;
+                        self.context_order.push_back((old, bytes));
+                        continue;
+                    }
+                }
                 self.contexts.remove(&old);
                 self.context_bytes -= bytes;
             }
             self.context_bytes += bytes;
             self.context_order.push_back((key, bytes));
-            self.contexts.insert(key, Arc::clone(&context));
+            self.contexts.insert(key, (Arc::clone(&context), false));
         }
         context
     }
@@ -6387,6 +6390,13 @@ impl<'a> RewardObjective<'a> {
         if coefficients.is_empty() {
             return;
         }
+        const CAPACITY: usize = 8 * 1024 * 1024;
+        if (coefficients.len() + previous.map_or(0, |p| p.coefficients.len()))
+            * std::mem::size_of::<f64>()
+            > CAPACITY
+        {
+            return;
+        }
         if let Some(previous) = previous {
             coefficients.extend_from_slice(&previous.coefficients);
         }
@@ -6397,18 +6407,22 @@ impl<'a> RewardObjective<'a> {
             rush: 0.0,
             general: 0.0,
         });
+        let bytes = projection.coefficients.capacity() * std::mem::size_of::<f64>();
+        if bytes > CAPACITY {
+            return;
+        }
         if let Some(old) = self.sampled_projections.remove(&key) {
-            self.sampled_projection_bytes -= old.coefficients.len() * std::mem::size_of::<f64>();
+            self.sampled_projection_bytes -=
+                old.coefficients.capacity() * std::mem::size_of::<f64>();
             self.sampled_projection_order.retain(|old| old != &key);
         }
-        let bytes = projection.coefficients.len() * std::mem::size_of::<f64>();
-        while self.sampled_projection_bytes + bytes > 8 * 1024 * 1024 {
+        while self.sampled_projection_bytes + bytes > CAPACITY {
             let Some(old) = self.sampled_projection_order.pop_front() else {
                 break;
             };
             if let Some(old) = self.sampled_projections.remove(&old) {
                 self.sampled_projection_bytes -=
-                    old.coefficients.len() * std::mem::size_of::<f64>();
+                    old.coefficients.capacity() * std::mem::size_of::<f64>();
             }
         }
         self.sampled_projection_bytes += bytes;
@@ -7259,11 +7273,16 @@ impl Objective for RewardObjective<'_> {
         worse: i32,
         delta: f64,
     ) -> bool {
-        if !self.allow_dominance
-            || !self.canonical_slots
-            || self.just_context.is_none()
-            || self.master.live.life_base <= 0.0
-        {
+        if !self.allow_dominance || !self.canonical_slots || self.master.live.life_base <= 0.0 {
+            return false;
+        }
+        let combo = self
+            .gekiso
+            .setup
+            .missions
+            .iter()
+            .all(|&mission| mission == 1);
+        if self.just_context.is_none() && !combo {
             return false;
         }
         let Some(bound) = &self.deterministic else {
@@ -7289,6 +7308,9 @@ impl Objective for RewardObjective<'_> {
         }
         let ai = self.performer_id(member, better);
         let bi = self.performer_id(member, worse);
+        if combo {
+            return ai == bi;
+        }
         self.just_bounds.score_dominates(
             self.master,
             &self.performers[ai as usize],
@@ -7323,6 +7345,13 @@ impl Objective for RewardObjective<'_> {
             return false;
         }
         let just = self.just_reward_enabled();
+        let ordered = just
+            || self
+                .gekiso
+                .setup
+                .missions
+                .iter()
+                .all(|&mission| mission == 1);
         let class = if let Some(&class) = self.member_dominance.get(&(better, worse)) {
             class
         } else {
@@ -7338,7 +7367,7 @@ impl Objective for RewardObjective<'_> {
                 let b = self.slot(worse, snap);
                 if a.signature() != b.signature() {
                     exact = false;
-                    if !just || !crate::just_bound::slot_dominates(&a, &b) {
+                    if !ordered || !crate::just_bound::slot_dominates(&a, &b) {
                         dominates = false;
                         break;
                     }
@@ -7357,10 +7386,10 @@ impl Objective for RewardObjective<'_> {
         match class {
             MemberDominance::Equivalent => true,
             MemberDominance::Stronger => {
-                just && self
-                    .deterministic
-                    .as_ref()
-                    .is_some_and(|bound| power_delta > bound.dominance_margin(self.power_estimate))
+                ordered
+                    && self.deterministic.as_ref().is_some_and(|bound| {
+                        power_delta > bound.dominance_margin(self.power_estimate)
+                    })
             }
             MemberDominance::Different => false,
         }
@@ -7393,24 +7422,13 @@ impl Objective for RewardObjective<'_> {
         )
     }
     fn member_bonus(&self, m: usize) -> f64 {
-        crate::power::member_event_percent(
-            &self.route.effects,
-            &self.members[m],
-            if self.points { 0 } else { 1 },
-        ) as f64
+        self.primary_member_bonus[m]
     }
     fn snap_bonus(&self, s: usize) -> f64 {
-        crate::power::snap_event_percent(
-            &self.route.effects,
-            &self.snaps[s],
-            if self.points { 0 } else { 1 },
-        ) as f64
+        self.primary_snap_bonus[s]
     }
     fn bound(&mut self, t: Totals) -> f64 {
-        self.total_bound(
-            t,
-            self.other_top.iter().take(5).sum::<f64>() + self.other_snap_top,
-        )
+        self.total_bound(t, self.other_member_top + self.other_snap_top)
     }
     fn bonus_floor(&mut self, limit: f64) -> Option<f64> {
         let required = self.reward_target.unwrap_or(limit);
@@ -8091,7 +8109,7 @@ impl Objective for RewardObjective<'_> {
                     .sum::<f64>()
                 + self.other_suffix[from].min(distinct)
         } else {
-            self.other_top.iter().take(5).sum::<f64>() + self.other_snap_top
+            self.other_member_top + self.other_snap_top
         };
         let mut upper = self.projected_bound(t, other, &coefficients);
         if self.below_limit(upper, limit) {

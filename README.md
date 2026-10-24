@@ -76,8 +76,9 @@ Live Top 1 proofs into
 `primary`, `other` and `score`. Later phases take the globally proven reward
 values and a legal incumbent floor. Their results carry the stage name;
 callers report a complete recommendation only after every stage is proven.
-Adjacent phases retain complete settlements for the same inventory, player
-and goal; replacing a chart invalidates this cache.
+Adjacent phases retain complete settlements for the same inventory, player,
+constraints and goal; replacing a chart invalidates this cache. Ordinary score
+contexts also include constraints because filtering can change the card indices.
 Pure JUST compares all three in one traversal;
 other modes search the exact equality groups of the preceding rewards.
 Pure COMBO and pure JUST ties keep the original selected-reward objective,
@@ -203,11 +204,24 @@ trace and price power and score together before snapshot enumeration. Necessary
 badge-bonus floors also constrain the member bounds; excluded snapshot branches
 retain their reward upper certificates. Coarse pure JUST bounds reuse the
 120-order coefficient distribution before preparing joint power/score prices.
-Pure JUST member pruning admits stronger ordinary skills when every snapshot
-has an equivalent normalized Gekisou score program. Replacements within one
-character require a power gain above the native rounding margin.
+Pure JUST and pure COMBO member pruning admit stronger ordinary skills when
+every snapshot has an equivalent normalized Gekisou score program. Pure COMBO
+snapshot pruning uses the same equivalence and native rounding margin.
+Replacements within one character require a power gain above that margin.
 Fully bound fixed-seed teams bypass free-team warm searches and still complete
 the ordinary exact search and proof.
+
+Gekiso reward bonus ceilings count at most one card per character. Reward
+bonuses are resolved once per card, and matching matrices omit snapshot columns
+that no remaining slot can use. Independent best columns settle directly in
+row order with the same outward rounding.
+Search reuses retained member-set keys and per-depth snapshot option buffers.
+Native replay reuses ordering buffers while preserving time, owner and insertion
+indices. Coefficient rows reference their interned templates instead of keeping
+a second physical copy.
+Reward replay contexts use a byte-limited second-chance cache. Sampled projection
+caches count allocated capacity and leave oversized projections uncached; every
+requested seed still participates in the settlement.
 
 Context and coefficient caches are local to the search and retain the skill
 programs, owner attributes and random inputs that can affect their values.

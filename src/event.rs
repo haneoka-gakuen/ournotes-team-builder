@@ -386,7 +386,7 @@ fn top_five(values: impl Iterator<Item = f64>) -> f64 {
     rows.sort_by(|a, b| b.total_cmp(a));
     rows.into_iter().take(5).sum()
 }
-fn top_character_bonus(members: &[Member], values: &[f64]) -> f64 {
+pub(crate) fn top_character_bonus(members: &[Member], values: &[f64]) -> f64 {
     let mut characters = HashMap::<i32, f64>::default();
     for (member, &value) in members.iter().zip(values) {
         characters

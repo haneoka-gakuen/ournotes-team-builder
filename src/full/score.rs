@@ -258,6 +258,8 @@ pub struct Incremental<'a> {
     pub max_frame: usize,
     pub notes: Vec<Vec<NoteCommand>>,
     factors: Vec<Vec<FactorCommand>>,
+    factor_order: Vec<usize>,
+    note_order: Vec<usize>,
     diffs: Vec<Diff>,
     previous: i32,
     added: i32,
@@ -274,6 +276,8 @@ impl<'a> Incremental<'a> {
             max_frame,
             notes: vec![Vec::new(); max_frame],
             factors: vec![Vec::new(); max_frame],
+            factor_order: Vec::new(),
+            note_order: Vec::new(),
             diffs: vec![Diff::default(); max_frame],
             previous: -1,
             added: -1,
@@ -403,10 +407,15 @@ impl<'a> Incremental<'a> {
             }
             return Ok(());
         }
-        let mut factor_order: Vec<_> = (0..fl.len()).collect();
-        factor_order.sort_by_key(|&i| (fl[i].time, fl[i].owner, i));
-        let mut note_order: Vec<_> = (0..nl.len()).collect();
-        note_order.sort_by_key(|&i| (nl[i].time, nl[i].id, i));
+        self.factor_order.clear();
+        self.factor_order.extend(0..fl.len());
+        self.factor_order
+            .sort_unstable_by_key(|&i| (fl[i].time, fl[i].owner, i));
+        self.note_order.clear();
+        self.note_order.extend(0..nl.len());
+        self.note_order
+            .sort_unstable_by_key(|&i| (nl[i].time, nl[i].id, i));
+        let (factor_order, note_order) = (&self.factor_order, &self.note_order);
         let (mut a, mut b) = (0, 0);
         while a < factor_order.len() || b < note_order.len() {
             if a < factor_order.len()
