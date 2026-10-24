@@ -650,27 +650,55 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         let allowed: Vec<_> = (0..s)
             .filter(|j| !excluded_snaps.contains(j) && !input.constraints.no_snaps)
             .collect();
+        let bound_elsewhere: HashSet<_> = input
+            .constraints
+            .bindings
+            .values()
+            .filter(|&&j| j >= 0)
+            .map(|&j| j as usize)
+            .collect();
+        let raw_options: Vec<Vec<i32>> = (0..n)
+            .map(|i| {
+                input.constraints.bindings.get(&i).map_or_else(
+                    || {
+                        allowed
+                            .iter()
+                            .filter(|j| !bound_elsewhere.contains(j))
+                            .map(|&j| j as i32)
+                            .chain(std::iter::once(-1))
+                            .collect()
+                    },
+                    |&bound| {
+                        if bound < 0 || allowed.contains(&(bound as usize)) {
+                            vec![bound]
+                        } else {
+                            Vec::new()
+                        }
+                    },
+                )
+            })
+            .collect();
         let (mut snap_power, mut skill, mut skill_low) = (
             vec![0.0; n * width],
             vec![0.0; n * width],
             vec![0.0; n * width],
         );
         for i in 0..n {
-            for &j in &allowed {
-                snap_power[i * width + j] = power::snap_points(
-                    input.master,
-                    &bases[i],
-                    &input.members[i],
-                    Some(&input.snaps[j]),
-                    snap_event[j],
-                ) as f64;
-                let (low, high) = input.objective.skill(i, j as i32);
-                skill_low[i * width + j] = low;
-                skill[i * width + j] = high;
+            for &j in &raw_options[i] {
+                let col = if j < 0 { s } else { j as usize };
+                if j >= 0 {
+                    snap_power[i * width + col] = power::snap_points(
+                        input.master,
+                        &bases[i],
+                        &input.members[i],
+                        Some(&input.snaps[col]),
+                        snap_event[col],
+                    ) as f64;
+                }
+                let (low, high) = input.objective.skill(i, j);
+                skill_low[i * width + col] = low;
+                skill[i * width + col] = high;
             }
-            let (low, high) = input.objective.skill(i, -1);
-            skill_low[i * width + s] = low;
-            skill[i * width + s] = high;
         }
         let member_bonus: Vec<_> = (0..n).map(|i| input.objective.member_bonus(i)).collect();
         let snap_bonus: Vec<_> = (0..s).map(|i| input.objective.snap_bonus(i)).collect();
@@ -694,35 +722,10 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                 required_snaps.remove(&(snap as usize));
             }
         }
-        let bound_elsewhere: HashSet<_> = input
-            .constraints
-            .bindings
-            .values()
-            .filter(|&&j| j >= 0)
-            .map(|&j| j as usize)
-            .collect();
         let best: Vec<_> = (0..n)
             .map(|i| {
-                let choices = input
-                    .constraints
-                    .bindings
-                    .get(&i)
-                    .map(|&b| {
-                        if b < 0 || allowed.contains(&(b as usize)) {
-                            vec![b]
-                        } else {
-                            Vec::new()
-                        }
-                    })
-                    .unwrap_or_else(|| {
-                        allowed
-                            .iter()
-                            .map(|&j| j as i32)
-                            .chain(std::iter::once(-1))
-                            .collect()
-                    });
                 let mut best = Best::default();
-                for j in choices {
+                for &j in &raw_options[i] {
                     let col = if j < 0 { s } else { j as usize };
                     if col > s {
                         continue;
@@ -772,13 +775,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                         Vec::new()
                     };
                 }
-                let list: Vec<i32> = allowed
-                    .iter()
-                    .copied()
-                    .filter(|j| !bound_elsewhere.contains(j))
-                    .map(|j| j as i32)
-                    .chain(std::iter::once(-1))
-                    .collect();
+                let list = &raw_options[i];
                 let values: Vec<Vec<f64>> = list
                     .iter()
                     .map(|&j| {
@@ -3757,6 +3754,60 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
 pub fn search<O: Objective + ?Sized>(input: Input<'_, O>) -> Result<Output, String> {
     search_at(input, crate::cancellation_generation())
 }
+fn feasible<O: Objective + ?Sized>(input: &Input<'_, O>) -> bool {
+    let c = &input.constraints;
+    if c.leader
+        .is_some_and(|i| i < 0 || i as usize >= input.members.len())
+    {
+        return false;
+    }
+    let required: HashSet<_> = c
+        .required_members
+        .iter()
+        .copied()
+        .chain(c.bindings.keys().copied())
+        .chain(c.leader.map(|i| i as usize))
+        .collect();
+    if required.len() > 5
+        || required
+            .iter()
+            .any(|&i| i >= input.members.len() || c.excluded_members.contains(&i))
+        || required
+            .iter()
+            .map(|&i| input.members[i].card.character_id)
+            .collect::<HashSet<_>>()
+            .len()
+            != required.len()
+        || input
+            .members
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !c.excluded_members.contains(i))
+            .map(|(_, m)| m.card.character_id)
+            .collect::<HashSet<_>>()
+            .len()
+            < 5
+    {
+        return false;
+    }
+    let mut snaps: HashSet<_> = c.required_snaps.iter().copied().collect();
+    let mut bound = HashSet::default();
+    let mut empty = 0;
+    for &snap in c.bindings.values() {
+        if snap == -1 {
+            empty += 1;
+        } else if snap < -1 || !bound.insert(snap as usize) {
+            return false;
+        } else {
+            snaps.insert(snap as usize);
+        }
+    }
+    snaps.len() <= 5 - empty
+        && (!c.no_snaps || snaps.is_empty())
+        && snaps
+            .iter()
+            .all(|&i| i < input.snaps.len() && !c.excluded_snaps.contains(&i))
+}
 pub(crate) fn search_at<O: Objective + ?Sized>(
     input: Input<'_, O>,
     generation: u64,
@@ -3765,6 +3816,14 @@ pub(crate) fn search_at<O: Objective + ?Sized>(
         return Ok(Output {
             hits: Vec::new(),
             proven: false,
+            bound: None,
+            stats: Stats::default(),
+        });
+    }
+    if !feasible(&input) {
+        return Ok(Output {
+            hits: Vec::new(),
+            proven: true,
             bound: None,
             stats: Stats::default(),
         });

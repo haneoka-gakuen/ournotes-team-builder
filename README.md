@@ -51,6 +51,12 @@ alternative cards of their characters before skill bounds are compiled. Five
 fixed members leave only those members in the preparation domain. Conflicting
 constraints still return no legal formation; manual evaluations retain the full
 inventory.
+Five member bindings also restrict preparation to the snapshots those slots
+can use. Search rejects conflicting required characters, reused bound snapshots
+and excess required snapshots before warming
+or expanding branches. Snapshot power and skill rows are priced only for legal
+member/snapshot choices; snapshots reserved by another member do not loosen
+that member's bounds.
 Regional bounds preserve sampled Rush and support joint frequencies and
 condition their envelopes on the number of physical random-effect snapshots.
 Fixed-seed assignment bounds match activation events with the number of

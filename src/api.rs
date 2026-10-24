@@ -517,9 +517,38 @@ fn search_box(master: &Master, request: &Value) -> Result<power::BoxCards, Strin
                 || fixed.len() < 5 && !characters.contains(&m.card.character_id))
     });
     let excluded = keys(&c["excludedSnaps"]);
-    cards
+    let required = if master::rows(&c["bindings"]).len() >= 5 {
+        let resolved = constraints(c, &cards.members, &cards.snaps);
+        (resolved.bindings.len() >= 5).then(|| {
+            resolved
+                .required_snaps
+                .iter()
+                .copied()
+                .chain(
+                    resolved
+                        .bindings
+                        .values()
+                        .filter(|&&s| s >= 0)
+                        .map(|&s| s as usize),
+                )
+                .collect::<std::collections::BTreeSet<_>>()
+        })
+    } else {
+        None
+    };
+    cards.snaps = cards
         .snaps
-        .retain(|s| c["noSnaps"] != true && !excluded.contains(s.key.as_str()));
+        .into_iter()
+        .enumerate()
+        .filter(|(i, s)| {
+            c["noSnaps"] != true
+                && !excluded.contains(s.key.as_str())
+                && required
+                    .as_ref()
+                    .is_none_or(|required| required.contains(i))
+        })
+        .map(|(_, s)| s)
+        .collect();
     Ok(cards)
 }
 impl Engine {
