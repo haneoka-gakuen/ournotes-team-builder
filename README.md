@@ -112,6 +112,15 @@ pruning parameter first. Primary-only bounds prepare the secondary reward when
 its tie phase needs it. Necessary reward-bonus floors
 also constrain physical snapshot matching; unvisited skill orders retain infinite
 upper bounds when the reward curve already proves the roster cannot improve.
+Pure COMBO passes reuse failed assignment bounds for the same members and exact
+snapshot domains at lower power and higher cutoffs. These certificates cover all
+skill orders and the native accumulation error; exact settlements and leader
+orders remain separate. At most 32,768 certificates and 4,096 domain vectors
+are retained, and changing the reward phase clears the certificates. Physical
+matching scratch is reused, and reward floors examine weaker skill orders first.
+Pricing rows retain five distinct witnesses before omitting a snapshot that is
+no better in power, event coefficient and reward bonus. Sparse matching keeps
+the original physical column identities; search options remain complete.
 Pure LUCK recommendations partition snapshot choices by random-effect programs.
 For domains with up to two random-effect snapshots, native traces preserve each
 program and actor order. Previously weak seeds tighten the physical score bounds;

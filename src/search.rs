@@ -166,6 +166,16 @@ pub trait Objective {
     }
     fn prepare_power(&mut self, _snapshots: Arc<Vec<f64>>, _width: usize) {}
     fn prepare_assignment_power(&mut self, _power: f64) {}
+    /// A reused rejection must cover this roster's full snapshot domains at `power`.
+    fn reused_assignment_bound(
+        &mut self,
+        _members: &[usize],
+        _options: &[Vec<i32>],
+        _power: f64,
+        _limit: f64,
+    ) -> Option<f64> {
+        None
+    }
     fn assignment_options(
         &self,
         _members: &[usize],
@@ -2496,6 +2506,14 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                     return Ok(());
                 }
             }
+        }
+        if self
+            .input
+            .objective
+            .reused_assignment_bound(&team, &options, base_power.iter().sum(), required)
+            .is_some_and(|upper| upper < limit || self.cannot_improve(upper))
+        {
+            return Ok(());
         }
         self.input.objective.prepare_assignment(&team, &options);
         let mut used = vec![false; self.input.snaps.len()];

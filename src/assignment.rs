@@ -251,6 +251,43 @@ impl Scratch {
                 self.small_columns[base + k] = c as i32;
             }
         }
+        self.small_result::<UPPER>(n)
+    }
+    pub(crate) fn sparse_upper(&mut self, weights: &[Vec<(usize, f64)>; 5], columns: usize) -> f64 {
+        if columns + 5 > 4096 {
+            return weights.iter().fold(0.0, |sum, row| {
+                (sum + row.iter().map(|cell| cell.1).fold(0.0, f64::max)).next_up()
+            });
+        }
+        if self.small_used.len() < 4096 {
+            self.small_used.resize(4096, false);
+        }
+        for (r, row) in weights.iter().enumerate() {
+            let base = r * 5;
+            for k in 0..5 {
+                self.small_columns[base + k] = (columns + k) as i32;
+                self.small_values[base + k] = -1e30;
+            }
+            for &(column, value) in row {
+                if !value.is_finite() {
+                    return f64::INFINITY;
+                }
+                if value <= self.small_values[base + 4] {
+                    continue;
+                }
+                let mut k = 4;
+                while k > 0 && self.small_values[base + k - 1] < value {
+                    self.small_values[base + k] = self.small_values[base + k - 1];
+                    self.small_columns[base + k] = self.small_columns[base + k - 1];
+                    k -= 1;
+                }
+                self.small_values[base + k] = value;
+                self.small_columns[base + k] = column as i32;
+            }
+        }
+        self.small_result::<true>(5).max(0.0)
+    }
+    fn small_result<const UPPER: bool>(&mut self, n: usize) -> f64 {
         if n == 1 {
             return self.small_values[0];
         }
@@ -290,7 +327,14 @@ impl Scratch {
                 return;
             }
             let upper = (r..n).fold(total, |value, row| {
-                sum::<UPPER>(value, s.small_values[row * 5])
+                let base = row * 5;
+                let first = (0..n)
+                    .find(|&k| {
+                        let column = s.small_columns[base + k];
+                        column >= 0 && !s.small_used[column as usize]
+                    })
+                    .unwrap();
+                sum::<UPPER>(value, s.small_values[base + first])
             });
             if upper <= *best {
                 return;
