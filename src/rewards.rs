@@ -5883,6 +5883,9 @@ pub struct RewardObjective<'a> {
     prefix_mean_targets: HashMap<(u64, u64, u64), f64>,
     reward_target: Option<f64>,
     single_lex: bool,
+    reward_only_ties: bool,
+    tie_other_reward: bool,
+    reward_ties_complete: bool,
     lex_incumbent: Option<[f64; 3]>,
     rank_other: bool,
     other_target: Option<f64>,
@@ -6200,6 +6203,9 @@ impl<'a> RewardObjective<'a> {
             bound_ids: vec![u32::MAX; members.len() * (snaps.len() + 1)],
             reward_target: None,
             single_lex: false,
+            reward_only_ties: false,
+            tie_other_reward: true,
+            reward_ties_complete: false,
             lex_incumbent: None,
             rank_other: false,
             other_target: None,
@@ -6712,16 +6718,35 @@ impl<'a> RewardObjective<'a> {
             .map(|&rank| self.other(bonus, rank))
             .fold(f64::NEG_INFINITY, f64::max)
     }
+    /// Set once before preparing projections or settlement caches.
+    pub(crate) fn set_reward_weights(&mut self, cp: f64, direct: f64) {
+        self.exchange = Some((cp, direct));
+    }
+    pub(crate) fn tie_challenge_points(&mut self) {
+        self.other_exchange = Some((1.0, 0.0));
+    }
+    /// A complete reward prefix may reject equality; a partial prefix requires a strict loss.
+    pub(crate) fn reward_ties(&mut self, incumbent: Option<[f64; 3]>, include_other: bool, complete: bool) {
+        self.single_lex = true;
+        self.reward_only_ties = true;
+        self.tie_other_reward = include_other;
+        self.reward_ties_complete = complete;
+        self.lex_incumbent = incumbent;
+    }
     pub(crate) fn enable_lexicographic(&mut self) -> bool {
         self.single_lex = self.just_reward_enabled();
         self.single_lex
     }
     fn below_limit(&self, upper: f64, limit: f64) -> bool {
         upper < limit || !self.single_lex && upper == limit
+            || self.reward_only_ties && self.lex_incumbent.is_some_and(|best| upper < best[0])
     }
     fn lex_bound(&self, primary: f64, other: f64, mean: f64) -> f64 {
         if let Some(best) = self.lex_incumbent {
-            if primary == best[0] && (other < best[1] || other == best[1] && mean <= best[2]) {
+            let tied_out = if self.reward_only_ties {
+                !self.tie_other_reward || other < best[1] || self.reward_ties_complete && other == best[1]
+            } else { other < best[1] || other == best[1] && mean <= best[2] };
+            if primary == best[0] && tied_out {
                 return primary.next_down();
             }
         }
@@ -7100,7 +7125,7 @@ impl<'a> RewardObjective<'a> {
             Some(_) if self.rank_other => values[1],
             Some(_) => mean(),
             None => {
-                let mean = if self
+                let mean = if !self.reward_only_ties && self
                     .lex_incumbent
                     .is_some_and(|best| values[0] == best[0] && values[1] == best[1])
                 {
@@ -9443,7 +9468,7 @@ impl<'a> RewardObjective<'a> {
         };
         if let Some(info) = projection_info {
             let needs_secondary =
-                self.reward_target.is_some() || self.other_target.is_some() || self.single_lex;
+                self.reward_target.is_some() || self.other_target.is_some() || self.single_lex && (!self.reward_only_ties || self.tie_other_reward);
             let key = (
                 info.ids,
                 self.live_projection_shapes(team),
@@ -9537,7 +9562,8 @@ impl<'a> RewardObjective<'a> {
                     up(add(sums[2], mul(remaining, score_peak)) / runs as f64),
                 ];
                 let required = self.reward_target.unwrap_or(cutoff.unwrap().key);
-                if upper[0] < required
+                if self.lex_bound(upper[0], upper[1], upper[2]) < upper[0]
+                    || upper[0] < required
                     || self.other_target.is_some_and(|target| upper[1] < target)
                     || self.reward_target.is_none()
                         && cutoff.is_some_and(|c| c.prune_equal && upper[0] <= c.key)
@@ -9729,7 +9755,12 @@ impl<'a> RewardObjective<'a> {
                         return Err("gekiso-reward-precision".into());
                     }
                     let upper = numerator / count as f64;
-                    if upper < cutoff.key || (cutoff.prune_equal && upper == cutoff.key) {
+                    let tied_out = self.lex_incumbent.is_some() && {
+                        let secondary = if self.reward_only_ties && !self.tie_other_reward { 0.0 }
+                            else { other_sum + (count - observations) as f64 * self.other_ceiling(power as f64, other_bonus, coefficient) };
+                        safe(secondary) && self.lex_bound(upper, secondary / count as f64, f64::INFINITY) < upper
+                    };
+                    if tied_out || upper < cutoff.key || (cutoff.prune_equal && upper == cutoff.key) {
                         return Ok(None);
                     }
                 }

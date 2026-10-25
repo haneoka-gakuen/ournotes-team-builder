@@ -74,6 +74,11 @@ values, direct rewards and the resolved plan. Top K bounds use the K-th retained
 legal result. Optional `autoCp` values earned CP using the best challenge payout
 under the same first-level reward sum; hosts resolve it once before sharding,
 within the original loading and computation deadline.
+Explicit Gekiso plans reuse support-program domains, complete assignment proofs
+and observed lottery witnesses. Native reward-prefix bounds use the K-th legal
+incumbent and omit score from reward-only ties. CP conversion combines CP with a direct reward in the source settlement within
+its exact integer range; other combined rewards retain rational plan bounds.
+Bonus constraints keep their selected direct-reward currency.
 Legacy event recommendations maximize the selected reward, then the other direct
 reward, then mean score.
 Fractional reward weights retain finite mean-reward bounds. When their binary

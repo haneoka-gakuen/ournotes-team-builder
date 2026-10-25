@@ -106,6 +106,18 @@ impl Plan {
             .find(|term| term.metric != Metric::ChallengePoints)
             .map_or(Metric::Points, |term| term.metric)
     }
+    pub(crate) fn gk_anchor(&self) -> Metric {
+        if self.levels[0].len() == 1 && self.levels[0][0].metric == Metric::ChallengePoints {
+            if let Some(level) = self.levels.get(1) {
+                return if level[0].metric == Metric::Items {
+                    Metric::Points
+                } else {
+                    Metric::Items
+                };
+            }
+        }
+        self.anchor()
+    }
     pub(crate) fn rank(&self, rewards: &[Fraction; 3]) -> Vec<Fraction> {
         self.levels
             .iter()
@@ -123,13 +135,15 @@ impl Plan {
                 level.iter().fold(0.0, |sum, term| {
                     let raw = rewards[term.metric.index()];
                     let product = raw * term.weight as f64;
-                    let product = if raw.fract() == 0.0 && product <= (1u64 << 53) as f64 {
+                    let product = if raw.fract() == 0.0 && product.abs() <= (1u64 << 53) as f64 {
                         product
                     } else {
                         product.next_up()
                     };
                     let total = sum + product;
-                    if sum.fract() == 0.0 && product.fract() == 0.0 && total <= (1u64 << 53) as f64
+                    if sum.fract() == 0.0
+                        && product.fract() == 0.0
+                        && total.abs() <= (1u64 << 53) as f64
                     {
                         total
                     } else {
@@ -223,6 +237,7 @@ impl<'a> Source<'a> {
 
 pub(crate) struct Context<'a> {
     pub plan: Plan,
+    pub source_anchor: Metric,
     pub route: Route,
     pub chart: Option<&'a Chart>,
     pub members: &'a [Member],
@@ -238,6 +253,7 @@ pub(crate) struct Ranked<'a> {
     source: Source<'a>,
     context: Context<'a>,
     anchor: usize,
+    anchor_metric: Metric,
     member_bonus: [Vec<f64>; 2],
     snap_bonus: [Vec<f64>; 2],
     bonus_max: [f64; 2],
@@ -249,13 +265,17 @@ pub(crate) struct Ranked<'a> {
     cap_levels: Vec<Fraction>,
     incumbent: Option<Vec<Fraction>>,
     raw_floor: f64,
+    composite: Option<(u64, u64)>,
+    source_lex: bool,
+    source_incumbent: Option<f64>,
     rounding: f64,
     integer_rewards: bool,
     last: Option<(TeamKey, [f64; 3])>,
 }
 impl<'a> Ranked<'a> {
-    pub(crate) fn new(source: Source<'a>, context: Context<'a>) -> Self {
-        let anchor = usize::from(context.plan.anchor() == Metric::Items);
+    pub(crate) fn new(mut source: Source<'a>, context: Context<'a>) -> Self {
+        let anchor_metric = context.source_anchor;
+        let anchor = usize::from(anchor_metric == Metric::Items);
         let member_bonus = std::array::from_fn(|kind| {
             context
                 .members
@@ -308,16 +328,94 @@ impl<'a> Ranked<'a> {
         }
         let caps = units.map(|value| Fraction::new(value, 10_000));
         let cap_levels = context.plan.rank(&caps);
-        let fractional = anchor == 1 && context.route.fractional_items();
+        let own = context.plan.levels[0]
+            .iter()
+            .find(|term| term.metric == anchor_metric);
+        let cp = context.plan.levels[0]
+            .iter()
+            .find(|term| term.metric == Metric::ChallengePoints);
+        let cp_only = context.plan.levels[0].len() == 1 && cp.is_some();
+        let mut composite = None;
+        let mut source_cap = caps[anchor_metric.index()].upper();
+        if let (Source::Gekiso(inner), Some(cp)) = (&mut source, cp) {
+            if own.is_some() || cp_only {
+                let own_weight = own.map_or(0, |term| term.weight);
+                let cap = ((source_cap * own_weight as f64).next_up()
+                    + (caps[1].upper() * cp.weight as f64).next_up())
+                .next_up();
+                if (cap * context.observations as f64).next_up() <= (1u64 << 52) as f64 {
+                    inner.set_reward_weights(cp.weight as f64, own_weight as f64);
+                    composite = Some((cp.weight, own_weight));
+                    source_cap = cap;
+                }
+            }
+        }
+        let cp_tie = context
+            .plan
+            .levels
+            .get(1)
+            .is_some_and(|level| level[0].metric == Metric::ChallengePoints);
+        if cp_tie {
+            if let Source::Gekiso(inner) = &mut source {
+                inner.tie_challenge_points();
+            }
+        }
+        let secondary_matches = context.plan.levels.get(1).is_none_or(|level| {
+            level[0].metric == Metric::ChallengePoints
+                || level[0].metric
+                    == if anchor_metric == Metric::Points {
+                        Metric::Items
+                    } else {
+                        Metric::Points
+                    }
+        });
+        let secondary_metric = if cp_tie {
+            Metric::ChallengePoints
+        } else if anchor_metric == Metric::Points {
+            Metric::Items
+        } else {
+            Metric::Points
+        };
+        let prefix_items = context
+            .plan
+            .levels
+            .iter()
+            .take(2)
+            .flatten()
+            .any(|term| term.metric == Metric::Items);
+        let lex_precision = (source_cap * context.observations as f64).next_up()
+            <= (1u64 << 52) as f64
+            && context.plan.levels.get(1).is_none_or(|_| {
+                (caps[secondary_metric.index()].upper() * context.observations as f64).next_up()
+                    <= (1u64 << 52) as f64
+            })
+            && (!prefix_items || !context.route.fractional_items());
+        let source_lex = matches!(source, Source::Gekiso(_))
+            && lex_precision
+            && secondary_matches
+            && (context.plan.levels[0].len() == 1 && (own.is_some() || composite.is_some())
+                || composite.is_some() && context.plan.levels[0].len() == 2);
+        if source_lex {
+            if let Source::Gekiso(inner) = &mut source {
+                inner.reward_ties(
+                    None,
+                    context.plan.levels.len() > 1,
+                    context.plan.levels.len() <= 2,
+                );
+            }
+        }
+        let fractional = anchor == 1
+            && !composite.is_some_and(|(_, own)| own == 0)
+            && context.route.fractional_items();
         let steps = (context.observations as f64 * 8.0 + 1024.0) * f64::EPSILON;
-        let rounding = caps[if anchor == 0 { 0 } else { 2 }].upper() * steps / (1.0 - steps);
-        let integer_rewards = !fractional
-            && caps[if anchor == 0 { 0 } else { 2 }].upper() * context.observations as f64
-                <= (1u64 << 53) as f64;
+        let rounding = source_cap * steps / (1.0 - steps);
+        let integer_rewards =
+            !fractional && source_cap * context.observations as f64 <= (1u64 << 53) as f64;
         let mut result = Self {
             source,
             context,
             anchor,
+            anchor_metric,
             member_bonus,
             snap_bonus,
             bonus_max,
@@ -329,6 +427,9 @@ impl<'a> Ranked<'a> {
             cap_levels,
             incumbent: None,
             raw_floor: f64::NEG_INFINITY,
+            composite,
+            source_lex,
+            source_incumbent: None,
             rounding,
             integer_rewards,
             last: None,
@@ -386,6 +487,11 @@ impl<'a> Ranked<'a> {
             .fold(2, i32::max)
     }
     fn raw_upper(&mut self, totals: Totals, bonuses: [f64; 2], anchor_upper: f64) -> [f64; 3] {
+        if self.source_lex && self.source_incumbent.is_some_and(|key| anchor_upper < key) {
+            let mut result = [0.0; 3];
+            result[self.context.plan.levels[0][0].metric.index()] = f64::NEG_INFINITY;
+            return result;
+        }
         let rank = self.rank_cap(self.source.score_upper(totals));
         let mut result = [0.0_f64; 3];
         for (kind, &bonus) in bonuses.iter().enumerate() {
@@ -417,6 +523,20 @@ impl<'a> Ranked<'a> {
         } else {
             (anchor_upper + self.rounding).next_up()
         };
+        let source = if let Some((cp, own)) = self.composite {
+            if own == 0 {
+                let cp_bound = source / cp as f64;
+                result[1] = result[1].min(if cp_bound.fract() == 0.0 {
+                    cp_bound
+                } else {
+                    cp_bound.next_up()
+                });
+                return result;
+            }
+            ((source - (result[1] * cp as f64).next_down()).next_up() / own as f64).next_up()
+        } else {
+            source
+        };
         result[at] = result[at].min(source);
         result
     }
@@ -438,17 +558,25 @@ impl<'a> Ranked<'a> {
         values[0]
     }
     fn primary_floor(&self, value: f64) -> f64 {
-        let level = &self.context.plan.levels[0];
-        let Some(own) = level
-            .iter()
-            .find(|term| term.metric == self.context.plan.anchor())
-        else {
-            return f64::NEG_INFINITY;
-        };
         if !value.is_finite() {
             return f64::NEG_INFINITY;
         }
         let Some(value) = Fraction::from_value(value.next_down()) else {
+            return f64::NEG_INFINITY;
+        };
+        let level = &self.context.plan.levels[0];
+        if self.composite.is_some() {
+            let others = level
+                .iter()
+                .filter(|term| {
+                    term.metric != self.anchor_metric && term.metric != Metric::ChallengePoints
+                })
+                .fold(BigRational::zero(), |sum, term| {
+                    sum + &self.caps[term.metric.index()].0 * BigInt::from(term.weight)
+                });
+            return Fraction(value.0 - others).lower() - self.rounding;
+        }
+        let Some(own) = level.iter().find(|term| term.metric == self.anchor_metric) else {
             return f64::NEG_INFINITY;
         };
         let others = level
@@ -464,11 +592,12 @@ impl<'a> Ranked<'a> {
         let Some(incumbent) = &self.incumbent else {
             return;
         };
+        if self.composite.is_some() {
+            self.raw_floor = self.raw_floor.max(self.primary_floor(incumbent[0].lower()));
+            return;
+        }
         for (index, level) in self.context.plan.levels.iter().enumerate() {
-            if let Some(own) = level
-                .iter()
-                .find(|term| term.metric == self.context.plan.anchor())
-            {
+            if let Some(own) = level.iter().find(|term| term.metric == self.anchor_metric) {
                 let others = level
                     .iter()
                     .filter(|term| term.metric != own.metric)
@@ -656,9 +785,30 @@ impl Objective for Ranked<'_> {
         compare(&a.detail["rewardRanking"], &b.detail["rewardRanking"])
     }
     fn observe_hits(&mut self, hits: &[Hit]) {
-        self.incumbent = hits
-            .get(self.context.k - 1)
-            .and_then(|hit| ranking(&hit.detail["rewardRanking"]));
+        if let Some(hit) = hits.first() {
+            let mut source_hit = hit.clone();
+            source_hit.key = hit.detail["settlement"]["mean"].as_f64().unwrap_or(hit.key);
+            self.source.objective().observe_hit(&source_hit);
+        }
+        let kth = hits.get(self.context.k - 1);
+        self.incumbent = kth.and_then(|hit| ranking(&hit.detail["rewardRanking"]));
+        if self.source_lex {
+            let incumbent = kth.map(|hit| {
+                [
+                    hit.detail["settlement"]["mean"].as_f64().unwrap(),
+                    hit.detail["settlement"]["otherMean"].as_f64().unwrap(),
+                    hit.detail["scores"]["mean"].as_f64().unwrap(),
+                ]
+            });
+            self.source_incumbent = incumbent.map(|row| row[0]);
+            if let Source::Gekiso(source) = &mut self.source {
+                source.reward_ties(
+                    incumbent,
+                    self.context.plan.levels.len() > 1,
+                    self.context.plan.levels.len() <= 2,
+                );
+            }
+        }
         self.update_floor();
     }
     fn seed_ceiling(&self) -> f64 {
@@ -674,10 +824,7 @@ impl Objective for Ranked<'_> {
                 if values[index] != self.cap_levels[index] {
                     return false;
                 }
-                if level
-                    .iter()
-                    .any(|term| term.metric == self.context.plan.anchor())
-                {
+                if level.iter().any(|term| term.metric == self.anchor_metric) {
                     return true;
                 }
             }
@@ -893,6 +1040,53 @@ impl Objective for Ranked<'_> {
         self.source.objective().prepare_assignment(members, options);
         self.prepare_choices(options);
     }
+    fn assignment_domains(
+        &mut self,
+        members: &[usize],
+        options: &[Vec<i32>],
+    ) -> Option<Vec<Vec<Vec<i32>>>> {
+        self.source.objective().assignment_domains(members, options)
+    }
+    fn assignment_options(
+        &self,
+        members: &[usize],
+        assigned: &[i32],
+        from: usize,
+        _limit: f64,
+    ) -> Option<Vec<i32>> {
+        self.source
+            .view()
+            .assignment_options(members, assigned, from, self.raw_floor)
+    }
+    fn reused_assignment_bound(
+        &mut self,
+        members: &[usize],
+        options: &[Vec<i32>],
+        power: f64,
+        _limit: f64,
+    ) -> Option<f64> {
+        let raw = self.source.objective().reused_assignment_bound(
+            members,
+            options,
+            power,
+            self.raw_floor,
+        )?;
+        let bonuses = std::array::from_fn(|kind| {
+            members
+                .iter()
+                .map(|&member| self.member_bonus[kind][member])
+                .sum::<f64>()
+                + self.snap_top[kind]
+        });
+        let totals = Totals {
+            power,
+            skill: f64::INFINITY,
+            bonus: bonuses[self.anchor],
+            ..Totals::default()
+        };
+        let rewards = self.raw_upper(totals, bonuses, raw);
+        Some(self.upper(rewards))
+    }
     fn prepare_assignment_domain(
         &mut self,
         members: &[usize],
@@ -956,7 +1150,8 @@ impl Objective for Ranked<'_> {
     fn interval(&mut self, team: &Team, totals: Totals) -> (f64, f64) {
         let (_, raw) = self.source.objective().interval(team, totals);
         let rewards = self.team_upper(team, totals, raw);
-        (0.0, self.upper(rewards))
+        let upper = self.upper(rewards);
+        (upper.min(0.0), upper)
     }
     fn exact(&mut self, team: &Team, power: f64, slots: &[f64]) -> Result<Exact, String> {
         let result = self.source.objective().exact(team, power, slots)?;
@@ -1015,8 +1210,14 @@ impl Objective for Ranked<'_> {
         )? {
             Evaluation::Exact(result) => self.finish(team, result).map(Evaluation::Exact),
             Evaluation::Pruned(raw) => {
-                let mut rewards = rewards;
-                rewards[if self.anchor == 0 { 0 } else { 2 }] = raw + self.rounding;
+                let bonuses = self.bonuses(&team.members, &team.snaps, 5);
+                let totals = Totals {
+                    power,
+                    skill: f64::INFINITY,
+                    bonus: bonuses[self.anchor],
+                    ..Totals::default()
+                };
+                let rewards = self.raw_upper(totals, bonuses, raw);
                 let upper = self.upper(rewards);
                 if upper < cutoff.key {
                     Ok(Evaluation::Pruned(upper))

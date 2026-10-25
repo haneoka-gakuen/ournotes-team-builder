@@ -84,9 +84,6 @@ pub fn validate(master: &Master, request: &Value) -> Result<Vec<String>, String>
             checked["goal"].as_object_mut().unwrap().remove("rewardPlan");
             checked["goal"]["measure"] = serde_json::json!(if metric == Metric::Points { "points" } else { "items" });
             checked["k"] = serde_json::json!(1);
-            if !goal["gekiso"].is_null() && master::int(&goal["gekiso"]["luckSamples"]) == 0 {
-                checked["goal"]["gekiso"]["luckSamples"] = serde_json::json!(1);
-            }
             if plan.uses(Metric::ChallengePoints) && goal["route"] == "live" {
                 checked["goal"]["cpExchange"] = serde_json::json!({"numerator":0,"denominator":1});
             }

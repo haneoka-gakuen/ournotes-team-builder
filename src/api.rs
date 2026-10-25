@@ -1931,7 +1931,7 @@ impl Engine {
                 Box::new(Ranked::new(Source::Ordinary(Box::new(EventObjective::new(
                     &self.master, &cards.members, &cards.snaps, chart, route.clone(),
                     plan.anchor() == Metric::Points, &goal["play"], true, 0.0, None, score_cap,
-                ))), Context { plan: plan.clone(), route: route.clone(), chart, members: &cards.members,
+                ))), Context { plan: plan.clone(), source_anchor: plan.anchor(), route: route.clone(), chart, members: &cards.members,
                     snaps: &cards.snaps, k, floor: f64::NEG_INFINITY, skip_rank: self.master.params.skip_rank, observations: 120 }))
             } else if cp_measure {
                 Box::new(ChallengePoints::new(
@@ -2684,8 +2684,11 @@ impl Engine {
             RouteKind::Live,
             master::int(&goal["consumption"]),
         )?;
-        let points = if goal["rewardPlan"].is_null() { goal["measure"] != "items" }
-            else { crate::reward_plan::Plan::parse(&goal["rewardPlan"])?.anchor() == crate::reward_plan::Metric::Points };
+        let reward_plan = (!goal["rewardPlan"].is_null()).then(|| crate::reward_plan::Plan::parse(&goal["rewardPlan"])).transpose()?;
+        let source_anchor = reward_plan.as_ref().map_or_else(
+            || if goal["measure"] == "items" { crate::reward_plan::Metric::Items } else { crate::reward_plan::Metric::Points },
+            |plan| if constraints.min_bonus.is_some() || constraints.max_bonus.is_some() { plan.anchor() } else { plan.gk_anchor() });
+        let points = source_anchor == crate::reward_plan::Metric::Points;
         let bonus_type = if points { 0 } else { 1 };
         let exchange = if !goal["rewardPlan"].is_null() || goal["cpExchange"].is_null() {
             None
@@ -2751,12 +2754,11 @@ impl Engine {
                 master::int(&request["shard"]["count"]) as usize,
             ))
         };
-        if !goal["rewardPlan"].is_null() {
+        if let Some(plan) = reward_plan {
             use crate::reward_plan::{Context, Ranked, Source};
-            let plan = crate::reward_plan::Plan::parse(&goal["rewardPlan"])?;
             let k = master::number(&request["k"], 1.0).max(1.0) as usize;
             let mut objective = Ranked::new(Source::Gekiso(Box::new(objective)), Context {
-                plan, route, chart: Some(chart), members: &cards.members, snaps: &cards.snaps, k,
+                plan, source_anchor, route, chart: Some(chart), members: &cards.members, snaps: &cards.snaps, k,
                 floor: f64::NEG_INFINITY, skip_rank: self.master.params.skip_rank,
                 observations: 120 * master::int(&goal["gekiso"]["luckSamples"]).max(1) as usize,
             });
