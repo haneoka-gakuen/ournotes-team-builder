@@ -1,5 +1,14 @@
 //! Reusable maximum-weight matching scratch, including the small top-column
 //! search used by the website for up to five remaining snap slots.
+pub(crate) const SLOT_MASKS: [&[usize]; 6] = [
+    &[0],
+    &[1, 2, 4, 8, 16],
+    &[3, 5, 6, 9, 10, 12, 17, 18, 20, 24],
+    &[7, 11, 13, 14, 19, 21, 22, 25, 26, 28],
+    &[15, 23, 27, 29, 30],
+    &[31],
+];
+
 pub(crate) fn flagged_capacity(flags: &[Vec<bool>]) -> usize {
     let mut reachable = 1u32;
     for column in 0..flags[0].len() {

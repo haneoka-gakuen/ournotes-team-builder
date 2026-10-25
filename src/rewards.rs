@@ -2498,23 +2498,26 @@ impl PrefixMeanPricing {
             .collect()
     }
     fn mean(&self, sums: &[f64], bonus: f64) -> f64 {
-        self.planes
+        let minimum = self
+            .planes
             .iter()
             .zip(sums)
-            .fold(f64::INFINITY, |upper, (plane, &sum)| {
+            .fold(f64::INFINITY, |minimum, (plane, &sum)| {
                 let total = (sum - (plane.mu * bonus).next_down()).next_up().max(0.0);
-                upper.min(up(mul(total, total) / (4.0 * self.converted)))
-            })
+                minimum.min(total)
+            });
+        up(mul(minimum, minimum) / (4.0 * self.converted))
     }
 }
 impl JointRewardRow {
     fn upper(&self, bonus: f64, converted: f64) -> f64 {
-        let mut upper = self.ceiling;
+        let mut minimum = f64::INFINITY;
         for &(constant, mu) in &self.prices {
             let total = (constant - (mu * bonus).next_down()).next_up().max(0.0);
-            upper = upper.min(up(mul(total, total) / (4.0 * converted)));
+            minimum = minimum.min(total);
         }
-        upper
+        self.ceiling
+            .min(up(mul(minimum, minimum) / (4.0 * converted)))
     }
 }
 struct JointRewardPricing {
@@ -2698,10 +2701,7 @@ impl RosterSuffix {
                     .enumerate()
                     .skip(parent.map_or(0, |_| count - 1))
                 {
-                    for mask in (0usize..32)
-                        .rev()
-                        .filter(|mask| mask.count_ones() as usize == slot)
-                    {
+                    for &mask in crate::assignment::SLOT_MASKS[slot] {
                         if dp[mask] == f64::NEG_INFINITY {
                             continue;
                         }
@@ -2723,11 +2723,8 @@ impl RosterSuffix {
             }
             let table = self.tables[plane].as_ref().unwrap();
             let mut variable = f64::NEG_INFINITY;
-            for mask in 0usize..32 {
-                if mask.count_ones() as usize == count
-                    && dp[mask] != f64::NEG_INFINITY
-                    && table[at][31 ^ mask] != f64::NEG_INFINITY
-                {
+            for &mask in crate::assignment::SLOT_MASKS[count] {
+                if dp[mask] != f64::NEG_INFINITY && table[at][31 ^ mask] != f64::NEG_INFINITY {
                     variable = variable.max((dp[mask] + table[at][31 ^ mask]).next_up());
                 }
             }
@@ -2827,7 +2824,7 @@ struct MemberPricingDomain<'a> {
 }
 impl MemberRewardPricing {
     fn mean(&self, members: &[usize], from: usize, floor: f64) -> f64 {
-        let mut upper = f64::INFINITY;
+        let mut minimum = f64::INFINITY;
         for plane in &self.planes {
             let mut sum = plane.constant;
             for &member in members {
@@ -2836,11 +2833,10 @@ impl MemberRewardPricing {
             sum = (sum + plane.mean_suffix[from][5 - members.len()]).next_up();
             sum = (sum - (plane.mu * floor).next_down()).next_up();
             if sum.is_finite() {
-                let sum = sum.max(0.0);
-                upper = upper.min(up(mul(sum, sum) / (4.0 * self.converted)));
+                minimum = minimum.min(sum.max(0.0));
             }
         }
-        upper
+        up(mul(minimum, minimum) / (4.0 * self.converted))
     }
     fn sums(&self, members: &[usize], from: usize) -> Vec<f64> {
         let mut prefixes = self.prefixes.lock().unwrap();
@@ -2898,15 +2894,14 @@ impl MemberRewardPricing {
             .collect();
         let mut scores = Vec::with_capacity(count);
         for row in sums.chunks_exact(self.planes.len()) {
-            let mut upper = f64::INFINITY;
+            let mut minimum = f64::INFINITY;
             for (&deduction, &sum) in deductions.iter().zip(row) {
                 let sum = (sum - deduction).next_up();
                 if sum.is_finite() {
-                    let sum = sum.max(0.0);
-                    upper = upper.min(up(mul(sum, sum) / (4.0 * self.converted)));
+                    minimum = minimum.min(sum.max(0.0));
                 }
             }
-            scores.push(upper);
+            scores.push(up(mul(minimum, minimum) / (4.0 * self.converted)));
         }
         scores
     }

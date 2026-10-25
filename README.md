@@ -255,6 +255,10 @@ Reward coefficient bounds, deterministic templates and healthy-play normalizatio
 share the same raw inventory skill table. Bound team evaluations keep their direct
 bindings, and normalized rows remain owned by each reward objective.
 
+Five-slot roster prefixes visit only masks of the required cardinality. Reward
+pricing first takes the smallest nonnegative plane sum, then applies the common
+monotone square/division once; each plane retains its original outward rounding.
+
 Member reward pricing retains one outward-rounded prefix per roster depth and
 reuses its parent event assignments. Suffix bounds keep their current character
 position, and each pricing plane prepares its bonus deduction once per score
