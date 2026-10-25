@@ -1303,6 +1303,25 @@ fn score_orders_selected(
         );
     }
     let generation = crate::cancellation_generation();
+    // Full single-seed plays can reuse the sparse note states used for multiple draws.
+    if chart.luck
+        && selected.is_none()
+        && ctx.seeds == 1
+        && ctx.nominal.is_none()
+        && master.live.life_base > 0.0
+    {
+        if let Some(plan) = NoteScorePlan::new(chart, slots) {
+            if generation != crate::cancellation_generation() {
+                return Err("cancelled".into());
+            }
+            if let Some(scores) = plan.score(master, chart, ctx, power)? {
+                if generation != crate::cancellation_generation() {
+                    return Err("cancelled".into());
+                }
+                return Ok(scores);
+            }
+        }
+    }
     let n = chart.notes.len();
     let t = f(f(master.live.adjustment * power as f64) * chart.difficulty_factor);
     let count = chart.full.converted as f64;
@@ -1774,11 +1793,57 @@ fn replay_orders_observed(
     } else {
         seeds.to_vec()
     };
+    let orders: Vec<_> = (0..live::orders().len()).collect();
+    let Some(values) = replay_selected_orders(master, chart, deck, &runs, power, &orders, observe)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(ReplayedScores {
+        scores: live::summarize(power, values.iter().map(|value| value.0).collect()),
+        range_scores: std::array::from_fn(|range| {
+            values.iter().map(|value| value.1[range]).sum::<f64>() / values.len() as f64
+        }),
+    }))
+}
+
+/// Complete only the requested deterministic orders, in the caller's order.
+/// The same native replay tree handles both subsets and full seeded replays.
+pub(crate) fn replay_order_subset(
+    master: &Master,
+    chart: &Chart,
+    deck: &[Performer],
+    power: i32,
+    orders: &[usize],
+) -> Result<Vec<ReplayValue>, String> {
+    if deck.len() != 5 {
+        return Err("a team requires five performers".into());
+    }
+    if chart.luck {
+        return Err("order completion requires a non-LUCK chart".into());
+    }
+    replay_selected_orders(master, chart, deck, &[0], power, orders, None).map(Option::unwrap)
+}
+
+fn replay_selected_orders(
+    master: &Master,
+    chart: &Chart,
+    deck: &[Performer],
+    runs: &[i32],
+    power: i32,
+    orders: &[usize],
+    observe: Option<&(dyn Fn(f64, usize) -> bool + Sync)>,
+) -> Result<Option<Vec<ReplayValue>>, String> {
+    if orders.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
     let generation = crate::cancellation_generation();
     let mut event_orders = Vec::new();
-    let mut indices = Vec::with_capacity(120);
+    let mut indices = Vec::with_capacity(orders.len());
     let mut cache = HashMap::default();
-    for order in live::orders() {
+    for &order_index in orders {
+        let order = live::orders()
+            .get(order_index)
+            .ok_or_else(|| format!("ordinary skill order {order_index} out of range"))?;
         let events = chart
             .full
             .events
@@ -1835,7 +1900,7 @@ fn replay_orders_observed(
     };
     let batches = crate::parallel::map(&jobs, |orders| -> Result<_, String> {
         let mut totals = vec![(0.0, [0.0; 3]); event_orders.len()];
-        for &seed in &runs {
+        for &seed in runs {
             let mut params = chart.params();
             params.power = power;
             params.music_type = chart.music_type;
@@ -1885,14 +1950,7 @@ fn replay_orders_observed(
             replays[order] = value;
         }
     }
-    let scores = indices.iter().map(|&i| replays[i].0).collect();
-    let range_scores = std::array::from_fn(|range| {
-        indices.iter().map(|&i| replays[i].1[range]).sum::<f64>() / indices.len() as f64
-    });
-    Ok(Some(ReplayedScores {
-        scores: live::summarize(power, scores),
-        range_scores,
-    }))
+    Ok(Some(indices.iter().map(|&i| replays[i]).collect()))
 }
 
 pub(crate) fn settle_extreme(

@@ -251,7 +251,11 @@ pub struct Life {
     limits: BTreeMap<i32, i32>,
     limit_counter: i32,
     frames: usize,
+    // The measured WASM hot path uses compact ordered buckets; native keeps its tree.
+    #[cfg(not(target_arch = "wasm32"))]
     commands: BTreeMap<usize, Vec<Command>>,
+    #[cfg(target_arch = "wasm32")]
+    commands: Vec<(usize, Vec<Command>)>,
     cached_frame: i32,
     cached: [i32; 3],
 }
@@ -270,7 +274,10 @@ impl Life {
             limits: BTreeMap::new(),
             limit_counter: 0,
             frames: length,
+            #[cfg(not(target_arch = "wasm32"))]
             commands: BTreeMap::new(),
+            #[cfg(target_arch = "wasm32")]
+            commands: Vec::new(),
             cached_frame: -1,
             cached: [0; 3],
         }
@@ -281,9 +288,29 @@ impl Life {
     fn frame_of(&self, time: i32) -> usize {
         (frame(time) as usize).min(self.frames - 1)
     }
+    #[cfg(not(target_arch = "wasm32"))]
     fn add(&mut self, command: Command) {
         let frame = self.frame_of(command.time);
         let commands = self.commands.entry(frame).or_default();
+        let at = commands.partition_point(|c| c.time <= command.time);
+        commands.insert(at, command);
+        if frame as i32 <= self.cached_frame {
+            self.cached_frame = -1;
+            self.cached = [0; 3];
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn add(&mut self, command: Command) {
+        let frame = self.frame_of(command.time);
+        let index = match self.commands.binary_search_by_key(&frame, |(at, _)| *at) {
+            Ok(index) => index,
+            Err(index) => {
+                self.commands.insert(index, (frame, Vec::new()));
+                index
+            }
+        };
+        let commands = &mut self.commands[index].1;
         let at = commands.partition_point(|c| c.time <= command.time);
         commands.insert(at, command);
         if frame as i32 <= self.cached_frame {
@@ -427,6 +454,7 @@ impl Life {
         }
         *state = [life, guard, reduction];
     }
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn at(&mut self, time: i32) -> i32 {
         if self.commands.is_empty() {
             return self.initial;
@@ -449,6 +477,51 @@ impl Life {
             self.cached = state;
         }
         for command in self.commands.get(&frame).into_iter().flatten() {
+            if command.time > time {
+                break;
+            }
+            self.step(&mut state, command);
+        }
+        state[0]
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn at(&mut self, time: i32) -> i32 {
+        if self.commands.is_empty() {
+            return self.initial;
+        }
+        let frame = self.frame_of(time);
+        let c = self.cached_frame;
+        let full = c >= 0 && frame as i32 <= c;
+        let (mut state, start) = if c < 0 || frame as i32 <= c {
+            ([self.initial, 0, 0], 0)
+        } else {
+            (self.cached, (c + 1) as usize)
+        };
+        let end = self.commands.partition_point(|(at, _)| *at < frame);
+        let begin = if start == 0 {
+            0
+        } else if start >= frame {
+            end
+        } else {
+            self.commands[..end].partition_point(|(at, _)| *at < start)
+        };
+        for (_, commands) in &self.commands[begin..end] {
+            for command in commands {
+                self.step(&mut state, command);
+            }
+        }
+        if !full {
+            self.cached_frame = frame as i32 - 1;
+            self.cached = state;
+        }
+        for command in self
+            .commands
+            .get(end)
+            .filter(|(at, _)| *at == frame)
+            .into_iter()
+            .flat_map(|(_, commands)| commands)
+        {
             if command.time > time {
                 break;
             }

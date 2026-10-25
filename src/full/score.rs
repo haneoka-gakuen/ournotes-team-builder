@@ -81,14 +81,16 @@ impl Factors {
         self.luck = self.luck.wrapping_add(c.luck);
     }
 }
+// Updates already quantize to binary32; retain that representation while
+// keeping accumulation and undo arithmetic in f64.
 #[derive(Clone, Default)]
 struct Diff {
-    combo: f64,
-    note: f64,
-    just: f64,
-    perfect: f64,
-    great: f64,
-    good: f64,
+    combo: f32,
+    note: f32,
+    just: f32,
+    perfect: f32,
+    great: f32,
+    good: f32,
     luck: i32,
 }
 impl Diff {
@@ -96,27 +98,27 @@ impl Diff {
         self.luck = self.luck.wrapping_add(c.luck);
         let (fc, fnote, fj) = (mill(c.combo), mill(c.note), mill(c.judge));
         if fc != 0.0 {
-            self.combo = f(self.combo + fc);
+            self.combo = f(self.combo as f64 + fc) as f32;
         }
         if fnote != 0.0 {
-            self.note = f(self.note + fnote);
+            self.note = f(self.note as f64 + fnote) as f32;
         }
         match c.judgement {
-            6 => self.just = f(self.just + fj),
-            5 => self.perfect = f(self.perfect + fj),
-            4 => self.great = f(self.great + fj),
-            3 => self.good = f(self.good + fj),
+            6 => self.just = f(self.just as f64 + fj) as f32,
+            5 => self.perfect = f(self.perfect as f64 + fj) as f32,
+            4 => self.great = f(self.great as f64 + fj) as f32,
+            3 => self.good = f(self.good as f64 + fj) as f32,
             _ => {}
         }
     }
     fn undo(&mut self, state: &mut Factors) {
-        state.just = f(state.just - self.just);
-        state.perfect = f(state.perfect - self.perfect);
-        state.combo = f(state.combo - self.combo);
-        state.note = f(state.note - self.note);
+        state.just = f(state.just - self.just as f64);
+        state.perfect = f(state.perfect - self.perfect as f64);
+        state.combo = f(state.combo - self.combo as f64);
+        state.note = f(state.note - self.note as f64);
         state.luck = state.luck.wrapping_sub(self.luck);
-        state.great = f(state.great - self.great);
-        state.good = f(state.good - self.good);
+        state.great = f(state.great - self.great as f64);
+        state.good = f(state.good - self.good as f64);
         *self = Self::default();
     }
 }
@@ -407,15 +409,24 @@ impl<'a> Incremental<'a> {
             }
             return Ok(());
         }
-        self.factor_order.clear();
-        self.factor_order.extend(0..fl.len());
-        self.factor_order
-            .sort_unstable_by_key(|&i| (fl[i].time, fl[i].owner, i));
-        self.note_order.clear();
-        self.note_order.extend(0..nl.len());
-        self.note_order
-            .sort_unstable_by_key(|&i| (nl[i].time, nl[i].id, i));
-        let (factor_order, note_order) = (&self.factor_order, &self.note_order);
+        let mut factor_stack = [0usize, 1, 2, 3, 4, 5, 6, 7];
+        let factor_order = if fl.len() <= factor_stack.len() {
+            &mut factor_stack[..fl.len()]
+        } else {
+            self.factor_order.clear();
+            self.factor_order.extend(0..fl.len());
+            self.factor_order.as_mut_slice()
+        };
+        factor_order.sort_unstable_by_key(|&i| (fl[i].time, fl[i].owner, i));
+        let mut note_stack = [0usize, 1, 2, 3, 4, 5, 6, 7];
+        let note_order = if nl.len() <= note_stack.len() {
+            &mut note_stack[..nl.len()]
+        } else {
+            self.note_order.clear();
+            self.note_order.extend(0..nl.len());
+            self.note_order.as_mut_slice()
+        };
+        note_order.sort_unstable_by_key(|&i| (nl[i].time, nl[i].id, i));
         let (mut a, mut b) = (0, 0);
         while a < factor_order.len() || b < note_order.len() {
             if a < factor_order.len()

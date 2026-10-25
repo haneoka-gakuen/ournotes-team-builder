@@ -41,11 +41,21 @@ pub struct Slot {
 impl Slot {
     /// Identifies equal skill shapes: the same fields with the same float bits.
     pub fn signature(&self) -> Vec<u64> {
-        let mut out = vec![
+        let mut out = Vec::new();
+        self.write_signature(&mut out);
+        out
+    }
+    pub(crate) fn write_signature(&self, out: &mut Vec<u64>) {
+        out.clear();
+        let len = 3
+            + self.effects.iter().map(|e| 7 + e.judgements.len()).sum::<usize>()
+            + self.convert.as_ref().map_or(1, |c| 2 + c.judgements.len());
+        out.reserve(len);
+        out.extend([
             self.extension_ms.to_bits(),
             self.recovery as u64,
             self.effects.len() as u64,
-        ];
+        ]);
         for e in &self.effects {
             out.extend([
                 e.kind as u64,
@@ -68,7 +78,6 @@ impl Slot {
                 out.extend(c.judgements.iter().map(|&j| j as u64));
             }
         }
-        out
     }
 }
 pub(crate) fn rounding_profile(slot: &Slot, life: Option<f64>) -> (usize, f64) {

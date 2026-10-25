@@ -1390,9 +1390,8 @@ impl<'a> Kernel<'a> {
         let has_gk: Vec<_> = members
             .iter()
             .map(|m| {
-                Performer::from_member(master, m, None)
-                    .gekisou_skill
-                    .is_some()
+                m.card.gekiso_skill_id != 0
+                    && master.gekiso_skills.contains_key(&m.card.gekiso_skill_id)
             })
             .collect();
         let gk_members: Vec<_> = members
@@ -1417,16 +1416,18 @@ impl<'a> Kernel<'a> {
                 }
             })
             .collect();
-        let mut support = Vec::with_capacity(members.len() * snaps.len());
-        let mut supports: HashMap<String, Performer> = HashMap::default();
-        for (i, member) in members.iter().enumerate() {
-            for snap in snaps {
-                if !has_gk[i] {
-                    support.push(None);
-                    continue;
-                }
-                let p = Performer::from_member(master, member, Some(snap));
-                let runs = p.gekisou_support_skills.iter().any(|&(id, _)| {
+        let band_only = read_all == ["bandId"];
+        let snap_supports: Vec<_> = snaps
+            .iter()
+            .map(|snap| {
+                let skills: Vec<_> = snap
+                    .card
+                    .gekiso_support_skills
+                    .into_iter()
+                    .zip(snap.gekiso_skill_levels)
+                    .filter(|(id, _)| *id != 0)
+                    .collect();
+                let runs = skills.iter().any(|&(id, _)| {
                     let mission = master
                         .gekiso_support_skills
                         .get(&id)
@@ -1434,47 +1435,64 @@ impl<'a> Kernel<'a> {
                         .unwrap_or(0);
                     mission == 4 || missions.contains(&mission) || missions.contains(&4)
                 });
-                if p.gekisou_support_skills.is_empty() || !runs {
+                if skills.is_empty() || !runs {
+                    return None;
+                }
+                let favoured = if band_only {
+                    favoured_band(master, &skills)
+                } else {
+                    0
+                };
+                Some((skills, favoured))
+            })
+            .collect();
+        let mut support = Vec::with_capacity(members.len() * snaps.len());
+        let mut supports: HashMap<_, Performer> = HashMap::default();
+        for (i, member) in members.iter().enumerate() {
+            for snap in &snap_supports {
+                let Some((skills, favoured)) = snap.as_ref().filter(|_| has_gk[i]) else {
                     support.push(None);
                     continue;
-                }
-                let band_only = read_all == ["bandId"];
-                let favoured = favoured_band(master, &p.gekisou_support_skills);
-                let band = if band_only && favoured != 0 {
-                    if p.band_id == favoured {
-                        favoured
-                    } else if favoured == 1 {
+                };
+                let band = if band_only && *favoured != 0 {
+                    if member.card.band_id == *favoured {
+                        *favoured
+                    } else if *favoured == 1 {
                         2
                     } else {
                         1
                     }
                 } else {
-                    p.band_id
+                    member.card.band_id
                 };
-                let key = json!([
-                    p.gekisou_support_skills,
-                    if band_only {
-                        json!(band)
-                    } else {
-                        json!([p.band_id, p.card_type, p.character_id])
-                    }
-                ])
-                .to_string();
-                let value = supports.entry(key).or_insert_with(|| {
+                let fields = if band_only {
+                    [band, 0, 0]
+                } else {
+                    [band, member.card.card_type, member.card.character_id]
+                };
+                let value = supports.entry((skills.as_slice(), fields)).or_insert_with(|| {
                     if band_only {
                         Performer {
                             band_id: band,
                             mission_only: Some(1),
-                            gekisou_support_skills: p.gekisou_support_skills.clone(),
+                            gekisou_support_skills: skills.clone(),
                             ..Performer::default()
                         }
                     } else {
-                        p.support_only()
+                        let mut p = Performer::from_member(master, member, None);
+                        p.live_skill = None;
+                        p.gekisou_skill = None;
+                        p.gekisou_support_skills = skills.clone();
+                        p.mission_only = Some(1);
+                        p
                     }
                 });
                 support.push(Some(value.clone()));
             }
         }
+        // Release constructor-only groups before preparing the slot table and contexts.
+        drop(supports);
+        drop(snap_supports);
         let bonuses = combo_bonuses(master, members, &chart.setup.missions);
         let opening_bonuses = opening_combo_bonuses(master, members, &chart.setup.missions);
         let template = if combo_ranges {
@@ -1510,18 +1528,7 @@ impl<'a> Kernel<'a> {
         } else {
             vec![0]
         };
-        let mut slots = Vec::new();
-        let mut unsupported = Vec::new();
-        for member in members {
-            for snap in std::iter::once(None).chain(snaps.iter().map(Some)) {
-                slots.push(crate::skills::resolve(
-                    master,
-                    member,
-                    snap,
-                    &mut unsupported,
-                ));
-            }
-        }
+        let mut slots = crate::skills::prepare(master, members, snaps).into_slots();
         let healthy = chart.accuracy.great == 0.0
             && chart.accuracy.miss_every == 0
             && crate::support_aliases::stable_life_conditions(
@@ -4268,9 +4275,21 @@ impl Kernel<'_> {
         mut rows: PartialOrderScores,
     ) -> Result<Exact, String> {
         let deck = self.original_deck(team);
-        for (order, row) in rows.iter_mut().enumerate() {
-            if row.is_none() {
-                *row = Some(gekiso::replay_order(
+        let missing: Vec<_> = rows
+            .iter()
+            .enumerate()
+            .filter_map(|(order, row)| row.is_none().then_some(order))
+            .collect();
+        // Amortize replay-tree and native worker setup over larger completions.
+        if missing.len() >= 30 {
+            let values =
+                gekiso::replay_order_subset(self.master, self.chart, &deck, power, &missing)?;
+            for (order, value) in missing.into_iter().zip(values) {
+                rows[order] = Some(value);
+            }
+        } else {
+            for order in missing {
+                rows[order] = Some(gekiso::replay_order(
                     self.master,
                     self.chart,
                     &deck,

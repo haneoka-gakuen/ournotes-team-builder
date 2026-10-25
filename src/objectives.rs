@@ -67,16 +67,31 @@ pub struct LiveCore {
     member_dominance: HashMap<(usize, usize), bool>,
 }
 /// Resolved skills of every member × snap pair and their shape ids, shared by the objectives of one engine call.
-type SlotTable = Arc<(Vec<Slot>, Vec<usize>, usize)>;
+type SlotTable = Arc<skills::Prepared>;
 /// Addresses and lengths of the master and the card slices the table was resolved from.
 type SlotTableKey = (usize, usize, usize, usize, usize);
+// The outer Option is present only while Engine::run owns the request scope.
+type RequestSlotTable = Option<(SlotTableKey, SlotTable)>;
 thread_local! {
-    static SLOT_TABLE: std::cell::RefCell<Option<(SlotTableKey, SlotTable)>> =
+    static SLOT_TABLE: std::cell::RefCell<Option<RequestSlotTable>> =
         const { std::cell::RefCell::new(None) };
 }
-/// Forgets the shared skill table; every engine call starts with this, as its cards may differ.
+/// Clears the current request's pointer lookup; the content cache validates itself.
 pub fn reset_slot_table() {
-    SLOT_TABLE.with(|t| t.borrow_mut().take());
+    SLOT_TABLE.with(|t| {
+        if let Some(table) = t.borrow_mut().as_mut() {
+            table.take();
+        }
+    });
+}
+pub(crate) struct SlotTableScope(Option<RequestSlotTable>);
+impl Drop for SlotTableScope {
+    fn drop(&mut self) {
+        SLOT_TABLE.with(|t| t.replace(self.0.take()));
+    }
+}
+pub(crate) fn slot_table_scope() -> SlotTableScope {
+    SlotTableScope(SLOT_TABLE.with(|t| t.replace(Some(None))))
 }
 fn slot_table(master: &Master, members: &[Member], snaps: &[Snap]) -> SlotTable {
     let key = (
@@ -89,26 +104,18 @@ fn slot_table(master: &Master, members: &[Member], snaps: &[Snap]) -> SlotTable 
     if let Some(table) = SLOT_TABLE.with(|t| {
         t.borrow()
             .as_ref()
+            .and_then(|table| table.as_ref())
             .filter(|(k, _)| *k == key)
             .map(|(_, v)| Arc::clone(v))
     }) {
         return table;
     }
-    let width = snaps.len() + 1;
-    let mut slots = Vec::with_capacity(members.len() * width);
-    let mut ids = Vec::with_capacity(members.len() * width);
-    let mut intern: HashMap<Vec<u64>, usize> = HashMap::new();
-    let mut unsupported = Vec::new();
-    for member in members {
-        for snap in std::iter::once(None).chain(snaps.iter().map(Some)) {
-            let slot = skills::resolve(master, member, snap, &mut unsupported);
-            let next = intern.len();
-            ids.push(*intern.entry(slot.signature()).or_insert(next));
-            slots.push(slot);
+    let table = skills::prepare(master, members, snaps);
+    SLOT_TABLE.with(|t| {
+        if let Some(cache) = t.borrow_mut().as_mut() {
+            *cache = Some((key, Arc::clone(&table)));
         }
-    }
-    let table = Arc::new((slots, ids, intern.len()));
-    SLOT_TABLE.with(|t| *t.borrow_mut() = Some((key, Arc::clone(&table))));
+    });
     table
 }
 impl LiveCore {
@@ -121,7 +128,7 @@ impl LiveCore {
     ) -> Self {
         let width = snaps.len() + 1;
         let table = slot_table(master, members, snaps);
-        let (mut slots, mut ids, mut intern_len) = (table.0.clone(), table.1.clone(), table.2);
+        let mut slots = table.slots.clone();
         let judgements = live::judgements(chart.times.len(), play);
         let input = chart::prepare(master, chart, 0, Vec::new(), judgements, 1.0, 100.0);
         let mut raise = 0.0_f64;
@@ -156,9 +163,11 @@ impl LiveCore {
                     i == j || (time as i64 - other as i64).abs() > longest as i64
                 })
             });
-        if input.judgements.is_none() && isolated {
+        let (ids, intern_len) = if input.judgements.is_none() && isolated {
             let mut intern = HashMap::<Vec<u64>, usize>::new();
-            for (slot, id) in slots.iter_mut().zip(&mut ids) {
+            let mut signature = Vec::new();
+            let mut ids = Vec::with_capacity(slots.len());
+            for slot in &mut slots {
                 slot.recovery = 0;
                 slot.convert = None;
                 slot.effects
@@ -173,11 +182,21 @@ impl LiveCore {
                 if slot.effects.is_empty() {
                     slot.extension_ms = 0.0;
                 }
-                let next = intern.len();
-                *id = *intern.entry(slot.signature()).or_insert(next);
+                slot.write_signature(&mut signature);
+                let id = if let Some(&id) = intern.get(signature.as_slice()) {
+                    id
+                } else {
+                    let id = intern.len();
+                    intern.insert(std::mem::take(&mut signature), id);
+                    id
+                };
+                ids.push(id);
             }
-            intern_len = intern.len();
-        }
+            (ids, intern.len())
+        } else {
+            let (ids, intern_len) = table.shapes();
+            (ids.clone(), *intern_len)
+        };
         let factor_cap = 1.0 + overlap as f64 * raise;
         let high = if let Some(j) = &input.judgements {
             model::linear_play(&input, j, true, 0, 1.0, recovery)
@@ -834,21 +853,18 @@ impl Potential {
     pub fn new(master: &Master, members: &[Member], snaps: &[Snap], window: f64) -> Self {
         let width = snaps.len() + 1;
         let mut areas = Vec::with_capacity(members.len() * width);
-        let mut unsupported = Vec::new();
-        for member in members {
-            for snap in std::iter::once(None).chain(snaps.iter().map(Some)) {
-                let skill = skills::resolve(master, member, snap, &mut unsupported);
-                let mut area = 0.0;
-                for effect in &skill.effects {
-                    if (effect.kind == 2000 || effect.judgements.contains(&5))
-                        && !effect.gate.blocks(master.live.life_base)
-                    {
-                        area += effect.delta as f64 / 100000.0
-                            * (window_ms(effect.seconds, skill.extension_ms) as f64 / 1000.0);
-                    }
+        let table = skills::prepare(master, members, snaps);
+        for skill in &table.slots {
+            let mut area = 0.0;
+            for effect in &skill.effects {
+                if (effect.kind == 2000 || effect.judgements.contains(&5))
+                    && !effect.gate.blocks(master.live.life_base)
+                {
+                    area += effect.delta as f64 / 100000.0
+                        * (window_ms(effect.seconds, skill.extension_ms) as f64 / 1000.0);
                 }
-                areas.push(area);
             }
+            areas.push(area);
         }
         Self {
             areas,

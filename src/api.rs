@@ -14,6 +14,9 @@ use std::collections::{BTreeMap, VecDeque};
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::Weak;
 use std::sync::{Arc, Mutex};
+mod gekiso_result_cache;
+use gekiso_result_cache::CompletedGekiso;
+
 type CachedScoreCap = (String, f64, Vec<crate::search::Team>);
 #[derive(Clone, Serialize, Deserialize)]
 struct ScoredSeeds {
@@ -63,6 +66,7 @@ pub struct Engine {
     chart_order: VecDeque<(i32, i32)>,
     live_cache: RefCell<Option<(String, crate::objectives::LiveCore)>>,
     gekiso_cache: RefCell<Option<(String, crate::gekiso::Chart)>>,
+    completed_gekiso: RefCell<CompletedGekiso>,
     reward_cache: RefCell<Option<(Value, crate::rewards::SettlementCache)>>,
     score_caps: RefCell<VecDeque<CachedScoreCap>>,
     pub(crate) scored_seeds: SharedScores,
@@ -132,6 +136,7 @@ impl Engine {
             chart_order: VecDeque::new(),
             live_cache: RefCell::new(None),
             gekiso_cache: RefCell::new(None),
+            completed_gekiso: RefCell::new(CompletedGekiso::default()),
             reward_cache: RefCell::new(None),
             score_caps: RefCell::new(VecDeque::new()),
             scored_seeds: SharedScores::default(),
@@ -167,6 +172,7 @@ impl Engine {
         self.score_caps.borrow_mut().clear();
         self.live_cache.replace(None);
         self.gekiso_cache.replace(None);
+        self.completed_gekiso.get_mut().clear();
         self.reward_cache.replace(None);
         self.chart_order.retain(|&old| old != key);
         if self.charts.len() >= 4 && !self.charts.contains_key(&key) {
@@ -1417,6 +1423,51 @@ impl Engine {
         now: &dyn Fn() -> f64,
     ) -> Result<Value, String> {
         let generation = crate::cancellation_generation();
+        let key = CompletedGekiso::key(request);
+        let cached = key.as_ref().and_then(|key| {
+            self.completed_gekiso
+                .borrow()
+                .get(&self.master, key, source)
+        });
+        if let Some(mut response) = cached {
+            let current = now();
+            let deadline = request["deadline"].as_f64().unwrap_or_else(|| {
+                request["timeLimitMs"]
+                    .as_f64()
+                    .map(|ms| started + ms)
+                    .unwrap_or(f64::INFINITY)
+            });
+            let expired = current >= deadline;
+            if !expired && generation == crate::cancellation_generation() {
+                let elapsed = current - started;
+                response["elapsedMs"] = json!(elapsed);
+                for result in response["results"].as_array_mut().into_iter().flatten() {
+                    result["stats"] = json!({
+                        "leaders":0, "memberNodes":0, "snapNodes":0,
+                        "candidates":0, "exact":0, "elapsedMs":elapsed, "cacheHits":1
+                    });
+                }
+                return Ok(response);
+            }
+        }
+        let response = self.search_gekiso_uncached(request, source, started, now, generation)?;
+        if generation == crate::cancellation_generation() {
+            if let Some(key) = key {
+                self.completed_gekiso
+                    .borrow_mut()
+                    .remember(&self.master, key, source, &response);
+            }
+        }
+        Ok(response)
+    }
+    fn search_gekiso_uncached(
+        &self,
+        request: &Value,
+        source: &crate::chart::Source,
+        started: f64,
+        now: &dyn Fn() -> f64,
+        generation: u64,
+    ) -> Result<Value, String> {
         let opponents = gekiso_opponents(&request["goal"]);
         if opponents.iter().all(Vec::is_empty) {
             return self.search_gekiso_at(request, source, started, now, generation);
@@ -2397,7 +2448,7 @@ impl Engine {
         started: f64,
         now: &dyn Fn() -> f64,
     ) -> Result<Value, String> {
-        crate::objectives::reset_slot_table();
+        let _slot_table_scope = crate::objectives::slot_table_scope();
         let request = &input["request"];
         let kind = request["goal"]["kind"].as_str().ok_or("missing-goal")?;
         crate::progress::mode(&request["goal"]);

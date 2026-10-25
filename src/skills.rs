@@ -5,6 +5,9 @@ use crate::{
     num::{f, judgement_delta, score_delta},
     power::{matches_targets, Member, Snap},
 };
+mod prepared;
+pub(crate) use prepared::{prepare, Prepared};
+
 enum Value {
     Static(bool),
     Life,

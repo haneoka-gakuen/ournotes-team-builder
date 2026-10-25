@@ -112,6 +112,133 @@ struct ComboObserver {
     updater: ConditionUpdater,
     frames: Vec<ComboSupportFrame>,
 }
+// Immutable input masks are shared by replay branches. Running one-shot effects
+// remain scheduled until their updater returns them to the idle pool.
+#[derive(Default)]
+struct ConditionInputs {
+    always: u64,
+    ungated: u64,
+    missions: HashMap<i32, u64>,
+    members: HashMap<usize, u64>,
+    ranges: u64,
+    lottery: u64,
+    judgements: u64,
+    rank: u64,
+}
+#[derive(Clone)]
+struct ConditionSchedule {
+    inputs: Rc<ConditionInputs>,
+    running: u64,
+}
+impl ConditionSchedule {
+    fn new(conditions: &[CondSkill]) -> Option<Self> {
+        if conditions.len() > u64::BITS as usize {
+            return None;
+        }
+        let mut inputs = ConditionInputs::default();
+        for (i, condition) in conditions.iter().enumerate() {
+            let bit = 1u64 << i;
+            match condition.updater.gate {
+                None | Some(gekisou::MISSION_ALL) => inputs.ungated |= bit,
+                Some(mission) => *inputs.missions.entry(mission).or_default() |= bit,
+            }
+            let Some(idle) = condition.updater.idle_inputs() else {
+                inputs.always |= bit;
+                continue;
+            };
+            for &member in &idle.members {
+                *inputs.members.entry(member).or_default() |= bit;
+            }
+            if idle.ranges {
+                inputs.ranges |= bit;
+            }
+            if idle.lottery {
+                inputs.lottery |= bit;
+            }
+            if idle.judgements {
+                inputs.judgements |= bit;
+            }
+            if idle.rank {
+                inputs.rank |= bit;
+            }
+        }
+        Some(Self {
+            inputs: Rc::new(inputs),
+            running: 0,
+        })
+    }
+    fn select(
+        &self,
+        events: &[(usize, i32)],
+        judged: bool,
+        rank: Option<i32>,
+        gk: Option<&GekisoLive>,
+    ) -> u64 {
+        let inputs = &self.inputs;
+        let mut selected = inputs.always;
+        for &(member, _) in events {
+            selected |= inputs.members.get(&member).copied().unwrap_or(0);
+        }
+        if judged {
+            selected |= inputs.judgements;
+        }
+        if rank.is_some() {
+            selected |= inputs.rank;
+        }
+        if gk.is_none_or(|g| !g.controller.updates.is_empty()) {
+            selected |= inputs.ranges;
+        }
+        if gk.is_none_or(|g| !g.previous_lots.is_empty()) {
+            selected |= inputs.lottery;
+        }
+        // All conditions see these same mission gates before phase-one effects
+        // are applied. Keep running one-shot effects eligible across gate changes.
+        if let Some(g) = gk {
+            let mut gated = inputs.ungated;
+            for &i in &g.controller.updates {
+                gated |= inputs
+                    .missions
+                    .get(&g.controller.ranges[i].mission)
+                    .copied()
+                    .unwrap_or(0);
+            }
+            if g.controller.current_playing >= 0 {
+                let mission = g.controller.ranges[g.controller.current_playing as usize].mission;
+                gated |= inputs.missions.get(&mission).copied().unwrap_or(0);
+            }
+            selected &= gated;
+        }
+        selected | self.running
+    }
+    fn update_running(&mut self, index: usize, running: bool) {
+        let bit = 1u64 << index;
+        if running {
+            self.running |= bit;
+        } else {
+            self.running &= !bit;
+        }
+    }
+}
+#[derive(Clone)]
+struct ConditionIndices {
+    selected: Option<u64>,
+    all: std::ops::Range<usize>,
+}
+impl Iterator for ConditionIndices {
+    type Item = usize;
+    #[inline]
+    fn next(&mut self) -> Option<usize> {
+        match &mut self.selected {
+            Some(0) => None,
+            Some(bits) => {
+                let index = bits.trailing_zeros() as usize;
+                *bits &= *bits - 1;
+                Some(index)
+            }
+            None => self.all.next(),
+        }
+    }
+}
 #[derive(Clone, Copy)]
 enum Listed {
     Live(usize, usize),
@@ -271,6 +398,7 @@ pub struct Model<'a> {
     pools: Vec<LivePool>,
     enabled: Vec<usize>,
     condition: Vec<CondSkill>,
+    condition_schedule: Option<ConditionSchedule>,
     guards: HashMap<Key, i32>,
     reductions: HashMap<Key, i32>,
     limits: HashMap<Key, i32>,
@@ -426,6 +554,7 @@ impl<'a> Model<'a> {
             pools: Vec::new(),
             enabled: Vec::new(),
             condition: Vec::new(),
+            condition_schedule: None,
             guards: HashMap::default(),
             reductions: HashMap::default(),
             limits: HashMap::default(),
@@ -599,6 +728,7 @@ impl<'a> Model<'a> {
                 }
             }
         }
+        model.condition_schedule = ConditionSchedule::new(&model.condition);
         Ok(model)
     }
     pub(crate) fn observe_rush_support(&mut self) -> Result<(), String> {
@@ -878,9 +1008,18 @@ impl<'a> Model<'a> {
             self.enabled
                 .sort_by_key(|&i| self.live[i].key as i64 * 10 + self.live[i].index as i64);
         }
-        for condition in &mut self.condition {
-            condition.updater.begin_frame();
-        }
+        let selected_conditions = self.condition_schedule.as_ref().map(|schedule| {
+            schedule.select(
+                &self.frame_events,
+                !self.judged.is_empty(),
+                self.frame_rank,
+                self.gk.as_ref(),
+            )
+        });
+        let condition_indices = ConditionIndices {
+            selected: selected_conditions,
+            all: 0..self.condition.len(),
+        };
         for observer in &mut self.rush_observers {
             observer.begin_frame();
         }
@@ -934,10 +1073,18 @@ impl<'a> Model<'a> {
                         }
                     }
                 }
-                for (i, condition) in self.condition.iter_mut().enumerate() {
+                for i in condition_indices.clone() {
+                    let condition = &mut self.condition[i];
                     let updater = &mut condition.updater;
+                    if phase == 1 {
+                        updater.begin_frame();
+                    }
                     updated.clear();
-                    updater.update(phase, &input, &mut ctx, &mut updated)?;
+                    let result = updater.update(phase, &input, &mut ctx, &mut updated);
+                    if let Some(schedule) = &mut self.condition_schedule {
+                        schedule.update_running(i, updater.executing());
+                    }
+                    result?;
                     for &u in &updated {
                         let current = &updater.updaters[u];
                         let effect = &updater.effects[current.effect];

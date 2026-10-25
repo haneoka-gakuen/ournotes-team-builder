@@ -261,12 +261,12 @@ pub fn mission_gate(gate: Option<i32>, ctx: &Context<'_>) -> Result<bool, String
     Ok(i >= 0 && controller.ranges[i as usize].mission == gate)
 }
 #[derive(Clone, Default)]
-struct IdleInputs {
-    members: Vec<usize>,
-    ranges: bool,
-    lottery: bool,
-    judgements: bool,
-    rank: bool,
+pub(super) struct IdleInputs {
+    pub(super) members: Vec<usize>,
+    pub(super) ranges: bool,
+    pub(super) lottery: bool,
+    pub(super) judgements: bool,
+    pub(super) rank: bool,
 }
 impl IdleInputs {
     fn insert(&mut self, input: IdleInput) {
@@ -425,6 +425,12 @@ impl ConditionUpdater {
             quiet: false,
         })
     }
+    pub(super) fn idle_inputs(&self) -> Option<&IdleInputs> {
+        self.idle_inputs.as_ref()
+    }
+    pub(super) fn executing(&self) -> bool {
+        !self.executing.is_empty()
+    }
     pub fn begin_frame(&mut self) {
         self.trigger_checked = false;
         self.quiet = false;
@@ -515,6 +521,7 @@ impl ConditionUpdater {
         }
         Ok(true)
     }
+    #[inline(always)]
     pub fn update(
         &mut self,
         phase: i32,
@@ -535,6 +542,16 @@ impl ConditionUpdater {
             }
             return Ok(());
         }
+        self.update_active(phase, input, ctx, updated, checked_gate)
+    }
+    fn update_active(
+        &mut self,
+        phase: i32,
+        input: &FrameInput,
+        ctx: &mut Context<'_>,
+        updated: &mut Vec<usize>,
+        checked_gate: Option<bool>,
+    ) -> Result<(), String> {
         let mut done = Vec::new();
         for k in 0..self.executing.len() {
             let index = self.executing[k];
