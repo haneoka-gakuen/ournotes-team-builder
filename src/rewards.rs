@@ -156,12 +156,8 @@ fn snapshot_regions(bonus: &[f64], minimum: f64) -> Option<Vec<SnapshotRegion>> 
     .then_some(regions)
 }
 fn up(n: f64) -> f64 {
-    if !n.is_finite() {
-        f64::INFINITY
-    } else {
-        assert!(n >= 0.0, "negative-score-bound");
-        f64::from_bits(n.to_bits() + 1)
-    }
+    let magnitude = n.to_bits() & 0x7fff_ffff_ffff_ffff;
+    f64::from_bits(magnitude.min(f64::INFINITY.to_bits() - 1) + 1)
 }
 fn add(a: f64, b: f64) -> f64 {
     up(a + b)
@@ -2368,6 +2364,7 @@ struct RewardDual {
 type DualOffers = Vec<Vec<Option<[f64; 5]>>>;
 type PowerFrontiers = Vec<[Vec<(f64, f64)>; 6]>;
 type PricingFrontiers = Vec<Vec<Option<[Vec<i32>; 5]>>>;
+type JointRewardOffers = [[Vec<(usize, f64, f64, f64)>; 5]; 5];
 #[derive(Clone)]
 struct ConverterOptions {
     rows: [[[u32; 5]; 2]; 6],
@@ -2525,6 +2522,11 @@ impl JointRewardPricing {
 struct MemberRewardPricing {
     planes: Vec<MemberRewardPlane>,
     converted: f64,
+    prefixes: Mutex<[Option<MemberPricePrefix>; 6]>,
+}
+struct MemberPricePrefix {
+    members: Vec<usize>,
+    sums: Vec<f64>,
 }
 pub(crate) struct RosterPricing {
     planes: Vec<(f64, Vec<[f64; 5]>)>,
@@ -2770,6 +2772,38 @@ fn member_orders(count: usize) -> &'static [[i8; 5]] {
         })
     })[count]
 }
+fn member_order_links(count: usize) -> &'static [(usize, usize, usize)] {
+    static LINKS: OnceLock<[Vec<(usize, usize, usize)>; 6]> = OnceLock::new();
+    &LINKS.get_or_init(|| {
+        std::array::from_fn(|count| {
+            member_orders(count)
+                .iter()
+                .map(|order| {
+                    let mask = order
+                        .iter()
+                        .enumerate()
+                        .fold(0usize, |mask, (event, &slot)| {
+                            mask | (usize::from(slot < 0) << event)
+                        });
+                    if count == 0 {
+                        return (0, 0, mask);
+                    }
+                    let event = order
+                        .iter()
+                        .position(|&slot| slot == count as i8 - 1)
+                        .unwrap();
+                    let mut previous = *order;
+                    previous[event] = -1;
+                    let source = member_orders(count - 1)
+                        .iter()
+                        .position(|order| *order == previous)
+                        .unwrap();
+                    (source, event, mask)
+                })
+                .collect()
+        })
+    })[count]
+}
 struct MemberPricingDomain<'a> {
     power: &'a [f64],
     snapshot_power: &'a [f64],
@@ -2795,19 +2829,47 @@ impl MemberRewardPricing {
         upper
     }
     fn sums(&self, members: &[usize], from: usize) -> Vec<f64> {
-        let orders = member_orders(members.len());
-        let mut sums = Vec::with_capacity(orders.len() * self.planes.len());
-        for order in orders {
-            for plane in &self.planes {
-                let mut sum = plane.constant;
-                let mut mask = 31;
-                for (event, &slot) in order.iter().enumerate() {
-                    if slot >= 0 {
-                        sum = (sum + plane.members[members[slot as usize]][event]).next_up();
-                        mask ^= 1 << event;
+        let mut prefixes = self.prefixes.lock().unwrap();
+        for count in 0..=members.len() {
+            if prefixes[count]
+                .as_ref()
+                .is_some_and(|prefix| prefix.members == members[..count])
+            {
+                continue;
+            }
+            let mut prefix = prefixes[count].take().unwrap_or_else(|| MemberPricePrefix {
+                members: Vec::with_capacity(count),
+                sums: Vec::new(),
+            });
+            prefix.members.clear();
+            prefix.members.extend_from_slice(&members[..count]);
+            prefix.sums.clear();
+            if count == 0 {
+                prefix
+                    .sums
+                    .extend(self.planes.iter().map(|plane| plane.constant));
+            } else {
+                let parent = &prefixes[count - 1].as_ref().unwrap().sums;
+                // Upward additions preserve an upper bound in the cached member order.
+                for &(source, event, _) in member_order_links(count) {
+                    for (plane, row) in self.planes.iter().enumerate() {
+                        prefix.sums.push(
+                            (parent[source * self.planes.len() + plane]
+                                + row.members[members[count - 1]][event])
+                                .next_up(),
+                        );
                     }
                 }
-                sums.push((sum + plane.suffix[from][mask]).next_up());
+            }
+            prefixes[count] = Some(prefix);
+        }
+        let prefix = &prefixes[members.len()].as_ref().unwrap().sums;
+        let mut sums = Vec::with_capacity(prefix.len());
+        for (order, &(_, _, mask)) in member_order_links(members.len()).iter().enumerate() {
+            for (plane, row) in self.planes.iter().enumerate() {
+                sums.push(
+                    (prefix[order * self.planes.len() + plane] + row.suffix[from][mask]).next_up(),
+                );
             }
         }
         sums
@@ -2815,11 +2877,16 @@ impl MemberRewardPricing {
 
     fn scores(&self, sums: &[f64], floor: f64) -> Vec<f64> {
         let count = sums.len() / self.planes.len();
+        let deductions: Vec<_> = self
+            .planes
+            .iter()
+            .map(|plane| (plane.mu * floor).next_down())
+            .collect();
         let mut scores = Vec::with_capacity(count);
         for row in sums.chunks_exact(self.planes.len()) {
             let mut upper = f64::INFINITY;
-            for (plane, &sum) in self.planes.iter().zip(row) {
-                let sum = (sum - (plane.mu * floor).next_down()).next_up();
+            for (&deduction, &sum) in deductions.iter().zip(row) {
+                let sum = (sum - deduction).next_up();
                 if sum.is_finite() {
                     let sum = sum.max(0.0);
                     upper = upper.min(up(mul(sum, sum) / (4.0 * self.converted)));
@@ -3504,6 +3571,7 @@ impl DeterministicBound {
         self.member_pricing = Some(Arc::new(MemberRewardPricing {
             planes,
             converted: self.converted,
+            prefixes: Mutex::new(std::array::from_fn(|_| None)),
         }));
     }
     pub(crate) fn fixed_component(&self) -> Option<FixedComponent> {
@@ -4840,6 +4908,41 @@ impl DeterministicBound {
         self.prepare_pricing_frontiers(members, c);
         let mut matching = std::mem::take(&mut self.physical_matching);
         let mut weights = std::mem::take(&mut self.sparse_matrix);
+        let offers: JointRewardOffers = std::array::from_fn(|slot| {
+            let member = members[slot];
+            std::array::from_fn(|event| {
+                let choices = if mean {
+                    self.option_cache[member].as_ref().unwrap()
+                } else {
+                    &self.pricing_frontiers[member][c].as_ref().unwrap()[event]
+                };
+                let mut offers = Vec::with_capacity(choices.len() + 4);
+                for &snap in choices {
+                    let power = snapshot_power
+                        [member * self.width + if snap < 0 { count } else { snap as usize }];
+                    let profile = self.shared
+                        [self.ids[member * self.width + (snap + 1) as usize][c] as usize];
+                    let coefficient = if mean {
+                        up(profile.into_iter().fold(0.0, add) / 5.0)
+                    } else {
+                        profile[event]
+                    };
+                    let bonus = if snap < 0 {
+                        0.0
+                    } else {
+                        self.snapshot_bonus[snap as usize]
+                    };
+                    if snap < 0 {
+                        offers.extend(
+                            (count..columns).map(|column| (column, power, coefficient, bonus)),
+                        );
+                    } else {
+                        offers.push((snap as usize, power, coefficient, bonus));
+                    }
+                }
+                offers
+            })
+        });
         let fill = |weights: &mut [Vec<(usize, f64)>; 5],
                     events: &[usize; 5],
                     mode: u8,
@@ -4848,46 +4951,28 @@ impl DeterministicBound {
             let inverse = up(1.0 / lambda);
             for (slot, row) in weights.iter_mut().enumerate() {
                 row.clear();
-                let member = members[slot];
-                let choices = if mean {
-                    self.option_cache[member].as_ref().unwrap()
-                } else {
-                    &self.pricing_frontiers[member][c].as_ref().unwrap()[events[slot]]
-                };
-                for &snap in choices {
-                    let p = snapshot_power
-                        [member * self.width + if snap < 0 { count } else { snap as usize }];
-                    let value = if mode == 0 {
-                        p
-                    } else {
-                        let profile = self.shared
-                            [self.ids[member * self.width + (snap + 1) as usize][c] as usize];
-                        let coefficient = if mean {
-                            up(profile.into_iter().fold(0.0, add) / 5.0)
-                        } else {
-                            profile[events[slot]]
-                        };
-                        if mode == 1 {
-                            coefficient
-                        } else {
-                            let blend = add(mul(lambda, p), mul(coefficient, inverse));
-                            if mu == 0.0 {
-                                blend
-                            } else {
-                                let bonus = if snap < 0 {
-                                    0.0
-                                } else {
-                                    self.snapshot_bonus[snap as usize]
-                                };
-                                add(blend, mul(mu, bonus))
-                            }
-                        }
-                    };
-                    if snap < 0 {
-                        row.extend((count..columns).map(|column| (column, value)));
-                    } else {
-                        row.push((snap as usize, value));
+                let offers = &offers[slot][events[slot]];
+                match mode {
+                    0 => row.extend(offers.iter().map(|&(column, power, _, _)| (column, power))),
+                    1 => row.extend(
+                        offers
+                            .iter()
+                            .map(|&(column, _, coefficient, _)| (column, coefficient)),
+                    ),
+                    _ if mu == 0.0 => {
+                        row.extend(offers.iter().map(|&(column, power, coefficient, _)| {
+                            (column, add(mul(lambda, power), mul(coefficient, inverse)))
+                        }))
                     }
+                    _ => row.extend(offers.iter().map(|&(column, power, coefficient, bonus)| {
+                        (
+                            column,
+                            add(
+                                add(mul(lambda, power), mul(coefficient, inverse)),
+                                mul(mu, bonus),
+                            ),
+                        )
+                    })),
                 }
             }
         };
@@ -6188,6 +6273,56 @@ impl<'a> RewardObjective<'a> {
     pub(crate) fn swap_settlements(&mut self, cache: &mut SettlementCache) {
         std::mem::swap(&mut self.exact_cache, &mut cache.values);
         std::mem::swap(&mut self.exact_order, &mut cache.order);
+    }
+    pub(crate) fn score_proposal(
+        &mut self,
+        team: &Team,
+        power: f64,
+        slots: &[f64],
+        cutoff: f64,
+    ) -> Result<Option<Exact>, String> {
+        let bonus = team
+            .members
+            .iter()
+            .map(|&m| self.member_bonus(m))
+            .sum::<f64>()
+            + team
+                .snaps
+                .iter()
+                .filter(|&&snap| snap >= 0)
+                .map(|&snap| self.snap_bonus(snap as usize))
+                .sum::<f64>();
+        let rewards: Vec<_> = self
+            .ranks
+            .iter()
+            .map(|&rank| self.value(bonus, rank))
+            .collect();
+        let peak = rewards.iter().copied().fold(0.0, f64::max);
+        let count = 120.0
+            * if self.gekiso.luck {
+                self.samples as f64
+            } else {
+                1.0
+            };
+        if !cutoff.is_finite()
+            || rewards.iter().any(|&reward| !safe(reward) || reward < 0.0)
+            || !safe(peak * count)
+        {
+            return self.exact(team, power, slots).map(Some);
+        }
+        self.evaluate(
+            team,
+            power,
+            slots,
+            Cutoff {
+                key: cutoff,
+                prune_equal: false,
+            },
+        )
+        .map(|value| match value {
+            Evaluation::Exact(exact) => Some(exact),
+            Evaluation::Pruned(_) => None,
+        })
     }
     pub(crate) fn install_scores(&mut self, hits: &[crate::search::Hit]) {
         for hit in hits {
@@ -9453,7 +9588,48 @@ impl<'a> RewardObjective<'a> {
                         )
                     })
                     .collect();
-                gekiso::replay_orders(self.master, &self.gekiso, &deck, &[seed], power)?.scores
+                let bounded = cutoff.filter(|_| self.deterministic.is_some());
+                let rewards: Vec<_> = self
+                    .ranks
+                    .iter()
+                    .map(|&rank| (rank, self.value(bonus, rank)))
+                    .collect();
+                let peak = rewards.iter().map(|row| row.1).fold(0.0, f64::max);
+                let bounded = bounded.filter(|_| {
+                    rewards.iter().all(|row| safe(row.1) && row.1 >= 0.0) && safe(120.0 * peak)
+                });
+                if let Some(cutoff) = bounded {
+                    let observed = Mutex::new((0.0, 0usize, true));
+                    let observe = |score: f64, count: usize| {
+                        let mut observed = observed.lock().unwrap();
+                        let rank = chart::battle_rank(self.chart, score);
+                        let reward = rewards.iter().find(|row| row.0 == rank).map(|row| row.1);
+                        if !score.is_finite() || score < 0.0 || reward.is_none() {
+                            observed.2 = false;
+                        }
+                        if !observed.2 {
+                            return true;
+                        }
+                        observed.0 += reward.unwrap() * count as f64;
+                        observed.1 += count;
+                        let upper = (observed.0 + (120 - observed.1) as f64 * peak) / 120.0;
+                        !(upper < cutoff.key || cutoff.prune_equal && upper == cutoff.key)
+                    };
+                    let Some(replayed) = gekiso::replay_orders_with_cutoff(
+                        self.master,
+                        &self.gekiso,
+                        &deck,
+                        &[seed],
+                        power,
+                        &observe,
+                    )?
+                    else {
+                        return Ok(None);
+                    };
+                    replayed.scores
+                } else {
+                    gekiso::replay_orders(self.master, &self.gekiso, &deck, &[seed], power)?.scores
+                }
             } else {
                 let prepared = if let Some(plan) = &prefix_plan {
                     plan.score(self.master, &self.gekiso, &context.simulation, power)?

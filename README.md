@@ -193,7 +193,8 @@ ignore the prerequisite.
 Deterministic Gekiso results and manual evaluations use complete native
 replay over all 120 skill orders. Orders share the full native state until
 their next ordinary skill event differs; each branch retains the original
-frame, RNG, LIFE and score history. Fixed-seed numeric searches initialize
+frame, RNG, LIFE and score history. Native replay groups follow the active worker
+budget; serial shards share the prefix before the first skill event as well. Fixed-seed numeric searches initialize
 legacy heuristic weights only when their compiled bound is unavailable.
 Exact COMBO BONUS searches bound remaining power by the attainable bonus sum,
 and member cuts retain their rounded prefix sums along the recursion.
@@ -246,6 +247,21 @@ Nominal Max and Min assignments reuse the current roster's base in their scalar
 and joint power/skill cuts. Each assignment domain refreshes that base. Fixed-seed
 Min also bounds physical snapshots in a fixed ordinary-skill order and retains
 the mean bound: a team's worst-order score is at most its score in any fixed order.
+
+Member reward pricing retains one outward-rounded prefix per roster depth and
+reuses its parent event assignments. Suffix bounds keep their current character
+position, and each pricing plane prepares its bonus deduction once per score
+batch. Joint pricing prepares physical column identities, power, event coefficients
+and reward bonuses once before filling its pricing planes. Nonnegative bound
+rounding uses the next positive float bit pattern, with nonfinite inputs
+remaining infinite. Exact native scoring still enumerates all 120 orders.
+Noncompetitive deterministic Gekiso reward candidates may stop native replay when completed
+orders, plus the maximum reward for every remaining order, cannot reach the
+current cutoff. The calculation uses exact integer reward totals and native order
+multiplicities. Retained teams always contain all 120 scores. Reward surrogate proposals use strict primary cutoffs and keep equal-primary
+teams for their complete mean-score comparison. Rejected proposals are remembered
+separately from complete seeds; the first feasible proposal and public input seeds
+are always scored completely.
 
 Member programs are interned before search; the 32 MiB note-weight cache gives
 recently used rows a second eviction chance. Trigger dependencies are classified
@@ -302,3 +318,7 @@ maximum-score Top K searches. Pending hits carry `pendingScores: true` and a
 null score; callers complete every candidate at the distinct-member primary
 boundary with native 120-order evaluation before publishing or claiming a full
 result. Requests without this flag retain complete scores.
+
+The `chart` operation reports `cachedCharts` from the engine after insertion.
+The list contains at most four charts in eviction order. Priming existing charts
+without inserting them keeps that order.

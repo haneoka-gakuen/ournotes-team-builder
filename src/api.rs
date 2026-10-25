@@ -2992,6 +2992,7 @@ impl Engine {
         };
         seeds.extend(probe.hits.iter().map(|h| h.team.clone()));
         let mut best = f64::NEG_INFINITY;
+        let mut rejected = Vec::<search::Team>::new();
         for hit in &probe.hits {
             best = best.max(objective.exact(&hit.team, hit.power, &hit.slot_powers)?.key);
         }
@@ -3058,7 +3059,7 @@ impl Engine {
                 )?;
                 probe.stats.add(&proposal.stats);
                 for hit in proposal.hits {
-                    if seeds.iter().any(|team| {
+                    if seeds.iter().chain(&rejected).any(|team| {
                         team.members == hit.team.members && team.snaps == hit.team.snaps
                     }) {
                         continue;
@@ -3085,8 +3086,13 @@ impl Engine {
                     {
                         continue;
                     }
-                    best = best.max(objective.exact(&hit.team, hit.power, &hit.slot_powers)?.key);
-                    seeds.push(hit.team);
+                    match objective.score_proposal(&hit.team, hit.power, &hit.slot_powers, best)? {
+                        Some(exact) => {
+                            best = best.max(exact.key);
+                            seeds.push(hit.team);
+                        }
+                        None => rejected.push(hit.team),
+                    }
                 }
             }
         }
@@ -3125,14 +3131,18 @@ impl Engine {
                 )?;
                 probe.stats.add(&proposal.stats);
                 for hit in proposal.hits {
-                    if seeds.iter().any(|team| {
+                    if seeds.iter().chain(&rejected).any(|team| {
                         team.members == hit.team.members && team.snaps == hit.team.snaps
                     }) {
                         continue;
                     }
-                    let value = objective.exact(&hit.team, hit.power, &hit.slot_powers)?.key;
-                    best = best.max(value);
-                    seeds.push(hit.team);
+                    match objective.score_proposal(&hit.team, hit.power, &hit.slot_powers, best)? {
+                        Some(exact) => {
+                            best = best.max(exact.key);
+                            seeds.push(hit.team);
+                        }
+                        None => rejected.push(hit.team),
+                    }
                 }
                 if best >= ceiling {
                     break;
@@ -3686,7 +3696,7 @@ impl Engine {
         }
         Ok(response)
     }
-    fn cached_chart_keys(&self) -> Vec<String> {
+    pub(crate) fn cached_chart_keys(&self) -> Vec<String> {
         self.chart_order
             .iter()
             .map(|(s, d)| format!("{s}:{d}"))

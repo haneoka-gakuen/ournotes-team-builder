@@ -146,7 +146,7 @@ pub fn execute(input: &Value) -> Result<Value, String> {
                     master::int(&song["difficulty"]),
                     source,
                 )?;
-                Ok(json!({"ready":true}))
+                Ok(json!({"ready":true,"cachedCharts":engine.cached_chart_keys()}))
             }
             "evaluate" => engine.evaluate(
                 &input["request"],

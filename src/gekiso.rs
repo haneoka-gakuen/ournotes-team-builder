@@ -18,7 +18,10 @@ use rustc_hash::FxHashMap as HashMap;
 use std::{
     borrow::Cow,
     collections::HashSet,
-    sync::{Arc, OnceLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, OnceLock,
+    },
 };
 #[derive(Clone)]
 pub struct MissRule {
@@ -1594,6 +1597,9 @@ struct ReplayTree<'a> {
     events: &'a [Vec<(usize, i32)>],
     chronological: Vec<usize>,
     generation: u64,
+    observe: Option<&'a (dyn Fn(f64, usize) -> bool + Sync)>,
+    multiplicities: &'a [usize],
+    stopped: AtomicBool,
 }
 impl ReplayTree<'_> {
     fn advance(&self, model: &mut Model<'_>, from: usize, to: usize) -> Result<(), String> {
@@ -1613,7 +1619,10 @@ impl ReplayTree<'_> {
         from: usize,
         fixed: usize,
         values: &mut [ReplayValue],
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
+        if self.stopped.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
         let representative = &self.events[orders[0]];
         let split = (fixed..self.chronological.len()).find(|&at| {
             let event = self.chronological[at];
@@ -1636,10 +1645,20 @@ impl ReplayTree<'_> {
                     *score = state.score() as f64;
                 }
             }
-            for &order in orders {
-                values[order] = (model.score.score.score as f64, ranges);
+            let score = model.score.score.score as f64;
+            if self.observe.is_some_and(|observe| {
+                !observe(
+                    score,
+                    orders.iter().map(|&order| self.multiplicities[order]).sum(),
+                )
+            }) {
+                self.stopped.store(true, Ordering::Relaxed);
+                return Ok(false);
             }
-            return Ok(());
+            for &order in orders {
+                values[order] = (score, ranges);
+            }
+            return Ok(true);
         }
         let at = split.unwrap();
         let time = self.chart.play.frames[until].time_ms;
@@ -1662,9 +1681,11 @@ impl ReplayTree<'_> {
             }
             let mut branch = model.clone();
             branch.set_event_members(&self.events[orders[0]]);
-            self.visit(branch, &orders, until, end, values)?;
+            if !self.visit(branch, &orders, until, end, values)? {
+                return Ok(false);
+            }
         }
-        Ok(())
+        Ok(true)
     }
 }
 /// Replay complete skill, conversion and LIFE state for each ordinary order
@@ -1676,6 +1697,29 @@ pub fn replay_orders(
     seeds: &[i32],
     power: i32,
 ) -> Result<ReplayedScores, String> {
+    replay_orders_observed(master, chart, deck, seeds, power, None).map(Option::unwrap)
+}
+
+/// Completed leaf orders carry their multiplicity in the native 120-order set.
+pub(crate) fn replay_orders_with_cutoff(
+    master: &Master,
+    chart: &Chart,
+    deck: &[Performer],
+    seeds: &[i32],
+    power: i32,
+    observe: &(dyn Fn(f64, usize) -> bool + Sync),
+) -> Result<Option<ReplayedScores>, String> {
+    replay_orders_observed(master, chart, deck, seeds, power, Some(observe))
+}
+
+fn replay_orders_observed(
+    master: &Master,
+    chart: &Chart,
+    deck: &[Performer],
+    seeds: &[i32],
+    power: i32,
+    observe: Option<&(dyn Fn(f64, usize) -> bool + Sync)>,
+) -> Result<Option<ReplayedScores>, String> {
     if deck.len() != 5 {
         return Err("a team requires five performers".into());
     }
@@ -1756,11 +1800,18 @@ pub fn replay_orders(
     }
     let mut chronological: Vec<_> = (0..chart.full.events.len()).collect();
     chronological.sort_by_key(|&event| (chart.full.events[event].1, event));
+    let mut multiplicities = vec![0; event_orders.len()];
+    for &index in &indices {
+        multiplicities[index] += 1;
+    }
     let tree = ReplayTree {
         chart,
         events: &event_orders,
         chronological,
         generation,
+        observe,
+        multiplicities: &multiplicities,
+        stopped: AtomicBool::new(false),
     };
     #[cfg(target_arch = "wasm32")]
     let jobs = vec![(0..event_orders.len()).collect::<Vec<_>>()];
@@ -1774,7 +1825,13 @@ pub fn replay_orders(
                 .map_or(0, |&event| events[event].0);
             jobs.entry(member).or_default().push(order);
         }
-        jobs.into_values().collect::<Vec<_>>()
+        let groups: Vec<_> = jobs.into_values().collect();
+        let count = crate::parallel::workers(groups.len());
+        let mut jobs = vec![Vec::new(); count];
+        for (index, group) in groups.into_iter().enumerate() {
+            jobs[index % count].extend(group);
+        }
+        jobs
     };
     let batches = crate::parallel::map(&jobs, |orders| -> Result<_, String> {
         let mut totals = vec![(0.0, [0.0; 3]); event_orders.len()];
@@ -1793,7 +1850,9 @@ pub fn replay_orders(
             )?;
             chart.fixed_life(&mut model);
             let mut values = vec![(0.0, [0.0; 3]); event_orders.len()];
-            tree.visit(model, orders, 0, 0, &mut values)?;
+            if !tree.visit(model, orders, 0, 0, &mut values)? {
+                return Ok(None);
+            }
             for &order in orders {
                 totals[order].0 += values[order].0;
                 for (total, value) in totals[order].1.iter_mut().zip(values[order].1) {
@@ -1801,22 +1860,27 @@ pub fn replay_orders(
                 }
             }
         }
-        Ok(orders
-            .iter()
-            .map(|&order| {
-                let (score, ranges) = totals[order];
-                (
-                    order,
+        Ok(Some(
+            orders
+                .iter()
+                .map(|&order| {
+                    let (score, ranges) = totals[order];
                     (
-                        score / runs.len() as f64,
-                        ranges.map(|v| v / runs.len() as f64),
-                    ),
-                )
-            })
-            .collect::<Vec<_>>())
+                        order,
+                        (
+                            score / runs.len() as f64,
+                            ranges.map(|v| v / runs.len() as f64),
+                        ),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        ))
     })?;
     let mut replays = vec![(0.0, [0.0; 3]); event_orders.len()];
     for batch in batches {
+        let Some(batch) = batch else {
+            return Ok(None);
+        };
         for (order, value) in batch {
             replays[order] = value;
         }
@@ -1825,10 +1889,10 @@ pub fn replay_orders(
     let range_scores = std::array::from_fn(|range| {
         indices.iter().map(|&i| replays[i].1[range]).sum::<f64>() / indices.len() as f64
     });
-    Ok(ReplayedScores {
+    Ok(Some(ReplayedScores {
         scores: live::summarize(power, scores),
         range_scores,
-    })
+    }))
 }
 
 pub(crate) fn settle_extreme(
