@@ -189,6 +189,58 @@ impl RewardCurve {
                 .min(self.steps.last().unwrap().1)
         }
     }
+    pub(crate) fn unordered_orders(&self, coefficients: &[f64], power: f64) -> f64 {
+        self.partial_orders(coefficients, power, coefficients.len())
+    }
+    pub(crate) fn partial_orders(&self, coefficients: &[f64], power: f64, count: usize) -> f64 {
+        let lowest = power * coefficients.iter().copied().fold(f64::INFINITY, f64::min);
+        let rank = self
+            .steps
+            .partition_point(|&(required, _)| required <= lowest)
+            .saturating_sub(1);
+        let mut before = 0;
+        let mut total = 0.0;
+        let mut value = self.steps[rank].1;
+        for &(required, next) in self.steps.iter().skip(rank + 1) {
+            if before == count {
+                break;
+            }
+            let count = coefficients
+                .iter()
+                .filter(|&&value| power * value < required)
+                .count();
+            total += (count - before) as f64 * value;
+            before = count;
+            value = next;
+        }
+        total += (count - before) as f64 * value;
+        let mean = total / count as f64;
+        if self.error == 0.0 {
+            mean
+        } else {
+            (mean.next_up() + self.error)
+                .next_up()
+                .min(self.steps.last().unwrap().1)
+        }
+    }
+    pub(crate) fn limited_orders(&self, coefficient: f64, power: f64, count: usize) -> f64 {
+        let score = power * coefficient;
+        let rank = self
+            .steps
+            .partition_point(|&(required, _)| required <= score)
+            .saturating_sub(1);
+        let maximum = self.steps.last().unwrap().1;
+        let low = self.steps[rank].1 * count as f64;
+        let high = maximum * (120 - count) as f64;
+        if self.error == 0.0 {
+            (low + high) / 120.0
+        } else {
+            ((((low.next_up() + high.next_up()).next_up() / 120.0).next_up() + self.error)
+                .next_up())
+            .min(maximum)
+        }
+    }
+
     pub(crate) fn shifted_sum(
         &self,
         coefficients: &[f64],

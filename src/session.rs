@@ -14,7 +14,14 @@ struct Session {
 }
 static NEXT: AtomicU64 = AtomicU64::new(1);
 static SESSIONS: OnceLock<Mutex<HashMap<u64, Arc<Session>>>> = OnceLock::new();
-type MasterCache = Mutex<Option<(Value, master::Master)>>;
+struct MasterEntry {
+    data: Value,
+    master: master::Master,
+    scores: crate::api::SharedScores,
+    #[cfg(not(target_arch = "wasm32"))]
+    floors: crate::api::SharedFloors,
+}
+type MasterCache = Mutex<Option<MasterEntry>>;
 static MASTER: OnceLock<MasterCache> = OnceLock::new();
 fn sessions() -> &'static Mutex<HashMap<u64, Arc<Session>>> {
     SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
@@ -40,11 +47,31 @@ pub fn execute(input: &Value) -> Result<Value, String> {
                 .map_err(|_| "master-cache-poisoned")?;
             if cache
                 .as_ref()
-                .is_none_or(|(data, _)| data != &input["data"])
+                .is_none_or(|entry| entry.data != input["data"])
             {
-                *cache = Some((input["data"].clone(), master::compile(&input["data"])?));
+                *cache = Some(MasterEntry {
+                    data: input["data"].clone(),
+                    master: master::compile(&input["data"])?,
+                    scores: crate::api::SharedScores::default(),
+                    #[cfg(not(target_arch = "wasm32"))]
+                    floors: crate::api::SharedFloors::default(),
+                });
             }
-            Engine::from_master(cache.as_ref().unwrap().1.clone())
+            let entry = cache.as_ref().unwrap();
+            let mut engine = Engine::from_master(entry.master.clone());
+            engine.scored_seeds = entry.scores.clone();
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                engine.shared_floors = entry.floors.clone();
+            }
+            engine.trusted_scores = input["trustedScores"] == true;
+            #[cfg(not(target_arch = "wasm32"))]
+            if engine.trusted_scores {
+                engine.worker_budget = input["workers"]
+                    .as_u64()
+                    .map(|value| value.clamp(1, 8) as usize);
+            }
+            engine
         };
         let id = NEXT.fetch_add(1, Ordering::Relaxed);
         sessions()
@@ -57,7 +84,11 @@ pub fn execute(input: &Value) -> Result<Value, String> {
                     generation: Arc::new(AtomicU64::new(0)),
                 }),
             );
-        return Ok(json!({"handle":id}));
+        let mut response = json!({"handle":id});
+        if input["trustedScores"] == true {
+            response["cooperativeFloor"] = json!(cfg!(not(target_arch = "wasm32")));
+        }
+        return Ok(response);
     }
     let handle = input["handle"].as_u64().ok_or("invalid-engine-context")?;
     if op == "dispose" {
@@ -85,11 +116,20 @@ pub fn execute(input: &Value) -> Result<Value, String> {
         if generation != crate::cancellation_generation() {
             return Err("cancelled".into());
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        let _budget = crate::parallel::enter_budget(engine.worker_budget);
         match op {
             "qualify" => {
                 Ok(json!({"issues":crate::pt::validate(&engine.master,&input["request"])?}))
             }
-            "run" => engine.run(input, started, &clock::milliseconds),
+            "run" => {
+                engine.import_scores(&input["scoredSeeds"]);
+                let mut result = engine.run(input, started, &clock::milliseconds)?;
+                if engine.trusted_scores && input["exportScores"] == true {
+                    result["_scoredSeeds"] = engine.export_scores(&input["request"]);
+                }
+                Ok(result)
+            }
             "growth" => engine.growth(input, started, &clock::milliseconds),
             "rates" => engine.rates(input),
             "evaluateAll" => engine.evaluate_all(input),

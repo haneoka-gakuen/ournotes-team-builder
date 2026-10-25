@@ -148,6 +148,51 @@ impl IdleInput {
     }
 }
 impl Checker {
+    pub(crate) fn fixed_life(&mut self, life: i32) {
+        let fixed = match &mut self.test {
+            Test::Life {
+                kind,
+                value: Some(value),
+            } => Some(match *kind {
+                2000 => *value < life as f64,
+                2001 => *value <= life as f64,
+                2002 => (life as f64) < *value,
+                _ => life as f64 <= *value,
+            }),
+            Test::And(items) | Test::Or(items) => {
+                for item in items.iter_mut() {
+                    item.fixed_life(life);
+                }
+                None
+            }
+            Test::Not(inner) => {
+                inner.fixed_life(life);
+                None
+            }
+            _ => None,
+        };
+        let fixed = fixed.or_else(|| match &self.test {
+            Test::And(items) if items.iter().all(|item| matches!(item.test, Test::Fixed(_))) => {
+                Some(
+                    items
+                        .iter()
+                        .all(|item| matches!(item.test, Test::Fixed(true))),
+                )
+            }
+            Test::Or(items) if items.iter().all(|item| matches!(item.test, Test::Fixed(_))) => {
+                Some(
+                    items
+                        .iter()
+                        .any(|item| matches!(item.test, Test::Fixed(true))),
+                )
+            }
+            _ => None,
+        });
+        if let Some(value) = fixed {
+            self.test = Test::Fixed(value);
+            self.idle = Self::classify_input(&self.test);
+        }
+    }
     pub fn new(test: Test) -> Self {
         let idle = Self::classify_input(&test);
         Self {

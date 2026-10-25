@@ -1,6 +1,11 @@
 //! Native CB timelines and additive support commands for deterministic bounds.
 use crate::{
-    full::{conditions::Performer, model::Model},
+    full::{
+        conditions::Performer,
+        core, effects,
+        model::{self, ComboSupportFrame, Model},
+        score,
+    },
     gekiso,
     master::{Condition, Cumulative, GekisoSkill, Master, SkillEffect},
     num::f,
@@ -230,10 +235,10 @@ pub(crate) struct ComboTrace {
     pub gk: Vec<f64>,
     pub maxima: Vec<f64>,
     support_cache: Option<ComboSupportCache>,
+    support_frames: Option<Vec<ComboSupportFrame>>,
 }
 impl ComboTrace {
     pub fn new(master: &Master, chart: &gekiso::Chart, actors: &[Performer]) -> Option<Self> {
-        let context = gekiso::context_fixed(master, chart, actors, &[0]).ok()?;
         let mut model = Model::new(
             master,
             actors,
@@ -244,6 +249,18 @@ impl ComboTrace {
             (0, false),
         )
         .ok()?;
+        model.score.score.calculator.factors_only = true;
+        chart.fixed_life(&mut model);
+        if chart.setup.missions.iter().all(|&mission| mission == 1)
+            && actors.iter().all(|actor| {
+                actor.live_skill.is_none()
+                    && actor.support_skills.is_empty()
+                    && actor.gekisou_support_skills.is_empty()
+            })
+            && combo_key(master, actors).starts_with("sum:")
+        {
+            model.observe_combo_support().ok()?;
+        }
         let mut maxima = vec![0.0_f64; chart.setup.fevers.len()];
         for k in chart.span.0..chart.span.1 {
             let frame = &chart.play.frames[k];
@@ -256,12 +273,25 @@ impl ComboTrace {
                 }
             }
         }
+        let index: HashMap<_, _> = chart
+            .notes
+            .iter()
+            .enumerate()
+            .map(|(i, note)| (note.id, i))
+            .collect();
+        let mut gk = vec![1.0; chart.notes.len()];
+        for (id, observation) in &model.score.score.calculator.observations {
+            if let Some(&index) = index.get(id) {
+                gk[index] = observation.gk;
+            }
+        }
         Some(Self {
             master: master.clone(),
             actors: actors.to_vec(),
-            gk: context.gk,
+            gk,
             maxima,
             support_cache: None,
+            support_frames: model.take_combo_support(),
         })
     }
     pub(crate) fn cache_bytes(&self) -> usize {
@@ -280,6 +310,13 @@ impl ComboTrace {
                 })
                 .sum::<usize>()
             + (self.gk.capacity() + self.maxima.capacity()) * std::mem::size_of::<f64>()
+            + self.support_frames.as_ref().map_or(0, |frames| {
+                frames.capacity() * std::mem::size_of::<ComboSupportFrame>()
+                    + frames
+                        .iter()
+                        .map(|frame| frame.states.capacity() * std::mem::size_of::<[i32; 4]>())
+                        .sum::<usize>()
+            })
             + self.support_cache.as_ref().map_or(0, |cache| {
                 let cache = cache.lock().unwrap_or_else(|error| error.into_inner());
                 cache.capacity() * (std::mem::size_of::<(Vec<[i32; 5]>, Vec<f64>)>() + 1)
@@ -369,6 +406,92 @@ impl ComboTrace {
         self.support_programs(chart, &[rows])?.pop()
     }
     fn support_programs(
+        &self,
+        chart: &gekiso::Chart,
+        programs: &[&[[i32; 5]]],
+    ) -> Option<Vec<Vec<f64>>> {
+        let Some(frames) = self.support_frames.as_ref().filter(|_| {
+            programs
+                .iter()
+                .flat_map(|rows| rows.iter())
+                .all(|row| row[3] == 7001 && (row[4] == 1 || row[4] == 4))
+        }) else {
+            return self.support_programs_native(chart, programs);
+        };
+        Self::recorded_support(chart, frames, programs)
+            .or_else(|| self.support_programs_native(chart, programs))
+    }
+    fn recorded_support(
+        chart: &gekiso::Chart,
+        frames: &[ComboSupportFrame],
+        programs: &[&[[i32; 5]]],
+    ) -> Option<Vec<Vec<f64>>> {
+        let mut commands = Vec::with_capacity(programs.len());
+        for rows in programs {
+            let mut values = Vec::new();
+            let mut counts = vec![[0; 5]; rows.len()];
+            let mut active = vec![[None; 5]; rows.len()];
+            for frame in frames {
+                for &[index, state, execute, finish] in &frame.states {
+                    let index = index as usize;
+                    for (row, &[value, maximum, unit, _, _]) in rows.iter().enumerate() {
+                        if state == effects::END {
+                            let mill: i32 = active[row][index].take()?;
+                            if mill != 0 {
+                                values.push((finish, mill.wrapping_neg()));
+                            }
+                            continue;
+                        }
+                        if state != effects::EXECUTE && (state != effects::EXECUTING || unit <= 0) {
+                            continue;
+                        }
+                        let value = if unit > 0 {
+                            let count = core::floor_i32(f(f(frame.combo as f64) / f(unit as f64)));
+                            if state == effects::EXECUTING && counts[row][index] == count {
+                                continue;
+                            }
+                            counts[row][index] = count;
+                            let value = value.wrapping_mul(count);
+                            if maximum > 0 {
+                                value.min(maximum)
+                            } else {
+                                value
+                            }
+                        } else {
+                            maximum
+                        };
+                        let factor = f(f(value as f64) / 10000.0);
+                        let mill = score::note_factor_mill(factor);
+                        if state == effects::EXECUTE {
+                            active[row][index] = Some(mill);
+                            if mill != 0 {
+                                values.push((execute, mill));
+                            }
+                        } else {
+                            let old = active[row][index]?;
+                            let previous = if old == 0 {
+                                0.0
+                            } else {
+                                f(f(old as f64) / 100000.0)
+                            };
+                            if !model::approximate(previous, factor) {
+                                if old != 0 {
+                                    values.push((frame.time, old.wrapping_neg()));
+                                }
+                                if mill != 0 {
+                                    values.push((frame.time, mill));
+                                }
+                                active[row][index] = Some(mill);
+                            }
+                        }
+                    }
+                }
+            }
+            commands.push(values);
+        }
+        Some(Self::support_values(chart, commands))
+    }
+    fn support_programs_native(
         &self,
         chart: &gekiso::Chart,
         programs: &[&[[i32; 5]]],
@@ -470,6 +593,8 @@ impl ComboTrace {
             (0, false),
         )
         .ok()?;
+        model.score.score.calculator.factors_only = true;
+        chart.fixed_life(&mut model);
         for k in chart.span.0..chart.span.1 {
             let frame = &chart.play.frames[k];
             model
@@ -483,25 +608,26 @@ impl ComboTrace {
                 commands[member as usize - self.actors.len()].push((time, value));
             }
         }
-        Some(
-            commands
-                .into_iter()
-                .map(|mut commands| {
-                    commands.sort_by_key(|c| c.0);
-                    let (mut at, mut current) = (0, 0.0);
-                    chart
-                        .times
-                        .iter()
-                        .map(|&time| {
-                            while at < commands.len() && commands[at].0 <= time {
-                                current += f(f(commands[at].1 as f64) / 100000.0);
-                                at += 1;
-                            }
-                            current.max(0.0)
-                        })
-                        .collect()
-                })
-                .collect(),
-        )
+        Some(Self::support_values(chart, commands))
+    }
+    fn support_values(chart: &gekiso::Chart, commands: Vec<Vec<(i32, i32)>>) -> Vec<Vec<f64>> {
+        commands
+            .into_iter()
+            .map(|mut commands| {
+                commands.sort_by_key(|c| c.0);
+                let (mut at, mut current) = (0, 0.0);
+                chart
+                    .times
+                    .iter()
+                    .map(|&time| {
+                        while at < commands.len() && commands[at].0 <= time {
+                            current += f(f(commands[at].1 as f64) / 100000.0);
+                            at += 1;
+                        }
+                        current.max(0.0)
+                    })
+                    .collect()
+            })
+            .collect()
     }
 }

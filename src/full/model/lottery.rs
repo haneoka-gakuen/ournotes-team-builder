@@ -132,6 +132,7 @@ pub(crate) fn rush_windows(
         Some(&chart.setup),
         (seeds[0], false),
     )?;
+    chart.fixed_life(&mut model);
     model.params.music_length = length;
     if model
         .rows

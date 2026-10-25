@@ -6,7 +6,7 @@ use crate::{
     power::{self, LeaderProfile, Member, Music, Player, SlotBase, Snap},
 };
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
 #[derive(Clone, Copy, Default)]
@@ -16,7 +16,7 @@ pub struct Totals {
     pub skill_low: f64,
     pub bonus: f64,
 }
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Team {
     pub members: Vec<usize>,
     pub snaps: Vec<i32>,
@@ -83,6 +83,9 @@ pub trait Objective {
     fn canonical_leader(&self) -> bool {
         false
     }
+    fn live_floor(&self) -> bool {
+        false
+    }
     fn needs_power_cap(&self) -> bool {
         false
     }
@@ -135,6 +138,13 @@ pub trait Objective {
     }
     fn prepare_members(&mut self, _characters: &[Vec<usize>]) {}
     fn prepare_member_domains(&mut self, _power: &[f64], _options: &[Vec<i32>]) {}
+    fn prepare_member_domains_at(&mut self, _leader: usize, power: &[f64], options: &[Vec<i32>]) {
+        self.prepare_member_domains(power, options);
+    }
+    /// A roster-only upper bound available before the generic joint cuts.
+    fn early_member_bound(&mut self, _members: &[usize], _from: usize, _limit: f64) -> Option<f64> {
+        None
+    }
     fn member_bound_at(
         &mut self,
         members: &[usize],
@@ -261,7 +271,7 @@ pub struct Constraints {
     pub max_bonus: Option<f64>,
     pub member_floor: Option<MemberFloor>,
 }
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Hit {
     pub team: Team,
@@ -943,7 +953,15 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         }
     }
     fn limit(&self) -> f64 {
-        self.frontier.threshold().max(self.input.floor)
+        let value = self.frontier.threshold().max(self.input.floor);
+        if self.input.objective.live_floor() {
+            if self.hits.len() >= self.input.k {
+                crate::publish_search_hit(&self.hits[self.input.k - 1]);
+            }
+            value.max(crate::search_floor())
+        } else {
+            value
+        }
     }
     fn necessary_limit(&self, limit: f64) -> f64 {
         if self.cannot_improve(limit) {
@@ -961,7 +979,10 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         }
     }
     fn cannot_improve(&self, upper: f64) -> bool {
-        (self.input.floor_exclusive && upper <= self.input.floor)
+        (self.input.objective.live_floor()
+            && !self.input.objective.score_ties()
+            && upper <= crate::search_floor())
+            || (self.input.floor_exclusive && upper <= self.input.floor)
             || (self.input.streaming
                 && self.hits.len() >= self.input.k
                 && (upper < self.hits[self.input.k - 1].key
@@ -2048,6 +2069,16 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             self.report_pending();
         }
         if left == 0 {
+            let limit = self.necessary_limit(self.limit());
+            if let Some(upper) = self
+                .input
+                .objective
+                .early_member_bound(chosen, index, limit)
+            {
+                if upper < self.limit() || self.cannot_improve(upper) {
+                    return Ok(());
+                }
+            }
             if !self.member_joint_possible(m, index, 0, member_part) {
                 return Ok(());
             }
@@ -2079,22 +2110,32 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             }
             return Ok(());
         }
+        let totals = Totals {
+            power: bonus_power.unwrap_or_else(|| power + top_sum(&m.char_power, index, left)),
+            skill: bonus_skill.unwrap_or_else(|| weight + top_sum(&m.char_skill, index, left)),
+            skill_low: 0.0,
+            bonus: (bonus + top_sum(&m.char_bonus, index, left)).min(
+                member_part + top_sum(&m.char_member_bonus, index, left) + self.snap_bonus_top5,
+            ),
+        };
+        let plain = self.input.objective.bound(totals);
+        if plain < self.limit() || self.cannot_improve(plain) {
+            return Ok(());
+        }
+        let limit = self.necessary_limit(self.limit());
+        if let Some(upper) = self
+            .input
+            .objective
+            .early_member_bound(chosen, index, limit)
+        {
+            if upper < self.limit() || self.cannot_improve(upper) {
+                return Ok(());
+            }
+        }
         if !self.member_joint_possible(m, index, left, member_part) {
             return Ok(());
         }
-        let bound = self.member_set_bound(
-            chosen,
-            Totals {
-                power: bonus_power.unwrap_or_else(|| power + top_sum(&m.char_power, index, left)),
-                skill: bonus_skill.unwrap_or_else(|| weight + top_sum(&m.char_skill, index, left)),
-                skill_low: 0.0,
-                bonus: (bonus + top_sum(&m.char_bonus, index, left)).min(
-                    member_part + top_sum(&m.char_member_bonus, index, left) + self.snap_bonus_top5,
-                ),
-            },
-            left,
-            index,
-        );
+        let bound = self.member_set_bound(chosen, totals, left, index);
         if bound < self.limit()
             || self.cannot_improve(bound)
             || self
@@ -3726,7 +3767,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             );
             self.input
                 .objective
-                .prepare_member_domains(&slot_power, &self.options);
+                .prepare_member_domains_at(leader, &slot_power, &self.options);
             self.input.objective.prepare_members(&characters);
             let leader_totals = Totals {
                 power: slot_power[leader] + self.best[leader].power,

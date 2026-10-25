@@ -35,6 +35,126 @@ use std::sync::{
     Arc,
 };
 static GENERATION: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_arch = "wasm32")]
+static SEARCH_FLOOR: AtomicU64 = AtomicU64::new(f64::NEG_INFINITY.to_bits());
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) struct SearchFloor {
+    value: AtomicU64,
+    hit: std::sync::Mutex<Option<search::Hit>>,
+    proofs: std::sync::Mutex<rewards::SharedRewardProofs>,
+}
+#[cfg(not(target_arch = "wasm32"))]
+impl Default for SearchFloor {
+    fn default() -> Self {
+        Self {
+            value: AtomicU64::new(f64::NEG_INFINITY.to_bits()),
+            hit: std::sync::Mutex::new(None),
+            proofs: std::sync::Mutex::new(rewards::SharedRewardProofs::default()),
+        }
+    }
+}
+#[cfg(not(target_arch = "wasm32"))]
+thread_local! { static LOCAL_FLOOR: RefCell<Option<Arc<SearchFloor>>> = const { RefCell::new(None) }; }
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) struct SearchFloorScope(Option<Arc<SearchFloor>>);
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for SearchFloorScope {
+    fn drop(&mut self) {
+        LOCAL_FLOOR.with(|local| {
+            local.replace(self.0.take());
+        });
+    }
+}
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn enter_search_floor(floor: Arc<SearchFloor>) -> SearchFloorScope {
+    SearchFloorScope(LOCAL_FLOOR.with(|local| local.replace(Some(floor))))
+}
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn local_search_floor() -> Option<Arc<SearchFloor>> {
+    LOCAL_FLOOR.with(|local| local.borrow().clone())
+}
+pub(crate) fn search_floor() -> f64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        f64::from_bits(SEARCH_FLOOR.load(Ordering::Relaxed))
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        LOCAL_FLOOR.with(|local| {
+            local.borrow().as_ref().map_or(f64::NEG_INFINITY, |floor| {
+                f64::from_bits(floor.value.load(Ordering::Acquire))
+            })
+        })
+    }
+}
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn shared_search_hit() -> Option<search::Hit> {
+    LOCAL_FLOOR.with(|local| {
+        local
+            .borrow()
+            .as_ref()
+            .and_then(|floor| floor.hit.lock().unwrap().clone())
+    })
+}
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn shared_reward_proof(key: &rewards::SharedRewardKey) -> Option<(f64, f64)> {
+    LOCAL_FLOOR.with(|local| {
+        local
+            .borrow()
+            .as_ref()
+            .and_then(|floor| floor.proofs.lock().unwrap().get(key))
+    })
+}
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn publish_reward_proof(key: rewards::SharedRewardKey, power: f64, limit: f64) {
+    LOCAL_FLOOR.with(|local| {
+        if let Some(floor) = local.borrow().as_ref() {
+            floor.proofs.lock().unwrap().record(key, power, limit);
+        }
+    });
+}
+pub(crate) fn reset_search_floor() {
+    #[cfg(target_arch = "wasm32")]
+    SEARCH_FLOOR.store(f64::NEG_INFINITY.to_bits(), Ordering::Relaxed);
+}
+pub(crate) fn publish_search_hit(hit: &search::Hit) {
+    if !hit.key.is_finite() || hit.key < 0.0 {
+        return;
+    }
+    #[cfg(target_arch = "wasm32")]
+    haneoka_search_floor(hit.key);
+    #[cfg(not(target_arch = "wasm32"))]
+    LOCAL_FLOOR.with(|local| {
+        if let Some(floor) = local.borrow().as_ref() {
+            if hit.key > f64::from_bits(floor.value.load(Ordering::Relaxed)) {
+                let mut best = floor.hit.lock().unwrap();
+                if hit.key > f64::from_bits(floor.value.load(Ordering::Relaxed)) {
+                    *best = Some(hit.clone());
+                    floor.value.store(hit.key.to_bits(), Ordering::Release);
+                }
+            }
+        }
+    });
+}
+#[cfg(target_arch = "wasm32")]
+#[no_mangle]
+pub extern "C" fn haneoka_search_floor(value: f64) {
+    if !value.is_finite() || value < 0.0 {
+        return;
+    }
+    let mut previous = SEARCH_FLOOR.load(Ordering::Relaxed);
+    while value > f64::from_bits(previous) {
+        match SEARCH_FLOOR.compare_exchange_weak(
+            previous,
+            value.to_bits(),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(current) => previous = current,
+        }
+    }
+}
 thread_local! { static LOCAL_CANCEL: RefCell<Option<Arc<AtomicU64>>> = const { RefCell::new(None) }; }
 
 pub(crate) fn with_cancellation<T>(generation: Arc<AtomicU64>, run: impl FnOnce() -> T) -> T {

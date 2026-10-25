@@ -101,6 +101,17 @@ struct CondSkill {
     skill_type: i32,
     updater: ConditionUpdater,
 }
+#[derive(Clone)]
+pub(crate) struct ComboSupportFrame {
+    pub time: i32,
+    pub combo: i32,
+    pub states: Vec<[i32; 4]>,
+}
+#[derive(Clone)]
+struct ComboObserver {
+    updater: ConditionUpdater,
+    frames: Vec<ComboSupportFrame>,
+}
 #[derive(Clone, Copy)]
 enum Listed {
     Live(usize, usize),
@@ -280,6 +291,7 @@ pub struct Model<'a> {
     pub record: Option<LuckRecord>,
     pub record_trace: bool,
     rush_observers: Vec<ConditionUpdater>,
+    combo_observer: Option<ComboObserver>,
     pub(crate) rush_support_commands: Vec<(i32, i32)>,
     /// Per-frame scratch, kept to avoid reallocating every frame.
     listed: Vec<Listed>,
@@ -294,11 +306,39 @@ fn mission_group(mission: i32) -> Result<i32, String> {
         )),
     }
 }
-fn approximate(a: f64, b: f64) -> bool {
+pub(crate) fn approximate(a: f64, b: f64) -> bool {
     let tolerance = f(f(1e-6) * a.abs().max(b.abs())).max(f(1.401298464324817e-45 * 8.0));
     f(b - a).abs() < tolerance
 }
 impl<'a> Model<'a> {
+    pub(crate) fn fixed_life(&mut self) {
+        if self.rows.iter().any(|row| {
+            matches!(row.kind, 3000..=3002)
+                || row.kind == 13005 && self.master.live.damage[6] != 0.0
+                || row.kind == 12006
+                    && (!(1..=6).contains(&row.value)
+                        || self.master.live.damage[row.value as usize] != 0.0)
+        }) {
+            return;
+        }
+        let life = self.master.live.life_base as i32;
+        for skill in &mut self.live {
+            for effect in &mut skill.effects {
+                for checker in [&mut effect.condition, &mut effect.release]
+                    .into_iter()
+                    .flatten()
+                {
+                    checker.fixed_life(life);
+                }
+            }
+        }
+        for skill in &mut self.condition {
+            skill.updater.fixed_life(life);
+        }
+        for observer in &mut self.rush_observers {
+            observer.fixed_life(life);
+        }
+    }
     pub fn new(
         master: &'a Master,
         deck: &[Performer],
@@ -410,6 +450,7 @@ impl<'a> Model<'a> {
             },
             record_trace: false,
             rush_observers: Vec::new(),
+            combo_observer: None,
             rush_support_commands: Vec::new(),
             listed: Vec::new(),
             updated: Vec::new(),
@@ -579,6 +620,35 @@ impl<'a> Model<'a> {
                 .push(ConditionUpdater::new(vec![effect], Some(gate))?);
         }
         Ok(())
+    }
+    pub(crate) fn observe_combo_support(&mut self) -> Result<bool, String> {
+        if self.phase(2000) != self.phase(2001) {
+            return Ok(false);
+        }
+        let effect = effects::Effect {
+            id: 1,
+            trigger_type: effects::ONE_SHOT,
+            act: 0.0,
+            phase: self.phase(2000),
+            trigger: Some(Checker::new(Test::RangeStart {
+                missions: Vec::new(),
+                triggered: Vec::new(),
+            })),
+            condition: None,
+            execute_limit: 0,
+            reset: None,
+            row: 0,
+            cumulative: None,
+            release: Some(Checker::new(Test::RangeComplete)),
+        };
+        self.combo_observer = Some(ComboObserver {
+            updater: ConditionUpdater::new(vec![effect], Some(gekisou::MISSION_COMBO))?,
+            frames: Vec::new(),
+        });
+        Ok(true)
+    }
+    pub(crate) fn take_combo_support(&mut self) -> Option<Vec<ComboSupportFrame>> {
+        self.combo_observer.take().map(|observer| observer.frames)
     }
     fn phase(&self, kind: i32) -> i32 {
         self.master.live.phases.get(&kind).copied().unwrap_or(1)
@@ -814,6 +884,9 @@ impl<'a> Model<'a> {
         for observer in &mut self.rush_observers {
             observer.begin_frame();
         }
+        if let Some(observer) = &mut self.combo_observer {
+            observer.updater.begin_frame();
+        }
         let mut listed = std::mem::take(&mut self.listed);
         let mut updated = std::mem::take(&mut self.updated);
         for phase in 1..=2 {
@@ -890,6 +963,45 @@ impl<'a> Model<'a> {
                             self.rush_support_commands.push((state.execute_ms, 1));
                         } else if state.state == effects::END {
                             self.rush_support_commands.push((state.finish_ms, -1));
+                        }
+                    }
+                }
+                if let Some(observer) = &mut self.combo_observer {
+                    updated.clear();
+                    observer
+                        .updater
+                        .update(phase, &input, &mut ctx, &mut updated)?;
+                    if phase == observer.updater.effects[0].phase {
+                        let combo = ctx
+                            .gk
+                            .as_ref()
+                            .filter(|g| g.controller.current_playing >= 0)
+                            .map_or(0, |g| {
+                                g.controller.states[g.controller.current_playing as usize].combo
+                            });
+                        let state = |&index: &usize| {
+                            let current = &observer.updater.updaters[index].state;
+                            [
+                                index as i32,
+                                current.state,
+                                current.execute_ms,
+                                current.finish_ms,
+                            ]
+                        };
+                        if observer.frames.last().is_none_or(|previous| {
+                            previous.combo != combo
+                                || previous.states.len() != updated.len()
+                                || !previous
+                                    .states
+                                    .iter()
+                                    .copied()
+                                    .eq(updated.iter().map(state))
+                        }) {
+                            observer.frames.push(ComboSupportFrame {
+                                time,
+                                combo,
+                                states: updated.iter().map(state).collect(),
+                            });
                         }
                     }
                 }

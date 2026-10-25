@@ -7,10 +7,55 @@ use crate::{
     power::{self, MemberInput, SnapInput},
     skills,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::Weak;
+use std::sync::{Arc, Mutex};
 type CachedScoreCap = (String, f64, Vec<crate::search::Team>);
+#[derive(Clone, Serialize, Deserialize)]
+struct ScoredSeeds {
+    scope: String,
+    source: Source,
+    hits: Vec<crate::search::Hit>,
+    request_id: String,
+    context_key: String,
+}
+#[derive(Clone, Default)]
+pub(crate) struct SharedScores(Arc<Mutex<VecDeque<ScoredSeeds>>>);
+#[cfg(not(target_arch = "wasm32"))]
+struct FloorGroup {
+    scope: String,
+    source: Source,
+    floor: Weak<crate::SearchFloor>,
+}
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Default)]
+pub(crate) struct SharedFloors(Arc<Mutex<VecDeque<FloorGroup>>>);
+#[cfg(not(target_arch = "wasm32"))]
+impl SharedFloors {
+    fn get(&self, scope: String, source: &Source) -> Arc<crate::SearchFloor> {
+        let mut groups = self.0.lock().unwrap();
+        groups.retain(|group| group.floor.strong_count() > 0);
+        if let Some(floor) = groups
+            .iter()
+            .find(|group| group.scope == scope && &group.source == source)
+            .and_then(|group| group.floor.upgrade())
+        {
+            return floor;
+        }
+        let floor = Arc::new(crate::SearchFloor::default());
+        groups.push_front(FloorGroup {
+            scope,
+            source: source.clone(),
+            floor: Arc::downgrade(&floor),
+        });
+        groups.truncate(32);
+        floor
+    }
+}
 pub struct Engine {
     pub master: Master,
     pub charts: BTreeMap<(i32, i32), Chart>,
@@ -20,8 +65,62 @@ pub struct Engine {
     gekiso_cache: RefCell<Option<(String, crate::gekiso::Chart)>>,
     reward_cache: RefCell<Option<(Value, crate::rewards::SettlementCache)>>,
     score_caps: RefCell<VecDeque<CachedScoreCap>>,
+    pub(crate) scored_seeds: SharedScores,
+    pub(crate) trusted_scores: bool,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) shared_floors: SharedFloors,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) worker_budget: Option<usize>,
 }
 impl Engine {
+    pub(crate) fn import_scores(&self, value: &Value) {
+        if !self.trusted_scores {
+            return;
+        }
+        if let Ok(packets) = serde_json::from_value::<Vec<ScoredSeeds>>(value.clone()) {
+            for packet in packets {
+                self.remember_scores(packet);
+            }
+        }
+    }
+    pub(crate) fn export_scores(&self, request: &Value) -> Value {
+        let cache = self.scored_seeds.0.lock().unwrap();
+        json!(cache
+            .iter()
+            .filter(|entry| {
+                request["requestId"].as_str() == Some(entry.request_id.as_str())
+                    && request["contextKey"].as_str() == Some(entry.context_key.as_str())
+            })
+            .collect::<Vec<_>>())
+    }
+    fn remember_scores(&self, mut packet: ScoredSeeds) {
+        packet.hits.retain(|hit| {
+            hit.detail["pendingScores"] != true
+                && hit.detail["scores"]["scores"]
+                    .as_array()
+                    .is_some_and(|scores| scores.len() == 120)
+        });
+        if packet.hits.is_empty() {
+            return;
+        }
+        let mut cache = self.scored_seeds.0.lock().unwrap();
+        if let Some(index) = cache
+            .iter()
+            .position(|entry| entry.scope == packet.scope && entry.source == packet.source)
+        {
+            let previous = cache.remove(index).unwrap();
+            for hit in previous.hits {
+                if !packet.hits.iter().any(|entry| {
+                    entry.team.members == hit.team.members && entry.team.snaps == hit.team.snaps
+                }) {
+                    packet.hits.push(hit);
+                }
+            }
+        }
+        packet.hits.truncate(32);
+        cache.push_front(packet);
+        cache.truncate(4);
+    }
     pub fn compile(data: &Value) -> Result<Self, String> {
         Ok(Self::from_master(master::compile(data)?))
     }
@@ -35,6 +134,12 @@ impl Engine {
             gekiso_cache: RefCell::new(None),
             reward_cache: RefCell::new(None),
             score_caps: RefCell::new(VecDeque::new()),
+            scored_seeds: SharedScores::default(),
+            trusted_scores: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            shared_floors: SharedFloors::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            worker_budget: None,
         }
     }
     pub fn insert_chart(
@@ -1429,37 +1534,110 @@ impl Engine {
         let floor = request["floors"][format!("{song_id}:{difficulty}")]
             .as_f64()
             .unwrap_or(f64::NEG_INFINITY);
-        let output = gekiso_objective::search(gekiso_objective::Input {
-            env: gekiso_objective::Environment {
-                master: &self.master,
-                player: &player,
-                members: &cards.members,
-                snaps: &cards.snaps,
-                music: Some(&music),
-                constraints: constraints.clone(),
-                now,
-                generation,
+        let initial = seed_teams(request, song, &cards.members, &cards.snaps);
+        let identity = request["requestId"]
+            .as_str()
+            .zip(request["contextKey"].as_str())
+            .filter(|(id, key)| !id.is_empty() && !key.is_empty());
+        let scope = identity.map(|(id, key)| json!([cache_key, goal, id, key]).to_string());
+        let scored = scope
+            .as_ref()
+            .and_then(|scope| {
+                self.scored_seeds
+                    .0
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|entry| &entry.scope == scope && &entry.source == source)
+                    .map(|entry| {
+                        entry
+                            .hits
+                            .iter()
+                            .filter(|hit| {
+                                initial.iter().any(|team| {
+                                    team.members == hit.team.members && team.snaps == hit.team.snaps
+                                })
+                            })
+                            .cloned()
+                            .collect::<Vec<_>>()
+                    })
+            })
+            .unwrap_or_default();
+        let cooperative_floor = self.trusted_scores
+            && identity.is_some()
+            && k == 1
+            && criterion == Criterion::Max
+            && chart.luck
+            && seeds.len() >= 16
+            && request["noFloor"] != true
+            && request["seedOnly"] != true
+            && (cfg!(not(target_arch = "wasm32")) || request["cooperativeFloor"] == true);
+        #[cfg(not(target_arch = "wasm32"))]
+        let _floor_scope = cooperative_floor.then(|| {
+            crate::enter_search_floor(self.shared_floors.get(
+                json!(["gekiso", scope.as_ref().unwrap()]).to_string(),
+                source,
+            ))
+        });
+        let output = gekiso_objective::search_scored(
+            gekiso_objective::Input {
+                env: gekiso_objective::Environment {
+                    master: &self.master,
+                    player: &player,
+                    members: &cards.members,
+                    snaps: &cards.snaps,
+                    music: Some(&music),
+                    constraints: constraints.clone(),
+                    now,
+                    generation,
+                },
+                chart: &mut chart,
+                seeds: seeds.clone(),
+                criterion,
+                k,
+                deadline,
+                initial,
+                seed_only: request["seedOnly"] == true,
+                seed_variant: match request["seedVariant"].as_str() {
+                    Some("sample") => Some(false),
+                    Some("quiet") => Some(true),
+                    _ => None,
+                },
+                defer_scores: request["deferScores"] == true,
+                cooperative_floor,
+                min_combo_bonus: master::int(&goal["minComboBonus"]),
+                seeded: request["seeded"] == true,
+                shard,
+                floor,
+                on_candidate: Some(&mut crate::progress::emit),
+                progress: None,
             },
-            chart: &mut chart,
-            seeds: seeds.clone(),
-            criterion,
-            k,
-            deadline,
-            initial: seed_teams(request, song, &cards.members, &cards.snaps),
-            seed_only: request["seedOnly"] == true,
-            seed_variant: match request["seedVariant"].as_str() {
-                Some("sample") => Some(false),
-                Some("quiet") => Some(true),
-                _ => None,
-            },
-            defer_scores: request["deferScores"] == true,
-            min_combo_bonus: master::int(&goal["minComboBonus"]),
-            seeded: request["seeded"] == true,
-            shard,
-            floor,
-            on_candidate: Some(&mut crate::progress::emit),
-            progress: None,
-        })?;
+            &scored,
+        )?;
+        #[cfg(not(target_arch = "wasm32"))]
+        let output =
+            {
+                let mut output = output;
+                if cooperative_floor {
+                    if let Some(hit) = crate::shared_search_hit() {
+                        if output.hits.first().is_none_or(|old| {
+                            gekiso_objective::compare_score_hits(&hit, old).is_gt()
+                        }) {
+                            output.hits = vec![hit];
+                        }
+                    }
+                }
+                output
+            };
+        if let Some((request_id, context_key)) = identity {
+            self.remember_scores(ScoredSeeds {
+                scope: scope.unwrap(),
+                source: source.clone(),
+                hits: output.hits.clone(),
+                request_id: request_id.into(),
+                context_key: context_key.into(),
+            });
+        }
 
         let compiled = crate::chart::compile(
             &self.master,
@@ -2206,6 +2384,19 @@ impl Engine {
         started: f64,
         now: &dyn Fn() -> f64,
     ) -> Result<Value, String> {
+        crate::reset_search_floor();
+        #[cfg(not(target_arch = "wasm32"))]
+        if input["request"]["shard"].is_object() {
+            return crate::parallel::serial(|| self.run_inner(input, started, now));
+        }
+        self.run_inner(input, started, now)
+    }
+    fn run_inner(
+        &mut self,
+        input: &Value,
+        started: f64,
+        now: &dyn Fn() -> f64,
+    ) -> Result<Value, String> {
         crate::objectives::reset_slot_table();
         let request = &input["request"];
         let kind = request["goal"]["kind"].as_str().ok_or("missing-goal")?;
@@ -2505,6 +2696,7 @@ impl Engine {
         }
         let cache_key = phase.map(|_| {
             json!([
+                song,
                 request["members"],
                 request["snaps"],
                 request["player"],
@@ -2523,7 +2715,97 @@ impl Engine {
                 .unwrap_or_default();
             objective.swap_settlements(&mut cache);
         }
+        let identity = request["requestId"]
+            .as_str()
+            .zip(request["contextKey"].as_str())
+            .filter(|(id, key)| !id.is_empty() && !key.is_empty());
+        let scope = identity.map(|(id, key)| {
+            json!([
+                song,
+                request["members"],
+                request["snaps"],
+                request["player"],
+                request["unknownPolicy"],
+                request["constraints"],
+                goal,
+                id,
+                key
+            ])
+            .to_string()
+        });
+        objective.live_floor = self.trusted_scores
+            && identity.is_some()
+            && phase.is_some()
+            && request["noFloor"] != true
+            && master::int(&request["k"]).max(1) == 1
+            && (cfg!(not(target_arch = "wasm32")) || request["cooperativeFloor"] == true);
+        #[cfg(not(target_arch = "wasm32"))]
+        let _floor_scope = objective.live_floor.then(|| {
+            let group = json!([
+                scope.as_ref().unwrap(),
+                phase,
+                request["rewardPhase"]["reward"],
+                request["rewardPhase"]["other"]
+            ])
+            .to_string();
+            crate::enter_search_floor(self.shared_floors.get(group, source))
+        });
+        if let Some(scope) = &scope {
+            let initial = seed_teams(request, song, &cards.members, &cards.snaps);
+            let scored = self
+                .scored_seeds
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|entry| &entry.scope == scope && &entry.source == source)
+                .map(|entry| {
+                    entry
+                        .hits
+                        .iter()
+                        .filter(|hit| {
+                            initial.iter().any(|team| {
+                                team.members == hit.team.members && team.snaps == hit.team.snaps
+                            })
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            objective.install_scores(&scored);
+        }
         let response = |output: search::Output, objective: &mut RewardObjective<'_>| {
+            #[cfg(not(target_arch = "wasm32"))]
+            let output = {
+                let mut output = output;
+                if objective.live_floor {
+                    if let Some(mut hit) = crate::shared_search_hit() {
+                        let key = |hit: &search::Hit| match phase {
+                            Some("other") => {
+                                master::number(&hit.detail["settlement"]["otherMean"], -1.0)
+                            }
+                            Some("score") => master::number(&hit.detail["scores"]["mean"], -1.0),
+                            _ => hit.key,
+                        };
+                        if output.hits.first().is_none_or(|old| key(&hit) > key(old)) {
+                            if phase.is_some_and(|phase| phase != "primary") {
+                                hit.key = request["rewardPhase"]["reward"].as_f64().unwrap();
+                            }
+                            output.hits = vec![hit];
+                        }
+                    }
+                }
+                output
+            };
+            if let Some((request_id, context_key)) = identity {
+                self.remember_scores(ScoredSeeds {
+                    scope: scope.clone().unwrap(),
+                    source: source.clone(),
+                    hits: output.hits.clone(),
+                    request_id: request_id.into(),
+                    context_key: context_key.into(),
+                });
+            }
             if let Some(key) = &cache_key {
                 let mut cache = crate::rewards::SettlementCache::default();
                 objective.swap_settlements(&mut cache);

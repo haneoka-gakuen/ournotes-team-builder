@@ -151,6 +151,17 @@ pub(crate) fn combo_factors(master: &Master, times: &[i32], judgements: &[usize]
 }
 
 impl Chart {
+    pub(crate) fn fixed_life(&self, model: &mut Model<'_>) {
+        if self
+            .play
+            .frames
+            .iter()
+            .flat_map(|frame| &frame.judged)
+            .all(|note| model.master.live.damage.get(note.judgement as usize) == Some(&0.0))
+        {
+            model.fixed_life();
+        }
+    }
     pub(crate) fn combo<'a>(&'a self, master: &Master, judgements: &[usize]) -> Cow<'a, [f64]> {
         if self
             .judgements
@@ -549,22 +560,32 @@ pub fn context_fixed(
     let n = chart.notes.len();
     if chart.luck && seeds.len() > 1 {
         let reduced: Vec<_> = deck.iter().map(Performer::gekiso_only).collect();
-        let initial = Model::new(
-            master,
-            &reduced,
-            &chart.full.notes,
-            &chart.full.events,
-            chart.params(),
-            Some(&chart.setup),
-            (seeds[0], false),
-        )?;
-        let draws: Vec<_> = seeds
-            .iter()
-            .map(|&seed| {
-                context_fixed_observed(master, chart, deck, &[seed], false, Some(&initial))
-                    .map(|(context, _)| Arc::new(context))
-            })
-            .collect::<Result<_, _>>()?;
+        let jobs: Vec<_> = seeds
+            .chunks(seeds.len().div_ceil(crate::parallel::preparation_workers()))
+            .collect();
+        let draws: Vec<_> = crate::parallel::map(&jobs, |batch| {
+            let mut initial = Model::new(
+                master,
+                &reduced,
+                &chart.full.notes,
+                &chart.full.events,
+                chart.params(),
+                Some(&chart.setup),
+                (seeds[0], false),
+            )?;
+            chart.fixed_life(&mut initial);
+
+            batch
+                .iter()
+                .map(|&seed| {
+                    context_fixed_observed(master, chart, deck, &[seed], false, Some(&initial))
+                        .map(|(context, _)| Arc::new(context))
+                })
+                .collect::<Result<Vec<_>, String>>()
+        })?
+        .into_iter()
+        .flatten()
+        .collect();
         let last = draws.last().unwrap();
         let average = |select: fn(&Context) -> &[f64]| {
             (0..n)
@@ -643,6 +664,7 @@ fn context_fixed_observed<'a>(
         if observe_rush {
             model.observe_rush_support()?;
         }
+        chart.fixed_life(&mut model);
         Ok(model)
     };
     let initial = if template.is_none() && runs.len() > 1 {
@@ -1550,6 +1572,7 @@ pub(crate) fn replay_order(
         Some(&chart.setup),
         (0, false),
     )?;
+    chart.fixed_life(&mut model);
     let generation = crate::cancellation_generation();
     for (k, frame) in chart.play.frames.iter().enumerate() {
         if generation != crate::cancellation_generation() {
@@ -1759,7 +1782,7 @@ pub fn replay_orders(
             let mut params = chart.params();
             params.power = power;
             params.music_type = chart.music_type;
-            let model = Model::new(
+            let mut model = Model::new(
                 master,
                 deck,
                 &chart.full.notes,
@@ -1768,6 +1791,7 @@ pub fn replay_orders(
                 Some(&chart.setup),
                 (seed, false),
             )?;
+            chart.fixed_life(&mut model);
             let mut values = vec![(0.0, [0.0; 3]); event_orders.len()];
             tree.visit(model, orders, 0, 0, &mut values)?;
             for &order in orders {

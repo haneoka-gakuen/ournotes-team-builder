@@ -20,6 +20,49 @@ use std::{
 };
 const REFINE_SLACK: f64 = 1e-4;
 const RELATIVE: f64 = 3e-6;
+#[cfg(not(target_arch = "wasm32"))]
+type SharedLuckKey = (String, usize);
+#[cfg(not(target_arch = "wasm32"))]
+type SharedLuckCell = Arc<OnceLock<Option<Arc<crate::rewards::LuckEnvelope>>>>;
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Default)]
+struct SharedLuckEntries {
+    values: HashMap<SharedLuckKey, SharedLuckCell>,
+    order: VecDeque<SharedLuckKey>,
+}
+#[cfg(not(target_arch = "wasm32"))]
+/// Level workers of one request have the same chart, seeds and support domain.
+struct SharedLuckCache {
+    entries: std::sync::Mutex<SharedLuckEntries>,
+    limit: usize,
+}
+#[cfg(not(target_arch = "wasm32"))]
+impl SharedLuckCache {
+    fn new(notes: usize) -> Self {
+        let bytes = notes
+            .saturating_mul(2 + 3 * std::mem::size_of::<usize>())
+            .saturating_add(4096);
+        Self {
+            entries: Default::default(),
+            limit: (8 * 1024 * 1024 / bytes).clamp(1, 256),
+        }
+    }
+    fn cell(&self, key: &SharedLuckKey) -> SharedLuckCell {
+        let mut entries = self.entries.lock().unwrap();
+        if let Some(value) = entries.values.get(key) {
+            return Arc::clone(value);
+        }
+        if entries.values.len() >= self.limit {
+            if let Some(old) = entries.order.pop_front() {
+                entries.values.remove(&old);
+            }
+        }
+        let value = Arc::new(OnceLock::new());
+        entries.values.insert(key.clone(), Arc::clone(&value));
+        entries.order.push_back(key.clone());
+        value
+    }
+}
 fn favoured_band(master: &Master, skills: &[(i32, i32)]) -> i32 {
     for &(id, level) in skills {
         for row in master
@@ -874,6 +917,8 @@ pub struct Kernel<'a> {
     fixed_luck_bounds: HashMap<FixedLuckKey, ComboBound>,
     fixed_luck_order: VecDeque<FixedLuckKey>,
     global_fixed_luck: Option<Option<Arc<crate::rewards::LuckEnvelope>>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    shared_fixed_luck: Option<Arc<SharedLuckCache>>,
     fixed_forced_members: Option<Vec<usize>>,
     converted_master: Option<Master>,
     fixed_choices: Vec<Option<FixedChoice>>,
@@ -929,6 +974,7 @@ pub struct Kernel<'a> {
     numeric_hull: Option<Arc<Vec<Arc<crate::just_bound::Upper>>>>,
     defer_scores: bool,
     seed_preview: bool,
+    live_floor: bool,
     numeric_hull_ready: bool,
     numeric_root_work: usize,
 }
@@ -1071,75 +1117,86 @@ fn collect_luck_envelope(
     supports: &[Vec<Performer>],
 ) -> Option<Arc<crate::rewards::LuckEnvelope>> {
     let generation = crate::cancellation_generation();
-    let value = (|| {
-        let mut value = crate::rewards::LuckEnvelope {
+    let aggregate = std::sync::Mutex::new((
+        crate::rewards::LuckEnvelope {
             fingerprint: OnceLock::new(),
             moments: None,
             changes: 0,
             rush: vec![false; chart.notes.len()],
             support: vec![false; chart.notes.len()],
-        };
-        let mut moments = crate::rewards::LuckMoments {
+        },
+        crate::rewards::LuckMoments {
             samples: seeds.len(),
             rush: vec![0; chart.notes.len()],
             support: vec![0; chart.notes.len()],
             joint: vec![0; chart.notes.len()],
-        };
-        for order in orders {
-            for support in supports {
-                if crate::cancellation_generation() != generation {
-                    return None;
-                }
-                let mut deck = order.clone();
-                deck.extend_from_slice(support);
-                let traces = crate::full::model::lottery::rush_windows(master, chart, &deck, seeds)
-                    .ok()??;
-                let mut rush = vec![0i32; chart.times.len() + 1];
-                let mut support = vec![0i32; chart.times.len() + 1];
-                let mut joint = vec![0i32; chart.times.len() + 1];
-                for trace in traces {
-                    value.changes = value.changes.max(trace.rush.len());
-                    let (mut rush_level, mut support_level, mut r, mut s) = (0, 0, 0, 0);
-                    while r < trace.rush.len() || s < trace.support.len() {
-                        let time = trace
-                            .rush
-                            .get(r)
-                            .map_or(i32::MAX, |v| v.0)
-                            .min(trace.support.get(s).map_or(i32::MAX, |v| v.0));
-                        let previous = (rush_level > 0, support_level > 0);
-                        while r < trace.rush.len() && trace.rush[r].0 == time {
-                            rush_level += trace.rush[r].1;
-                            r += 1;
-                        }
-                        while s < trace.support.len() && trace.support[s].0 == time {
-                            support_level += trace.support[s].1;
-                            s += 1;
-                        }
-                        let current = (rush_level > 0, support_level > 0);
-                        let at = chart.times.partition_point(|&note| note < time);
-                        rush[at] += i32::from(current.0) - i32::from(previous.0);
-                        support[at] += i32::from(current.1) - i32::from(previous.1);
-                        joint[at] +=
-                            i32::from(current.0 && current.1) - i32::from(previous.0 && previous.1);
+        },
+    ));
+    let jobs = orders.len().checked_mul(supports.len())?;
+    let workers = crate::parallel::preparation_workers().min(jobs.max(1));
+    let tasks: Vec<_> = (0..workers).collect();
+    crate::parallel::map(&tasks, |&worker| -> Result<(), ()> {
+        for index in (worker..jobs).step_by(workers) {
+            if crate::cancellation_generation() != generation {
+                return Err(());
+            }
+            let mut deck = orders[index / supports.len()].clone();
+            deck.extend_from_slice(&supports[index % supports.len()]);
+            let traces = crate::full::model::lottery::rush_windows(master, chart, &deck, seeds)
+                .ok()
+                .flatten()
+                .ok_or(())?;
+            let mut changes = 0;
+            let mut rush = vec![0i32; chart.times.len() + 1];
+            let mut support = vec![0i32; chart.times.len() + 1];
+            let mut joint = vec![0i32; chart.times.len() + 1];
+            for trace in traces {
+                changes = changes.max(trace.rush.len());
+                let (mut rush_level, mut support_level, mut r, mut s) = (0, 0, 0, 0);
+                while r < trace.rush.len() || s < trace.support.len() {
+                    let time = trace
+                        .rush
+                        .get(r)
+                        .map_or(i32::MAX, |v| v.0)
+                        .min(trace.support.get(s).map_or(i32::MAX, |v| v.0));
+                    let previous = (rush_level > 0, support_level > 0);
+                    while r < trace.rush.len() && trace.rush[r].0 == time {
+                        rush_level += trace.rush[r].1;
+                        r += 1;
                     }
-                }
-                let (mut r, mut s, mut j) = (0, 0, 0);
-                for at in 0..chart.times.len() {
-                    r += rush[at];
-                    s += support[at];
-                    j += joint[at];
-                    value.rush[at] |= r > 0;
-                    value.support[at] |= s > 0;
-                    moments.rush[at] = moments.rush[at].max(r as usize);
-                    moments.support[at] = moments.support[at].max(s as usize);
-                    moments.joint[at] = moments.joint[at].max(j as usize);
+                    while s < trace.support.len() && trace.support[s].0 == time {
+                        support_level += trace.support[s].1;
+                        s += 1;
+                    }
+                    let current = (rush_level > 0, support_level > 0);
+                    let at = chart.times.partition_point(|&note| note < time);
+                    rush[at] += i32::from(current.0) - i32::from(previous.0);
+                    support[at] += i32::from(current.1) - i32::from(previous.1);
+                    joint[at] +=
+                        i32::from(current.0 && current.1) - i32::from(previous.0 && previous.1);
                 }
             }
+            let mut result = aggregate.lock().unwrap();
+            let (value, moments) = &mut *result;
+            value.changes = value.changes.max(changes);
+            let (mut r, mut s, mut j) = (0, 0, 0);
+            for at in 0..chart.times.len() {
+                r += rush[at];
+                s += support[at];
+                j += joint[at];
+                value.rush[at] |= r > 0;
+                value.support[at] |= s > 0;
+                moments.rush[at] = moments.rush[at].max(r as usize);
+                moments.support[at] = moments.support[at].max(s as usize);
+                moments.joint[at] = moments.joint[at].max(j as usize);
+            }
         }
-        value.moments = Some(Arc::new(moments));
-        Some(Arc::new(value))
-    })();
-    value
+        Ok(())
+    })
+    .ok()?;
+    let (mut value, moments) = aggregate.into_inner().unwrap();
+    value.moments = Some(Arc::new(moments));
+    Some(Arc::new(value))
 }
 
 type RewardEnvelopeKey = (String, Vec<String>, i32);
@@ -1656,6 +1713,8 @@ impl<'a> Kernel<'a> {
             fixed_luck_bounds: HashMap::default(),
             fixed_luck_order: VecDeque::new(),
             global_fixed_luck: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            shared_fixed_luck: None,
             fixed_forced_members: None,
             converted_master: None,
             fixed_choices: vec![None; members.len() * (snaps.len() + 1)],
@@ -1711,6 +1770,7 @@ impl<'a> Kernel<'a> {
             numeric_hull: None,
             defer_scores: false,
             seed_preview: false,
+            live_floor: false,
             numeric_hull_ready: false,
             numeric_root_work: 0,
         }
@@ -1898,58 +1958,71 @@ impl<'a> Kernel<'a> {
             self.fixed_luck_count_order.push_back(key);
             return value.clone();
         }
-        let previous = (0..support_limit).rev().find_map(|count| {
-            self.fixed_luck_counts
-                .get(&(key.0.clone(), count))
-                .and_then(|value| value.as_ref())
-                .map(|value| (count, Arc::clone(value)))
-        });
-        let supports = self.fixed_luck_supports()?;
-        let supports = supports
-            .iter()
-            .filter(|family| {
-                family.len() <= support_limit
-                    && previous
-                        .as_ref()
-                        .is_none_or(|(count, _)| family.len() > *count)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        let value = self
-            .collect_fixed_luck(lottery_member_orders(self.master, members), &supports)
-            .map(|current| {
-                let Some((_, previous)) = previous else {
-                    return current;
-                };
-                let (a, b) = (
-                    previous.moments.as_ref().unwrap(),
-                    current.moments.as_ref().unwrap(),
-                );
-                let maxima =
-                    |a: &[usize], b: &[usize]| a.iter().zip(b).map(|(&a, &b)| a.max(b)).collect();
-                Arc::new(crate::rewards::LuckEnvelope {
-                    fingerprint: OnceLock::new(),
-                    changes: previous.changes.max(current.changes),
-                    rush: previous
-                        .rush
-                        .iter()
-                        .zip(&current.rush)
-                        .map(|(&a, &b)| a || b)
-                        .collect(),
-                    support: previous
-                        .support
-                        .iter()
-                        .zip(&current.support)
-                        .map(|(&a, &b)| a || b)
-                        .collect(),
-                    moments: Some(Arc::new(crate::rewards::LuckMoments {
-                        samples: a.samples,
-                        rush: maxima(&a.rush, &b.rush),
-                        support: maxima(&a.support, &b.support),
-                        joint: maxima(&a.joint, &b.joint),
-                    })),
-                })
+        #[cfg(not(target_arch = "wasm32"))]
+        let shared = self.shared_fixed_luck.clone();
+        let mut compute = || {
+            let previous = (0..support_limit).rev().find_map(|count| {
+                self.fixed_luck_counts
+                    .get(&(key.0.clone(), count))
+                    .and_then(|value| value.as_ref())
+                    .map(|value| (count, Arc::clone(value)))
             });
+            let supports = self.fixed_luck_supports()?;
+            let supports = supports
+                .iter()
+                .filter(|family| {
+                    family.len() <= support_limit
+                        && previous
+                            .as_ref()
+                            .is_none_or(|(count, _)| family.len() > *count)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let value = self
+                .collect_fixed_luck(lottery_member_orders(self.master, members), &supports)
+                .map(|current| {
+                    let Some((_, previous)) = previous else {
+                        return current;
+                    };
+                    let (a, b) = (
+                        previous.moments.as_ref().unwrap(),
+                        current.moments.as_ref().unwrap(),
+                    );
+                    let maxima = |a: &[usize], b: &[usize]| {
+                        a.iter().zip(b).map(|(&a, &b)| a.max(b)).collect()
+                    };
+                    Arc::new(crate::rewards::LuckEnvelope {
+                        fingerprint: OnceLock::new(),
+                        changes: previous.changes.max(current.changes),
+                        rush: previous
+                            .rush
+                            .iter()
+                            .zip(&current.rush)
+                            .map(|(&a, &b)| a || b)
+                            .collect(),
+                        support: previous
+                            .support
+                            .iter()
+                            .zip(&current.support)
+                            .map(|(&a, &b)| a || b)
+                            .collect(),
+                        moments: Some(Arc::new(crate::rewards::LuckMoments {
+                            samples: a.samples,
+                            rush: maxima(&a.rush, &b.rush),
+                            support: maxima(&a.support, &b.support),
+                            joint: maxima(&a.joint, &b.joint),
+                        })),
+                    })
+                });
+            value
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        let value = match shared {
+            Some(shared) => shared.cell(&key).get_or_init(compute).clone(),
+            None => compute(),
+        };
+        #[cfg(target_arch = "wasm32")]
+        let value = compute();
 
         if self.fixed_luck_counts.len() >= 32 {
             if let Some(old) = self.fixed_luck_count_order.pop_front() {
@@ -2443,9 +2516,11 @@ impl<'a> Kernel<'a> {
                 if !choice.supported {
                     return None;
                 }
-                if let Some(converter) = choice.converter {
+                if let Some(converter) = choice.converter.as_ref() {
                     choices.push(converter.program);
-                    programs.entry(converter.program).or_insert(converter);
+                    programs
+                        .entry(converter.program)
+                        .or_insert_with(|| Arc::clone(converter));
                 }
             }
         }
@@ -2745,74 +2820,81 @@ impl<'a> Kernel<'a> {
         self.fixed_combo_trace_order.push_back(key.clone());
         self.fixed_combo_traces.get(&key).map(Arc::clone)
     }
-    fn fixed_choice(&mut self, member: usize, snap: i32) -> FixedChoice {
+    fn fixed_choice(&mut self, member: usize, snap: i32) -> &FixedChoice {
         let index = self.slot_index(member, snap);
-        if let Some(choice) = &self.fixed_choices[index] {
-            return choice.clone();
-        }
-        let mut actor = self.actor_of(member, snap);
-        let order = self.performer_key(&actor);
-        let active =
-            actor.gekisou_skill.is_some() || actor.mission_only.is_some_and(|mission| mission != 0);
-        let lottery = active
-            && actor.gekisou_support_skills.iter().any(|&(id, level)| {
+        if self.fixed_choices[index].is_none() {
+            let mut actor = self.actor_of(member, snap);
+            let order = self.performer_key(&actor);
+            let active = actor.gekisou_skill.is_some()
+                || actor.mission_only.is_some_and(|mission| mission != 0);
+            let lottery = active
+                && actor.gekisou_support_skills.iter().any(|&(id, level)| {
+                    self.master.gekiso_support_skills[&id]
+                        .effects
+                        .iter()
+                        .any(|row| {
+                            row.level == level
+                                && ((11000..=11005).contains(&row.kind)
+                                    || condition_rows(self.master, row).any(|c| c.kind == 4011))
+                        })
+                });
+            actor.gekisou_support_skills.retain(|&(id, level)| {
+                active
+                    && self.master.gekiso_support_skills[&id]
+                        .effects
+                        .iter()
+                        .any(|row| row.level == level && row.kind == 13005)
+            });
+            let mut supported = actor.gekisou_support_skills.iter().all(|&(id, level)| {
                 self.master.gekiso_support_skills[&id]
                     .effects
                     .iter()
-                    .any(|row| {
-                        row.level == level
-                            && ((11000..=11005).contains(&row.kind)
-                                || condition_rows(self.master, row).any(|c| c.kind == 4011))
+                    .filter(|row| row.level == level && row.kind == 13005)
+                    .all(|row| {
+                        condition_rows(self.master, row).all(|condition| {
+                            [0, 1030, 1040, 2000, 2001, 5000, 7010, 7013, 7020]
+                                .contains(&condition.kind)
+                        }) && self
+                            .master
+                            .condition_sets
+                            .get(&row.condition_group)
+                            .into_iter()
+                            .flatten()
+                            .flatten()
+                            .all(|id| {
+                                self.master
+                                    .conditions
+                                    .get(id)
+                                    .is_some_and(|c| [0, 2000, 2001, 5000].contains(&c.kind))
+                            })
                     })
             });
-        actor.gekisou_support_skills.retain(|&(id, level)| {
-            active
-                && self.master.gekiso_support_skills[&id]
-                    .effects
-                    .iter()
-                    .any(|row| row.level == level && row.kind == 13005)
-        });
-        let mut supported = actor.gekisou_support_skills.iter().all(|&(id, level)| {
-            self.master.gekiso_support_skills[&id]
-                .effects
-                .iter()
-                .filter(|row| row.level == level && row.kind == 13005)
-                .all(|row| {
-                    condition_rows(self.master, row).all(|condition| {
-                        [0, 1030, 1040, 2000, 2001, 5000, 7010, 7013, 7020]
-                            .contains(&condition.kind)
-                    }) && self
-                        .master
-                        .condition_sets
-                        .get(&row.condition_group)
-                        .into_iter()
-                        .flatten()
-                        .flatten()
-                        .all(|id| {
-                            self.master
-                                .conditions
-                                .get(id)
-                                .is_some_and(|c| [0, 2000, 2001, 5000].contains(&c.kind))
-                        })
-                })
-        });
-        actor.gekisou_skill = None;
-        actor.mission_only = Some(1);
-        let converter = if actor.gekisou_support_skills.is_empty() {
-            None
+            actor.gekisou_skill = None;
+            actor.mission_only = Some(1);
+            let converter = if actor.gekisou_support_skills.is_empty() {
+                None
+            } else {
+                let converter = self.just_bounds.converter(self.master, &actor);
+                supported &= converter.is_some();
+                converter
+            };
+            let choice = FixedChoice {
+                order,
+                converter,
+                lottery,
+                supported,
+            };
+            self.fixed_choices[index] = Some(choice);
+        }
+        self.fixed_choices[index].as_ref().unwrap()
+    }
+    fn fixed_lottery(&mut self, member: usize, snap: i32) -> bool {
+        let index = self.slot_index(member, snap);
+        if let Some(choice) = &self.fixed_choices[index] {
+            choice.lottery
         } else {
-            let converter = self.just_bounds.converter(self.master, &actor);
-            supported &= converter.is_some();
-            converter
-        };
-        let choice = FixedChoice {
-            order,
-            converter,
-            lottery,
-            supported,
-        };
-        self.fixed_choices[index] = Some(choice.clone());
-        choice
+            self.fixed_choice(member, snap).lottery
+        }
     }
     fn shape_id(&mut self, member: usize, snap: i32) -> u32 {
         let index = self.slot_index(member, snap);
@@ -6036,6 +6118,11 @@ impl Kernel<'_> {
         upper
     }
 }
+struct RosterPriceEntry {
+    power: Vec<f64>,
+    options: Vec<Vec<i32>>,
+    pricing: Arc<crate::rewards::RosterPricing>,
+}
 pub struct Adapter<'k, 'a> {
     kernel: &'k mut Kernel<'a>,
     level: i32,
@@ -6055,6 +6142,13 @@ pub struct Adapter<'k, 'a> {
     nominal_base: Option<f64>,
     member_dominance: HashMap<(usize, usize), bool>,
     deterministic: Option<crate::rewards::DeterministicBound>,
+    roster_price: Option<Arc<crate::rewards::RosterPricing>>,
+    roster_prices: VecDeque<RosterPriceEntry>,
+    roster_suffix: Option<crate::rewards::RosterSuffix>,
+    roster_extra: Option<crate::rewards::RosterSuffix>,
+    roster_extra_ready: bool,
+    roster_leader: Option<usize>,
+    roster_last: Option<([usize; 5], usize, f64)>,
     dominance_margin: f64,
     refine_cutoff: f64,
     numeric_cohorts: CohortCache,
@@ -6080,6 +6174,47 @@ pub struct Adapter<'k, 'a> {
     reuse_assignment: bool,
 }
 impl<'k, 'a> Adapter<'k, 'a> {
+    fn roster_upper(&mut self, members: &[usize], from: usize, limit: f64) -> Option<f64> {
+        let mut key = [usize::MAX; 5];
+        key[..members.len()].copy_from_slice(members);
+        if let Some((old, index, upper)) = self.roster_last {
+            if old == key && index == from {
+                return Some(upper);
+            }
+        }
+        let mut upper = self.roster_suffix.as_mut()?.upper(members, from, limit);
+        if upper >= limit {
+            if !self.roster_extra_ready {
+                self.roster_extra_ready = true;
+                if let (Some(leader), Some(base), Some(suffix), Some(bound)) = (
+                    self.roster_leader,
+                    &self.roster_price,
+                    &self.roster_suffix,
+                    &self.deterministic,
+                ) {
+                    if let Some(entry) = self
+                        .roster_prices
+                        .iter()
+                        .find(|entry| Arc::ptr_eq(&entry.pricing, base))
+                    {
+                        self.roster_extra = bound
+                            .roster_pricing(
+                                &entry.power,
+                                &entry.options,
+                                self.kernel.members,
+                                Some((leader, &self.kernel.bonuses, self.level)),
+                            )
+                            .map(|extra| suffix.repriced(Arc::new(extra)));
+                    }
+                }
+            }
+            if let Some(extra) = &mut self.roster_extra {
+                upper = upper.min(extra.upper(members, from, limit));
+            }
+        }
+        self.roster_last = Some((key, from, upper));
+        Some(upper)
+    }
     fn new(
         kernel: &'k mut Kernel<'a>,
         level: i32,
@@ -6164,6 +6299,13 @@ impl<'k, 'a> Adapter<'k, 'a> {
             nominal_base: None,
             member_dominance: HashMap::default(),
             deterministic,
+            roster_price: None,
+            roster_prices: VecDeque::new(),
+            roster_suffix: None,
+            roster_extra: None,
+            roster_extra_ready: false,
+            roster_leader: None,
+            roster_last: None,
             dominance_margin: f64::INFINITY,
             refine_cutoff: f64::NEG_INFINITY,
             numeric_cohorts: HashMap::default(),
@@ -6331,7 +6473,7 @@ impl<'k, 'a> Adapter<'k, 'a> {
             .members
             .iter()
             .zip(&team.snaps)
-            .map(|(&member, &snap)| self.kernel.fixed_choice(member, snap))
+            .map(|(&member, &snap)| self.kernel.fixed_choice(member, snap).clone())
             .collect::<Vec<_>>();
         if choices.iter().any(|choice| !choice.supported) {
             return None;
@@ -6566,7 +6708,7 @@ impl<'k, 'a> Adapter<'k, 'a> {
                         } else {
                             snap as usize
                         };
-                        flags[column] = self.kernel.fixed_choice(team.members[slot], snap).lottery;
+                        flags[column] = self.kernel.fixed_lottery(team.members[slot], snap);
                     }
                     flags
                 })
@@ -6714,7 +6856,7 @@ impl<'k, 'a> Adapter<'k, 'a> {
         let with_supports = options.iter().enumerate().any(|(slot, choices)| {
             choices
                 .iter()
-                .any(|&snap| self.kernel.fixed_choice(members[slot], snap).lottery)
+                .any(|&snap| self.kernel.fixed_lottery(members[slot], snap))
         });
         let mut upper = f64::NEG_INFINITY;
         for supports in [false, true] {
@@ -6724,7 +6866,7 @@ impl<'k, 'a> Adapter<'k, 'a> {
             let mut allowed = options.clone();
             if !supports {
                 for (slot, choices) in allowed.iter_mut().enumerate() {
-                    choices.retain(|&snap| !self.kernel.fixed_choice(members[slot], snap).lottery);
+                    choices.retain(|&snap| !self.kernel.fixed_lottery(members[slot], snap));
                 }
             }
             if allowed.iter().any(Vec::is_empty) {
@@ -6814,7 +6956,7 @@ impl<'k, 'a> Adapter<'k, 'a> {
                         }
                         team.snaps[slot] = snap;
                         options[slot] = vec![snap];
-                        with_supports |= self.kernel.fixed_choice(members[slot], snap).lottery;
+                        with_supports |= self.kernel.fixed_lottery(members[slot], snap);
                     }
                     None => {
                         team.snaps[slot] = -1;
@@ -6830,9 +6972,7 @@ impl<'k, 'a> Adapter<'k, 'a> {
                     let mut allowed = options.clone();
                     if !supports {
                         for (slot, choices) in allowed.iter_mut().enumerate() {
-                            choices.retain(|&snap| {
-                                !self.kernel.fixed_choice(members[slot], snap).lottery
-                            });
+                            choices.retain(|&snap| !self.kernel.fixed_lottery(members[slot], snap));
                         }
                     }
                     if allowed.iter().any(Vec::is_empty) {
@@ -7713,6 +7853,9 @@ impl<'k, 'a> Adapter<'k, 'a> {
     }
 }
 impl Objective for Adapter<'_, '_> {
+    fn live_floor(&self) -> bool {
+        self.kernel.live_floor && !self.surrogate && !self.estimate
+    }
     fn score_ties(&self) -> bool {
         !self.estimate && !self.surrogate && self.kernel.criterion != Criterion::Mean
     }
@@ -7912,6 +8055,43 @@ impl Objective for Adapter<'_, '_> {
         self.snapshot_power = power;
         self.power_width = width;
     }
+    fn prepare_member_domains(&mut self, power: &[f64], options: &[Vec<i32>]) {
+        self.roster_last = None;
+        self.roster_price = None;
+        if self.generic_assignment_product() {
+            return;
+        }
+        if let Some(entry) = self
+            .roster_prices
+            .iter()
+            .find(|entry| entry.power == power && entry.options == options)
+        {
+            self.roster_price = Some(Arc::clone(&entry.pricing));
+            return;
+        }
+        if let Some(pricing) = self
+            .deterministic
+            .as_ref()
+            .and_then(|bound| bound.roster_pricing(power, options, self.kernel.members, None))
+        {
+            let pricing = Arc::new(pricing);
+            self.roster_price = Some(Arc::clone(&pricing));
+            if self.roster_prices.len() == 8 {
+                self.roster_prices.pop_front();
+            }
+            self.roster_prices.push_back(RosterPriceEntry {
+                power: power.to_vec(),
+                options: options.to_vec(),
+                pricing,
+            });
+        }
+    }
+    fn prepare_member_domains_at(&mut self, leader: usize, power: &[f64], options: &[Vec<i32>]) {
+        self.roster_leader = Some(leader);
+        self.roster_extra_ready = false;
+        self.roster_extra = None;
+        self.prepare_member_domains(power, options);
+    }
     fn prepare_assignment_power(&mut self, power: f64) {
         self.plain_second_bounds.clear();
         self.plain_pair_bound = None;
@@ -7954,8 +8134,17 @@ impl Objective for Adapter<'_, '_> {
         None
     }
     fn prepare_members(&mut self, characters: &[Vec<usize>]) {
+        self.roster_last = None;
         if let Some(bound) = &mut self.deterministic {
             bound.prepare_members(characters);
+            self.roster_suffix = self.roster_price.as_ref().map(|pricing| {
+                crate::rewards::RosterSuffix::new(
+                    Arc::clone(pricing),
+                    characters,
+                    &self.kernel.bonuses,
+                    self.level,
+                )
+            });
             return;
         }
         if self.preserve_snap_options() {
@@ -7976,6 +8165,9 @@ impl Objective for Adapter<'_, '_> {
             self.suffix_rows[from] = row;
         }
     }
+    fn early_member_bound(&mut self, members: &[usize], from: usize, limit: f64) -> Option<f64> {
+        self.roster_upper(members, from, limit)
+    }
     fn member_bound_at(
         &mut self,
         members: &[usize],
@@ -7985,7 +8177,14 @@ impl Objective for Adapter<'_, '_> {
         limit: f64,
     ) -> Option<f64> {
         if let Some(bound) = &mut self.deterministic {
-            return Some(bound.member_score_ceiling(members, from, t.power, self.kernel.criterion));
+            let mut upper =
+                bound.member_score_ceiling(members, from, t.power, self.kernel.criterion);
+            if upper >= limit {
+                if let Some(roster) = self.roster_upper(members, from, limit) {
+                    upper = upper.min(roster);
+                }
+            }
+            return Some(upper);
         }
         if self.preserve_snap_options() {
             return Some(f64::INFINITY);
@@ -8274,12 +8473,14 @@ impl Objective for Adapter<'_, '_> {
     }
     fn roster_bound(&mut self, members: &[usize], totals: Totals, limit: f64) -> Option<f64> {
         if let Some(bound) = &mut self.deterministic {
-            return Some(bound.member_score_ceiling(
-                members,
-                0,
-                totals.power,
-                self.kernel.criterion,
-            ));
+            let upper = bound.member_score_ceiling(members, 0, totals.power, self.kernel.criterion);
+            return Some(
+                upper.min(
+                    self.roster_price
+                        .as_ref()
+                        .map_or(f64::INFINITY, |pricing| pricing.upper(members, limit)),
+                ),
+            );
         }
         if !self.kernel.chart.luck
             || self.kernel.criterion != Criterion::Max && !self.bounded_minimum()
@@ -8369,6 +8570,14 @@ impl Objective for Adapter<'_, '_> {
             && self.deterministic.is_some()
             && !self.surrogate
             && !self.estimate
+    }
+    fn generic_assignment_product(&self) -> bool {
+        !(self.kernel.chart.luck
+            && self.kernel.seeds.len() >= 16
+            && self.kernel.criterion == Criterion::Max
+            && self.deterministic.is_some()
+            && !self.surrogate
+            && !self.estimate)
     }
     fn product_base(&self) -> Option<f64> {
         if let Some(bound) = &self.deterministic {
@@ -8490,7 +8699,7 @@ impl Objective for Adapter<'_, '_> {
                 if !choice.supported {
                     return None;
                 }
-                if let Some(converter) = choice.converter {
+                if let Some(converter) = choice.converter.as_ref() {
                     candidates.push((choice.order, converter.program, slot, snap));
                 } else {
                     plain[slot].push(snap);
@@ -9717,6 +9926,7 @@ pub struct Input<'a> {
     pub seed_only: bool,
     pub seed_variant: Option<bool>,
     pub defer_scores: bool,
+    pub cooperative_floor: bool,
     pub min_combo_bonus: i32,
     pub seeded: bool,
     pub shard: Option<(usize, usize)>,
@@ -9773,7 +9983,7 @@ fn ranked(hits: &[Hit], k: usize) -> Vec<Hit> {
     hits.truncate(k);
     hits
 }
-fn compare_score_hits(a: &Hit, b: &Hit) -> std::cmp::Ordering {
+pub(crate) fn compare_score_hits(a: &Hit, b: &Hit) -> std::cmp::Ordering {
     a.key.total_cmp(&b.key).then_with(|| {
         a.detail["scores"]["mean"]
             .as_f64()
@@ -10243,6 +10453,8 @@ fn warm_pool(
 struct SharedLevelBounds {
     preparation: Option<Arc<crate::rewards::BoundPreparation>>,
     luck: Option<Option<Arc<crate::rewards::LuckEnvelope>>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    luck_cache: Arc<SharedLuckCache>,
 }
 struct LevelSchedule {
     levels: Vec<i32>,
@@ -10259,6 +10471,8 @@ struct NativeLevelSeed {
     hits: Vec<Hit>,
     bounds: SharedLevelBounds,
     queue: Arc<std::sync::Mutex<VecDeque<i32>>>,
+    cooperative_floor: bool,
+    split_leaders: bool,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -10289,6 +10503,7 @@ fn native_levels(
         ((env.now)() - origin.elapsed().as_secs_f64() * 1000.0).to_bits(),
     ));
     let cancellation = crate::local_cancellation();
+    let shared_floor = crate::local_search_floor();
     let (master, player, members, snaps, music, generation) = (
         env.master,
         env.player,
@@ -10303,8 +10518,11 @@ fn native_levels(
             let clock = Arc::clone(&clock);
             let constraints = env.constraints.clone();
             let cancellation = cancellation.clone();
+            let shared_floor = shared_floor.clone();
             let seed = &seed;
             scope.spawn(move || {
+                let level_count = levels.len();
+                let _floor_scope = shared_floor.map(crate::enter_search_floor);
                 let mut completed = 0;
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let run = || {
@@ -10355,16 +10573,17 @@ fn native_levels(
                                     seed_only: false,
                                     seed_variant: None,
                                     defer_scores: false,
+                                    cooperative_floor: seed.cooperative_floor,
                                     min_combo_bonus: seed.min_combo_bonus,
                                     seeded: true,
-                                    shard: None,
+                                    shard: seed.split_leaders.then_some((worker, total)),
                                     floor: seed.floor,
                                     on_candidate: Some(&mut candidate),
                                     progress: Some(&mut progress),
                                 },
                                 Some(LevelSchedule {
                                     levels,
-                                    queue: Some(Arc::clone(&seed.queue)),
+                                    queue: (!seed.split_leaders).then(|| Arc::clone(&seed.queue)),
                                 }),
                                 &seed.hits,
                                 Some(&seed.bounds),
@@ -10378,6 +10597,12 @@ fn native_levels(
                     }
                 }))
                 .unwrap_or_else(|_| Err("native-level-worker-panic".to_owned()));
+                if seed.split_leaders && result.as_ref().is_ok_and(|output| output.proven) {
+                    completed = level_count;
+                    let _ = send.send(Message::Update(NativeLevelUpdate::Progress(
+                        worker, completed,
+                    )));
+                }
                 if result.is_err() {
                     seed.queue.lock().unwrap().clear();
                 }
@@ -10436,8 +10661,7 @@ fn native_levels(
     })
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-fn native_level_order(env: &Environment<'_>, bonuses: &[i32], levels: &[i32]) -> Vec<i32> {
+fn level_order(env: &Environment<'_>, bonuses: &[i32], levels: &[i32]) -> Vec<i32> {
     let maximum = levels.iter().copied().max().unwrap_or(0) as usize;
     let mut order = levels.to_vec();
     if maximum > 128 {
@@ -10481,6 +10705,9 @@ fn native_level_order(env: &Environment<'_>, bonuses: &[i32], levels: &[i32]) ->
 pub fn search(input: Input<'_>) -> Result<search::Output, String> {
     search_levels(input, None, &[], None)
 }
+pub(crate) fn search_scored(input: Input<'_>, scores: &[Hit]) -> Result<search::Output, String> {
+    search_levels(input, None, scores, None)
+}
 
 fn search_levels(
     input: Input<'_>,
@@ -10501,6 +10728,7 @@ fn search_levels(
         seed_only,
         seed_variant,
         defer_scores,
+        cooperative_floor,
         min_combo_bonus,
         seeded,
         shard,
@@ -10584,6 +10812,10 @@ fn search_levels(
     if let Some(bounds) = shared_bounds {
         kernel.global_fixed_preparation = bounds.preparation.clone();
         kernel.global_fixed_luck = bounds.luck.clone();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            kernel.shared_fixed_luck = Some(Arc::clone(&bounds.luck_cache));
+        }
     }
     kernel.defer_scores = defer_scores
         && k > 1
@@ -10591,6 +10823,11 @@ fn search_levels(
         && kernel.seeds.is_empty()
         && criterion == Criterion::Max;
     kernel.seed_preview = seed_only;
+    kernel.live_floor = cooperative_floor
+        && k == 1
+        && criterion == Criterion::Max
+        && kernel.chart.luck
+        && kernel.seeds.len() >= 16;
     if kernel.chart.luck && !kernel.seeds.is_empty() {
         let forced = env
             .constraints
@@ -10633,7 +10870,7 @@ fn search_levels(
             maximum,
         });
     }
-    let (levels, work_queue) = if let Some(schedule) = selected_levels {
+    let (mut levels, work_queue) = if let Some(schedule) = selected_levels {
         (schedule.levels, schedule.queue)
     } else {
         (
@@ -10641,6 +10878,24 @@ fn search_levels(
             None,
         )
     };
+    let level_shards = !seed_only
+        && k == 1
+        && criterion == Criterion::Max
+        && kernel.chart.luck
+        && kernel.seeds.len() >= 16
+        && env.members.len() >= 20
+        && env.constraints.leader.is_none()
+        && levels.len() >= 8
+        && shard.is_some_and(|(_, count)| count > 1);
+    if level_shards {
+        let (index, count) = shard.unwrap();
+        let owned: HashSet<_> = level_order(&env, &kernel.bonuses, &levels)
+            .into_iter()
+            .enumerate()
+            .filter_map(|(slot, level)| (slot % count == index).then_some(level))
+            .collect();
+        levels.retain(|level| owned.contains(level));
+    }
     let mut stats = search::Stats::default();
     if levels.is_empty() {
         return Ok(search::Output {
@@ -10717,6 +10972,12 @@ fn search_levels(
         if late() {
             break;
         }
+        if hits
+            .iter()
+            .any(|hit| hit.team.members == team.members && hit.team.snaps == team.snaps)
+        {
+            continue;
+        }
         let power = env.power(&team)?;
         let result = kernel.search_exact(&team, power.total as i32, true)?;
         kernel.exact_calls += 1;
@@ -10738,6 +10999,19 @@ fn search_levels(
         )?;
         publish(&hits, &mut on_candidate);
     }
+    let fixed_assignment = kernel.fixed_forced_members.as_ref().is_some_and(|members| {
+        env.constraints.no_snaps
+            || members
+                .iter()
+                .all(|member| env.constraints.bindings.contains_key(member))
+    });
+    let mut proposal_power = None;
+    let projected_warm = seed_only
+        && k == 1
+        && criterion == Criterion::Max
+        && kernel.seeds.len() >= 16
+        && !seeded
+        && !fixed_assignment;
     if kernel.chart.luck && hits.is_empty() && !owned_seed_floor && (env.now)() < deadline {
         let preference = kernel
             .gk_members
@@ -10781,25 +11055,29 @@ fn search_levels(
         if let Some(hit) = out.hits.first().filter(|_| (env.now)() < deadline) {
             let team = hit.team.clone();
             let power = env.power(&team)?;
-            let result = kernel.search_exact(&team, power.total as i32, true)?;
-            kernel.exact_calls += 1;
-            offer_scored(
-                &mut kernel,
-                &mut hits,
-                env.members,
-                Hit {
-                    team,
-                    power: power.total as f64,
-                    slot_powers: power.slots.iter().map(|&v| v as f64).collect(),
-                    totals: Totals {
+            if projected_warm {
+                proposal_power = Some(power.total as f64);
+            } else {
+                let result = kernel.search_exact(&team, power.total as i32, true)?;
+                kernel.exact_calls += 1;
+                offer_scored(
+                    &mut kernel,
+                    &mut hits,
+                    env.members,
+                    Hit {
+                        team,
                         power: power.total as f64,
-                        ..Totals::default()
+                        slot_powers: power.slots.iter().map(|&v| v as f64).collect(),
+                        totals: Totals {
+                            power: power.total as f64,
+                            ..Totals::default()
+                        },
+                        key: result.key,
+                        detail: result.detail,
                     },
-                    key: result.key,
-                    detail: result.detail,
-                },
-            )?;
-            publish(&hits, &mut on_candidate);
+                )?;
+                publish(&hits, &mut on_candidate);
+            }
         }
     }
     if (env.now)() >= deadline {
@@ -10817,12 +11095,6 @@ fn search_levels(
         "{}:{minimum}:{seed_variant:?}",
         seed_key(&env, criterion, k, &kernel.seeds)
     );
-    let fixed_assignment = kernel.fixed_forced_members.as_ref().is_some_and(|members| {
-        env.constraints.no_snaps
-            || members
-                .iter()
-                .all(|member| env.constraints.bindings.contains_key(member))
-    });
     let cached = if seeded || fixed_assignment {
         Some(Vec::new())
     } else {
@@ -10835,7 +11107,9 @@ fn search_levels(
             }
         }
     } else {
-        let reference_power = hits.first().map_or(1.0, |hit| hit.power);
+        let reference_power = hits
+            .first()
+            .map_or(proposal_power.unwrap_or(1.0), |hit| hit.power);
         let warm_k = if kernel.chart.luck && criterion == Criterion::Max {
             k.max(5)
         } else {
@@ -11053,17 +11327,16 @@ fn search_levels(
         && criterion == Criterion::Max
         && kernel.chart.luck
         && kernel.seeds.len() >= 16
-        && env.members.len() >= 20
+        && (env.members.len() >= 20 || kernel.live_floor)
         && env.constraints.leader.is_none()
-        && levels.len() >= 8
         && !late()
     {
-        let workers = std::thread::available_parallelism()
-            .map_or(1, |count| count.get())
-            .min(4);
+        let workers = crate::parallel::preparation_workers();
         if workers > 1 {
+            let split_leaders = levels.len() < 8;
+            let progress_total = levels.len() * if split_leaders { workers } else { 1 };
             let queue = Arc::new(std::sync::Mutex::new(
-                native_level_order(&env, &kernel.bonuses, &levels)
+                level_order(&env, &kernel.bonuses, &levels)
                     .into_iter()
                     .collect(),
             ));
@@ -11082,6 +11355,8 @@ fn search_levels(
                 let _ = Adapter::new(&mut kernel, levels[0], false, false, deadline, env.now);
                 let seed = NativeLevelSeed {
                     seeds: kernel.seeds.clone(),
+                    cooperative_floor: kernel.live_floor,
+                    split_leaders,
                     k,
                     deadline,
                     min_combo_bonus,
@@ -11091,6 +11366,9 @@ fn search_levels(
                     bounds: SharedLevelBounds {
                         preparation: kernel.global_fixed_preparation.clone(),
                         luck: kernel.global_fixed_luck.clone(),
+                        luck_cache: Arc::clone(kernel.shared_fixed_luck.get_or_insert_with(|| {
+                            Arc::new(SharedLuckCache::new(kernel.chart.notes.len()))
+                        })),
                     },
                 };
                 let mut finished = vec![0; jobs.len()];
@@ -11105,7 +11383,7 @@ fn search_levels(
                         NativeLevelUpdate::Progress(worker, done) => {
                             finished[worker] = done;
                             if let Some(progress) = progress.as_deref_mut() {
-                                progress(finished.iter().sum(), levels.len());
+                                progress(finished.iter().sum(), progress_total);
                             }
                         }
                     }
@@ -11207,7 +11485,11 @@ fn search_levels(
                 k,
                 deadline,
                 seeds: best.into_iter().map(|hit| hit.team).collect(),
-                shard: if owned.is_some() { None } else { shard },
+                shard: if owned.is_some() || level_shards {
+                    None
+                } else {
+                    shard
+                },
                 floor: level_floor,
             },
             if owned.is_some() { Some(&owns) } else { None },

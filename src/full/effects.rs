@@ -312,9 +312,31 @@ pub struct ConditionUpdater {
     trigger_checked: bool,
     cache: Vec<Option<Trigger>>,
     idle_inputs: Option<IdleInputs>,
+    second_phase: bool,
+    first_phase: bool,
     quiet: bool,
 }
 impl ConditionUpdater {
+    pub(crate) fn fixed_life(&mut self, life: i32) {
+        for effect in &mut self.effects {
+            for checker in [
+                &mut effect.trigger,
+                &mut effect.condition,
+                &mut effect.release,
+                &mut effect.reset,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                checker.fixed_life(life);
+            }
+        }
+        for updater in &mut self.updaters {
+            if let Some(checker) = &mut updater.release {
+                checker.fixed_life(life);
+            }
+        }
+    }
     pub fn new(effects: Vec<Effect>, gate: Option<i32>) -> Result<Self, String> {
         let mut ids: Vec<_> = effects.iter().map(|e| e.id).collect();
         ids.sort_unstable();
@@ -383,6 +405,8 @@ impl ConditionUpdater {
             idle.as_mut().unwrap().insert(input.unwrap());
         }
         let count = effects.len();
+        let second_phase = effects.iter().any(|effect| effect.phase == 2);
+        let first_phase = effects.iter().any(|effect| effect.phase == 1);
         Ok(Self {
             effects,
             gate,
@@ -396,6 +420,8 @@ impl ConditionUpdater {
             trigger_checked: false,
             cache: vec![None; count],
             idle_inputs: idle,
+            second_phase,
+            first_phase,
             quiet: false,
         })
     }
@@ -422,13 +448,11 @@ impl ConditionUpdater {
             }
         }
     }
-    pub fn update(
+    fn begin_checks(
         &mut self,
-        phase: i32,
         input: &FrameInput,
         ctx: &mut Context<'_>,
-        updated: &mut Vec<usize>,
-    ) -> Result<(), String> {
+    ) -> Result<Option<bool>, String> {
         let mut checked_gate = None;
         if !self.trigger_checked
             && self.executing.is_empty()
@@ -447,6 +471,68 @@ impl ConditionUpdater {
             self.quiet = true;
         }
         if self.quiet {
+            return Ok(checked_gate);
+        }
+        Ok(checked_gate)
+    }
+    fn prepare_triggers(
+        &mut self,
+        input: &FrameInput,
+        ctx: &mut Context<'_>,
+        checked_gate: Option<bool>,
+    ) -> Result<bool, String> {
+        self.trigger_checked = true;
+        self.cache.fill(None);
+        if input.finished || !checked_gate.map_or_else(|| mission_gate(self.gate, ctx), Ok)? {
+            return Ok(false);
+        }
+        if self
+            .idle_inputs
+            .as_ref()
+            .is_some_and(|inputs| !inputs.active(ctx))
+        {
+            for &index in &self.sorted {
+                self.effects[index].trigger.as_mut().unwrap().override_time = None;
+            }
+            return Ok(false);
+        }
+        for &index in &self.resets {
+            let effect = &mut self.effects[index];
+            if effect.reset.as_mut().unwrap().check(ctx)?.0 {
+                self.execute_count.remove(&effect.id);
+            }
+        }
+        for &e in &self.sorted {
+            self.cache[e] = Some(if let Some(checker) = &mut self.effects[e].trigger {
+                let hit = checker.check(ctx)?.0;
+                Trigger {
+                    hit,
+                    time: checker.override_time().unwrap_or(input.time),
+                }
+            } else {
+                Trigger::default()
+            });
+        }
+        Ok(true)
+    }
+    pub fn update(
+        &mut self,
+        phase: i32,
+        input: &FrameInput,
+        ctx: &mut Context<'_>,
+        updated: &mut Vec<usize>,
+    ) -> Result<(), String> {
+        if phase == 2 && self.trigger_checked && !self.second_phase {
+            return Ok(());
+        }
+        let checked_gate = self.begin_checks(input, ctx)?;
+        if self.quiet {
+            return Ok(());
+        }
+        if phase == 1 && !self.first_phase {
+            if !self.trigger_checked {
+                self.prepare_triggers(input, ctx, checked_gate)?;
+            }
             return Ok(());
         }
         let mut done = Vec::new();
@@ -461,30 +547,9 @@ impl ConditionUpdater {
                 }
             }
         }
-        if !self.trigger_checked {
-            self.trigger_checked = true;
-            self.cache.fill(None);
-            if input.finished || !checked_gate.map_or_else(|| mission_gate(self.gate, ctx), Ok)? {
-                self.finish(&done);
-                return Ok(());
-            }
-            for &index in &self.resets {
-                let effect = &mut self.effects[index];
-                if effect.reset.as_mut().unwrap().check(ctx)?.0 {
-                    self.execute_count.remove(&effect.id);
-                }
-            }
-            for &e in &self.sorted {
-                self.cache[e] = Some(if let Some(checker) = &mut self.effects[e].trigger {
-                    let hit = checker.check(ctx)?.0;
-                    Trigger {
-                        hit,
-                        time: checker.override_time().unwrap_or(input.time),
-                    }
-                } else {
-                    Trigger::default()
-                });
-            }
+        if !self.trigger_checked && !self.prepare_triggers(input, ctx, checked_gate)? {
+            self.finish(&done);
+            return Ok(());
         }
         for k in 0..self.sorted.len() {
             let e = self.sorted[k];

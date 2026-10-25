@@ -76,6 +76,15 @@ Live Top 1 proofs into
 `primary`, `other` and `score`. Later phases take the globally proven reward
 values and a legal incumbent floor. Their results carry the stage name;
 callers report a complete recommendation only after every stage is proven.
+Trusted worker contexts exchange complete scored seeds across shards and stages.
+Their keys include the full inventory growth, player, constraints, scoring goal,
+request identity and parsed chart; replacing a chart cannot reuse its scores.
+The bounded cache retains four groups of at most 32 fully scored teams.
+Cooperative Top 1 shards publish legal incumbent floors during a proof. Native
+contexts share these floors and complete hits only within the same scoring scope;
+WebAssembly exposes `haneoka_search_floor` for the worker's active call.
+The caller still waits for every shard. Native COMBO shards also share at most
+8,192 non-improving root bounds with exact snapshot-domain masks.
 Adjacent phases retain complete settlements for the same inventory, player,
 constraints and goal; replacing a chart invalidates this cache. Ordinary score
 contexts also include constraints because filtering can change the card indices.
@@ -115,7 +124,8 @@ upper bounds when the reward curve already proves the roster cannot improve.
 Pure COMBO passes reuse failed assignment bounds for the same members and exact
 snapshot domains at lower power and higher cutoffs. These certificates cover all
 skill orders and the native accumulation error; exact settlements and leader
-orders remain separate. At most 32,768 certificates and 4,096 domain vectors
+orders remain separate. Stored upper bounds also retain equal-cutoff proofs;
+each phase keeps its own tie policy. At most 32,768 certificates and 4,096 domain vectors
 are retained, and changing the reward phase clears the certificates. Physical
 matching scratch is reused, and reward floors examine weaker skill orders first.
 Pricing rows retain five distinct witnesses before omitting a snapshot that is
@@ -135,12 +145,27 @@ reset with the reward phase. Dual offer rows are prepared on first use.
 Five required, unbound snapshots restrict assignment choices without reindexing
 the native preparation domain; linear objectives solve that fixed set directly.
 Fixed member-bonus searches condition power, skill and joint-pricing suffixes
-on the same reachable bonus sum. Large unsharded native LUCK maximum searches
-partition complete COMBO levels across at most four workers. They share
+on the same reachable bonus sum. Roster pricing also matches the current COMBO
+sum while keeping characters and skill events distinct; sums up to 64 use
+tables built only when their pricing plane is needed. Larger sums keep the
+general suffix bound. An additional plane prices physical snapshots against
+the current leader, COMBO sum and distinct skill events. It is prepared only
+after the existing planes leave a branch open. Roster cuts run before generic
+joint cuts and snapshot preparation, with repeated prefix results retained.
+Large unsharded native LUCK maximum searches
+partition complete COMBO levels across the native worker budget. They share
 scored seeds and immutable preparation, claim levels from a common queue,
-and suppress nested replay threads. The caller retains progress callbacks,
+and suppress nested replay threads. Fewer than eight levels use leader shards
+within that same budget. Trusted contexts accept a `workers` budget from one
+to eight; other native calls retain the default of four preparation workers.
+Seed batches and lottery-envelope jobs use this budget without changing their
+input order or requested seeds. The caller retains progress callbacks,
 the deadline and cancellation generation; completion still requires every
 level. Explicit client shards retain their original partition.
+Native level workers share fixed-seed lottery envelopes for the same member
+program and support count. One worker prepares a missing envelope; peers reuse
+the completed result. The cache lives for one request, retains at most 256
+entries and reduces its capacity for longer charts.
 Pure LUCK recommendations partition snapshot choices by random-effect programs.
 For domains with up to two random-effect snapshots, native traces preserve each
 program and actor order. Previously weak seeds tighten the physical score bounds;
@@ -202,7 +227,10 @@ COMBO scripts normalize each inventory member once per search.
 Timed nonnegative COMBO gains retain finite search bounds by remaining active
 in the upper envelope; exact replay preserves their activation and expiry.
 Independent cumulative COMBO supports share a native replay and retain their
-owner-specific commands within the existing 64-program cache. Fixed-seed replays
+owner-specific commands within the existing 64-program cache. Pure COMBO traces
+record sparse activations with the native condition updater and generate
+counter-based support coefficients from those records, retaining native f32
+rounding and factor replacement. Other programs use the full replay. Fixed-seed replays
 clone an initialized model and reset each seed's RNG before
 advancing its own state. Native effects with edge-only handlers apply at
 activation and finish; one-shot cumulative factors update when their count changes.
@@ -227,6 +255,10 @@ Context preparation records factors in replay order and keeps each note's latest
 observation after history rewinds. It omits unused integer note totals. Frame
 buffers are reused, recorded frames share unchanged range-state slices, and LIFE
 without commands returns its initial value.
+Fresh models with no note damage or LIFE-changing effects fold constant LIFE
+checks before playback. Other models retain the full LIFE state machine.
+COMBO traces collect note factors and combo maxima in one replay; support
+preparation records factor commands without calculating unused note totals.
 
 Pure JUST reward bounds share whole-inventory coefficient rows by converter
 trace and price power and score together before snapshot enumeration. Necessary
