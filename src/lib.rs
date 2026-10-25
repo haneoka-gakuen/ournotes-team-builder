@@ -21,6 +21,7 @@ pub mod power;
 pub mod progress;
 pub mod pt;
 mod reward_trace;
+mod reward_plan;
 pub mod rewards;
 pub mod runtime_chart;
 pub mod search;

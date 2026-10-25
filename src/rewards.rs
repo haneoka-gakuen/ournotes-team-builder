@@ -5964,6 +5964,9 @@ pub struct RewardObjective<'a> {
     member_dominance: HashMap<(usize, usize), MemberDominance>,
 }
 impl<'a> RewardObjective<'a> {
+    pub(crate) fn score_upper(&self, totals: Totals) -> f64 {
+        up(totals.power * self.coefficient)
+    }
     pub(crate) fn reward_ceiling(&self) -> f64 {
         self.ceiling(f64::INFINITY, self.bonus_max, self.coefficient)
     }

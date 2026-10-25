@@ -66,7 +66,15 @@ Positive-seed member bounds price contested physical snapshots once per leader;
 nonnegative column prices prevent one snapshot from being assigned to several
 members in the relaxed bound.
 
-Event recommendations maximize the selected reward, then the other direct
+Explicit event `rewardPlan` requests maximize a nonnegative weighted sum of
+PT, CP and badges, followed by up to two ordered reward-only tie levels.
+Weights are integers; `unit` is the primary reward's scale. Omitted metrics do
+not break ties. Results and progress include exact numerator/denominator ranking
+values, direct rewards and the resolved plan. Top K bounds use the K-th retained
+legal result. Optional `autoCp` values earned CP using the best challenge payout
+under the same first-level reward sum; hosts resolve it once before sharding,
+within the original loading and computation deadline.
+Legacy event recommendations maximize the selected reward, then the other direct
 reward, then mean score.
 Fractional reward weights retain finite mean-reward bounds. When their binary
 exponents exceed the integer hull's range, bounds compare all rank pairs with

@@ -15,6 +15,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::Weak;
 use std::sync::{Arc, Mutex};
 mod gekiso_result_cache;
+mod reward_plan;
 use gekiso_result_cache::CompletedGekiso;
 
 type CachedScoreCap = (String, f64, Vec<crate::search::Team>);
@@ -1757,7 +1758,7 @@ impl Engine {
                 .map(|ms| started + ms)
                 .unwrap_or(f64::INFINITY)
         });
-        let exchange = if goal["cpExchange"].is_null() {
+        let exchange = if !goal["rewardPlan"].is_null() || goal["cpExchange"].is_null() {
             None
         } else {
             Some((
@@ -1912,7 +1913,8 @@ impl Engine {
                     None => objective,
                 }
             };
-            let cp_measure =
+            let plan = (!goal["rewardPlan"].is_null()).then(|| crate::reward_plan::Plan::parse(&goal["rewardPlan"])).transpose()?;
+            let cp_measure = plan.is_none() &&
                 goal["measure"] == "challenge-points" && chart.is_some() && kind != RouteKind::Skip;
             let phase = request["rewardPhase"]["kind"].as_str();
             if phase.is_some_and(|phase| !["primary", "other", "score"].contains(&phase))
@@ -1924,7 +1926,14 @@ impl Engine {
             {
                 return Err("event-reward-phase".into());
             }
-            let mut objective: Box<dyn Objective> = if cp_measure {
+            let mut objective: Box<dyn Objective> = if let Some(plan) = &plan {
+                use crate::reward_plan::{Context, Metric, Ranked, Source};
+                Box::new(Ranked::new(Source::Ordinary(Box::new(EventObjective::new(
+                    &self.master, &cards.members, &cards.snaps, chart, route.clone(),
+                    plan.anchor() == Metric::Points, &goal["play"], true, 0.0, None, score_cap,
+                ))), Context { plan: plan.clone(), route: route.clone(), chart, members: &cards.members,
+                    snaps: &cards.snaps, k, floor: f64::NEG_INFINITY, skip_rank: self.master.params.skip_rank, observations: 120 }))
+            } else if cp_measure {
                 Box::new(ChallengePoints::new(
                     LiveObjective {
                         core: LiveCore::new(
@@ -2054,7 +2063,7 @@ impl Engine {
             };
             output.stats.add(&cap_stats);
             if let Some(tie_chart) = chart.filter(|_| {
-                phase.is_none() && !cp_measure && kind != RouteKind::Skip && !output.hits.is_empty()
+                plan.is_none() && phase.is_none() && !cp_measure && kind != RouteKind::Skip && !output.hits.is_empty()
             }) {
                 let mut keys: Vec<_> = output.hits.iter().map(|h| h.key).collect();
                 keys.sort_by(|a, b| b.total_cmp(a));
@@ -2147,7 +2156,7 @@ impl Engine {
                 }
                 output.hits = ordered;
             }
-            if kind == RouteKind::Skip && !output.hits.is_empty() {
+            if plan.is_none() && kind == RouteKind::Skip && !output.hits.is_empty() {
                 let mut keys: Vec<_> = output.hits.iter().map(|h| h.key).collect();
                 keys.sort_by(|a, b| b.total_cmp(a));
                 keys.dedup();
@@ -2193,7 +2202,7 @@ impl Engine {
                 if pt {value["event"]["rewardSum"]=d["rewardSum"].clone();value["event"]["comparisonSum"]=d["comparisonSum"].clone();value["event"]["orders"]=json!(120);value["event"]["directMean"]=json!(master::number(&d["rewardSum"],0.0)/120.0);value["event"]["convertedMean"]=json!(exchange.map(|(n,den)|master::number(&d["challengePoints"],0.0)*n/den).unwrap_or(0.0));}
                 if let Some(chart)=chart.filter(|_|!d["scores"].is_null()){
                     let scores=&d["scores"];let values:Vec<_>=master::rows(&scores["scores"]).iter().map(|v|master::number(v,0.0)).collect();let mut sorted=values.clone();sorted.sort_by(f64::total_cmp);let mut ranks=BTreeMap::<i32,i32>::new();for &v in &values{*ranks.entry(chart::score_rank(chart,v)).or_default()+=1;}let keys=|order:usize|live::orders()[order].map(|slot|cards.members[hit.team.members[slot]].key.clone());value["score"]=json!({"mean":scores["mean"],"min":scores["min"],"max":scores["max"],"median":(sorted[59]+sorted[60])/2.0,"orders":values,"bestOrder":keys(master::int(&scores["maxOrder"]) as usize),"worstOrder":keys(master::int(&scores["minOrder"]) as usize),"ranks":ranks});
-                }value
+                }crate::reward_plan::decorate(&mut value, d);value
             }).collect();
             overall.extend(hits.iter().cloned());
             let mut part = json!({"song":song,"hits":hits,"proven":output.proven,"bound":output.bound,"stats":output.stats});
@@ -2447,10 +2456,15 @@ impl Engine {
         started: f64,
         now: &dyn Fn() -> f64,
     ) -> Result<Value, String> {
+        if input["request"]["goal"]["kind"] == "event" && !input["request"]["goal"]["rewardPlan"].is_null()
+            && (input["request"]["resolveRewardPlan"] == true || !input["request"]["goal"]["rewardPlan"]["autoCp"].is_null()) {
+            return self.resolve_reward_plan(input, started, now);
+        }
         let _slot_table_scope = crate::objectives::slot_table_scope();
         let request = &input["request"];
         let kind = request["goal"]["kind"].as_str().ok_or("missing-goal")?;
         crate::progress::mode(&request["goal"]);
+        if !request["goal"]["rewardPlan"].is_null() && !request["rewardPhase"].is_null() { return Err("reward-plan-phase".into()); }
         let primary = kind == "event" && !request["goal"]["ranking"].is_null();
         let pt = kind == "event" && request["goal"]["ranking"] == "pt-only";
         if !request["cutoff"].is_null()
@@ -2670,9 +2684,10 @@ impl Engine {
             RouteKind::Live,
             master::int(&goal["consumption"]),
         )?;
-        let points = goal["measure"] != "items";
+        let points = if goal["rewardPlan"].is_null() { goal["measure"] != "items" }
+            else { crate::reward_plan::Plan::parse(&goal["rewardPlan"])?.anchor() == crate::reward_plan::Metric::Points };
         let bonus_type = if points { 0 } else { 1 };
-        let exchange = if goal["cpExchange"].is_null() {
+        let exchange = if !goal["rewardPlan"].is_null() || goal["cpExchange"].is_null() {
             None
         } else {
             Some((
@@ -2736,6 +2751,42 @@ impl Engine {
                 master::int(&request["shard"]["count"]) as usize,
             ))
         };
+        if !goal["rewardPlan"].is_null() {
+            use crate::reward_plan::{Context, Ranked, Source};
+            let plan = crate::reward_plan::Plan::parse(&goal["rewardPlan"])?;
+            let k = master::number(&request["k"], 1.0).max(1.0) as usize;
+            let mut objective = Ranked::new(Source::Gekiso(Box::new(objective)), Context {
+                plan, route, chart: Some(chart), members: &cards.members, snaps: &cards.snaps, k,
+                floor: f64::NEG_INFINITY, skip_rank: self.master.params.skip_rank,
+                observations: 120 * master::int(&goal["gekiso"]["luckSamples"]).max(1) as usize,
+            });
+            let output = search::search(search::Input {
+                master: &self.master, player: &player, members: &cards.members, snaps: &cards.snaps,
+                music: Some(&music), objective: &mut objective, constraints, k, deadline, now,
+                seeds: seed_teams(request, song, &cards.members, &cards.snaps), shard, owns: None,
+                floor: f64::NEG_INFINITY, floor_exclusive: false, streaming: true,
+                disable_snap_dominance: false, member_power_percent: None, snap_power_percent: None,
+                on_candidate: Some(&mut crate::progress::emit), progress: None,
+            })?;
+            let hits: Vec<_> = output.hits.iter().map(|hit| {
+                let d = &hit.detail; let settlement = &d["settlement"];
+                let count = master::number(&settlement["observations"], 1.0);
+                let mut value = hit_json(hit, song, &cards.members, &cards.snaps, Some(chart), true);
+                value["comboBonus"] = d["comboBonus"].clone();
+                value["score"]["ranks"] = settlement["ranks"].clone();
+                value["gekiso"] = json!({"just":d["just"],"luckSamples":d["luckSamples"],"sampled":d["sampled"],"rank":1});
+                value["event"] = json!({"mean":0,"bonusPercent":master::number(&d["bonus"],0.0)/100.0,
+                    "challengePoints":master::number(&settlement["cpSum"],0.0)/count,
+                    "perPlayMin":settlement["directMin"],"perPlayMax":settlement["directMax"],
+                    "rewardSum":settlement["rewardSum"],"comparisonSum":settlement["comparisonSum"],
+                    "orders":count,"directMean":master::number(&settlement["rewardSum"],0.0)/count,
+                    "otherMean":settlement["otherMean"]});
+                crate::reward_plan::decorate(&mut value, d); value
+            }).collect();
+            return Ok(json!({"results":[{"song":song,"hits":hits,"proven":output.proven,"bound":output.bound,"stats":output.stats}],
+                "overall":hits,"unknownCards":cards.unknown,"elapsedMs":now()-started,
+                "stopReason":if output.proven {"complete"} else if generation!=crate::cancellation_generation(){"cancelled"}else{"budget"}}));
+        }
         let phase = request["rewardPhase"]["kind"].as_str();
         if phase.is_some_and(|phase| !["primary", "other", "score"].contains(&phase))
             || phase.is_some()
@@ -3825,16 +3876,11 @@ fn merge_reward_candidates(
 }
 
 fn compare_hits(a: &Value, b: &Value) -> std::cmp::Ordering {
-    master::number(&b["key"], 0.0)
+    let ranking = crate::reward_plan::compare(&b["rewardRanking"], &a["rewardRanking"]);
+    ranking.unwrap_or_else(|| master::number(&b["key"], 0.0)
         .total_cmp(&master::number(&a["key"], 0.0))
-        .then_with(|| {
-            master::number(&b["event"]["otherMean"], 0.0)
-                .total_cmp(&master::number(&a["event"]["otherMean"], 0.0))
-        })
-        .then_with(|| {
-            master::number(&b["score"]["mean"], 0.0)
-                .total_cmp(&master::number(&a["score"]["mean"], 0.0))
-        })
+        .then_with(|| master::number(&b["event"]["otherMean"], 0.0).total_cmp(&master::number(&a["event"]["otherMean"], 0.0)))
+        .then_with(|| master::number(&b["score"]["mean"], 0.0).total_cmp(&master::number(&a["score"]["mean"], 0.0))))
         .then_with(|| master::int(&a["song"]["songId"]).cmp(&master::int(&b["song"]["songId"])))
         .then_with(|| {
             master::int(&a["song"]["difficulty"]).cmp(&master::int(&b["song"]["difficulty"]))

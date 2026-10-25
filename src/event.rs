@@ -434,6 +434,20 @@ impl Route {
             0.0
         }
     }
+    pub(crate) fn reward_units(&self, points: f64, items: f64, rank: i32) -> [u128; 3] {
+        let badges = self.rank_row(rank).map_or(0, |row| {
+            row.items.iter().map(|&(count, probability)| {
+                let count = (imul(imul(count, i32(items + 10000.0)), i32(self.reward_rate)) as f64 / 10000.0).trunc();
+                count as u128 * probability as u128
+            }).sum()
+        });
+        [(self.points(points, rank) * 10000.0).round() as u128,
+         (self.cp(rank) * 10000.0).round() as u128, badges]
+    }
+    pub(crate) fn fractional_items(&self) -> bool {
+        self.ranks.iter().flat_map(|row| &row.items)
+            .any(|&(_, probability)| probability != 0.0 && probability != 10000.0)
+    }
 }
 fn top_five(values: impl Iterator<Item = f64>) -> f64 {
     let mut rows: Vec<_> = values.collect();
@@ -473,6 +487,7 @@ pub struct EventObjective {
     targets: HashMap<u64, Vec<JointTarget>>,
     curves: HashMap<(u64, u64), Option<RewardCurve>>,
     other_curves: HashMap<u64, Option<RewardCurve>>,
+    cp_curve: Option<Option<RewardCurve>>,
     profiles: Vec<[f64; 5]>,
     profile_ids: HashMap<[u64; 5], u32>,
     slot_profiles: HashMap<usize, u32>,
@@ -490,6 +505,9 @@ pub struct EventObjective {
     mean_frontiers: Vec<Vec<(f64, f64)>>,
 }
 impl EventObjective {
+    pub(crate) fn score_upper(&self, totals: Totals) -> f64 {
+        self.core.as_ref().map_or(f64::INFINITY, |core| core.score_high(totals).min(self.score_cap))
+    }
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         master: &Master,
@@ -552,6 +570,7 @@ impl EventObjective {
             targets: HashMap::default(),
             curves: HashMap::default(),
             other_curves: HashMap::default(),
+            cp_curve: None,
             profiles: Vec::new(),
             profile_ids: HashMap::default(),
             slot_profiles: HashMap::default(),
@@ -655,6 +674,29 @@ impl EventObjective {
     fn mean_bound(&mut self, bonus: f64, other: f64, score: f64) -> f64 {
         self.curve(bonus, other)
             .map_or(f64::INFINITY, |curve| curve.upper(score))
+    }
+    fn cp_curve(&mut self) -> Option<&RewardCurve> {
+        if self.cp_curve.is_none() {
+            let points = self.rank_points().into_iter().map(|(rank, score)| (score, self.route.cp(rank))).collect();
+            self.cp_curve = Some(RewardCurve::new(points));
+        }
+        self.cp_curve.as_ref().and_then(Option::as_ref)
+    }
+    pub(crate) fn cp_member_upper(&mut self, members: &[usize], from: usize, power: f64) -> Option<f64> {
+        if self.core.as_ref()?.input.judgements.is_some() { return None; }
+        let ids = std::array::from_fn(|slot| if slot < members.len() {
+            self.global_profile(members[slot])
+        } else { self.suffix_profiles[from] });
+        let coefficients = self.order_coefficients(ids);
+        self.cp_curve().map(|curve| curve.orders(&coefficients, power))
+    }
+    pub(crate) fn cp_assignment_upper(&mut self, members: &[usize], assigned: &[i32], from: usize, power: f64) -> Option<f64> {
+        if self.core.as_ref()?.input.judgements.is_some() { return None; }
+        let ids = std::array::from_fn(|slot| if slot < from {
+            self.slot_profile(members[slot], assigned[slot])
+        } else { self.assignment_profiles[slot] });
+        let coefficients = self.order_coefficients(ids);
+        self.cp_curve().map(|curve| curve.orders(&coefficients, power))
     }
     fn other_mean_bound(&mut self, bonus: f64, score: f64) -> f64 {
         let key = bonus.to_bits();

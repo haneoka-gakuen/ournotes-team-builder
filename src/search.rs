@@ -56,6 +56,10 @@ pub trait Objective {
     }
     /// Only evaluated, retained legal hits may tighten objective-local tie bounds.
     fn observe_hit(&mut self, _hit: &Hit) {}
+    fn observe_hits(&mut self, hits: &[Hit]) {
+        if let Some(hit) = hits.first() { self.observe_hit(hit); }
+    }
+    fn compare_rank(&self, _a: &Hit, _b: &Hit) -> Option<std::cmp::Ordering> { None }
     fn seed_objective(&self) -> Option<Box<dyn Objective>> {
         None
     }
@@ -990,6 +994,9 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                         && upper == self.hits[self.input.k - 1].key))
     }
     fn compare_hit(&mut self, hit: &mut Hit, index: usize) -> Result<std::cmp::Ordering, String> {
+        if let Some(order) = self.input.objective.compare_rank(hit, &self.hits[index]) {
+            return Ok(order);
+        }
         let primary = hit.key.total_cmp(&self.hits[index].key);
         if !primary.is_eq() || !self.input.objective.score_ties() {
             return Ok(primary);
@@ -1121,9 +1128,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             let key = self.hit_keys.pop().unwrap();
             self.retained.remove(&key);
         }
-        if let Some(hit) = self.hits.first() {
-            self.input.objective.observe_hit(hit);
-        }
+        self.input.objective.observe_hits(&self.hits);
         if let Some(callback) = self.input.on_candidate.as_deref_mut() {
             callback(&self.hits);
         }

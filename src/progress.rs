@@ -152,6 +152,7 @@ fn hit_json(state: &State, hit: &Hit) -> Value {
     if !detail["potential"].is_null() {
         value["potential"] = json!({"value":detail["potential"],"area":detail["area"]});
     }
+    crate::reward_plan::decorate(&mut value, detail);
     crate::api::normalize_hit(&mut value);
     value
 }

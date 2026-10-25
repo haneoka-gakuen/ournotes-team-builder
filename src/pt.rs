@@ -74,6 +74,26 @@ fn gekiso_effects(
 }
 pub fn validate(master: &Master, request: &Value) -> Result<Vec<String>, String> {
     let goal = &request["goal"];
+    if !goal["rewardPlan"].is_null() {
+        use crate::reward_plan::{Metric, Plan};
+        let plan = Plan::parse(&goal["rewardPlan"])?;
+        let mut issues = Vec::new();
+        for metric in [Metric::Points, Metric::Items] {
+            if !plan.uses(metric) && metric != plan.anchor() { continue; }
+            let mut checked = request.clone();
+            checked["goal"].as_object_mut().unwrap().remove("rewardPlan");
+            checked["goal"]["measure"] = serde_json::json!(if metric == Metric::Points { "points" } else { "items" });
+            checked["k"] = serde_json::json!(1);
+            if !goal["gekiso"].is_null() && master::int(&goal["gekiso"]["luckSamples"]) == 0 {
+                checked["goal"]["gekiso"]["luckSamples"] = serde_json::json!(1);
+            }
+            if plan.uses(Metric::ChallengePoints) && goal["route"] == "live" {
+                checked["goal"]["cpExchange"] = serde_json::json!({"numerator":0,"denominator":1});
+            }
+            for issue in validate(master, &checked)? { if !issues.contains(&issue) { issues.push(issue); } }
+        }
+        return Ok(issues);
+    }
     let mut issues = Vec::new();
     if goal["kind"] != "event"
         || goal["route"] == "skip"
