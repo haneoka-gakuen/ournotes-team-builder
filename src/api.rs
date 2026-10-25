@@ -1442,10 +1442,9 @@ impl Engine {
                 let elapsed = current - started;
                 response["elapsedMs"] = json!(elapsed);
                 for result in response["results"].as_array_mut().into_iter().flatten() {
-                    result["stats"] = json!({
-                        "leaders":0, "memberNodes":0, "snapNodes":0,
-                        "candidates":0, "exact":0, "elapsedMs":elapsed, "cacheHits":1
-                    });
+                    result["stats"] = json!(crate::search::Stats::default());
+                    result["stats"]["elapsedMs"] = json!(elapsed);
+                    result["stats"]["cacheHits"] = json!(1);
                 }
                 return Ok(response);
             }

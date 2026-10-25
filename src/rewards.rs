@@ -394,6 +394,9 @@ pub fn score_coefficient(
         }
         let (mut shapes, mut seen, mut max_absolute, mut max_actions) =
             (Vec::new(), BTreeSet::new(), 0.0_f64, 0usize);
+        let prepared = bindings
+            .is_none()
+            .then(|| skills::prepare(master, members, snaps));
         for (index, member) in members.iter().enumerate() {
             let photos: Vec<_> = if let Some(b) = bindings {
                 vec![b[index].as_ref()]
@@ -402,10 +405,16 @@ pub fn score_coefficient(
                     .chain(snaps.iter().map(Some))
                     .collect()
             };
-            for snap in photos {
-                let slot = skills::resolve(master, member, snap, &mut Vec::new());
+            for (photo_index, snap) in photos.into_iter().enumerate() {
+                let resolved;
+                let slot = if let Some(table) = &prepared {
+                    &table.slots[index * (snaps.len() + 1) + photo_index]
+                } else {
+                    resolved = skills::resolve(master, member, snap, &mut Vec::new());
+                    &resolved
+                };
                 let mut shape = Vec::new();
-                let (actions, absolute) = live::rounding_profile(&slot, None);
+                let (actions, absolute) = live::rounding_profile(slot, None);
                 for e in &slot.effects {
                     let diff = f(e.delta as f64 / 100000.0);
                     let duration = window_ms(e.seconds, slot.extension_ms);
@@ -1593,8 +1602,12 @@ impl BoundPreparation {
         let mut slots = Vec::new();
         let mut row_ids = Vec::new();
         let mut templates = HashMap::<Vec<u64>, u32>::default();
-        for member in members {
-            for snap in std::iter::once(None).chain(snaps.iter().map(Some)) {
+        let mut prepared_skills = None;
+        for (member_index, member) in members.iter().enumerate() {
+            for (snap_index, snap) in std::iter::once(None)
+                .chain(snaps.iter().map(Some))
+                .enumerate()
+            {
                 let p = Performer::from_member(master, member, snap);
                 let mut positive = 0.0;
                 let mut converts = 0.0;
@@ -1782,7 +1795,9 @@ impl BoundPreparation {
                         }
                     }
                 }
-                let slot = skills::resolve(master, member, snap, &mut Vec::new());
+                let raw =
+                    prepared_skills.get_or_insert_with(|| skills::prepare(master, members, snaps));
+                let slot = &raw.slots[member_index * (snaps.len() + 1) + snap_index];
                 if slot
                     .convert
                     .as_ref()
@@ -1790,8 +1805,7 @@ impl BoundPreparation {
                 {
                     return None;
                 }
-                let (actions, absolute) =
-                    live::rounding_profile(&slot, Some(master.live.life_base));
+                let (actions, absolute) = live::rounding_profile(slot, Some(master.live.life_base));
                 let mut shape = Vec::new();
                 let mut normal_windows = Vec::new();
                 for effect in &slot.effects {
@@ -5834,6 +5848,7 @@ pub struct RewardObjective<'a> {
     bound_ids: Vec<u32>,
     stable_life: bool,
     canonical_slots: bool,
+    raw_slots: Option<Arc<skills::Prepared>>,
     deterministic: Option<DeterministicBound>,
     empty_luck: Option<crate::gekiso_objective::EmptyLuckPrograms>,
     empty_options: Option<Vec<Vec<i32>>>,
@@ -6066,23 +6081,20 @@ impl<'a> RewardObjective<'a> {
                         .is_some_and(|skill| life_changes(skill, snap.gekiso_skill_levels[i]))
                 })
         });
-        let canonical_slots = stable_life
-            && gekiso.accuracy.great == 0.0
-            && gekiso.accuracy.miss_every == 0
-            && members.iter().all(|member| {
-                std::iter::once(None)
-                    .chain(snaps.iter().map(Some))
-                    .all(|snap| {
-                        let slot = skills::resolve(master, member, snap, &mut Vec::new());
-                        slot.effects.iter().all(|e| {
-                            e.gate.blocks(master.live.life_base)
-                                == e.gate.blocks(2.0 * master.live.life_base)
-                        }) && slot
-                            .convert
-                            .as_ref()
-                            .is_none_or(|c| !c.judgements.contains(&6))
-                    })
-            });
+        let raw_slots =
+            (stable_life && gekiso.accuracy.great == 0.0 && gekiso.accuracy.miss_every == 0)
+                .then(|| skills::prepare(master, members, snaps));
+        let canonical_slots = raw_slots.as_ref().is_some_and(|table| {
+            table.slots.iter().all(|slot| {
+                slot.effects.iter().all(|e| {
+                    e.gate.blocks(master.live.life_base)
+                        == e.gate.blocks(2.0 * master.live.life_base)
+                }) && slot
+                    .convert
+                    .as_ref()
+                    .is_none_or(|c| !c.judgements.contains(&6))
+            })
+        });
         let just_context = JustContext::new(master, &gekiso, members, snaps);
         let canonical_slots = canonical_slots
             && master
@@ -6148,6 +6160,7 @@ impl<'a> RewardObjective<'a> {
             snap_bounds,
             stable_life,
             canonical_slots,
+            raw_slots,
             deterministic,
             empty_luck,
             empty_options: None,
@@ -8318,12 +8331,16 @@ impl<'a> RewardObjective<'a> {
     }
     fn slot(&mut self, member: usize, snap: i32) -> Arc<live::Slot> {
         Arc::clone(self.slots.entry((member, snap)).or_insert_with(|| {
-            let mut slot = skills::resolve(
-                self.master,
-                &self.members[member],
-                (snap >= 0).then(|| &self.snaps[snap as usize]),
-                &mut Vec::new(),
-            );
+            let mut slot = if let Some(raw) = &self.raw_slots {
+                raw.slots[member * (self.snaps.len() + 1) + (snap + 1) as usize].clone()
+            } else {
+                skills::resolve(
+                    self.master,
+                    &self.members[member],
+                    (snap >= 0).then(|| &self.snaps[snap as usize]),
+                    &mut Vec::new(),
+                )
+            };
             if self.canonical_slots {
                 slot.recovery = 0;
                 slot.convert = None;

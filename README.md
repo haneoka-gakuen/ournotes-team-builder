@@ -251,6 +251,10 @@ and joint power/skill cuts. Each assignment domain refreshes that base. Fixed-se
 Min also bounds physical snapshots in a fixed ordinary-skill order and retains
 the mean bound: a team's worst-order score is at most its score in any fixed order.
 
+Reward coefficient bounds, deterministic templates and healthy-play normalization
+share the same raw inventory skill table. Bound team evaluations keep their direct
+bindings, and normalized rows remain owned by each reward objective.
+
 Member reward pricing retains one outward-rounded prefix per roster depth and
 reuses its parent event assignments. Suffix bounds keep their current character
 position, and each pricing plane prepares its bonus deduction once per score
