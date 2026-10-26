@@ -2439,6 +2439,17 @@ impl Engine {
         now: &dyn Fn() -> f64,
     ) -> Result<Value, String> {
         crate::reset_search_floor();
+        if self.trusted_scores
+            && input["request"]["cooperativeFloor"] == true
+            && input["request"]["rewardLexicographic"] == true
+        {
+            let value = &input["request"]["rewardIncumbent"];
+            if let (Some(primary), Some(other), Some(mean)) =
+                (value[0].as_f64(), value[1].as_f64(), value[2].as_f64())
+            {
+                crate::set_reward_floor([primary, other, mean]);
+            }
+        }
         #[cfg(not(target_arch = "wasm32"))]
         if input["request"]["shard"].is_object() {
             return crate::parallel::serial(|| self.run_inner(input, started, now));
@@ -2792,6 +2803,9 @@ impl Engine {
         {
             return Err("gekiso-reward-phase".into());
         }
+        let single_lex = phase.is_none()
+            && master::int(&request["k"]).max(1) == 1
+            && objective.enable_lexicographic();
         let cache_key = phase.map(|_| {
             json!([
                 song,
@@ -2833,7 +2847,7 @@ impl Engine {
         });
         objective.live_floor = self.trusted_scores
             && identity.is_some()
-            && phase.is_some()
+            && (phase.is_some() || single_lex)
             && request["noFloor"] != true
             && master::int(&request["k"]).max(1) == 1
             && (cfg!(not(target_arch = "wasm32")) || request["cooperativeFloor"] == true);
@@ -3252,7 +3266,6 @@ impl Engine {
             master::number(&request["floors"][&song_key], f64::NEG_INFINITY)
                 .max(master::number(&request["rewardCutoff"], f64::NEG_INFINITY))
         });
-        let single_lex = master::int(&request["k"]).max(1) == 1 && objective.enable_lexicographic();
         let mut output = search::search_at(
             search::Input {
                 master: &self.master,

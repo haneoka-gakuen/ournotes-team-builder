@@ -38,6 +38,39 @@ use std::sync::{
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_arch = "wasm32")]
 static SEARCH_FLOOR: AtomicU64 = AtomicU64::new(f64::NEG_INFINITY.to_bits());
+#[cfg(target_arch = "wasm32")]
+thread_local! { static REWARD_FLOOR: std::cell::Cell<Option<[f64; 3]>> = const { std::cell::Cell::new(None) }; }
+pub(crate) fn reward_floor() -> Option<[f64; 3]> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        REWARD_FLOOR.with(std::cell::Cell::get)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        None
+    }
+}
+pub(crate) fn set_reward_floor(value: [f64; 3]) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        if value.iter().any(|value| !value.is_finite() || *value < 0.0) {
+            return;
+        }
+        REWARD_FLOOR.with(|floor| {
+            if floor.get().is_none_or(|old| value > old) {
+                floor.set(Some(value));
+            }
+        });
+        haneoka_search_floor(value[0]);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = value;
+}
+#[cfg(target_arch = "wasm32")]
+#[no_mangle]
+pub extern "C" fn haneoka_search_reward(primary: f64, other: f64, mean: f64) {
+    set_reward_floor([primary, other, mean]);
+}
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) struct SearchFloor {
     value: AtomicU64,
@@ -116,7 +149,10 @@ pub(crate) fn publish_reward_proof(key: rewards::SharedRewardKey, power: f64, li
 }
 pub(crate) fn reset_search_floor() {
     #[cfg(target_arch = "wasm32")]
-    SEARCH_FLOOR.store(f64::NEG_INFINITY.to_bits(), Ordering::Relaxed);
+    {
+        SEARCH_FLOOR.store(f64::NEG_INFINITY.to_bits(), Ordering::Relaxed);
+        REWARD_FLOOR.with(|floor| floor.set(None));
+    }
 }
 pub(crate) fn publish_search_hit(hit: &search::Hit) {
     if !hit.key.is_finite() || hit.key < 0.0 {

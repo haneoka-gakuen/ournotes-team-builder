@@ -20,6 +20,12 @@ use std::{
 };
 const REFINE_SLACK: f64 = 1e-4;
 const RELATIVE: f64 = 3e-6;
+fn luck_envelope_limit(notes: usize) -> usize {
+    let bytes = notes
+        .saturating_mul(2 + 3 * std::mem::size_of::<usize>())
+        .saturating_add(4096);
+    (8 * 1024 * 1024 / bytes).clamp(1, 256)
+}
 #[cfg(not(target_arch = "wasm32"))]
 type SharedLuckKey = (String, usize);
 #[cfg(not(target_arch = "wasm32"))]
@@ -39,12 +45,9 @@ struct SharedLuckCache {
 #[cfg(not(target_arch = "wasm32"))]
 impl SharedLuckCache {
     fn new(notes: usize) -> Self {
-        let bytes = notes
-            .saturating_mul(2 + 3 * std::mem::size_of::<usize>())
-            .saturating_add(4096);
         Self {
             entries: Default::default(),
-            limit: (8 * 1024 * 1024 / bytes).clamp(1, 256),
+            limit: luck_envelope_limit(notes),
         }
     }
     fn cell(&self, key: &SharedLuckKey) -> SharedLuckCell {
@@ -2031,7 +2034,12 @@ impl<'a> Kernel<'a> {
         #[cfg(target_arch = "wasm32")]
         let value = compute();
 
-        if self.fixed_luck_counts.len() >= 32 {
+        let limit = if cfg!(target_arch = "wasm32") {
+            luck_envelope_limit(self.chart.notes.len()).min(128)
+        } else {
+            32
+        };
+        if self.fixed_luck_counts.len() >= limit {
             if let Some(old) = self.fixed_luck_count_order.pop_front() {
                 self.fixed_luck_counts.remove(&old);
             }

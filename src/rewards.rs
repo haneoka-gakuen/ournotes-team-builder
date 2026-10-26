@@ -6774,15 +6774,24 @@ impl<'a> RewardObjective<'a> {
         self.lex_incumbent = incumbent;
     }
     pub(crate) fn enable_lexicographic(&mut self) -> bool {
-        self.single_lex = self.just_reward_enabled();
+        self.single_lex = self.just_reward_enabled() || self.member_combo_caps.is_some();
         self.single_lex
     }
     fn below_limit(&self, upper: f64, limit: f64) -> bool {
         upper < limit || !self.single_lex && upper == limit
-            || self.reward_only_ties && self.lex_incumbent.is_some_and(|best| upper < best[0])
+            || self.reward_only_ties && self.lex_cutoff().is_some_and(|best| upper < best[0])
+    }
+    fn lex_cutoff(&self) -> Option<[f64; 3]> {
+        let shared = (self.live_floor && !self.reward_only_ties)
+            .then(crate::reward_floor)
+            .flatten();
+        match (self.lex_incumbent, shared) {
+            (Some(local), Some(shared)) => Some(if local > shared { local } else { shared }),
+            (local, shared) => local.or(shared),
+        }
     }
     fn lex_bound(&self, primary: f64, other: f64, mean: f64) -> f64 {
-        if let Some(best) = self.lex_incumbent {
+        if let Some(best) = self.lex_cutoff() {
             let tied_out = if self.reward_only_ties {
                 !self.tie_other_reward || other < best[1] || self.reward_ties_complete && other == best[1]
             } else { other < best[1] || other == best[1] && mean <= best[2] };
@@ -6812,7 +6821,7 @@ impl<'a> RewardObjective<'a> {
                     score_bound(coefficient, power)
                 }
             }
-            None if self.lex_incumbent.is_some_and(|best| reward == best[0]) => self.lex_bound(
+            None if self.lex_cutoff().is_some_and(|best| reward == best[0]) => self.lex_bound(
                 reward,
                 self.other_ceiling(power, other, coefficient),
                 score_bound(coefficient, power),
@@ -7146,7 +7155,7 @@ impl<'a> RewardObjective<'a> {
             if secondary
                 && self.reward_target.is_none()
                 && self.other_target.is_none()
-                && self.lex_incumbent.is_none()
+                && self.lex_cutoff().is_none()
             {
                 continue;
             }
@@ -7172,7 +7181,7 @@ impl<'a> RewardObjective<'a> {
             if i == 1
                 && self.reward_target.is_none()
                 && self.other_target.is_none()
-                && self.lex_incumbent.is_none()
+                && self.lex_cutoff().is_none()
             {
                 continue;
             }
@@ -7205,9 +7214,10 @@ impl<'a> RewardObjective<'a> {
             Some(_) if self.rank_other => values[1],
             Some(_) => mean(),
             None => {
-                let mean = if !self.reward_only_ties && self
-                    .lex_incumbent
-                    .is_some_and(|best| values[0] == best[0] && values[1] == best[1])
+                let mean = if !self.reward_only_ties
+                    && self
+                        .lex_cutoff()
+                        .is_some_and(|best| values[0] == best[0] && values[1] == best[1])
                 {
                     mean()
                 } else {
@@ -7757,7 +7767,7 @@ impl<'a> RewardObjective<'a> {
                 .fold(f64::NEG_INFINITY, f64::max);
             if self.reward_target.is_none()
                 && self.other_target.is_none()
-                && self.lex_incumbent.is_none()
+                && self.lex_cutoff().is_none()
             {
                 return reward;
             }
@@ -9835,7 +9845,7 @@ impl<'a> RewardObjective<'a> {
                         return Err("gekiso-reward-precision".into());
                     }
                     let upper = numerator / count as f64;
-                    let tied_out = self.lex_incumbent.is_some() && {
+                    let tied_out = self.lex_cutoff().is_some() && {
                         let secondary = if self.reward_only_ties && !self.tie_other_reward { 0.0 }
                             else { other_sum + (count - observations) as f64 * self.other_ceiling(power as f64, other_bonus, coefficient) };
                         safe(secondary) && self.lex_bound(upper, secondary / count as f64, f64::INFINITY) < upper

@@ -84,8 +84,10 @@ reward, then mean score.
 Fractional reward weights retain finite mean-reward bounds. When their binary
 exponents exceed the integer hull's range, bounds compare all rank pairs with
 outward rounding to obtain the same upper concave envelope.
-The private `rewardPhase` request separates pure COMBO and weighted ordinary
-Live Top 1 proofs into
+Deterministic COMBO and JUST Top 1 rewards with an available numeric model
+compare the primary payout, other payout and mean score in one traversal.
+The private `rewardPhase` request retains
+separate proof scopes for
 `primary`, `other` and `score`. Later phases take the globally proven reward
 values and a legal incumbent floor. Their results carry the stage name;
 callers report a complete recommendation only after every stage is proven.
@@ -96,13 +98,19 @@ The bounded cache retains four groups of at most 32 fully scored teams.
 Cooperative Top 1 shards publish legal incumbent floors during a proof. Native
 contexts share these floors and complete hits only within the same scoring scope;
 WebAssembly exposes `haneoka_search_floor` for the worker's active call.
+For a single COMBO reward traversal, trusted WebAssembly hosts also exchange
+the complete `(primary, other, mean)` lower bound through
+`haneoka_search_reward`. The call starts with its current validated
+`rewardIncumbent`; every new run clears the previous tuple. Reward-only plans
+keep their exact ranking protocol. Hosts retain the legal scored witness even
+when another shard returns a weaker local result.
 The caller still waits for every shard. Native COMBO shards also share at most
 8,192 non-improving root bounds with exact snapshot-domain masks.
 Adjacent phases retain complete settlements for the same inventory, player,
 constraints and goal; replacing a chart invalidates this cache. Ordinary score
 contexts also include constraints because filtering can change the card indices.
-Pure JUST compares all three in one traversal;
-other modes search the exact equality groups of the preceding rewards.
+Weighted ordinary Live uses the separate proof phases. Other reward modes
+retain their equality-group searches.
 Pure COMBO and pure JUST ties keep the original selected-reward objective,
 preserving its snapshot bonus constraints and
 compiled scoring data. Long-term CP conversion belongs to the selected
@@ -183,6 +191,9 @@ Native level workers share fixed-seed lottery envelopes for the same member
 program and support count. One worker prepares a missing envelope; peers reuse
 the completed result. The cache lives for one request, retains at most 256
 entries and reduces its capacity for longer charts.
+WebAssembly retains up to 128 local lottery envelopes and uses a smaller limit
+on longer charts. These entries remain local to one kernel and its fixed
+inventory, judgement stream and requested seeds.
 Pure LUCK recommendations partition snapshot choices by random-effect programs.
 For domains with up to two random-effect snapshots, native traces preserve each
 program and actor order. Previously weak seeds tighten the physical score bounds;
