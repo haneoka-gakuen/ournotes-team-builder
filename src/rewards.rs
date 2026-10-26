@@ -3004,6 +3004,11 @@ impl DeterministicBound {
         };
         for &scale in scales {
             let lambda = ratio * scale;
+            let coefficients: Vec<_> = self
+                .shared
+                .iter()
+                .map(|row| row.map(|value| (value / lambda).next_up()))
+                .collect();
             let cells: Vec<Vec<_>> = power
                 .iter()
                 .enumerate()
@@ -3015,15 +3020,12 @@ impl DeterministicBound {
                                 + self.snapshot_power[member * self.width
                                     + if snap < 0 { count } else { snap as usize }])
                             .next_up();
-                            let row = self.shared[self.ids
+                            let row = coefficients[self.ids
                                 [member * self.width + (snap + 1) as usize][self.capacity]
                                 as usize];
                             (
                                 snap,
-                                row.map(|value| {
-                                    ((lambda * power).next_up() + (value / lambda).next_up())
-                                        .next_up()
-                                }),
+                                row.map(|value| ((lambda * power).next_up() + value).next_up()),
                             )
                         })
                         .collect()
@@ -3446,6 +3448,11 @@ impl DeterministicBound {
         let count = self.width - 1;
         let columns = count + 5;
         let mut planes = Vec::new();
+        let coefficients: Vec<_> = self
+            .shared
+            .iter()
+            .map(|row| row.map(|value| up(value / lambda)))
+            .collect();
         for factor in [0.0, 0.2, 0.6, 1.2] {
             let mu = factor * spread;
             let mut cells = vec![Vec::<(i32, [f64; 5])>::new(); power.len()];
@@ -3457,7 +3464,7 @@ impl DeterministicBound {
                         snapshot_power
                             [member * self.width + if snap < 0 { count } else { snap as usize }],
                     );
-                    let row = self.shared[self.ids[member * self.width + (snap + 1) as usize]
+                    let row = coefficients[self.ids[member * self.width + (snap + 1) as usize]
                         [self.capacity] as usize];
                     let bonus = member_bonus[member]
                         + if snap < 0 {
@@ -3465,8 +3472,7 @@ impl DeterministicBound {
                         } else {
                             snap_bonus[snap as usize]
                         };
-                    let values = row
-                        .map(|value| add(add(mul(lambda, p), up(value / lambda)), mul(mu, bonus)));
+                    let values = row.map(|value| add(add(mul(lambda, p), value), mul(mu, bonus)));
                     let mean = values.iter().sum::<f64>() / 5.0;
                     maxima[member] = maxima[member].max(mean);
                     cells[member].push((snap, values));
@@ -4920,6 +4926,9 @@ impl DeterministicBound {
         let offers: JointRewardOffers = std::array::from_fn(|slot| {
             let member = members[slot];
             std::array::from_fn(|event| {
+                if mean && event != 0 {
+                    return Vec::new();
+                }
                 let choices = if mean {
                     self.option_cache[member].as_ref().unwrap()
                 } else {
@@ -4960,7 +4969,7 @@ impl DeterministicBound {
             let inverse = up(1.0 / lambda);
             for (slot, row) in weights.iter_mut().enumerate() {
                 row.clear();
-                let offers = &offers[slot][events[slot]];
+                let offers = &offers[slot][if mean { 0 } else { events[slot] }];
                 match mode {
                     0 => row.extend(offers.iter().map(|&(column, power, _, _)| (column, power))),
                     1 => row.extend(
@@ -5024,8 +5033,31 @@ impl DeterministicBound {
             let mut ceiling = upper;
             let mut prices = Vec::new();
             let ratio = (ccap / pcap).sqrt();
-            for scale in [1.0, 0.85, 1.15] {
-                let lambda = ratio * scale;
+            let mut balanced = ratio;
+            for _ in 0..2 {
+                let mut power = base_power;
+                let mut coefficient = self.base;
+                for slot in 0..5 {
+                    let choices = &offers[slot][if mean { 0 } else { events[slot] }];
+                    if let Some(&(_, p, c, _)) = choices.iter().max_by(|a, b| {
+                        (balanced * a.1 + a.2 / balanced)
+                            .total_cmp(&(balanced * b.1 + b.2 / balanced))
+                    }) {
+                        power += p;
+                        coefficient += c;
+                    }
+                }
+                if power > 0.0 && coefficient > 0.0 {
+                    balanced = (balanced * (coefficient / power).sqrt()).sqrt();
+                }
+            }
+            let trials = [balanced, ratio];
+            let trials = if floors.is_empty() {
+                &trials[..]
+            } else {
+                &trials[..1]
+            };
+            for (trial, &lambda) in trials.iter().enumerate() {
                 fill(&mut weights, &events, 2, lambda, 0.0);
                 let variable = matching.sparse_upper(&weights, columns);
                 let total = add(
@@ -5035,7 +5067,7 @@ impl DeterministicBound {
                 let cap = up(mul(total, total) / (4.0 * self.converted));
                 ceiling = ceiling.min(cap);
                 upper = upper.min(cap);
-                if scale == 1.0 && minimum_bonus.is_finite() && minimum_bonus > 0.0 {
+                if trial == 0 && minimum_bonus.is_finite() && minimum_bonus > 0.0 {
                     let spread = total / minimum_bonus;
                     for factor in [0.1, 0.4] {
                         let mu = factor * spread;
@@ -5727,8 +5759,10 @@ enum GaugeCoreKey {
 }
 type SettlementKey = (Vec<usize>, Vec<i32>, i32, Option<(u64, u64)>);
 type AssignmentCertificate = ([usize; 5], [u32; 5]);
+type PhysicalRewardKey = ([usize; 5], [u128; 5]);
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) type SharedRewardKey = ([usize; 5], [u128; 5]);
+pub(crate) type SharedRewardKey = PhysicalRewardKey;
+type PrimaryProofs = HashMap<[usize; 5], Vec<([u128; 5], f64, f64)>>;
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Default)]
 pub(crate) struct SharedRewardProofs {
@@ -5758,6 +5792,7 @@ impl SharedRewardProofs {
 }
 #[derive(Default)]
 pub(crate) struct SettlementCache {
+    primary_proofs: PrimaryProofs,
     values: HashMap<SettlementKey, (f64, serde_json::Value)>,
     order: VecDeque<SettlementKey>,
 }
@@ -5864,6 +5899,8 @@ pub struct RewardObjective<'a> {
     assignment_combo: Option<ComboModelKey>,
     assignment_power: f64,
     assignment_certificate: Option<AssignmentCertificate>,
+    primary_certificate: Option<PhysicalRewardKey>,
+    primary_proofs: PrimaryProofs,
     #[cfg(not(target_arch = "wasm32"))]
     assignment_shared_certificate: Option<SharedRewardKey>,
     certificate_domains: HashMap<Vec<i32>, u32>,
@@ -6182,6 +6219,8 @@ impl<'a> RewardObjective<'a> {
             assignment_combo: None,
             assignment_power: 0.0,
             assignment_certificate: None,
+            primary_certificate: None,
+            primary_proofs: HashMap::default(),
             #[cfg(not(target_arch = "wasm32"))]
             assignment_shared_certificate: None,
             certificate_domains: HashMap::default(),
@@ -6288,6 +6327,7 @@ impl<'a> RewardObjective<'a> {
         }
     }
     pub(crate) fn swap_settlements(&mut self, cache: &mut SettlementCache) {
+        std::mem::swap(&mut self.primary_proofs, &mut cache.primary_proofs);
         std::mem::swap(&mut self.exact_cache, &mut cache.values);
         std::mem::swap(&mut self.exact_order, &mut cache.order);
     }
@@ -6831,6 +6871,7 @@ impl<'a> RewardObjective<'a> {
     }
     fn prepare_assignment_certificate(&mut self, members: &[usize], options: &[Vec<i32>]) {
         self.assignment_certificate = None;
+        self.primary_certificate = None;
         #[cfg(not(target_arch = "wasm32"))]
         {
             self.assignment_shared_certificate = None;
@@ -6838,20 +6879,22 @@ impl<'a> RewardObjective<'a> {
         if self.member_combo_caps.is_none() || self.single_lex {
             return;
         }
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            if self.live_floor && self.snaps.len() < 128 {
-                let mut slots = [(0usize, 0u128); 5];
-                for (slot, &member) in members.iter().enumerate() {
-                    let mask = options[slot]
+        if self.snaps.len() < 128 {
+            let mut slots = [(0usize, 0u128); 5];
+            for (slot, &member) in members.iter().enumerate() {
+                slots[slot] = (
+                    member,
+                    options[slot]
                         .iter()
-                        .fold(0u128, |mask, &snap| mask | (1u128 << (snap + 1) as usize));
-                    slots[slot] = (member, mask);
-                }
-                slots.sort_unstable();
-                self.assignment_shared_certificate =
-                    Some((slots.map(|slot| slot.0), slots.map(|slot| slot.1)));
+                        .fold(0u128, |mask, &snap| mask | (1u128 << (snap + 1) as usize)),
+                );
             }
+            slots.sort_unstable();
+            self.primary_certificate = Some((slots.map(|slot| slot.0), slots.map(|slot| slot.1)));
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.live_floor {
+            self.assignment_shared_certificate = self.primary_certificate;
         }
         let mut slots = [(0usize, 0u32); 5];
         for (slot, &member) in members.iter().enumerate() {
@@ -6880,6 +6923,25 @@ impl<'a> RewardObjective<'a> {
             return;
         };
         let power = self.assignment_power;
+        if self.reward_target.is_none() && !self.single_lex && bound < limit {
+            if let Some((members, domains)) = self.primary_certificate {
+                if self.primary_proofs.len() >= 8192 && !self.primary_proofs.contains_key(&members)
+                {
+                    self.primary_proofs.clear();
+                }
+                let proofs = self.primary_proofs.entry(members).or_default();
+                if let Some(old) = proofs.iter_mut().find(|old| old.0 == domains) {
+                    if power > old.1 || power == old.1 && bound < old.2 {
+                        *old = (domains, power, bound);
+                    }
+                } else {
+                    if proofs.len() >= 4 {
+                        proofs.remove(0);
+                    }
+                    proofs.push((domains, power, bound));
+                }
+            }
+        }
         #[cfg(not(target_arch = "wasm32"))]
         if self.live_floor {
             if let Some(key) = self.assignment_shared_certificate {
@@ -6902,6 +6964,24 @@ impl<'a> RewardObjective<'a> {
         self.certificate_order.push_back(key);
     }
     fn certified_assignment_bound(&self, power: f64, limit: f64) -> Option<f64> {
+        if let (Some(target), Some((members, domains))) =
+            (self.reward_target, self.primary_certificate)
+        {
+            if self.below_limit(self.combo_discarded_upper, limit)
+                && self.primary_proofs.get(&members).is_some_and(|proofs| {
+                    proofs.iter().any(|&(allowed, maximum, bound)| {
+                        power <= maximum
+                            && bound < target
+                            && domains
+                                .iter()
+                                .zip(allowed)
+                                .all(|(&used, allowed)| used & !allowed == 0)
+                    })
+                })
+            {
+                return Some(self.combo_discarded_upper);
+            }
+        }
         // COMBO certificates cover skill and accumulation orders. Lowering
         // power preserves their rejection and the native rounding envelope.
         let check = |(maximum, proved): (f64, f64)| {

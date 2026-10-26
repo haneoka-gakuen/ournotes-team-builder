@@ -139,8 +139,12 @@ snapshot domains at lower power and higher cutoffs. These certificates cover all
 skill orders and the native accumulation error; exact settlements and leader
 orders remain separate. Stored upper bounds also retain equal-cutoff proofs;
 each phase keeps its own tie policy. At most 32,768 certificates and 4,096 domain vectors
-are retained, and changing the reward phase clears the certificates. Physical
-matching scratch is reused, and reward floors examine weaker skill orders first.
+are retained, and changing the reward phase clears these certificates.
+Strict primary-reward cuts also survive adjacent phases. Later phases reuse a
+cut only at no greater power and within its physical snapshot domains;
+excluded-domain bounds still participate. This cache retains at most 8,192
+rosters and four domain certificates per roster. Physical matching scratch is
+reused, and reward floors examine weaker skill orders first.
 Pricing rows retain five distinct witnesses before omitting a snapshot that is
 no better in power, event coefficient and reward bonus. Sparse matching keeps
 the original physical column identities; search options remain complete.
@@ -276,7 +280,12 @@ Member reward pricing retains one outward-rounded prefix per roster depth and
 reuses its parent event assignments. Suffix bounds keep their current character
 position, and each pricing plane prepares its bonus deduction once per score
 batch. Joint pricing prepares physical column identities, power, event coefficients
-and reward bonuses once before filling its pricing planes. Nonnegative bound
+and reward bonuses once before filling its pricing planes. Pricing scales each
+shared coefficient row once per plane, then reuses it across member/snapshot
+pairs. Joint assignment planes balance their positive tangent parameter against
+the row envelopes before physical matching, retaining outward rounding. Mean
+pricing prepares one offer row per slot because its coefficients are independent
+of skill order. Nonnegative bound
 rounding uses the next positive float bit pattern, with nonfinite inputs
 remaining infinite. Exact native scoring still enumerates all 120 orders.
 Noncompetitive deterministic Gekiso reward candidates may stop native replay when completed
