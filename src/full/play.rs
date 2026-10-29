@@ -115,6 +115,47 @@ fn choose(count: usize, wanted: i64, mut select: impl FnMut(usize)) {
         }
     }
 }
+fn project_combo_openings(
+    master: &Master,
+    setup: &Setup,
+    times: &[i32],
+    rows: &mut [(usize, &LiveNote, i32)],
+) {
+    for (range, &(start, end)) in setup.fevers.iter().enumerate() {
+        if setup.missions.get(range) != Some(&1) {
+            continue;
+        }
+        let first = rows.partition_point(|row| row.1.time_ms < start);
+        let Some(&(frame, note, _)) = rows.get(first).filter(|row| row.1.time_ms <= end) else {
+            continue;
+        };
+        let Some(&next_time) = times.get(frame + 1).filter(|&&time| time < end) else {
+            continue;
+        };
+        let mut last = first;
+        while last < rows.len() && rows[last].0 == frame && rows[last].1.time_ms <= end {
+            last += 1;
+        }
+        if last - first < 2
+            || !rows[first..last].iter().all(|row| {
+                row.1.time_ms == note.time_ms
+                    && matches!(row.1.op, 1 | 40)
+                    && master
+                        .live
+                        .perfect_after_ms
+                        .get(&row.1.judgement_type)
+                        .is_some_and(|&after| {
+                            next_time as i64 - row.1.time_ms as i64 <= after as i64
+                        })
+            })
+        {
+            continue;
+        }
+        for row in &mut rows[first + 1..last] {
+            row.0 = frame + 1;
+        }
+    }
+}
 pub fn judgement_stream(
     master: &Master,
     chart: &Chart,
@@ -164,7 +205,7 @@ pub fn judgement_stream(
             windows.push((first, end));
         }
     }
-    let rows: Vec<_> = judged
+    let mut rows: Vec<_> = judged
         .iter()
         .map(|note| {
             let frame = times.partition_point(|&t| t < note.time_ms);
@@ -196,6 +237,9 @@ pub fn judgement_stream(
         for i in ((every - 1)..rows.len()).step_by(every) {
             grade[i] = 1;
         }
+    }
+    if let Some(setup) = setup {
+        project_combo_openings(master, setup, &times, &mut rows);
     }
     let mut out: Vec<_> = times
         .iter()

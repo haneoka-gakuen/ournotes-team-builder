@@ -327,6 +327,9 @@ Fresh models with no note damage or LIFE-changing effects fold constant LIFE
 checks before playback. Other models retain the full LIFE state machine.
 Combined conditions retain the latest trigger time from successful children;
 failed conjunctions clear it, and disjunctions use their first successful branch.
+Normal COMBO opening chords made entirely of independent taps or flicks span
+two existing 60 Hz frames when every note fits its base Perfect window and the
+range. Their nominal times, identities and judgement grades stay the same.
 COMBO traces collect note factors and combo maxima in one replay; support
 preparation records factor commands without calculating unused note totals.
 
