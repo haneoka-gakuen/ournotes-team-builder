@@ -56,11 +56,24 @@ impl Cumulative {
     pub(crate) fn at_cap(&self) -> i32 {
         // This is a search bound, not a replayed counter. A large or unlimited
         // cap can wrap the native product before the effect maximum is applied.
-        let mut value = self.value.saturating_mul(self.cap);
+        let mut value = self
+            .value
+            .checked_mul(self.cap)
+            .map_or(i32::MAX, |value| value.max(0));
         if self.maximum > 0 && self.maximum < value {
             value = self.maximum;
         }
         crate::full::score::note_factor_mill(f(f(value as f64) / 10000.0))
+    }
+
+    fn magnitude_cap(&self) -> f64 {
+        let Some(mut value) = self.value.checked_mul(self.cap) else {
+            return (i32::MIN as f64).abs();
+        };
+        if self.maximum > 0 && self.maximum < value {
+            value = self.maximum;
+        }
+        (crate::full::score::note_factor_mill(f(f(value as f64) / 10000.0)) as f64).abs()
     }
 
     pub(crate) fn duration_ms(&self) -> i32 {
@@ -161,7 +174,7 @@ pub(crate) fn rounding_profile(slot: &Slot, life: Option<f64>) -> (usize, f64) {
     // the subtraction/add cycles used by the played-judgement path.
     for factor in &slot.cumulative {
         let steps = usize::try_from(factor.cap).unwrap_or(usize::MAX);
-        let delta = f(factor.at_cap().abs() as f64 / 100000.0);
+        let delta = f(factor.magnitude_cap() / 100000.0);
         for &judgement in &factor.judgements {
             let Some(channel) = [3, 4, 5, 6].iter().position(|&j| j == judgement) else {
                 continue;
@@ -868,7 +881,25 @@ pub fn score(input: &Input) -> Result<Scores, String> {
         }
         play(input, judgements)
     } else {
-        Ok(ap(input))
+        let count = n.min(i32::MAX as usize) as i32;
+        let native_cumulative = input
+            .slots
+            .iter()
+            .flat_map(|slot| &slot.cumulative)
+            .any(|factor| {
+                factor.judgements.contains(&5)
+                    && ((factor.maximum <= 0 && factor.value != 0)
+                        || factor
+                        .value
+                        .checked_mul((count / factor.unit).min(factor.cap))
+                        .is_none()
+                        || factor.mill(count) == i32::MIN)
+            });
+        if native_cumulative {
+            play(input, &vec![5; n])
+        } else {
+            Ok(ap(input))
+        }
     }
 }
 

@@ -243,11 +243,18 @@ fn search_bounds_price_the_cumulative_cap() {
 }
 
 #[test]
-fn large_cumulative_caps_keep_search_bounds_above_replay() {
+fn cumulative_caps_keep_search_bounds_above_replay() {
     for (unit, value, maximum, cap) in [
         (1, 3000, 6000, 999999),
         (2, 2000, 4000, i32::MAX),
         (1, 3000, 0, 999999),
+        (1, -3000, 6000, 12),
+        (1, -3000, 6000, 999999),
+        (2, -2000, 4000, i32::MAX),
+        (1, 500_000_000, 6000, 12),
+        (1, -500_000_000, 6000, 12),
+        (1, 0, 0, i32::MAX),
+        (1, -500_000_000, 0, 1),
     ] {
         let factor = Cumulative {
             unit,
@@ -256,11 +263,21 @@ fn large_cumulative_caps_keep_search_bounds_above_replay() {
             cap,
             ..climbing(cap, 5.0)
         };
+        let played = input(vec![slot(vec![factor.clone()])], Some(vec![PERFECT; 12]), 12);
         let input = input(vec![slot(vec![factor])], None, 12);
-        let exact = live::score(&input).unwrap().scores[0];
+        let prefix = live::score(&input).unwrap().scores[0];
+        let native = live::score(&played).unwrap().scores[0];
+        if (maximum <= 0 && value != 0) || i64::from(value).abs() >= 500_000_000 {
+            assert_eq!(prefix, native);
+        }
+        let exact = prefix.max(native);
         let linear = model::linear(&input);
         let upper = model::skill_weights(&linear, &input, &input.slots[0], true);
-        assert!(upper.per_event[0] > 0.0);
+        if value > 0 || value.checked_mul(cap).is_none() {
+            assert!(upper.per_event[0] > 0.0);
+        } else {
+            assert_eq!(upper.per_event[0], 0.0);
+        }
 
         let judgements = vec![PERFECT; 12];
         let mut bounds = model::PlayBounds::new(&input, &judgements);

@@ -423,6 +423,12 @@ Ordinary cumulative snapshot score-ups also run in nominal and sampled Gekiso
 scoring. Counters advance over the full simultaneous judgement frame and expire
 at their activation window; cumulative slots use the dynamic scorer.
 
+Cumulative search caps bound the positive factor independently from the native
+wrapping counter replay. Rounding envelopes retain the full signed magnitude
+when a reachable product can wrap. Ordinary all-Perfect scoring uses the native
+played-judgement path for uncapped factors and when cumulative products or replacements exceed
+the prefix path's signed range; regular finite caps keep the prefix path.
+
 ## Multi-song teams
 
 `request.aggregation: "mean"` searches one formation over all `goal.songs` for
