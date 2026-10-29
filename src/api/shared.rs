@@ -15,6 +15,7 @@ struct SongObjective<'a> {
     skills: Vec<(f64, f64)>,
     cap: f64,
     linear: Option<(f64, f64)>,
+    unbounded: bool,
     slots: Vec<Vec<f64>>,
     opening: Vec<i32>,
 }
@@ -105,10 +106,10 @@ impl Objective for Combined<'_> {
         self.songs.iter().all(|s| s.objective.canonical_leader())
     }
     fn preserve_snap_options(&self) -> bool {
-        self.event
+        self.event || self.songs.iter().any(|song| song.unbounded)
     }
     fn conditional_snap_dominance(&self) -> bool {
-        !self.event
+        !self.event && !self.songs.iter().any(|song| song.unbounded)
     }
     fn snap_dominance(&mut self, member: usize, snap: i32) -> Vec<f64> {
         let width = self.snaps.len() + 1;
@@ -241,7 +242,7 @@ impl Objective for Combined<'_> {
         self.upper(members, assigned, from)
     }
     fn interval(&mut self, _team: &Team, _t: Totals) -> (f64, f64) {
-        (0.0, f64::INFINITY)
+        (if self.songs.iter().any(|song| song.unbounded) { f64::NEG_INFINITY } else { 0.0 }, f64::INFINITY)
     }
     fn exact(&mut self, team: &Team, _power: f64, _slots: &[f64]) -> Result<Exact, String> {
         if !self.eligible(team) {
@@ -428,6 +429,7 @@ impl Engine {
                 )
             });
             let mut linear = None;
+            let unbounded;
             let mut objective: Box<dyn Objective> = if let Some(route) = &route {
                 let raw = if battle {
                     let mut gk = crate::gekiso::Chart::new(
@@ -469,6 +471,10 @@ impl Engine {
                         exchange,
                         f64::INFINITY,
                     )))
+                };
+                unbounded = match &raw {
+                    crate::reward_plan::Source::Ordinary(event) => event.core.as_ref().is_some_and(|core| core.unbounded),
+                    crate::reward_plan::Source::Gekiso(_) => false,
                 };
                 if let Some(plan) = &plan {
                     Box::new(Ranked::new(
@@ -524,7 +530,8 @@ impl Engine {
                 let scale = ((1.0 + crate::model::RELATIVE_ERROR)
                     / core.input.converted_count as f64)
                     .next_up();
-                linear = Some(((core.high.total * scale).next_up(), scale));
+                unbounded = core.unbounded;
+                linear = (!unbounded).then(|| ((core.high.total * scale).next_up(), scale));
                 Box::new(LiveObjective {
                     core,
                     criterion: Criterion::Mean,
@@ -616,6 +623,7 @@ impl Engine {
                 skills,
                 cap,
                 linear,
+                unbounded,
                 slots: Vec::new(),
                 opening,
             });

@@ -49,6 +49,7 @@ pub struct LiveCore {
     pub score_cap: f64,
     pub max_recovery: i32,
     pub drains: bool,
+    pub(crate) unbounded: bool,
     pub slots: Vec<Slot>,
     ids: Vec<usize>,
     width: usize,
@@ -205,6 +206,8 @@ impl LiveCore {
             let (ids, intern_len) = table.shapes();
             (ids.clone(), *intern_len)
         };
+        let unbounded = slots.iter().flat_map(|slot| &slot.cumulative)
+            .any(|factor| factor.requires_unbounded_bounds(input.times.len()));
         let factor_cap = 1.0 + overlap as f64 * raise;
         let high = if let Some(j) = &input.judgements {
             model::linear_play(&input, j, true, 0, 1.0, recovery)
@@ -231,6 +234,7 @@ impl LiveCore {
             score_cap: f64::INFINITY,
             max_recovery: recovery,
             drains,
+            unbounded,
             slots,
             ids,
             width,
@@ -291,10 +295,14 @@ impl LiveCore {
         self.ids[self.at(member, snap)]
     }
     pub fn score_high(&self, t: Totals) -> f64 {
+        if self.unbounded { return f64::INFINITY; }
+
         t.power * (self.high.total + t.skill) / self.input.converted_count as f64
             * (1.0 + RELATIVE_ERROR)
     }
     pub fn score_low(&self, t: Totals) -> f64 {
+        if self.unbounded { return f64::NEG_INFINITY; }
+
         (t.power * (self.low.total + t.skill_low) / self.input.converted_count as f64
             * (1.0 - RELATIVE_ERROR)
             - self.low.absolute_error)
@@ -325,6 +333,8 @@ impl LiveCore {
         Ok(scores)
     }
     pub fn order_bounds(&mut self, team: &Team, power: f64) -> (Vec<f64>, Vec<f64>) {
+        if self.unbounded { return (vec![f64::NEG_INFINITY; 120], vec![f64::INFINITY; 120]); }
+
         let mut lows = vec![0.0; 120];
         let mut highs = vec![0.0; 120];
         if let Some(mut bounds) = self.play_bounds.take() {
@@ -375,6 +385,8 @@ impl LiveCore {
         (lows, highs)
     }
     pub(crate) fn prepare_dominance(&mut self, power_cap: f64) {
+        if self.unbounded { return; }
+
         if self.input.judgements.is_none()
             && self
                 .slots
@@ -452,6 +464,8 @@ impl LiveCore {
         }
     }
     fn member_max_bound(&mut self, members: &[usize], totals: Totals, from: usize) -> Option<f64> {
+        if self.unbounded { return None; }
+
         let suffix = *self.suffix_profiles.get(from)?;
         let matrix: [[f64; 5]; 5] = std::array::from_fn(|slot| {
             if slot < members.len() {
@@ -514,6 +528,7 @@ impl LiveCore {
         from: usize,
         totals: Totals,
     ) -> Option<f64> {
+        if self.unbounded { return None; }
         if self.max_frontiers.len() != 5 {
             return None;
         }
@@ -591,6 +606,8 @@ impl LiveCore {
         })
     }
     pub fn team_high(&mut self, team: &Team, t: Totals) -> f64 {
+        if self.unbounded { return f64::INFINITY; }
+
         let Some(j) = &self.input.judgements else {
             return self.score_high(t);
         };
@@ -658,13 +675,16 @@ impl Objective for LiveObjective {
         self.target.is_none() && self.criterion != Criterion::Mean
     }
     fn exchange_snap_equivalent(&mut self, member: usize, a: i32, b: i32) -> bool {
-        self.core.shape(member, a) == self.core.shape(member, b)
+        !self.core.unbounded && self.core.shape(member, a) == self.core.shape(member, b)
+    }
+    fn preserve_snap_options(&self) -> bool {
+        self.core.unbounded
     }
     fn conditional_snap_dominance(&self) -> bool {
-        true
+        !self.core.unbounded
     }
     fn canonical_leader(&self) -> bool {
-        true
+        !self.core.unbounded
     }
     fn numeric_member_dominance(&mut self, better: usize, worse: usize, power_delta: f64) -> bool {
         self.core
@@ -760,6 +780,7 @@ impl Objective for LiveObjective {
         })
     }
     fn joint_targets(&mut self, limit: f64) -> Option<Vec<crate::search::JointTarget>> {
+        if self.core.unbounded { return None; }
         let mut score = limit;
         if let Some(target) = self.target {
             score = if !target.capped && self.core.score_cap < target.score {
@@ -780,7 +801,7 @@ impl Objective for LiveObjective {
         }])
     }
     fn product_base(&self) -> Option<f64> {
-        Some(self.core.high.total)
+        (!self.core.unbounded).then_some(self.core.high.total)
     }
     fn leaf_bound(&mut self, team: &Team, t: Totals) -> Option<f64> {
         if self.core.input.judgements.is_some() {
@@ -923,13 +944,16 @@ pub struct ScoreCap {
 }
 impl Objective for ScoreCap {
     fn exchange_snap_equivalent(&mut self, member: usize, a: i32, b: i32) -> bool {
-        self.core.shape(member, a) == self.core.shape(member, b)
+        !self.core.unbounded && self.core.shape(member, a) == self.core.shape(member, b)
+    }
+    fn preserve_snap_options(&self) -> bool {
+        self.core.unbounded
     }
     fn conditional_snap_dominance(&self) -> bool {
-        true
+        !self.core.unbounded
     }
     fn canonical_leader(&self) -> bool {
-        true
+        !self.core.unbounded
     }
     fn needs_power_cap(&self) -> bool {
         self.core.input.judgements.is_none()
@@ -988,6 +1012,7 @@ impl Objective for ScoreCap {
         self.core.score_high(t)
     }
     fn joint_targets(&mut self, limit: f64) -> Option<Vec<crate::search::JointTarget>> {
+        if self.core.unbounded { return None; }
         Some(vec![crate::search::JointTarget {
             bonus: 0.0,
             product: (limit.max(0.0) * self.core.input.converted_count as f64
@@ -997,13 +1022,15 @@ impl Objective for ScoreCap {
         }])
     }
     fn product_base(&self) -> Option<f64> {
-        Some(self.core.high.total)
+        (!self.core.unbounded).then_some(self.core.high.total)
     }
     fn interval(&mut self, team: &Team, t: Totals) -> (f64, f64) {
+        if self.core.unbounded { return (f64::INFINITY, f64::INFINITY); }
         let value = self.core.order_high(team, t.power);
         (value, value)
     }
     fn exact(&mut self, team: &Team, power: f64, _slots: &[f64]) -> Result<Exact, String> {
+        if self.core.unbounded { return Ok(Exact { key: f64::INFINITY, detail: Value::Null }); }
         Ok(Exact {
             key: self.core.order_high(team, power),
             detail: Value::Null,

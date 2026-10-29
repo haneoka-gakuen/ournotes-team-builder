@@ -255,6 +255,7 @@ fn cumulative_caps_keep_search_bounds_above_replay() {
         (1, -500_000_000, 6000, 12),
         (1, 0, 0, i32::MAX),
         (1, -500_000_000, 0, 1),
+        (1, 1, 6000, 13),
     ] {
         let factor = Cumulative {
             unit,
@@ -267,7 +268,7 @@ fn cumulative_caps_keep_search_bounds_above_replay() {
         let input = input(vec![slot(vec![factor])], None, 12);
         let prefix = live::score(&input).unwrap().scores[0];
         let native = live::score(&played).unwrap().scores[0];
-        if (maximum <= 0 && value != 0) || i64::from(value).abs() >= 500_000_000 {
+        if (maximum <= 0 && value != 0) || i64::from(value).abs() >= 500_000_000 || cap > 12 {
             assert_eq!(prefix, native);
         }
         let exact = prefix.max(native);
@@ -281,7 +282,7 @@ fn cumulative_caps_keep_search_bounds_above_replay() {
 
         let judgements = vec![PERFECT; 12];
         let mut bounds = model::PlayBounds::new(&input, &judgements);
-        let (_, high) = bounds.order(
+        let (low, high) = bounds.order(
             &input,
             &judgements,
             &input.slots,
@@ -289,6 +290,38 @@ fn cumulative_caps_keep_search_bounds_above_replay() {
             &[0, 1, 2, 3, 4],
             1000.0,
         );
+        assert!(low <= exact, "cap {cap}: lower {low} > replay {exact}");
         assert!(high >= exact, "cap {cap}: bound {high} < replay {exact}");
+        if value != 0 && cap > 12 {
+            assert_eq!(low, f64::NEG_INFINITY);
+            assert_eq!(high, f64::INFINITY);
+        }
+    }
+
+    for value in [-100_000_000, 100_000_000] {
+        let mut ghost_slot = slot(vec![Cumulative {
+            unit: 1,
+            value,
+            maximum: if value < 0 { 6000 } else { value },
+            cap: 1,
+            seconds: 0.15,
+            ..climbing(1, 0.15)
+        }]);
+        ghost_slot.effects.push(Effect {
+            kind: 2000,
+            delta: 70_000,
+            seconds: 5.0,
+            gate: Gate { kind: 0, value: 0.0, positive: true },
+            judgements: Vec::new(),
+        });
+        let mut ghost = input(vec![ghost_slot], None, 2);
+        ghost.power = 1_000_000;
+        ghost.note_frac = vec![0.0, 1.0];
+        let exact = live::score(&ghost).unwrap().scores[0];
+        let judgements = vec![PERFECT; 2];
+        let mut bounds = model::PlayBounds::new(&ghost, &judgements);
+        let (low, high) = bounds.order(&ghost, &judgements, &ghost.slots, &[0], &[0, 1, 2, 3, 4], ghost.power as f64);
+        assert!(low <= exact, "signed-factor residue: lower {low} > replay {exact}");
+        assert!(high >= exact, "signed-factor residue: bound {high} < replay {exact}");
     }
 }

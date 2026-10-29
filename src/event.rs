@@ -870,6 +870,7 @@ impl EventObjective {
     }
     pub(crate) fn nonmonotone(&self) -> bool {
         self.direct_envelope.is_some() || self.other_envelope.is_some()
+            || self.core.as_ref().is_some_and(|core| core.unbounded)
     }
     fn other_upper(&self, bonus: f64, rank: i32) -> f64 {
         self.other_envelope.as_ref().map_or_else(
@@ -966,7 +967,7 @@ impl EventObjective {
         from: usize,
         power: f64,
     ) -> Option<f64> {
-        if self.core.as_ref()?.input.judgements.is_some() {
+        if self.core.as_ref()?.unbounded || self.core.as_ref()?.input.judgements.is_some() {
             return None;
         }
         let ids = std::array::from_fn(|slot| {
@@ -987,7 +988,7 @@ impl EventObjective {
         from: usize,
         power: f64,
     ) -> Option<f64> {
-        if self.core.as_ref()?.input.judgements.is_some() {
+        if self.core.as_ref()?.unbounded || self.core.as_ref()?.input.judgements.is_some() {
             return None;
         }
         let ids = std::array::from_fn(|slot| {
@@ -1081,7 +1082,7 @@ impl EventObjective {
         from: usize,
         power: f64,
     ) -> Option<[f64; 120]> {
-        if self.core.as_ref()?.input.judgements.is_some() {
+        if self.core.as_ref()?.unbounded || self.core.as_ref()?.input.judgements.is_some() {
             return None;
         }
         let ids = std::array::from_fn(|slot| {
@@ -1104,7 +1105,7 @@ impl EventObjective {
         t: Totals,
         other: f64,
     ) -> Option<(f64, f64)> {
-        if self.core.as_ref()?.input.judgements.is_some() {
+        if self.core.as_ref()?.unbounded || self.core.as_ref()?.input.judgements.is_some() {
             return None;
         }
         let ids = std::array::from_fn(|slot| {
@@ -1136,7 +1137,7 @@ impl EventObjective {
         other: f64,
     ) -> Option<(f64, f64, f64)> {
         let core = self.core.as_ref()?;
-        if core.input.judgements.is_some() {
+        if core.unbounded || core.input.judgements.is_some() {
             return None;
         }
         let (base, converted) = (core.high.total, core.input.converted_count as f64);
@@ -1266,7 +1267,7 @@ impl EventObjective {
         from: usize,
         other: f64,
     ) -> Option<(f64, f64)> {
-        if self.core.as_ref()?.input.judgements.is_some() {
+        if self.core.as_ref()?.unbounded || self.core.as_ref()?.input.judgements.is_some() {
             return None;
         }
         let ids = std::array::from_fn(|slot| {
@@ -1406,6 +1407,7 @@ impl Objective for EventObjective {
             })
     }
     fn exchange_snap_equivalent(&mut self, member: usize, a: i32, b: i32) -> bool {
+        if self.core.as_ref().is_some_and(|core| core.unbounded) { return false; }
         self.core
             .as_ref()
             .is_none_or(|core| core.shape(member, a) == core.shape(member, b))
@@ -1417,7 +1419,7 @@ impl Objective for EventObjective {
         !self.nonmonotone()
     }
     fn canonical_leader(&self) -> bool {
-        true
+        !self.core.as_ref().is_some_and(|core| core.unbounded)
     }
     fn numeric_member_dominance(&mut self, better: usize, worse: usize, power_delta: f64) -> bool {
         !self.nonmonotone()
@@ -1936,13 +1938,13 @@ impl ScoreTie {
 }
 impl Objective for ScoreTie {
     fn exchange_snap_equivalent(&mut self, member: usize, a: i32, b: i32) -> bool {
-        self.mean.core.shape(member, a) == self.mean.core.shape(member, b)
+        !self.mean.core.unbounded && self.mean.core.shape(member, a) == self.mean.core.shape(member, b)
     }
     fn conditional_snap_dominance(&self) -> bool {
         true
     }
     fn canonical_leader(&self) -> bool {
-        true
+        self.event.canonical_leader()
     }
     fn numeric_member_dominance(&mut self, better: usize, worse: usize, power_delta: f64) -> bool {
         self.excluded.is_empty()
@@ -2444,11 +2446,14 @@ impl Objective for ChallengePoints {
         self.mean.snap_dominance(m, s)
     }
 
+    fn preserve_snap_options(&self) -> bool {
+        self.mean.preserve_snap_options()
+    }
     fn conditional_snap_dominance(&self) -> bool {
-        true
+        self.mean.conditional_snap_dominance()
     }
     fn canonical_leader(&self) -> bool {
-        true
+        self.mean.canonical_leader()
     }
     fn skill(&mut self, m: usize, s: i32) -> (f64, f64) {
         self.mean.skill(m, s)

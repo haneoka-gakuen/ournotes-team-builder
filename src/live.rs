@@ -42,6 +42,9 @@ pub struct Cumulative {
     pub cap: i32,
     pub seconds: f64,
 }
+const FINITE_CUMULATIVE_MAX_BP: i32 = 24_000;
+const FINITE_CUMULATIVE_MAX_STEPS: i32 = 12;
+
 impl Cumulative {
     /// Native mill of the factor after `count` matching judgements.
     pub(crate) fn mill(&self, count: i32) -> i32 {
@@ -74,6 +77,17 @@ impl Cumulative {
             value = self.maximum;
         }
         (crate::full::score::note_factor_mill(f(f(value as f64) / 10000.0)) as f64).abs()
+    }
+
+    pub(crate) fn requires_unbounded_bounds(&self, notes: usize) -> bool {
+        if self.value == 0 { return false; }
+        let count = notes.min(i32::MAX as usize) as i32;
+        self.value < 0
+            || self.maximum <= 0
+            || !(1..=FINITE_CUMULATIVE_MAX_STEPS).contains(&self.cap)
+            || self.value.saturating_mul(self.cap).min(self.maximum) > FINITE_CUMULATIVE_MAX_BP
+            || self.value.checked_mul((count / self.unit).min(self.cap)).is_none()
+            || self.mill(count) == i32::MIN
     }
 
     pub(crate) fn duration_ms(&self) -> i32 {
@@ -881,20 +895,11 @@ pub fn score(input: &Input) -> Result<Scores, String> {
         }
         play(input, judgements)
     } else {
-        let count = n.min(i32::MAX as usize) as i32;
         let native_cumulative = input
             .slots
             .iter()
             .flat_map(|slot| &slot.cumulative)
-            .any(|factor| {
-                factor.judgements.contains(&5)
-                    && ((factor.maximum <= 0 && factor.value != 0)
-                        || factor
-                        .value
-                        .checked_mul((count / factor.unit).min(factor.cap))
-                        .is_none()
-                        || factor.mill(count) == i32::MIN)
-            });
+            .any(|factor| factor.requires_unbounded_bounds(n));
         if native_cumulative {
             play(input, &vec![5; n])
         } else {

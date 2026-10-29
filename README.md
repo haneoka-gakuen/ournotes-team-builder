@@ -428,6 +428,13 @@ wrapping counter replay. Rounding envelopes retain the full signed magnitude
 when a reachable product can wrap. Ordinary all-Perfect scoring uses the native
 played-judgement path for uncapped factors and when cumulative products or replacements exceed
 the prefix path's signed range; regular finite caps keep the prefix path.
+Finite ordinary cumulative bounds use the validated current-card domain: positive
+capped factors, at most 12 authored counter steps and at most 24,000 effective BP.
+Signed, uncapped, larger-domain and reachable-overflow factors retain unbounded
+ordinary-score intervals and complete snapshot domains, including joint-song
+searches. Their rounding residue can outlive the activation window, so finite
+window coefficients do not certify those searches. Exact replay still evaluates
+every retained team; inputs outside the finite domain remain accepted.
 
 ## Multi-song teams
 

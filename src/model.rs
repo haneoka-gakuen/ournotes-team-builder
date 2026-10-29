@@ -273,6 +273,11 @@ impl PlayBounds {
         order: &[usize; 5],
         power: f64,
     ) -> (f64, f64) {
+        if slots.iter().flat_map(|slot| &slot.cumulative)
+            .any(|factor| factor.requires_unbounded_bounds(input.times.len()))
+        {
+            return (f64::NEG_INFINITY, f64::INFINITY);
+        }
         let n = input.times.len();
         let key = order.map(|slot| slots.get(slot).map(|s| s.recovery).unwrap_or(0));
         let bounds = self.life.entry(key).or_insert_with(|| {
