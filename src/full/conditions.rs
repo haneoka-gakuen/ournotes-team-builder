@@ -246,8 +246,8 @@ impl Checker {
         }
     }
     pub fn check(&mut self, ctx: &mut Context<'_>) -> Result<(bool, i32), String> {
+        self.override_time = None;
         if self.idle.is_some_and(|input| !input.active(ctx)) {
-            self.override_time = None;
             return Ok((false, 0));
         }
         let result = match &mut self.test {
@@ -269,10 +269,12 @@ impl Checker {
                         all = false;
                         break;
                     }
+                    self.override_time = self.override_time.max(items[i].override_time());
                 }
                 if all {
                     (true, hit)
                 } else {
+                    self.override_time = None;
                     (false, 0)
                 }
             }
@@ -283,6 +285,7 @@ impl Checker {
                     let (ok, h) = item.check(ctx)?;
                     hit = hit.max(h);
                     if ok {
+                        self.override_time = item.override_time();
                         any = true;
                         break;
                     }
@@ -692,6 +695,7 @@ impl Checker {
         Ok(result)
     }
     pub fn reset(&mut self, ctx: &mut Context<'_>) -> Result<(), String> {
+        self.override_time = None;
         match &mut self.test {
             Test::And(items) | Test::Or(items) => {
                 for item in items {
