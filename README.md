@@ -415,6 +415,7 @@ search; only the joint formation search proves the result. Per-song bounds are
 combined conservatively, and equal-power charts share a coupled scalar bound.
 Every retained hit contains complete per-song scores in `aggregate.songs`. Partial
 requests retain candidates without a complete proof.
+One effective chart in mean or shared mode uses the single-chart solver.
 
 ## Shared song rules
 

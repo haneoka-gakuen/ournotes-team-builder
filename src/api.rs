@@ -2477,6 +2477,27 @@ impl Engine {
         started: f64,
         now: &dyn Fn() -> f64,
     ) -> Result<Value, String> {
+        let request = &input["request"];
+        let goal = &request["goal"];
+        if matches!(goal["kind"].as_str(), Some("score" | "event" | "gekiso"))
+            && (request["aggregation"] == "mean" || goal["arena"]["mode"] == "shared")
+        {
+            let songs = master::rows(&goal["songs"]);
+            if let Some(first) = songs.first().filter(|first| {
+                songs.iter().all(|song| {
+                    song["songId"] == first["songId"]
+                        && song["difficulty"] == first["difficulty"]
+                })
+            }) {
+                let mut single = input.clone();
+                single["request"]["aggregation"] = Value::Null;
+                single["request"]["goal"]["songs"] = json!([first]);
+                if single["request"]["goal"]["arena"]["mode"] == "shared" {
+                    single["request"]["goal"]["arena"]["mode"] = json!("individual");
+                }
+                return self.run_inner(&single, started, now);
+            }
+        }
         if input["request"]["songRules"].is_object() {
             let (mut scoped, scoped_input) = self.song_rule_view(input)?;
             let mut result = scoped.run(&scoped_input, started, now)?;
