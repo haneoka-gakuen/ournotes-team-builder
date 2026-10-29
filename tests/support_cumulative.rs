@@ -241,3 +241,37 @@ fn search_bounds_price_the_cumulative_cap() {
     );
     assert!(high > low);
 }
+
+#[test]
+fn large_cumulative_caps_keep_search_bounds_above_replay() {
+    for (unit, value, maximum, cap) in [
+        (1, 3000, 6000, 999999),
+        (2, 2000, 4000, i32::MAX),
+        (1, 3000, 0, 999999),
+    ] {
+        let factor = Cumulative {
+            unit,
+            value,
+            maximum,
+            cap,
+            ..climbing(cap, 5.0)
+        };
+        let input = input(vec![slot(vec![factor])], None, 12);
+        let exact = live::score(&input).unwrap().scores[0];
+        let linear = model::linear(&input);
+        let upper = model::skill_weights(&linear, &input, &input.slots[0], true);
+        assert!(upper.per_event[0] > 0.0);
+
+        let judgements = vec![PERFECT; 12];
+        let mut bounds = model::PlayBounds::new(&input, &judgements);
+        let (_, high) = bounds.order(
+            &input,
+            &judgements,
+            &input.slots,
+            &[0],
+            &[0, 1, 2, 3, 4],
+            1000.0,
+        );
+        assert!(high >= exact, "cap {cap}: bound {high} < replay {exact}");
+    }
+}

@@ -574,7 +574,12 @@ pub fn validate(master: &Master, request: &Value) -> Result<Vec<String>, String>
         } else {
             boost.event_point_rate
         };
-        if bonus > 1000000.0 || (bonus + 10000.0) * rate * max_base > i32::MAX as f64 {
+        // Settlement widens the product before dividing and caps the final row
+        // at i32::MAX. Only an overflowing i64 product invalidates monotonicity.
+        let product = (bonus as i128 + 10000)
+            * crate::num::i32(rate) as i128
+            * max_base as i128;
+        if bonus > 1000000.0 || product > i64::MAX as i128 {
             add(&mut issues, "rules", "settlement-range")
         }
         if has_cp {

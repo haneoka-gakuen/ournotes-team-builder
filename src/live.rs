@@ -54,7 +54,13 @@ impl Cumulative {
     }
 
     pub(crate) fn at_cap(&self) -> i32 {
-        self.mill(self.cap.saturating_mul(self.unit))
+        // This is a search bound, not a replayed counter. A large or unlimited
+        // cap can wrap the native product before the effect maximum is applied.
+        let mut value = self.value.saturating_mul(self.cap);
+        if self.maximum > 0 && self.maximum < value {
+            value = self.maximum;
+        }
+        crate::full::score::note_factor_mill(f(f(value as f64) / 10000.0))
     }
 
     pub(crate) fn duration_ms(&self) -> i32 {

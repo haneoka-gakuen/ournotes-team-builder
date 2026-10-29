@@ -184,7 +184,8 @@ impl Finite {
             (self.settlement.starting as u128 + self.settlement.lives as u128 * cp)
                 / self.settlement.cost as u128
         };
-        ((self.settlement.lives as f64 * 214_748.0).next_up()
+        // The wide settlement caps the final per-live reward, not its product.
+        ((self.settlement.lives as f64 * i32::MAX as f64).next_up()
             + (plays as f64 * self.settlement.points.max(0.0)).next_up()).next_up()
     }
 
