@@ -443,6 +443,9 @@ ordinary score, Gekiso score and event rewards. Score objectives use mean scores
 event objectives average their selected rewards. Explicit reward plans retain
 exact rational averages at every ranking level and ignore unselected rewards.
 CP calibration selects the best challenge chart before the joint search.
+Automatic CP calibration also returns that proven team as `cpChallenge`, including
+its original chart and direct rewards. Resolving a plan before sharding preserves
+the same field; no additional challenge search is needed for presentation.
 `aggregate.songs` preserves each chart's complete score and reward settlement.
 
 Joint Gekiso workers partition common COMBO levels or leaders and share certified mean-score

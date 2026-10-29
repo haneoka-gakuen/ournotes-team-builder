@@ -15,6 +15,7 @@ impl Engine {
     ) -> Result<Value, String> {
         let request = &input["request"];
         let mut plan = Plan::parse(&request["goal"]["rewardPlan"])?;
+        let mut challenge = None;
         if let Some(auto) = plan.auto_cp.take() {
             let mut calibration = input.clone();
             let cal = &mut calibration["request"];
@@ -77,16 +78,22 @@ impl Engine {
                     weight,
                 });
             }
+            challenge = Some(response["overall"][0].clone());
         }
         if request["resolveRewardPlan"] == true {
-            return Ok(
-                json!({"results":[],"overall":[],"unknownCards":[],"elapsedMs":now()-started,"resolvedRewardPlan":plan}),
-            );
+            let mut response = json!({"results":[],"overall":[],"unknownCards":[],"elapsedMs":now()-started,"resolvedRewardPlan":plan});
+            if let Some(challenge) = challenge {
+                response["cpChallenge"] = challenge;
+            }
+            return Ok(response);
         }
         let mut resolved = input.clone();
         resolved["request"]["goal"]["rewardPlan"] = json!(plan);
         let mut response = self.run_inner(&resolved, started, now)?;
         response["resolvedRewardPlan"] = json!(plan);
+        if let Some(challenge) = challenge {
+            response["cpChallenge"] = challenge;
+        }
         Ok(response)
     }
 }
