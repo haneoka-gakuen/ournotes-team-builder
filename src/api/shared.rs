@@ -39,6 +39,7 @@ struct Combined<'a> {
     joint_suffix: Vec<[f64; 6]>,
     joint_slots: Vec<Vec<f64>>,
     joint_matching: crate::assignment::Scratch,
+    joint_zero: bool,
     priority: Vec<f64>,
     floor: f64,
     k: usize,
@@ -135,6 +136,9 @@ impl Combined<'_> {
         })
     }
     fn upper(&mut self, members: &[usize], assigned: &[i32], from: usize) -> f64 {
+        if self.joint_zero {
+            return 0.0;
+        }
         let joint = self
             .joint_assignment_bound(assigned, from)
             .unwrap_or(f64::INFINITY);
@@ -302,6 +306,9 @@ impl Objective for Combined<'_> {
         }])
     }
     fn bound(&mut self, t: Totals) -> f64 {
+        if self.joint_zero {
+            return 0.0;
+        }
         if let Some(base) = self.affine {
             return ((t.power * (base + t.skill).next_up()).next_up() * (1.0 + 3e-12)).next_up();
         }
@@ -320,6 +327,7 @@ impl Objective for Combined<'_> {
         }
         self.joint_members.clear();
         self.joint_suffix.clear();
+        self.joint_zero = false;
         if !self.joint_linear()
             || self
                 .songs
@@ -356,6 +364,22 @@ impl Objective for Combined<'_> {
         {
             return;
         }
+        let width = self.snaps.len() + 1;
+        let domains = &self.domains;
+        self.joint_zero = self.songs.iter_mut().zip(&caps).all(|(song, &power)| {
+            domains.iter().enumerate().all(|(member, options)| {
+                options.iter().all(|&snap| {
+                    song.skills[member * width + if snap < 0 { width - 1 } else { snap as usize }].1
+                        <= 0.0
+                })
+            }) && song.objective.bound(Totals {
+                power,
+                ..Totals::default()
+            }) == 0.0
+        });
+        if self.joint_zero {
+            return;
+        }
         self.joint_members = (0..self.members.len())
             .map(|member| {
                 self.domains[member]
@@ -383,6 +407,7 @@ impl Objective for Combined<'_> {
     }
     fn prepare_member_domains_at(&mut self, leader: usize, _power: &[f64], options: &[Vec<i32>]) {
         self.leader = leader;
+        self.joint_zero = false;
         if !self.joint_linear() {
             return;
         }
@@ -486,6 +511,7 @@ impl Objective for Combined<'_> {
                     })
                 })
             }) {
+                self.joint_zero = false;
                 return;
             }
             let caps: Vec<_> = self
@@ -511,6 +537,10 @@ impl Objective for Combined<'_> {
                 .iter()
                 .any(|cap| !(0.0..=i32::MAX as f64).contains(cap))
             {
+                self.joint_zero = false;
+                return;
+            }
+            if self.joint_zero {
                 return;
             }
             self.joint_slots = members
@@ -554,6 +584,7 @@ impl Objective for Combined<'_> {
         }
         let width = self.snaps.len() + 1;
         let (mut low, mut high) = (0.0_f64, 0.0_f64);
+        let mut exact_zero = true;
         for song in &mut self.songs {
             if song.slots.len() != 5 {
                 return fallback;
@@ -574,8 +605,12 @@ impl Objective for Combined<'_> {
                 return fallback;
             }
             let range = song.objective.interval(team, totals);
+            exact_zero &= range.0 == 0.0 && range.1 == 0.0;
             low = (low + range.0).next_down();
             high = (high + range.1).next_up();
+        }
+        if exact_zero {
+            return (0.0, 0.0);
         }
         (
             (low / self.songs.len() as f64).next_down(),
@@ -988,7 +1023,13 @@ impl Engine {
         });
         let music = objectives[0].music.clone();
         let width = cards.snaps.len() + 1;
-        let priority = if !event && objectives.iter().all(|song| song.linear.is_some()) {
+        let priority = if !event
+            && objectives.iter().all(|song| {
+                song.linear.is_some_and(|(base, scale)| {
+                    base.is_finite() && base >= 0.0 && scale.is_finite() && scale >= 0.0
+                }) && (0.0..=i32::MAX as f64).contains(&song.cap)
+                    && song.skills.iter().all(|skill| skill.1.is_finite())
+            }) {
             (0..cards.members.len())
                 .flat_map(|member| {
                     let objectives = &objectives;
@@ -1028,6 +1069,7 @@ impl Engine {
             joint_suffix: Vec::new(),
             joint_slots: Vec::new(),
             joint_matching: crate::assignment::Scratch::default(),
+            joint_zero: false,
             priority,
             floor: f64::NEG_INFINITY,
             k,
