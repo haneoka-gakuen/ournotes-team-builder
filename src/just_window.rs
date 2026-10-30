@@ -150,10 +150,18 @@ pub(crate) struct Prepared {
     profiles: Vec<Profile>,
     probes: Vec<Probe>,
     phases: Vec<Probe>,
+    phase_values: Vec<Vec<f64>>,
+    assignment: Option<Assignment>,
     seeds: Vec<i32>,
     cache: HashMap<(Vec<usize>, Vec<i32>, i32), Option<Window>>,
     force_model: bool,
     nominal: bool,
+    dominance_safe: bool,
+}
+
+struct Assignment {
+    members: Vec<usize>,
+    best: Vec<[Vec<(i32, f64)>; 5]>,
 }
 
 fn random_row(master: &Master, row: &SkillEffect) -> bool {
@@ -205,6 +213,9 @@ fn profile_row(
     actor: &Performer,
     out: &mut Profile,
 ) -> Option<()> {
+    if master.live.phases.get(&4004) != Some(&2) {
+        return None;
+    }
     if row.targets.len() != 1
         || master.targets.get(&row.targets[0])?.judgement != 6
         || row.value < 0
@@ -479,6 +490,62 @@ impl Prepared {
                 }
             }
         }
+        if profiles.iter().all(|profile| !profile.dynamic) {
+            let mut distinct: Vec<Probe> = Vec::new();
+            for phase in phases {
+                let redundant = distinct.iter().any(|old| {
+                    old.before == phase.before
+                        && old.after == phase.after
+                        && old.cap_before == phase.cap_before
+                        && old.cap_after == phase.cap_after
+                        && old.activated == phase.activated
+                        && profiles
+                            .iter()
+                            .all(|row| row.extra(old.timed) == row.extra(phase.timed))
+                });
+                if !redundant {
+                    distinct.push(phase);
+                }
+            }
+            phases = distinct;
+        }
+        let dominance_safe = profiles.iter().all(|profile| !profile.dynamic)
+            && phases.iter().all(|phase| {
+                let maximum = profiles
+                    .iter()
+                    .map(|row| {
+                        if phase.activated {
+                            row.extra(phase.timed)
+                        } else {
+                            0
+                        }
+                    })
+                    .max()
+                    .unwrap_or(0);
+                maximum >= 0
+                    && maximum.checked_mul(5).is_some_and(|extra| {
+                        extra <= i32::MAX as i64
+                            && phase.before as i64 + extra <= phase.cap_before as i64
+                            && phase.after as i64 + extra <= phase.cap_after as i64
+                    })
+            });
+        let phase_values: Vec<Vec<f64>> = phases
+            .iter()
+            .map(|phase| {
+                profiles
+                    .iter()
+                    .map(|row| {
+                        if row.dynamic {
+                            f64::INFINITY
+                        } else if !phase.activated {
+                            0.0
+                        } else {
+                            row.extra(phase.timed) as f64
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
         Ok(Self {
             minimum,
             width,
@@ -487,6 +554,8 @@ impl Prepared {
             profiles,
             probes,
             phases,
+            phase_values,
+            assignment: None,
             seeds: if seeds.is_empty() {
                 vec![0]
             } else {
@@ -495,6 +564,7 @@ impl Prepared {
             cache: HashMap::default(),
             force_model: false,
             nominal: seeds.is_empty(),
+            dominance_safe,
         })
     }
     pub(crate) fn measure_full(
@@ -512,27 +582,105 @@ impl Prepared {
     pub(crate) fn active(&self) -> bool {
         !self.probes.is_empty()
     }
-    pub(crate) fn impossible(&self) -> bool {
-        self.phases.iter().any(|phase| {
-            let ceiling = self
-                .profiles
-                .iter()
-                .map(|row| {
-                    if row.dynamic {
-                        f64::INFINITY
-                    } else if !phase.activated {
-                        0.0
-                    } else {
-                        row.extra(phase.timed) as f64
-                    }
-                })
-                .fold(f64::NEG_INFINITY, f64::max)
-                * 5.0;
-            ceiling >= i32::MIN as f64
-                && ceiling <= i32::MAX as f64
-                && (phase.before as f64 + ceiling < self.minimum
-                    || phase.after as f64 + ceiling < self.minimum)
+    pub(crate) fn snap_dominates(&self, member: usize, better: i32, worse: i32) -> bool {
+        if better == worse || !self.active() {
+            return true;
+        }
+        if !self.dominance_safe {
+            return false;
+        }
+        let column = |snap: i32| {
+            member * self.width
+                + if snap < 0 {
+                    self.width - 1
+                } else {
+                    snap as usize
+                }
+        };
+        self.phase_values
+            .iter()
+            .all(|values| values[column(better)] >= values[column(worse)])
+    }
+    pub(crate) fn permutation_invariant(&self) -> bool {
+        !self.active() || self.dominance_safe
+    }
+    pub(crate) fn member_dominates(&self, better: usize, worse: usize) -> bool {
+        if better == worse || !self.active() {
+            return true;
+        }
+        if !self.dominance_safe
+            || (self.members[better].card.gekiso_skill_id == 0)
+                != (self.members[worse].card.gekiso_skill_id == 0)
+        {
+            return false;
+        }
+        self.phase_values.iter().all(|values| {
+            (0..self.width).all(|column| {
+                values[better * self.width + column] >= values[worse * self.width + column]
+            })
         })
+    }
+    pub(crate) fn pricing_constraints(&self) -> Option<Vec<(f64, &[f64])>> {
+        if !self.dominance_safe || !self.active() {
+            return None;
+        }
+        Some(
+            self.phases
+                .iter()
+                .zip(&self.phase_values)
+                .filter_map(|(phase, values)| {
+                    let required =
+                        (self.minimum - phase.before.min(phase.after) as f64).next_down();
+                    (required > 0.0).then_some((required, values.as_slice()))
+                })
+                .collect(),
+        )
+    }
+    pub(crate) fn impossible(&self) -> bool {
+        self.phases
+            .iter()
+            .zip(&self.phase_values)
+            .any(|(phase, values)| {
+                let ceiling = values.iter().copied().fold(f64::NEG_INFINITY, f64::max) * 5.0;
+                ceiling >= i32::MIN as f64
+                    && ceiling <= i32::MAX as f64
+                    && (phase.before as f64 + ceiling < self.minimum
+                        || phase.after as f64 + ceiling < self.minimum)
+            })
+    }
+    pub(crate) fn prepare_assignment(&mut self, members: &[usize], options: &[Vec<i32>]) {
+        self.assignment = None;
+        if members.len() != 5 || options.len() != 5 || self.phases.is_empty() { return; }
+        let best = self.phase_values.iter().map(|values| std::array::from_fn(|slot| {
+            let mut row: Vec<_> = options[slot].iter().map(|&snap| {
+                let col = if snap < 0 { self.width - 1 } else { snap as usize };
+                (snap, values[members[slot] * self.width + col])
+            }).collect();
+            let compare = |a: &(i32, f64), b: &(i32, f64)| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0));
+            if row.len() > 6 { row.select_nth_unstable_by(5, compare); row.truncate(6); }
+            row.sort_unstable_by(compare); row
+        })).collect();
+        self.assignment = Some(Assignment { members: members.to_vec(), best });
+    }
+    pub(crate) fn possible_prepared(&self, members: &[usize], assigned: &[i32], from: usize, options: &[Vec<i32>]) -> bool {
+        let Some(assignment) = self.assignment.as_ref().filter(|a| a.members == members) else {
+            return self.possible(members, assigned, from, options);
+        };
+        for ((phase, values), best) in self.phases.iter().zip(&self.phase_values).zip(&assignment.best) {
+            let mut upper = 0.0;
+            for (slot, &member) in members.iter().enumerate() {
+                upper += if slot < from {
+                    let snap = assigned[slot];
+                    values[member * self.width + if snap < 0 { self.width - 1 } else { snap as usize }]
+                } else {
+                    best[slot].iter().find(|(snap, _)| *snap < 0 || !assigned[..from].contains(snap))
+                        .map_or(f64::NEG_INFINITY, |(_, value)| *value)
+                };
+            }
+            if upper < i32::MIN as f64 || upper > i32::MAX as f64 { continue; }
+            if phase.before as f64 + upper < self.minimum || phase.after as f64 + upper < self.minimum { return false; }
+        }
+        true
     }
     pub(crate) fn possible(
         &self,
@@ -544,24 +692,16 @@ impl Prepared {
         if self.phases.is_empty() || options.len() != members.len() {
             return true;
         }
-        for phase in &self.phases {
+        for (phase, values) in self.phases.iter().zip(&self.phase_values) {
             let mut upper = 0.0;
             for (slot, &member) in members.iter().enumerate() {
                 let value = |snap: i32| {
-                    let row = self.profiles[member * self.width
+                    values[member * self.width
                         + if snap < 0 {
                             self.width - 1
                         } else {
                             snap as usize
-                        }];
-                    if row.dynamic {
-                        return f64::INFINITY;
-                    }
-                    if !phase.activated {
-                        0.0
-                    } else {
-                        row.extra(phase.timed) as f64
-                    }
+                        }]
                 };
                 let high = if slot < from {
                     value(assigned[slot])

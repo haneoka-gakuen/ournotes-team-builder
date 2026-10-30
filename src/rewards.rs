@@ -2426,10 +2426,74 @@ struct FixedScoreOptions {
     converter: bool,
     minimum_conversion: f64,
 }
+struct WindowPlane {
+    constant: f64,
+    values: [Vec<f64>; 5],
+    best: [Vec<(i32, f64)>; 5],
+}
+struct WindowScoreBound {
+    planes: Vec<WindowPlane>,
+    converted: f64,
+}
+impl WindowScoreBound {
+    fn upper(&self, assigned: &[i32], from: usize) -> f64 {
+        self.planes.iter().map(|plane| {
+            let mut total = plane.constant;
+            for slot in 0..5 {
+                let value = if slot < from { plane.values[slot][(assigned[slot] + 1) as usize] }
+                    else { plane.best[slot].iter().find(|(snap, _)| *snap < 0 || !assigned[..from].contains(snap)).map_or(f64::NEG_INFINITY, |(_, value)| *value) };
+                total = add(total, value);
+            }
+            if total < 0.0 { 0.0 } else { up(mul(total, total) / (4.0 * self.converted)) }
+        }).fold(f64::INFINITY, f64::min)
+    }
+}
+pub(crate) struct WindowRosterBound {
+    planes: Vec<WindowRosterPlane>,
+    converted: f64,
+}
+struct WindowRosterPlane {
+    constant: f64,
+    members: Vec<f64>,
+    suffix: Vec<[f64; 5]>,
+}
+impl WindowRosterBound {
+    pub(crate) fn prepare_members(&mut self, characters: &[Vec<usize>]) {
+        for plane in &mut self.planes {
+            plane.suffix = vec![[f64::NEG_INFINITY; 5]; characters.len() + 1];
+            plane.suffix[characters.len()][0] = 0.0;
+            for from in (0..characters.len()).rev() {
+                plane.suffix[from] = plane.suffix[from + 1];
+                let value = characters[from].iter().map(|&m| plane.members[m])
+                    .fold(f64::NEG_INFINITY, f64::max);
+                for count in 1..=4 {
+                    plane.suffix[from][count] = plane.suffix[from][count]
+                        .max(add(plane.suffix[from + 1][count - 1], value));
+                }
+            }
+        }
+    }
+    pub(crate) fn upper(&self, members: &[usize], from: usize, limit: f64) -> f64 {
+        let mut upper = f64::INFINITY;
+        for plane in &self.planes {
+            let mut total = plane.constant;
+            for &member in members { total = add(total, plane.members[member]); }
+            total = add(total, plane.suffix[from][5 - members.len()]);
+            if total == f64::NEG_INFINITY { return total; }
+            upper = upper.min(if total < 0.0 { 0.0 } else {
+                up(mul(total, total) / (4.0 * self.converted))
+            });
+            if upper < limit { break; }
+        }
+        upper
+    }
+}
 pub(crate) struct DeterministicBound {
     pub(crate) base: f64,
     combo_multiplier: f64,
     capacity: usize,
+    window_score_bound: Option<WindowScoreBound>,
+    window_coefficients: Option<Vec<f64>>,
     pub(crate) coefficient_limit: usize,
     duals: Vec<Vec<RewardDual>>,
     dual_witnesses: [usize; 6],
@@ -4278,6 +4342,8 @@ impl DeterministicBound {
         let mut result = Self {
             combo_multiplier,
             capacity,
+            window_score_bound: None,
+            window_coefficients: None,
             coefficient_limit: 4096,
             duals: Vec::new(),
             dual_witnesses: [0; 6],
@@ -4723,6 +4789,159 @@ impl DeterministicBound {
     pub(crate) fn prepare_score_assignment(&mut self, members: &[usize], options: &[Vec<i32>]) {
         self.prepare_score_rows(members, options, true);
     }
+    fn window_coefficients(&mut self) -> Option<&[f64]> {
+        if self.window_coefficients.is_none() {
+            let values: Vec<f64> = self.ids.iter().map(|ids| {
+                let envelope: [f64; 5] = std::array::from_fn(|event| {
+                    ids.iter().take(self.capacity + 1)
+                        .map(|&id| self.shared[id as usize][event])
+                        .fold(f64::NEG_INFINITY, f64::max)
+                });
+                up(envelope.into_iter().fold(0.0, add) / 5.0)
+            }).collect();
+            if values.iter().any(|v| !v.is_finite() || *v < 0.0) { return None; }
+            self.window_coefficients = Some(values);
+        }
+        self.window_coefficients.as_deref()
+    }
+    pub(crate) fn window_roster_pricing(
+        &mut self,
+        window: &crate::just_window::Prepared,
+        power: &[f64],
+        options: &[Vec<i32>],
+        criterion: crate::objectives::Criterion,
+    ) -> Option<WindowRosterBound> {
+        if criterion != crate::objectives::Criterion::Mean || self.base < 0.0 || self.snapshot_power.is_empty() { return None; }
+        let constraints = window.pricing_constraints()?;
+        if constraints.is_empty() { return None; }
+        self.window_coefficients()?;
+        let coefficients = self.window_coefficients.as_ref()?;
+        let mut cells = Vec::with_capacity(power.len());
+        let mut power_caps = Vec::with_capacity(power.len());
+        let mut coefficient_caps = Vec::with_capacity(power.len());
+        for (member, &base) in power.iter().enumerate() {
+            let mut row = Vec::with_capacity(options[member].len());
+            for &snap in &options[member] {
+                let width_col = if snap < 0 { self.width - 1 } else { snap as usize };
+                let p = add(base, self.snapshot_power[member * self.width + width_col]);
+                let q = coefficients[member * self.width + (snap + 1) as usize];
+                if !p.is_finite() || p < 0.0 { return None; }
+                row.push((width_col, p, q));
+            }
+            power_caps.push(row.iter().map(|&(_, p, _)| p).fold(0.0, f64::max));
+            coefficient_caps.push(row.iter().map(|&(_, _, q)| q).fold(0.0, f64::max));
+            cells.push(row);
+        }
+        power_caps.sort_unstable_by(|a, b| b.total_cmp(a));
+        coefficient_caps.sort_unstable_by(|a, b| b.total_cmp(a));
+        let power_high = power_caps.into_iter().take(5).fold(0.0, add);
+        let coefficient_high = coefficient_caps.into_iter().take(5).fold(self.base, add);
+        if !(0.0..=i32::MAX as f64).contains(&power_high) { return None; }
+        let ratio = (coefficient_high / power_high.max(1.0)).sqrt();
+        if !ratio.is_finite() || ratio <= 0.0 { return None; }
+        let mut planes = Vec::new();
+        for scale in [1.0, 0.75, 1.5] {
+            let lambda = ratio * scale;
+            let raw: Vec<Vec<f64>> = cells.iter().map(|row| row.iter()
+                .map(|&(_, p, q)| add(mul(lambda, p), up(q / lambda))).collect()).collect();
+            let spread = raw.iter().map(|row| {
+                let (lo, hi) = row.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+                (hi - lo).max(0.0)
+            }).fold(1.0_f64, f64::max);
+            for &(required, widths) in &constraints {
+                for factor in [0.0, 0.25, 1.0, 4.0] {
+                    let mu = factor * spread / required.max(1.0);
+                    if !mu.is_finite() || mu < 0.0 { continue; }
+                    let values: Vec<Vec<_>> = cells.iter().zip(&raw).enumerate().map(|(m, (cells, raw))| {
+                        cells.iter().zip(raw).map(|(&(col, _, _), &raw)|
+                            add(raw, mul(mu, widths[m * self.width + col]))).collect()
+                    }).collect();
+                    let mut ranked: Vec<_> = (0..cells.len()).collect();
+                    let maxima: Vec<_> = values.iter().map(|row| row.iter().copied().fold(f64::NEG_INFINITY, f64::max)).collect();
+                    ranked.sort_unstable_by(|&a, &b| maxima[b].total_cmp(&maxima[a]));
+                    ranked.truncate(5);
+                    let count = self.width - 1;
+                    let columns = count + 5;
+                    let matrix: Vec<_> = ranked.iter().map(|&m| {
+                        let mut row = vec![-1e100; columns];
+                        for (&(col, _, _), &value) in cells[m].iter().zip(&values[m]) {
+                            if col == count { row[count..].fill(value); } else { row[col] = value; }
+                        }
+                        row
+                    }).collect();
+                    let mut matching = crate::assignment::Scratch::default();
+                    matching.maximum(&matrix, columns, Some(&mut [0; 5]));
+                    let mut prices = matching.column_prices(columns);
+                    prices[count..].fill(0.0);
+                    let members = cells.iter().zip(&values).map(|(cells, values)| {
+                        cells.iter().zip(values).map(|(&(col, _, _), &value)|
+                            (value - prices[col]).next_up()).fold(f64::NEG_INFINITY, f64::max)
+                    }).collect();
+                    let constant = (add(up(self.base / lambda), prices.into_iter().fold(0.0, add))
+                        - (mu * required).next_down()).next_up();
+                    planes.push(WindowRosterPlane { constant, members, suffix: Vec::new() });
+                }
+            }
+        }
+        Some(WindowRosterBound { planes, converted: self.converted })
+    }
+    pub(crate) fn prepare_window_score(&mut self, window: &crate::just_window::Prepared, members: &[usize], options: &[Vec<i32>], base_power: f64, criterion: crate::objectives::Criterion) {
+        self.window_score_bound = None;
+        if criterion != crate::objectives::Criterion::Mean || !base_power.is_finite() || base_power < 0.0 || self.snapshot_power.is_empty() { return; }
+        let Some(constraints) = window.pricing_constraints() else { return; };
+        if constraints.is_empty() { return; }
+        if self.window_coefficients().is_none() { return; }
+        let all_coefficients = self.window_coefficients.as_ref().unwrap();
+        let mut powers = std::array::from_fn::<_, 5, _>(|_| vec![f64::NEG_INFINITY; self.width]);
+        let mut coefficients = powers.clone();
+        let mut power_high = base_power;
+        let mut coefficient_high = self.base;
+        for (slot, &member) in members.iter().enumerate() {
+            for &snap in &options[slot] {
+                let col = (snap + 1) as usize;
+                let power = self.snapshot_power[member * self.width + if snap < 0 { self.width - 1 } else { snap as usize }];
+                let coefficient = all_coefficients[member * self.width + col];
+                if !power.is_finite() || power < 0.0 || !coefficient.is_finite() || coefficient < 0.0 { return; }
+                powers[slot][col] = power; coefficients[slot][col] = coefficient;
+            }
+            power_high = add(power_high, powers[slot].iter().copied().fold(f64::NEG_INFINITY, f64::max));
+            coefficient_high = add(coefficient_high, coefficients[slot].iter().copied().fold(f64::NEG_INFINITY, f64::max));
+        }
+        if !(0.0..=i32::MAX as f64).contains(&power_high) || self.base < 0.0 { return; }
+        let ratio = (coefficient_high / power_high.max(1.0)).sqrt();
+        if !ratio.is_finite() || ratio <= 0.0 { return; }
+        let mut planes = Vec::new();
+        for scale in [1.0, 0.75, 1.5] {
+            let lambda = ratio * scale;
+            let raw: [Vec<f64>; 5] = std::array::from_fn(|slot| (0..self.width).map(|col| add(mul(lambda, powers[slot][col]), up(coefficients[slot][col] / lambda))).collect());
+            let spread = options.iter().enumerate().map(|(slot, choices)| {
+                let (low, high) = choices.iter().map(|snap| raw[slot][(snap + 1) as usize]).fold((f64::INFINITY, f64::NEG_INFINITY), |(low, high), value| (low.min(value), high.max(value)));
+                (high - low).max(0.0)
+            }).fold(1.0_f64, f64::max);
+            for &(required, widths) in &constraints {
+                for factor in [0.0, 0.25, 1.0, 4.0] {
+                    let mu = factor * spread / required.max(1.0);
+                    if !mu.is_finite() || mu < 0.0 { continue; }
+                    let values: [Vec<f64>; 5] = std::array::from_fn(|slot| {
+                        let member = members[slot];
+                        (0..self.width).map(|col| {
+                            let width_col = if col == 0 { self.width - 1 } else { col - 1 };
+                            add(raw[slot][col], mul(mu, widths[member * self.width + width_col]))
+                        }).collect()
+                    });
+                    let best: [Vec<(i32, f64)>; 5] = std::array::from_fn(|slot| {
+                        let mut row: Vec<_> = options[slot].iter().map(|&snap| (snap, values[slot][(snap + 1) as usize])).collect();
+                        let compare = |a: &(i32, f64), b: &(i32, f64)| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0));
+                        if row.len() > 6 { row.select_nth_unstable_by(5, compare); row.truncate(6); }
+                        row.sort_unstable_by(compare); row
+                    });
+                    let constant = (add(mul(lambda, base_power), up(self.base / lambda)) - (mu * required).next_down()).next_up();
+                    planes.push(WindowPlane { constant, values, best });
+                }
+            }
+        }
+        self.window_score_bound = Some(WindowScoreBound { planes, converted: self.converted });
+    }
     pub(crate) fn prepare_fixed_score_assignment(
         &mut self,
         members: &[usize],
@@ -4731,6 +4950,7 @@ impl DeterministicBound {
         self.prepare_score_rows(members, options, false);
     }
     fn prepare_score_rows(&mut self, members: &[usize], options: &[Vec<i32>], price: bool) {
+        self.window_score_bound = None;
         self.joint_scores = None;
         self.joint_rewards = None;
         self.joint_mean = None;
@@ -5177,7 +5397,8 @@ impl DeterministicBound {
         let coefficient = self.score_coefficient(ids, criterion);
         let coefficient = self.with_normal_error(coefficient, self.assignment_normal_error);
         let deduction = self.conversion_overlap(members, assigned, from);
-        mul(power, (coefficient - deduction).next_up().max(0.0))
+        let original = mul(power, (coefficient - deduction).next_up().max(0.0));
+        self.window_score_bound.as_ref().map_or(original, |bound| original.min(bound.upper(assigned, from)))
     }
     fn repeated_order_floor(&mut self, mut ids: [u32; 5]) -> Option<(f64, usize)> {
         ids.sort_unstable();
@@ -6049,7 +6270,6 @@ impl<'a> RewardObjective<'a> {
         )?;
         if prepared.active() {
             self.just_window = Some(prepared);
-            self.allow_dominance = false;
         }
         Ok(())
     }
@@ -6495,7 +6715,7 @@ impl<'a> RewardObjective<'a> {
         self.clear_assignment_certificates();
         self.reward_target = Some(target);
         self.rank_other = true;
-        self.allow_dominance = proven && self.just_window.is_none();
+        self.allow_dominance = proven;
         self.prepare_bonus_ceilings();
         self.combo_member_floor = None;
         self.member_snapshot_floor(f64::NEG_INFINITY);
@@ -6505,7 +6725,7 @@ impl<'a> RewardObjective<'a> {
         self.other_target = Some(target);
         self.other_exchange = exchange;
         self.other_bonus_floors.clear();
-        self.allow_dominance = proven && self.just_window.is_none();
+        self.allow_dominance = proven;
         self.reward_curves.clear();
         self.settlement_values.clear();
         self.prepare_bonus_frontier(target);
@@ -6783,7 +7003,7 @@ impl<'a> RewardObjective<'a> {
         self.reward_target = Some(target);
         self.rank_other = false;
         self.other_target = Some(other);
-        self.allow_dominance = proven && self.just_window.is_none();
+        self.allow_dominance = proven;
         self.prepare_bonus_frontier(other);
         self.prepare_bonus_ceilings();
         self.combo_member_floor = None;
@@ -9989,8 +10209,14 @@ impl<'a> RewardObjective<'a> {
     }
 }
 impl Objective for RewardObjective<'_> {
+    fn filter_member_dominates(&self, better: usize, worse: usize) -> bool { self.just_window.as_ref().is_none_or(|window| window.member_dominates(better, worse)) }
+    fn filter_permutation_invariant(&self) -> bool { self.just_window.as_ref().is_none_or(crate::just_window::Prepared::permutation_invariant) }
+
+    fn filter_snap_dominates(&self, member: usize, better: i32, worse: i32) -> bool {
+        self.just_window.as_ref().is_none_or(|window| window.snap_dominates(member, better, worse))
+    }
     fn feasible_assignment(&self, members: &[usize], assigned: &[i32], from: usize, options: &[Vec<i32>]) -> bool {
-        self.just_window.as_ref().is_none_or(|window| window.possible(members, assigned, from, options))
+        self.just_window.as_ref().is_none_or(|window| window.possible_prepared(members, assigned, from, options))
     }
     fn has_team_filter(&self) -> bool {
         self.just_window.is_some()
@@ -10624,7 +10850,8 @@ impl Objective for RewardObjective<'_> {
             }
         }
     }
-    fn prepare_assignment(&mut self, _members: &[usize], options: &[Vec<i32>]) {
+    fn prepare_assignment(&mut self, members: &[usize], options: &[Vec<i32>]) {
+        if let Some(window) = &mut self.just_window { window.prepare_assignment(members, options); }
         if self.just_window.is_some() {
             self.just_window_options.resize_with(options.len(), Vec::new);
             for (row, choices) in self.just_window_options.iter_mut().zip(options) {
@@ -10648,7 +10875,7 @@ impl Objective for RewardObjective<'_> {
                 .collect::<Vec<_>>()
         });
         let numeric_options = filtered.as_deref().unwrap_or(options);
-        self.prepare_assignment_certificate(_members, numeric_options);
+        self.prepare_assignment_certificate(members, numeric_options);
         self.assignment_filtered_empty = numeric_options.iter().any(Vec::is_empty);
         if self.just_reward_enabled() {
             self.just_root_caps.clear();
@@ -10662,7 +10889,7 @@ impl Objective for RewardObjective<'_> {
             let shared_preparation = global.preparation.as_ref().map(Arc::clone);
             let scripted = self.stable_life && self.gekiso.setup.missions.iter().all(|&m| m == 1);
             let formation = (scripted || global.combo_multiplier != 1.0).then(|| {
-                _members
+                members
                     .iter()
                     .map(|&m| self.members[m].clone())
                     .collect::<Vec<_>>()
@@ -10675,7 +10902,7 @@ impl Objective for RewardObjective<'_> {
                     .get_or_insert_with(|| {
                         crate::reward_trace::Scripts::new(self.master, self.members)
                     })
-                    .select(_members)
+                    .select(members)
             } else {
                 None
             };
@@ -10737,13 +10964,13 @@ impl Objective for RewardObjective<'_> {
                 }
             }
         }
-        self.assignment_primary = _members.iter().map(|&m| self.member_bonus(m)).sum();
+        self.assignment_primary = members.iter().map(|&m| self.member_bonus(m)).sum();
         let power = Arc::clone(&self.snapshot_power);
         let bonus = Arc::clone(&self.primary_snap_bonus);
         let estimate = self.power_estimate;
         let maximum = self.bonus_max;
         if let Some(bound) = self.assignment_model() {
-            bound.prepare_assignment(_members, numeric_options, power, bonus, estimate, maximum);
+            bound.prepare_assignment(members, numeric_options, power, bonus, estimate, maximum);
         }
         if self.reward_target.is_none() && !self.single_lex {
             return;

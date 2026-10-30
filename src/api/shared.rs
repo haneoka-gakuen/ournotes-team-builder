@@ -201,6 +201,12 @@ impl Combined<'_> {
     }
 }
 impl Objective for Combined<'_> {
+    fn filter_member_dominates(&self, better: usize, worse: usize) -> bool { self.songs.iter().all(|song| song.objective.filter_member_dominates(better, worse)) }
+    fn filter_permutation_invariant(&self) -> bool { self.songs.iter().all(|song| song.objective.filter_permutation_invariant()) }
+
+    fn filter_snap_dominates(&self, member: usize, better: i32, worse: i32) -> bool {
+        self.songs.iter().all(|song| song.objective.filter_snap_dominates(member, better, worse))
+    }
     fn has_team_filter(&self) -> bool { self.songs.iter().any(|song| song.objective.has_team_filter()) }
     fn team_filter_impossible(&self) -> bool { self.songs.iter().any(|song| song.objective.team_filter_impossible()) }
     fn feasible_assignment(&self, members: &[usize], assigned: &[i32], from: usize, options: &[Vec<i32>]) -> bool {

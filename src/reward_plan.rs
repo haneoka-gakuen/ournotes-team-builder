@@ -804,6 +804,12 @@ impl<'a> Ranked<'a> {
 }
 
 impl Objective for Ranked<'_> {
+    fn filter_member_dominates(&self, better: usize, worse: usize) -> bool { self.source.view().filter_member_dominates(better, worse) }
+    fn filter_permutation_invariant(&self) -> bool { self.source.view().filter_permutation_invariant() }
+
+    fn filter_snap_dominates(&self, member: usize, better: i32, worse: i32) -> bool {
+        self.source.view().filter_snap_dominates(member, better, worse)
+    }
     fn has_team_filter(&self) -> bool {
         self.source.view().has_team_filter()
     }

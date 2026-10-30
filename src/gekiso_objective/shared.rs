@@ -448,6 +448,12 @@ impl<'k, 'a> Combined<'k, 'a> {
 }
 
 impl Objective for Combined<'_, '_> {
+    fn filter_member_dominates(&self, better: usize, worse: usize) -> bool { self.songs.iter().all(|song| song.adapter.filter_member_dominates(better, worse)) }
+    fn filter_permutation_invariant(&self) -> bool { self.songs.iter().all(|song| song.adapter.filter_permutation_invariant()) }
+
+    fn filter_snap_dominates(&self, member: usize, better: i32, worse: i32) -> bool {
+        self.songs.iter().all(|song| song.adapter.filter_snap_dominates(member, better, worse))
+    }
     fn has_team_filter(&self) -> bool { self.songs.iter().any(|song| song.adapter.has_team_filter()) }
     fn team_filter_impossible(&self) -> bool { self.songs.iter().any(|song| song.adapter.team_filter_impossible()) }
     fn feasible_assignment(&self, members: &[usize], assigned: &[i32], from: usize, options: &[Vec<i32>]) -> bool {

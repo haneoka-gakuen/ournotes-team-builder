@@ -6700,6 +6700,7 @@ pub struct Adapter<'k, 'a> {
     member_dominance: HashMap<(usize, usize), bool>,
     deterministic: Option<crate::rewards::DeterministicBound>,
     roster_price: Option<Arc<crate::rewards::RosterPricing>>,
+    window_roster: Option<crate::rewards::WindowRosterBound>,
     roster_prices: VecDeque<RosterPriceEntry>,
     roster_suffix: Option<crate::rewards::RosterSuffix>,
     roster_extra: Option<crate::rewards::RosterSuffix>,
@@ -6718,7 +6719,6 @@ pub struct Adapter<'k, 'a> {
     combo_bound: Option<ComboBound>,
     combo_attempted: bool,
     combo_options: Vec<Vec<i32>>,
-    window_options: Vec<Vec<i32>>,
     fixed_no_rng_bound: Option<ComboBound>,
     fixed_no_rng_attempted: bool,
     fixed_region_models: HashMap<(FixedConversionBound, Option<usize>), RegionalBound>,
@@ -6858,6 +6858,7 @@ impl<'k, 'a> Adapter<'k, 'a> {
             member_dominance: HashMap::default(),
             deterministic,
             roster_price: None,
+            window_roster: None,
             roster_prices: VecDeque::new(),
             roster_suffix: None,
             roster_extra: None,
@@ -6876,7 +6877,6 @@ impl<'k, 'a> Adapter<'k, 'a> {
             combo_bound: None,
             combo_attempted: false,
             combo_options: Vec::new(),
-            window_options: Vec::new(),
             fixed_no_rng_bound: None,
             fixed_no_rng_attempted: false,
             fixed_region_models: HashMap::default(),
@@ -8412,11 +8412,17 @@ impl<'k, 'a> Adapter<'k, 'a> {
     }
 }
 impl Objective for Adapter<'_, '_> {
+    fn filter_member_dominates(&self, better: usize, worse: usize) -> bool { self.kernel.just_window.as_ref().is_none_or(|window| window.member_dominates(better, worse)) }
+    fn filter_permutation_invariant(&self) -> bool { self.kernel.just_window.as_ref().is_none_or(crate::just_window::Prepared::permutation_invariant) }
+
+    fn filter_snap_dominates(&self, member: usize, better: i32, worse: i32) -> bool {
+        self.kernel.just_window.as_ref().is_none_or(|window| window.snap_dominates(member, better, worse))
+    }
     fn has_team_filter(&self) -> bool { self.kernel.has_team_filter() }
     fn team_filter_impossible(&self) -> bool { self.kernel.just_window.as_ref().is_some_and(crate::just_window::Prepared::impossible) }
     fn feasible_team(&mut self, team: &Team, power: f64) -> Result<bool, String> { self.kernel.feasible_team(team, power) }
     fn feasible_assignment(&self, members: &[usize], assigned: &[i32], from: usize, options: &[Vec<i32>]) -> bool {
-        self.kernel.just_window.as_ref().is_none_or(|window| window.possible(members, assigned, from, options))
+        self.kernel.just_window.as_ref().is_none_or(|window| window.possible_prepared(members, assigned, from, options))
     }
     fn live_floor(&self) -> bool {
         self.kernel.live_floor && !self.surrogate && !self.estimate
@@ -8429,7 +8435,7 @@ impl Objective for Adapter<'_, '_> {
     }
 
     fn preserve_snap_options(&self) -> bool {
-        self.kernel.has_team_filter() || (!self.kernel.chart.luck || !self.kernel.seeds.is_empty())
+        (!self.kernel.chart.luck || !self.kernel.seeds.is_empty())
             && !self.surrogate
             && !self.estimate
             && self.deterministic.is_none()
@@ -8656,6 +8662,10 @@ impl Objective for Adapter<'_, '_> {
         self.roster_extra_ready = false;
         self.roster_extra = None;
         self.prepare_member_domains(power, options);
+        self.window_roster = match (&mut self.deterministic, &self.kernel.just_window) {
+            (Some(bound), Some(window)) => bound.window_roster_pricing(window, power, options, self.kernel.criterion),
+            _ => None,
+        };
     }
     fn prepare_assignment_power(&mut self, power: f64) {
         self.plain_second_bounds.clear();
@@ -8701,6 +8711,7 @@ impl Objective for Adapter<'_, '_> {
     }
     fn prepare_members(&mut self, characters: &[Vec<usize>]) {
         self.roster_last = None;
+        if let Some(window) = &mut self.window_roster { window.prepare_members(characters); }
         if let Some(bound) = &mut self.deterministic {
             bound.prepare_members(characters);
             self.roster_suffix = self.roster_price.as_ref().map(|pricing| {
@@ -8745,6 +8756,7 @@ impl Objective for Adapter<'_, '_> {
         if let Some(bound) = &mut self.deterministic {
             let mut upper =
                 bound.member_score_ceiling(members, from, t.power, self.kernel.criterion);
+            if let Some(window) = &self.window_roster { upper = upper.min(window.upper(members, from, limit)); }
             if upper >= limit {
                 if let Some(roster) = self.roster_upper(members, from, limit) {
                     upper = upper.min(roster);
@@ -9086,9 +9098,6 @@ impl Objective for Adapter<'_, '_> {
         assigned: &[i32],
         from: usize,
     ) -> f64 {
-        if self.kernel.just_window.as_ref().is_some_and(|window| !window.possible(members, assigned, from, &self.window_options)) {
-            return f64::NEG_INFINITY;
-        }
         if let Some(bound) = &mut self.deterministic {
             let mut upper =
                 bound.score_ceiling(members, assigned, from, totals.power, self.kernel.criterion);
@@ -9321,7 +9330,7 @@ impl Objective for Adapter<'_, '_> {
         self.fixed_box_complete = complete;
     }
     fn prepare_assignment(&mut self, members: &[usize], options: &[Vec<i32>]) {
-        if self.kernel.has_team_filter() { self.window_options = options.to_vec(); }
+        if let Some(window) = &mut self.kernel.just_window { window.prepare_assignment(members, options); }
         self.nominal_base = if self.kernel.chart.luck
             && self.kernel.seeds.is_empty()
             && self.kernel.criterion != Criterion::Mean
@@ -9384,6 +9393,7 @@ impl Objective for Adapter<'_, '_> {
             } else {
                 bound.prepare_score_assignment(members, options);
             }
+            if let Some(window) = &self.kernel.just_window { bound.prepare_window_score(window, members, options, self.base_power, self.kernel.criterion); }
             if !compiled {
                 return;
             }
@@ -10109,11 +10119,20 @@ struct WarmProjection<'p, 'k, 'a> {
     mean: bool,
 }
 impl Objective for WarmProjection<'_, '_, '_> {
+    fn filter_member_dominates(&self, better: usize, worse: usize) -> bool { self.adapter.filter_member_dominates(better, worse) }
+    fn filter_permutation_invariant(&self) -> bool { self.adapter.filter_permutation_invariant() }
+
+    fn filter_snap_dominates(&self, member: usize, better: i32, worse: i32) -> bool {
+        self.adapter.filter_snap_dominates(member, better, worse)
+    }
     fn has_team_filter(&self) -> bool { self.adapter.has_team_filter() }
     fn team_filter_impossible(&self) -> bool { self.adapter.team_filter_impossible() }
     fn feasible_team(&mut self, team: &Team, power: f64) -> Result<bool, String> { self.adapter.feasible_team(team, power) }
     fn feasible_assignment(&self, members: &[usize], assigned: &[i32], from: usize, options: &[Vec<i32>]) -> bool {
         self.adapter.feasible_assignment(members, assigned, from, options)
+    }
+    fn prepare_assignment(&mut self, members: &[usize], options: &[Vec<i32>]) {
+        if let Some(window) = &mut self.adapter.kernel.just_window { window.prepare_assignment(members, options); }
     }
     fn canonical_leader(&self) -> bool {
         true
@@ -10821,13 +10840,19 @@ struct ReplayObjective<'a> {
     just_window: Option<crate::just_window::Prepared>,
 }
 impl Objective for ReplayObjective<'_> {
+    fn filter_member_dominates(&self, better: usize, worse: usize) -> bool { self.just_window.as_ref().is_none_or(|window| window.member_dominates(better, worse)) }
+    fn filter_permutation_invariant(&self) -> bool { self.just_window.as_ref().is_none_or(crate::just_window::Prepared::permutation_invariant) }
+
+    fn filter_snap_dominates(&self, member: usize, better: i32, worse: i32) -> bool {
+        self.just_window.as_ref().is_none_or(|window| window.snap_dominates(member, better, worse))
+    }
     fn has_team_filter(&self) -> bool { self.just_window.as_ref().is_some_and(crate::just_window::Prepared::active) }
     fn team_filter_impossible(&self) -> bool { self.just_window.as_ref().is_some_and(crate::just_window::Prepared::impossible) }
     fn feasible_team(&mut self, team: &Team, power: f64) -> Result<bool, String> {
         self.just_window.as_mut().map_or(Ok(true), |window| window.allows(self.master, self.chart, team, power as i32))
     }
     fn feasible_assignment(&self, members: &[usize], assigned: &[i32], from: usize, options: &[Vec<i32>]) -> bool {
-        self.just_window.as_ref().is_none_or(|window| window.possible(members, assigned, from, options))
+        self.just_window.as_ref().is_none_or(|window| window.possible_prepared(members, assigned, from, options))
     }
     fn score_ties(&self) -> bool {
         self.criterion != Criterion::Mean
@@ -10888,6 +10913,7 @@ impl Objective for ReplayObjective<'_> {
             .map(|b| b.member_score_ceiling(members, from, t.power, self.criterion))
     }
     fn prepare_assignment(&mut self, members: &[usize], options: &[Vec<i32>]) {
+        if let Some(window) = &mut self.just_window { window.prepare_assignment(members, options); }
         if let Some(b) = &mut self.bound {
             b.prepare_score_assignment(members, options);
         }

@@ -49,6 +49,15 @@ pub trait Objective {
     fn feasible_team(&mut self, _team: &Team, _power: f64) -> Result<bool, String> {
         Ok(true)
     }
+    fn filter_snap_dominates(&self, _member: usize, _better: i32, _worse: i32) -> bool {
+        !self.has_team_filter()
+    }
+    fn filter_member_dominates(&self, _better: usize, _worse: usize) -> bool {
+        !self.has_team_filter()
+    }
+    fn filter_permutation_invariant(&self) -> bool {
+        !self.has_team_filter()
+    }
     fn feasible_assignment(
         &self,
         _members: &[usize],
@@ -816,7 +825,6 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             input.objective.prepare_dominance(5.0 * maximum);
         }
         let conditional_dominance = input.objective.conditional_snap_dominance()
-            && !team_filter
             && !input.disable_snap_dominance
             && !input.objective.preserve_snap_options();
         let mut dominators = vec![vec![Vec::new(); width]; n];
@@ -848,8 +856,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                     .iter()
                     .enumerate()
                     .filter(|&(a, &j)| {
-                        if team_filter
-                            || input.disable_snap_dominance
+                        if input.disable_snap_dominance
                             || input.objective.preserve_snap_options()
                             || (j >= 0 && required_snaps.contains(&(j as usize)))
                         {
@@ -862,6 +869,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                             }
                             let (x, y) = (&values[a], &values[b]);
                             if (input.constraints.max_bonus.is_none() || y[3] == x[3])
+                                && input.objective.filter_snap_dominates(i, other, j)
                                 && y[..4].iter().zip(&x[..4]).all(|(y, x)| y >= x)
                                 && (y[4..].iter().zip(&x[4..]).all(|(y, x)| y >= x)
                                     || input.objective.numeric_snap_dominance(
@@ -871,7 +879,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                                         y[0] - x[0],
                                     ))
                             {
-                                let equal = y == x;
+                                let equal = y == x && input.objective.filter_snap_dominates(i, j, other);
                                 if !equal || b < a {
                                     if conditional_dominance && j >= 0 {
                                         dominators[i][j as usize].push(other as usize);
@@ -3296,6 +3304,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                     return false;
                 }
                 for &other in dominators {
+                    if self.team_filter { break; }
                     if !available(other) {
                         continue;
                     }
@@ -3349,6 +3358,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             }
             if j >= 0
                 && self.conditional_dominance
+                && !self.team_filter
                 && !self.input.disable_snap_dominance
                 && !self.input.objective.preserve_snap_options()
             {
@@ -3537,7 +3547,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         });
         let mut leader_group = vec![usize::MAX; n];
         let mut leader_rank = vec![usize::MAX; n];
-        if !self.team_filter && self.input.objective.canonical_leader() {
+        if self.input.objective.filter_permutation_invariant() && self.input.objective.canonical_leader() {
             let mut groups = HashMap::default();
             for (rank, &leader) in leaders.iter().enumerate() {
                 let profile = self.profile(leader);
@@ -3653,8 +3663,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                     groups.push((ch, vec![i]));
                 }
             }
-            if !self.team_filter
-                && self.input.objective.needs_power_cap()
+            if self.input.objective.needs_power_cap()
                 && !self.input.objective.preserve_snap_options()
             {
                 for (_, list) in &mut groups {
@@ -3668,6 +3677,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                         let mut witnesses = 0;
                         for &better in &original {
                             if better == worse
+                                || !self.input.objective.filter_member_dominates(better, worse)
                                 || self.input.constraints.bindings.contains_key(&better)
                                 || self.member_bonus[better] < self.member_bonus[worse]
                                 || self.input.constraints.max_bonus.is_some()
