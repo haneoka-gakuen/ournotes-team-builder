@@ -1,6 +1,6 @@
 //! Ordered vector dynamic programming for the merged website's Gekiso lottery.
 //! Called only inside the compute backend, never from Flutter's UI isolate.
-use rustc_hash::FxHashMap as HashMap;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use serde::{Deserialize, Serialize};
 use std::{cell::RefCell, collections::BTreeMap, sync::Arc};
 const HIGH: u64 = (1 << 18) - 1;
@@ -33,6 +33,9 @@ fn pack(l: usize, n: i32, r: usize, m: i32, flags: u64) -> u64 {
 }
 fn floor_i32(x: f32) -> i32 {
     (x.floor() as i64) as i32
+}
+fn gauge_delta(maximum: usize, value: i32) -> i32 {
+    floor_i32((maximum as i32).wrapping_mul(value) as f32 / 10000.0)
 }
 #[derive(Clone, Deserialize)]
 pub struct Input {
@@ -108,20 +111,65 @@ struct Row {
 struct Rows {
     rows: Vec<Row>,
     index: HashMap<u64, usize>,
+    dense: Option<(Vec<u32>, Vec<u32>)>,
 }
+thread_local! { static INDEX_POOL: RefCell<Vec<(Vec<u32>, Vec<u32>)>> = const { RefCell::new(Vec::new()) }; }
 impl Rows {
     fn new() -> Self {
         Self {
             rows: Vec::new(),
             index: HashMap::default(),
+            dense: None,
         }
     }
+    fn dense() -> Self {
+        let mut rows = Self::new();
+        rows.dense = Some(INDEX_POOL.with(|pool| {
+            pool.borrow_mut()
+                .pop()
+                .unwrap_or_else(|| (vec![0; HIGH as usize + 1], Vec::new()))
+        }));
+        rows
+    }
+    fn position(&self, key: u64) -> Option<usize> {
+        if let Some((index, _)) = self
+            .dense
+            .as_ref()
+            .filter(|(index, _)| key < index.len() as u64)
+        {
+            let value = index[key as usize];
+            (value != 0).then(|| value as usize - 1)
+        } else {
+            self.index.get(&key).copied()
+        }
+    }
+    fn put_index(&mut self, key: u64, row: usize) {
+        if let Some((index, touched)) = self
+            .dense
+            .as_mut()
+            .filter(|(index, _)| key < index.len() as u64)
+        {
+            index[key as usize] = row as u32 + 1;
+            touched.push(key as u32);
+        } else {
+            self.index.insert(key, row);
+        }
+    }
+    fn clear_index(&mut self) {
+        if let Some((index, touched)) = &mut self.dense {
+            // Unary transforms change row keys after these entries were written.
+            for key in touched.drain(..) {
+                index[key as usize] = 0;
+            }
+        }
+        self.index.clear();
+    }
     fn at(&mut self, key: u64, width: usize, pool: &mut Vec<Vec<f64>>) -> &mut Row {
-        let i = if let Some(&i) = self.index.get(&key) {
+        let i = if let Some(i) = self.position(key) {
             i
         } else {
             let i = self.rows.len();
-            self.index.insert(key, i);
+            self.put_index(key, i);
             let values = pool.pop().unwrap_or_else(|| vec![0.0; width]);
             self.rows.push(Row {
                 key,
@@ -134,7 +182,7 @@ impl Rows {
         &mut self.rows[i]
     }
     fn adopt(&mut self, row: Row, pool: &mut Vec<Vec<f64>>) {
-        if let Some(&i) = self.index.get(&row.key) {
+        if let Some(i) = self.position(row.key) {
             let into = &mut self.rows[i];
             for g in row.low..row.high {
                 into.values[g] += row.values[g];
@@ -143,8 +191,21 @@ impl Rows {
             into.high = into.high.max(row.high);
             release(row, pool);
         } else {
-            self.index.insert(row.key, self.rows.len());
+            self.put_index(row.key, self.rows.len());
             self.rows.push(row);
+        }
+    }
+}
+impl Drop for Rows {
+    fn drop(&mut self) {
+        self.clear_index();
+        if let Some(buffers) = self.dense.take() {
+            INDEX_POOL.with(|pool| {
+                let mut pool = pool.borrow_mut();
+                if pool.len() < 2 {
+                    pool.push(buffers);
+                }
+            });
         }
     }
 }
@@ -163,17 +224,24 @@ struct LotTransitions {
 }
 struct Engine<'a> {
     input: &'a Input,
+    unit: usize,
+    maxima: [usize; 2],
     width: usize,
     rows: Rows,
     spare: Rows,
     pool: Vec<Vec<f64>>,
     draws: HashMap<(usize, i32, i32), Vec<(f64, i32)>>,
     transitions: LotTransitions,
+    last_transition: Option<(u64, i32, usize)>,
     lot_tables: [Vec<(i32, i32)>; 5],
+    observed: [Option<[f64; 3]>; 2],
 }
 impl<'a> Engine<'a> {
     fn new(input: &'a Input) -> Self {
-        let width = input.maximum.max(input.rush_maximum);
+        let unit = gauge_unit(input);
+        let maxima = [input.maximum / unit, input.rush_maximum / unit];
+        let width = maxima[0].max(maxima[1]);
+        let dense = input.modulus == 0 && input.initial == 0;
         let pool = POOL.with(|p| {
             let mut p = p.borrow_mut();
             if p.0 == width {
@@ -193,23 +261,24 @@ impl<'a> Engine<'a> {
         }
         Self {
             input,
+            unit,
+            maxima,
             width,
-            rows: Rows::new(),
-            spare: Rows::new(),
+            rows: if dense { Rows::dense() } else { Rows::new() },
+            spare: if dense { Rows::dense() } else { Rows::new() },
             pool,
             draws: HashMap::default(),
             transitions: LotTransitions::default(),
+            last_transition: None,
             lot_tables,
+            observed: [None; 2],
         }
     }
     fn maximum(&self, r: usize) -> usize {
-        if r > 0 {
-            self.input.rush_maximum
-        } else {
-            self.input.maximum
-        }
+        self.maxima[usize::from(r > 0)]
     }
     fn pass(&mut self, mut step: impl FnMut(&mut Self, Row)) {
+        self.observed = [None; 2];
         let mut from = std::mem::replace(
             &mut self.rows,
             std::mem::replace(&mut self.spare, Rows::new()),
@@ -217,10 +286,11 @@ impl<'a> Engine<'a> {
         for row in from.rows.drain(..) {
             step(self, row);
         }
-        from.index.clear();
+        from.clear_index();
         self.spare = from;
     }
     fn unary(&mut self, mut f: impl FnMut(u64) -> u64) {
+        self.observed = [None; 2];
         // Keys are only looked up in the destination of a pass. Preserve source
         // row order and defer merging, just as the website's pending transforms.
         for row in &mut self.rows.rows {
@@ -324,7 +394,13 @@ impl<'a> Engine<'a> {
         out
     }
     fn lot_rows(&mut self, high: u64, buff: i32) -> usize {
+        if let Some((previous_high, previous_buff, index)) = self.last_transition {
+            if high == previous_high && buff == previous_buff {
+                return index;
+            }
+        }
         if let Some(&i) = self.transitions.index.get(&(high, buff)) {
+            self.last_transition = Some((high, buff, i));
             return i;
         }
         let s = high << 8;
@@ -375,6 +451,7 @@ impl<'a> Engine<'a> {
         let i = self.transitions.lists.len();
         self.transitions.lists.push(out);
         self.transitions.index.insert((high, buff), i);
+        self.last_transition = Some((high, buff, i));
         i
     }
     /// Consumes one lot from row `key`, holding `scale ×` values [a, b) of `row` at gauge `g + offset`.
@@ -446,12 +523,16 @@ impl<'a> Engine<'a> {
                     e.rows.adopt(row, &mut e.pool);
                     return;
                 }
-                let gauge = (e.maximum(rush((row.key & HIGH) << 8)) as i32).wrapping_mul(value);
+                let maximum = if rush((row.key & HIGH) << 8) > 0 {
+                    e.input.rush_maximum
+                } else {
+                    e.input.maximum
+                };
                 e.shift(
                     row.key,
                     &row,
                     chance,
-                    floor_i32(gauge as f32 / 10000.0),
+                    gauge_delta(maximum, value) / e.unit as i32,
                     None,
                 );
                 e.axpy(row.key, &row, 1.0 - chance, row.low, row.high);
@@ -491,12 +572,16 @@ impl<'a> Engine<'a> {
                     + (pack(lots(s), next(s), rush(s), minimum(s).max(result), s & FLAGS) >> 8);
                 e.axpy(to, &row, a.chance, row.low, row.high);
             } else {
-                let gauge = (e.maximum(rush(s)) as i32).wrapping_mul(a.value);
+                let maximum = if rush(s) > 0 {
+                    e.input.rush_maximum
+                } else {
+                    e.input.maximum
+                };
                 e.shift(
                     row.key,
                     &row,
                     a.chance,
-                    floor_i32(gauge as f32 / 10000.0),
+                    gauge_delta(maximum, a.value) / e.unit as i32,
                     None,
                 );
             }
@@ -525,27 +610,34 @@ impl<'a> Engine<'a> {
                 e.rows.adopt(row, &mut e.pool);
             });
         } else {
-            let mut value = [0.0; 3];
-            for row in &self.rows.rows {
-                let s = (row.key & HIGH) << 8;
-                let bonus = s & BONUS != 0;
-                let skill = s & bit != 0;
-                if !bonus && !skill {
-                    continue;
+            let index = usize::from(at_frame);
+            let value = if let Some(value) = self.observed[index] {
+                value
+            } else {
+                let mut value = [0.0; 3];
+                for row in &self.rows.rows {
+                    let s = (row.key & HIGH) << 8;
+                    let bonus = s & BONUS != 0;
+                    let skill = s & bit != 0;
+                    if !bonus && !skill {
+                        continue;
+                    }
+                    let total = row.values[row.low.min(row.high)..row.high]
+                        .iter()
+                        .fold(0.0, |a, b| a + b);
+                    if bonus {
+                        value[0] += total;
+                    }
+                    if skill {
+                        value[1] += total;
+                    }
+                    if bonus && skill {
+                        value[2] += total;
+                    }
                 }
-                let total = row.values[row.low.min(row.high)..row.high]
-                    .iter()
-                    .fold(0.0, |a, b| a + b);
-                if bonus {
-                    value[0] += total;
-                }
-                if skill {
-                    value[1] += total;
-                }
-                if bonus && skill {
-                    value[2] += total;
-                }
-            }
+                self.observed[index] = Some(value);
+                value
+            };
             let into = out.curve.entry(j.id).or_default();
             for i in 0..3 {
                 into[i] += value[i];
@@ -553,10 +645,11 @@ impl<'a> Engine<'a> {
         }
     }
     fn reset(&mut self, initial: usize) {
+        self.observed = [None; 2];
         for row in self.rows.rows.drain(..) {
             release(row, &mut self.pool);
         }
-        self.rows.index.clear();
+        self.rows.clear_index();
         let start = self
             .rows
             .at((initial as u64) << 18, self.width, &mut self.pool);
@@ -606,6 +699,49 @@ fn base_points(input: &Input, n: &Note) -> Vec<(f64, i32)> {
         .map(|(p, v)| (p, floor_i32((n.speed + 1.0) as f32 * v as f32)))
         .collect()
 }
+fn gauge_unit(input: &Input) -> usize {
+    fn gcd(mut a: usize, mut b: usize) -> usize {
+        while b != 0 {
+            (a, b) = (b, a % b);
+        }
+        a
+    }
+    fn include(unit: usize, value: i32) -> usize {
+        if value < 0 {
+            1
+        } else {
+            gcd(unit, value as usize)
+        }
+    }
+    let mut unit = gcd(input.maximum, input.rush_maximum);
+    let mut seen = HashSet::default();
+    for note in &input.notes {
+        if !seen.insert((note.op, note.judgement, note.speed.to_bits())) {
+            continue;
+        }
+        for (_, value) in base_points(input, note) {
+            unit = include(unit, value);
+        }
+        if unit == 1 {
+            return 1;
+        }
+    }
+    for value in input
+        .actions
+        .iter()
+        .filter(|action| action.kind != 11005)
+        .map(|action| action.value)
+        .chain(input.miss.iter().map(|&(value, _)| value))
+    {
+        for maximum in [input.maximum, input.rush_maximum] {
+            unit = include(unit, gauge_delta(maximum, value));
+        }
+        if unit == 1 {
+            return 1;
+        }
+    }
+    unit
+}
 pub fn run(input: &Input) -> Result<Output, String> {
     if input.maximum == 0
         || input.rush_maximum == 0
@@ -622,6 +758,7 @@ pub fn run(input: &Input) -> Result<Output, String> {
     let mut notes: HashMap<(usize, usize), Vec<usize>> = HashMap::default();
     let mut actions: HashMap<(usize, usize), Vec<usize>> = HashMap::default();
     let mut points: HashMap<(i32, i32, i64), Vec<(f64, i32)>> = HashMap::default();
+    let mut times = Vec::new();
     for (i, n) in input.notes.iter().enumerate() {
         notes.entry((n.frame, n.range)).or_default().push(i);
     }
@@ -703,17 +840,20 @@ pub fn run(input: &Input) -> Result<Output, String> {
             });
             let mut note_step = |e: &mut Engine, n: &Note| {
                 let key = (n.op, n.judgement, (n.speed * 10.0 + 0.5).floor() as i64);
-                let p = points.entry(key).or_insert_with(|| base_points(input, n));
+                let p = points.entry(key).or_insert_with(|| {
+                    base_points(input, n)
+                        .into_iter()
+                        .map(|(chance, value)| (chance, value / e.unit as i32))
+                        .collect()
+                });
                 e.note(n, state, p);
             };
-            let mut times: Vec<i32> = list
-                .iter()
-                .map(|&i| input.notes[i].time)
-                .chain(frame.judged.iter().map(|j| j.time))
-                .collect();
+            times.clear();
+            times.extend(list.iter().map(|&i| input.notes[i].time));
+            times.extend(frame.judged.iter().map(|j| j.time));
             times.sort_unstable();
             times.dedup();
-            for at in times {
+            for &at in &times {
                 if at >= frame.time {
                     continue;
                 }
