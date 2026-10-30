@@ -1,476 +1,81 @@
 # ournotes-team-builder
 
-The team-building engine shared by [Haneoka](https://haneoka.org) on the web
-(WebAssembly) and in the Haneoka app (native).
+The team-building engine for BanG Dream! Our Notes. Given a card inventory and a song, it finds the best team, and proves that no legal team scores higher.
 
-## Search and settlement
+It powers the team builder on [Haneoka](https://haneoka.org), as WebAssembly in the browser and as native code in the Haneoka app, so both give the same results.
 
-Search applies member, snapshot, leader and binding constraints to warm teams
-and final candidates. Unknown required cards or bindings leave no legal team;
-manual evaluation rejects unknown snapshots. Sharded ordinary reward warm
-searches expand only their assigned leaders while sharing legal incumbent
-teams across shards. Search retains distinct member sets and uses legal
-incumbents to prune branches. Snapshot dominance requires
-enough interchangeable witnesses to respect the five distinct snapshot slots.
-Assignment bounds couple power
-and skill effects; deterministic Gekiso bounds also track converter activation
-within each mission and its activation limit. Mean and extreme bounds use
-five-event matching directly. Scoring-equivalent snapshots share dominance
-classes; power-neutral exchanges retain one canonical placement. Rounding
-bounds account for the independent judgement channels and the selected roster.
-Bounds reuse coefficients for equivalent slot programs while preserving the
-order of active judgement converters. Compiled score programs and legal
-converter cohorts are shared across snapshot prefixes. Deterministic warm
-search scores each neighborhood before replaying its best proposal; the final
-search still proves the optimum over every legal team. Deterministic mean and
-minimum searches share an envelope of reachable conversion traces before
-planning individual rosters. Maximum searches compare the accumulated local
-planning work with the chart-wide profile grid before preparing that envelope.
-LUCK assignment bounds preprice snapshot choices on fixed power/coefficient
-planes, with outward rounding and distinct-snapshot matching. The planner
-chooses its representation from the snapshot program structure.
-Pure COMBO assignments reuse the selected members' activation timeline to
-tighten deterministic bounds before evaluating snapshot combinations.
-Nominal LUCK maximum bounds combine the member base with five-event matching
-before preparing snapshot assignments. Minimum bounds use the minimum
-five-event assignment over relaxed snapshot choices. Snapshot regions group
-remaining support programs by mission before refining individual programs. Equal stripped references
-share non-Rush support gains while retaining each context's Rush contribution.
-Owner-local actor normalization is cached once per search. Nominal LUCK mean
-search partitions each slot into context-changing and ordinary snapshot domains,
-applying physical assignment bounds before expanding each domain. Maximum-score
-search uses the same domains and retains exact warm-search neighbors to seed
-every requested distinct-member result. Nominal LUCK minimum assignments also
-compare a relaxed worst-order pricing plane.
-Fixed-seed initialization bounds draws from total gauge input, including
-queued draws. Multi-seed warm searches use isolated proposal charts and
-accept candidates only after evaluating every requested seed.
-Search preparation excludes forbidden cards and, when snapshots are disabled,
-all snapshots. Required members, the leader and member bindings also exclude
-alternative cards of their characters before skill bounds are compiled. Five
-fixed members leave only those members in the preparation domain. Conflicting
-constraints still return no legal formation; manual evaluations retain the full
-inventory.
-Five member bindings also restrict preparation to the snapshots those slots
-can use. Search rejects conflicting required characters, reused bound snapshots
-and excess required snapshots before warming
-or expanding branches. Snapshot power and skill rows are priced only for legal
-member/snapshot choices; snapshots reserved by another member do not loosen
-that member's bounds.
-Regional bounds preserve sampled Rush and support joint frequencies and
-condition their envelopes on the number of physical random-effect snapshots.
-Fixed-seed assignment bounds match activation events with the number of
-random-effect snapshots. Growing support domains extend cached native lottery
-envelopes.
-Positive-seed member bounds price contested physical snapshots once per leader;
-nonnegative column prices prevent one snapshot from being assigned to several
-members in the relaxed bound.
+## What it does
 
-Explicit event `rewardPlan` requests maximize a nonnegative weighted sum of
-PT, CP and badges, followed by up to two ordered reward-only tie levels.
-Weights are integers; `unit` is the primary reward's scale. Omitted metrics do
-not break ties. Results and progress include exact numerator/denominator ranking
-values, direct rewards and the resolved plan. Native event bonuses widen the
-count and percentage to a signed 64-bit product, divide toward zero and cap each
-reward row at the signed 32-bit maximum before probability weighting. Exact
-ranking numerators retain their sign, with positive denominators.
-An automatic CP rate that would be negative returns `reward-plan-rate`.
-Top K bounds use the K-th retained
-legal result. Optional `autoCp` values earned CP using the best challenge payout
-under the same first-level reward sum; hosts resolve it once before sharding,
-within the original loading and computation deadline.
-Explicit Gekiso plans reuse support-program domains, complete assignment proofs
-and observed lottery witnesses. Native reward-prefix bounds use the K-th legal
-incumbent and omit score from reward-only ties. CP conversion combines CP with a direct reward in the source settlement within
-its exact integer range; other combined rewards retain rational plan bounds.
-Bonus constraints keep their selected direct-reward currency.
-Legacy event recommendations maximize the selected reward, then the other direct
-reward, then mean score.
-Fractional reward weights retain finite mean-reward bounds. When their binary
-exponents exceed the integer hull's range, bounds compare all rank pairs with
-outward rounding to obtain the same upper concave envelope.
-Deterministic COMBO and JUST Top 1 rewards with an available numeric model
-compare the primary payout, other payout and mean score in one traversal.
-The private `rewardPhase` request retains
-separate proof scopes for
-`primary`, `other` and `score`. Later phases take the globally proven reward
-values and a legal incumbent floor. Their results carry the stage name;
-callers report a complete recommendation only after every stage is proven.
-Trusted worker contexts exchange complete scored seeds across shards and stages.
-Their keys include the full inventory growth, player, constraints, scoring goal,
-request identity and parsed chart; replacing a chart cannot reuse its scores.
-The bounded cache retains four groups of at most 32 fully scored teams.
-Cooperative Top 1 shards publish legal incumbent floors during a proof. Native
-contexts share these floors and complete hits only within the same scoring scope;
-WebAssembly exposes `haneoka_search_floor` for the worker's active call.
-For a single COMBO reward traversal, trusted WebAssembly hosts also exchange
-the complete `(primary, other, mean)` lower bound through
-`haneoka_search_reward`. The call starts with its current validated
-`rewardIncumbent`; every new run clears the previous tuple. Reward-only plans
-keep their exact ranking protocol. Hosts retain the legal scored witness even
-when another shard returns a weaker local result.
-The caller still waits for every shard. Native COMBO shards also share at most
-8,192 non-improving root bounds with exact snapshot-domain masks.
-Adjacent phases retain complete settlements for the same inventory, player,
-constraints and goal; replacing a chart invalidates this cache. Ordinary score
-contexts also include constraints because filtering can change the card indices.
-Weighted ordinary Live uses the separate proof phases. Other reward modes
-retain their equality-group searches.
-Pure COMBO and pure JUST ties keep the original selected-reward objective,
-preserving its snapshot bonus constraints and
-compiled scoring data. Long-term CP conversion belongs to the selected
-reward; the secondary reward is the direct per-play payout. Skip settlements
-return both payouts using the same values as their objective.
-Finite resource plans preserve snapshot choices and use conservative payout
-bounds when native rewards can wrap or the challenge payout is negative.
-Partial searches retain their candidates without a complete proof.
-Optional `minJustWindowMs` requires the selected half-width on ordinary JUST taps after each range's opening activation; timed effects retain their actual expiry, and fixed-team evaluations report the measured window without changing their scores.
-Gekiso rewards use the score search's default room of five equal-score players.
-Each sampled personal score is compared with the battle rank threshold: both
-the room total and its native five-player threshold scale by five. Rank shares
-count every sampled outcome before averaging rewards; ordinary solo rewards
-retain their personal rank thresholds. Manual activity evaluations with
-positive samples use the same settlement, including actual score extrema and
-rank shares.
-Sampled Gekiso rewards reuse integer note-score prefixes across skill orders
-with identical active factors, preserving per-note and mission settlement.
-LUCK recommendations also seed the search with a legal team that maximizes the
-other reward bonus while retaining the primary-bonus roster or snapshots.
-Reward passes share their replay contexts. Pure LUCK bounds share lottery
-cores across equivalent integer-gauge programs, preserving native member and
-support registration order and each requested seed. Both envelope and core
-caches retain at most 2 MiB. Rush projections use the native
-sustained-support timeline, including its frame tail, while sharing contexts
-across support values.
-Reward bounds compile identical skill templates once and retain the original
-member and snapshot slots for matching. Bonus-based snapshot filtering keeps
-a reward upper bound for every excluded branch. Pure COMBO roster bounds reject
-impossible member sets before snapshot preparation. Reward dual bounds reuse
-valid event assignments before building matrices, and try their most recent
-pruning parameter first. Primary-only bounds prepare the secondary reward when
-its tie phase needs it. Necessary reward-bonus floors
-also constrain physical snapshot matching; unvisited skill orders retain infinite
-upper bounds when the reward curve already proves the roster cannot improve.
-Pure COMBO passes reuse failed assignment bounds for the same members and exact
-snapshot domains at lower power and higher cutoffs. These certificates cover all
-skill orders and the native accumulation error; exact settlements and leader
-orders remain separate. Stored upper bounds also retain equal-cutoff proofs;
-each phase keeps its own tie policy. At most 32,768 certificates and 4,096 domain vectors
-are retained, and changing the reward phase clears these certificates.
-Strict primary-reward cuts also survive adjacent phases. Later phases reuse a
-cut only at no greater power and within its physical snapshot domains;
-excluded-domain bounds still participate. This cache retains at most 8,192
-rosters and four domain certificates per roster. Physical matching scratch is
-reused, and reward floors examine weaker skill orders first.
-Pricing rows retain five distinct witnesses before omitting a snapshot that is
-no better in power, event coefficient and reward bonus. Sparse matching keeps
-the original physical column identities; search options remain complete.
-COMBO roster bounds jointly price power, skill events and reward bonuses.
-Suffix matching keeps characters distinct, and nonnegative snapshot column
-prices charge each physical snapshot once. Mean-score bounds use the reward
-curve's upper concave envelope before checking individual skill orders.
-Snapshot prefixes reuse mean pricing planes and their five best available
-columns. Integer reward sums exclude unattainable reward equality groups.
-Bonus tables retain at most 4,096 sums; high-bonus proofs enumerate at most
-4,096 complete four- or five-positive-snapshot sets when three cannot reach
-the required snapshot bonus. A fifth zero-bonus slot remains relaxed. Larger domains
-keep the general bounds. Mean-target caches retain at most 16,384 entries and
-reset with the reward phase. Dual offer rows are prepared on first use.
-Five required, unbound snapshots restrict assignment choices without reindexing
-the native preparation domain; linear objectives solve that fixed set directly.
-Fixed member-bonus searches condition power, skill and joint-pricing suffixes
-on the same reachable bonus sum. Roster pricing also matches the current COMBO
-sum while keeping characters and skill events distinct; sums up to 64 use
-tables built only when their pricing plane is needed. Larger sums keep the
-general suffix bound. An additional plane prices physical snapshots against
-the current leader, COMBO sum and distinct skill events. It is prepared only
-after the existing planes leave a branch open. Roster cuts run before generic
-joint cuts and snapshot preparation, with repeated prefix results retained.
-Large unsharded native LUCK maximum searches
-partition complete COMBO levels across the native worker budget. They share
-scored seeds and immutable preparation, claim levels from a common queue,
-and suppress nested replay threads. Fewer than eight levels use leader shards
-within that same budget. Trusted contexts accept a `workers` budget from one
-to eight; other native calls retain the default of four preparation workers.
-Seed batches and lottery-envelope jobs use this budget without changing their
-input order or requested seeds. The caller retains progress callbacks,
-the deadline and cancellation generation; completion still requires every
-level. Explicit client shards retain their original partition.
-Native level workers share fixed-seed lottery envelopes for the same member
-program and support count. One worker prepares a missing envelope; peers reuse
-the completed result. The cache lives for one request, retains at most 256
-entries and reduces its capacity for longer charts.
-WebAssembly retains up to 128 local lottery envelopes and uses a smaller limit
-on longer charts. These entries remain local to one kernel and its fixed
-inventory, judgement stream and requested seeds.
-Pure LUCK recommendations partition snapshot choices by random-effect programs.
-For domains with up to two random-effect snapshots, native traces preserve each
-program and actor order. Previously weak seeds tighten the physical score bounds;
-unexamined seeds keep the full reward ceiling. Integer settlement certificates
-retain exact reward ties.
+- **Finds teams** for score, team power, event rewards and Gekiso, on one song or averaged across several.
+- **Proves the result.** A search that finishes has checked every legal team. One stopped early returns its best teams, marked as unproven.
+- **Evaluates a fixed team** with a full replay of the chart, including skill order and LUCK outcomes.
+- **Runs anywhere.** Native and WebAssembly builds share the same algorithms and numeric behaviour.
 
-Ordinary score targets first prove the mean-score Top K. When every retained
-team reaches the target in all 120 orders, those teams also prove the target
-optimum. Other targets retain the mean teams as seeds for the complete search.
-Target bounds combine mean-score bounds with five-event maximum bounds,
-including the secondary mean-score term.
-Successive score phases keep the request's original cancellation generation.
+## Install
 
-Finite Live Boost plans maximize total event points over the selected budget.
-They settle the discrete CP distribution across skill orders, including the
-expected challenge count and remaining CP. Equal totals prefer mean score.
-Circular convolution and exponentiation reuse each reward distribution without
-enumerating individual play sequences.
+```toml
+[dependencies]
+ournotes-team-builder = { git = "https://github.com/haneoka-gakuen/ournotes-team-builder" }
+```
 
-Gekiso's minimum COMBO BONUS is the sustained base multiplier after the first
-COMBO activation, evaluated at initial LIFE. Later combo thresholds affect
-scoring and do not satisfy this prerequisite. Charts without COMBO missions
-ignore the prerequisite.
+The library is named `haneoka_team_engine`.
 
-Deterministic Gekiso results and manual evaluations use complete native
-replay over all 120 skill orders. Orders share the full native state until
-their next ordinary skill event differs; each branch retains the original
-frame, RNG, LIFE and score history. Native replay groups follow the active worker
-budget; serial shards share the prefix before the first skill event as well. Fixed-seed numeric searches initialize
-legacy heuristic weights only when their compiled bound is unavailable.
-Exact COMBO BONUS searches bound remaining power by the attainable bonus sum,
-and member cuts retain their rounded prefix sums along the recursion.
-Equal minimum or maximum scores prefer the higher mean. Ties fill score
-summaries when the comparison needs them. Maximum searches replay orders by their
-strict upper bounds and fill the remaining orders for retained teams.
-When at least thirty deterministic orders remain, completion uses the same
-native replay tree to share their common state; smaller completions replay
-orders individually. Previously computed orders retain their original scores.
-Positive seed counts enumerate seeds from
-zero; zero retains the nominal LUCK calculation.
-The private `seedVariant` selects the sampled or Rush-free warm projection.
-Retained proposals are evaluated on the full requested seed set before they
-are reported; the complete search still proves every legal formation. Fixed-seed bounds enumerate
-reachable lottery programs in native frame order and combine COMBO, JUST and
-LUCK coefficients for the same physical snapshot assignment. Combined regional
-rows are shared across rosters, filled per member and reclaimed by an 8 MiB
-clock cache that counts allocated rows separately from their shared sources.
-Positive-seed
-search divides leaders among shards and keeps equal-power leader positions
-distinct, since their random-effect order can change settlement. With five
-forced members, lottery preparation uses those members' programs. Nominal LUCK
-keeps member sets together to reuse their contexts. Replays without active
-random effects share one identical seed result. Sampled scoring shares native
-integer note-score prefixes across ordinary skill orders and falls back to full
-replay when judgement conversion or LIFE conditions need it. LIFE follows the
-game's damage, healing and recovery order. Mission-end release uses END + 1 ms.
-Pure COMBO reward models share native combo traces and memoized support gains
-within an 8 MiB trace cache; the complete model cache retains 32 entries.
-Their owner conditions, ordinary skill windows and cumulative-counter layout
-are prepared once for the same chart and inventory; each trace still computes
-its native score weights separately.
-COMBO scripts normalize each inventory member once per search.
-Timed nonnegative COMBO gains retain finite search bounds by remaining active
-in the upper envelope; exact replay preserves their activation and expiry.
-Independent cumulative COMBO supports share a native replay and retain their
-owner-specific commands within the existing 64-program cache. Pure COMBO traces
-record sparse activations with the native condition updater and generate
-counter-based support coefficients from those records, retaining native f32
-rounding and factor replacement. Other programs use the full replay. Fixed-seed replays
-clone an initialized model and reset each seed's RNG before
-advancing its own state. Native effects with edge-only handlers apply at
-activation and finish; one-shot cumulative factors update when their count changes.
-Lottery envelopes share a cached fingerprint. Rush and support changes accumulate
-at their first affected notes, then one prefix pass combines all requested seeds.
-Random-support bounds cap the active count by a matching of slots to distinct
-physical snapshots. Fixed-seed regional components
-share up to 16 skill/window preparations by conversion trace. Lottery-command
-counts and note weights are priced from the current envelope. Physical snapshot
-matching resolves its final two rows directly with distinct available columns.
-Regional bounds read each member's cached row slice once for its snapshot offers.
-Nominal Max and Min assignments reuse the current roster's base in their scalar
-and joint power/skill cuts. Each assignment domain refreshes that base. Fixed-seed
-Min also bounds physical snapshots in a fixed ordinary-skill order and retains
-the mean bound: a team's worst-order score is at most its score in any fixed order.
+## Usage
 
-Reward coefficient bounds, deterministic templates and healthy-play normalization
-share the same raw inventory skill table. Bound team evaluations keep their direct
-bindings, and normalized rows remain owned by each reward objective.
+Every call goes through `session::execute`, which takes and returns JSON. Create a session from a game data document, then run requests against it.
 
-Five-slot roster prefixes visit only masks of the required cardinality. Reward
-pricing first takes the smallest nonnegative plane sum, then applies the common
-monotone square/division once; each plane retains its original outward rounding.
+```rust
+use haneoka_team_engine::session;
+use serde_json::json;
 
-Member reward pricing retains one outward-rounded prefix per roster depth and
-reuses its parent event assignments. Suffix bounds keep their current character
-position, and each pricing plane prepares its bonus deduction once per score
-batch. Joint pricing prepares physical column identities, power, event coefficients
-and reward bonuses once before filling its pricing planes. Pricing scales each
-shared coefficient row once per plane, then reuses it across member/snapshot
-pairs. Joint assignment planes balance their positive tangent parameter against
-the row envelopes before physical matching, retaining outward rounding. Mean
-pricing prepares one offer row per slot because its coefficients are independent
-of skill order. Nonnegative bound
-rounding uses the next positive float bit pattern, with nonfinite inputs
-remaining infinite. Exact native scoring still enumerates all 120 orders.
-Noncompetitive deterministic Gekiso reward candidates may stop native replay when completed
-orders, plus the maximum reward for every remaining order, cannot reach the
-current cutoff. The calculation uses exact integer reward totals and native order
-multiplicities. Retained teams always contain all 120 scores. Reward surrogate proposals use strict primary cutoffs and keep equal-primary
-teams for their complete mean-score comparison. Rejected proposals are remembered
-separately from complete seeds; the first feasible proposal and public input seeds
-are always scored completely.
+let created = session::execute(&json!({ "op": "create", "data": game_data }))?;
+let handle = created["handle"].clone();
 
-Member programs are interned before search; the 32 MiB note-weight cache gives
-recently used rows a second eviction chance. Trigger dependencies are classified
-once, and unchanged input frames skip their corresponding checks. Settled
-sustained states return directly, and update calls reuse their mission-gate result.
-Context preparation records factors in replay order and keeps each note's latest
-observation after history rewinds. It omits unused integer note totals. Frame
-buffers are reused, recorded frames share unchanged range-state slices, and LIFE
-without commands returns its initial value.
-Fresh models with no note damage or LIFE-changing effects fold constant LIFE
-checks before playback. Other models retain the full LIFE state machine.
-Combined conditions retain the latest trigger time from successful children;
-failed conjunctions clear it, and disjunctions use their first successful branch.
-Normal COMBO opening chords made entirely of independent taps or flicks span
-two existing 60 Hz frames when every note fits its base Perfect window and the
-range. Their nominal times, identities and judgement grades stay the same.
-COMBO traces collect note factors and combo maxima in one replay; support
-preparation records factor commands without calculating unused note totals.
+let output = session::execute(&json!({
+    "op": "run",
+    "handle": handle,
+    "request": request,
+    "charts": charts,
+}))?;
+```
 
-Pure JUST reward bounds share whole-inventory coefficient rows by converter
-trace and price power and score together before snapshot enumeration. Necessary
-badge-bonus floors also constrain the member bounds; excluded snapshot branches
-retain their reward upper certificates. Coarse pure JUST bounds reuse the
-120-order coefficient distribution before preparing joint power/score prices.
-Pure JUST and pure COMBO member pruning admit stronger ordinary skills when
-every snapshot has an equivalent normalized Gekisou score program. Pure COMBO
-snapshot pruning uses the same equivalence and native rounding margin.
-Replacements within one character require a power gain above that margin.
-Fully bound fixed-seed teams bypass free-team warm searches and still complete
-the ordinary exact search and proof.
+[`examples/bench.rs`](examples/bench.rs) is a complete program. Run it with a JSON file holding `data`, `request` and `charts`:
 
-Gekiso reward bonus ceilings count at most one card per character. Reward
-bonuses are resolved once per card, and matching matrices omit snapshot columns
-that no remaining slot can use. Independent best columns settle directly in
-row order with the same outward rounding.
-Search reuses retained member-set keys and per-depth snapshot option buffers.
-Native replay reuses ordering buffers while preserving time, owner and insertion
-indices. Coefficient rows reference their interned templates instead of keeping
-a second physical copy.
-Reward replay contexts use a byte-limited second-chance cache. Sampled projection
-caches count allocated capacity and leave oversized projections uncached; every
-requested seed still participates in the settlement.
+```sh
+cargo run --release --example bench -- input.json
+```
 
-Context and coefficient caches are local to the search and retain the skill
-programs, owner attributes and random inputs that can affect their values. Healthy
-all-LUCK fixed-seed score searches cache ordered lottery contexts and unit-Rush
-projections within 18 MiB per kernel; retained teams replay original binary32
-factor operations for every seed and all 120 orders.
-Bounded LUCK caches evict cold entries incrementally. Snapshot choice rows
-are shared across pricing planes; priced frontiers retain their exact plane key.
+| Operation | Purpose |
+| --- | --- |
+| `create` | Load game data and return a session handle |
+| `chart` | Cache a chart ahead of a run |
+| `run` | Search for the best teams |
+| `evaluate` | Score one fixed team |
+| `timeline` | Show when a fixed team's skills activate |
+| `qualify` | Check a request before running it |
+| `growth` | Rank card upgrades by how much each one gains |
+| `rates` | Report each song's scoring weights, rank thresholds and skill windows |
 
-Member/snap normal-live skill preparation is shared across requests using the
-same master tables. Each native library / WASM instance retains one ordered
-inventory, up to 16 MiB of table/key payload. Resolved skill levels, member
-condition fields and all five source skill/condition tables determine reuse.
-Ordinary score, potential and Gekiso share raw slots; chart/accuracy/LIFE
-normalization stays local to each objective. Shape ids are prepared lazily for
-ordinary score. Oversized tables are computed without cross-request retention;
-ordinary objectives still share them within one request, then release them on
-return (including early errors).
-The cache survives individual engine disposal; the budget excludes active
-objective copies and allocator overhead.
+`cancel()` stops running searches. For other languages, the same engine is exposed as C functions that take and return JSON strings, such as `haneoka_context_json`.
+
+## Build
+
+```sh
+cargo build --release
+cargo test
+```
+
+The crate builds a Rust library, a C shared library and a static library. For the web:
+
+```sh
+rustup target add wasm32-unknown-unknown
+cargo build --release --target wasm32-unknown-unknown
+```
+
+## Learn more
+
+[Engine notes](docs/engine-notes.md) cover how the search works and what each request option guarantees.
 
 ## License
 
-AGPL-3.0-only, with an additional attribution term under section 7(b): any
-interface that shows results computed by this engine, or by a work based on it,
-must display "Team-building algorithm from Haneoka — https://haneoka.org" with
-an explicit hyperlink to https://haneoka.org. See [NOTICE](NOTICE) and
-[LICENSE](LICENSE).
-
-The private `deferScores` request flag applies only to unsampled, non-LUCK
-maximum-score Top K searches. Pending hits carry `pendingScores: true` and a
-null score; callers complete every candidate at the distinct-member primary
-boundary with native 120-order evaluation before publishing or claiming a full
-result. Requests without this flag retain complete scores.
-
-The `chart` operation reports `cachedCharts` from the engine after insertion.
-The list contains at most four charts in eviction order. Priming existing charts
-without inserting them keeps that order.
-
-Completed unsharded Gekiso score requests retain one proven, fully settled result per engine,
-within a 1 MiB serialized payload budget including the request, chart source and response
-(excluding Value node and allocator overhead). Identical search inputs reuse that proof across
-budget and delivery metadata changes (`deadline`, `timeLimitMs`, `requestId`, `contextKey`);
-all other request fields, the chart source and Master data identities must match.
-Weak guards detect table replacement and copy-on-write without retaining old Master tables. Chart replacement
-clears it. Partial, deferred, seed-only and sharded results are not retained. A hit preserves
-teams, scores and proof status, reports `stats.cacheHits = 1`, zero new search/exact work,
-and the current call's elapsed time. Cancellation generations are checked before reuse.
-
-## Gekiso Arena
-
-An optional `goal.arena` on Gekiso requests scopes the league band, music type
-and three mission overrides to the call. Zero inherits the original song field.
-The raw source cache retains its original identity. The same scoped inputs work
-for fixed-team evaluation and timelines.
-
-`mode: "shared"` searches one fixed leader, member set and snapshot assignment
-for the equal-weight average over every selected chart. Song optima may seed the
-search; only the joint formation search proves the result. Per-song bounds are
-combined conservatively, and equal-power charts share a coupled scalar bound.
-Every retained hit contains complete per-song scores in `aggregate.songs`. Partial
-requests retain candidates without a complete proof.
-One effective chart in mean or shared mode uses the single-chart solver.
-
-## Shared song rules
-
-`request.songRules` overrides the song type and each of the three Gekiso ranges.
-Zero preserves the source field; type 99 selects ALL. Live, Gekiso, rewards,
-manual evaluation and timelines use a call-local Master view, including challenge
-song types, while raw charts retain their release identity. Arena adds its league
-constraints to the same rule projection.
-
-Ordinary cumulative snapshot score-ups also run in nominal and sampled Gekiso
-scoring. Counters advance over the full simultaneous judgement frame and expire
-at their activation window; cumulative slots use the dynamic scorer.
-
-Cumulative search caps bound the positive factor independently from the native
-wrapping counter replay. Rounding envelopes retain the full signed magnitude
-when a reachable product can wrap. Ordinary all-Perfect scoring uses the native
-played-judgement path for uncapped factors and when cumulative products or replacements exceed
-the prefix path's signed range; regular finite caps keep the prefix path.
-Finite ordinary cumulative bounds use the validated current-card domain: positive
-capped factors, at most 12 authored counter steps and at most 24,000 effective BP.
-Signed, uncapped, larger-domain and reachable-overflow factors retain unbounded
-ordinary-score intervals and complete snapshot domains, including joint-song
-searches. Their rounding residue can outlive the activation window, so finite
-window coefficients do not certify those searches. Exact replay still evaluates
-every retained team; inputs outside the finite domain remain accepted.
-
-## Multi-song teams
-
-`request.aggregation: "mean"` searches one formation over all `goal.songs` for
-ordinary score, Gekiso score and event rewards. Score objectives use mean scores;
-event objectives average their selected rewards. Explicit reward plans retain
-exact rational averages at every ranking level and ignore unselected rewards.
-CP calibration selects the best challenge chart before the joint search.
-Automatic CP calibration also returns that proven team as `cpChallenge`, including
-its original chart and direct rewards. Resolving a plan before sharding preserves
-the same field; no additional challenge search is needed for presentation.
-`aggregate.songs` preserves each chart's complete score and reward settlement.
-
-Joint Gekiso workers partition common COMBO levels or leaders and share certified mean-score
-floors. A single-chart warm search provides an initial legal formation; deterministic
-mean bounds retain JUST counters read by the actual formation. Ordinary joint
-score objectives couple power with normalized skill weights only when every
-chart has the same power model. Full replay remains the scoring authority.
-
-For large Arena Top 1 pools, the browser evaluates a legal warm candidate over
-all charts in parallel. Trusted seeded searches retain its physical formation as
-already evaluated, return their aspiration floor, and explore all remaining
-formations and COMBO levels. The coordinator preserves the complete candidate
-while merging the full proof; no score field from a public seed is used by Rust.
-
-Snapshot-prefix bounds cache each slot's five greatest power and skill values;
-at most four occupied snapshots can exclude them. Candidate enumeration still
-uses the complete domain. Deterministic mean bounds tighten songs progressively
-and stop when the remaining safe sum cannot improve the retained formation.
+AGPL-3.0-only, with an additional attribution term under section 7(b): any interface that shows results computed by this engine, or by a work based on it, must display "Team-building algorithm from Haneoka — https://haneoka.org" with an explicit hyperlink to https://haneoka.org. See [NOTICE](NOTICE) and [LICENSE](LICENSE).
