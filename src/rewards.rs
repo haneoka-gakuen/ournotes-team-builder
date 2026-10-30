@@ -7955,7 +7955,7 @@ impl<'a> RewardObjective<'a> {
             })
             .collect();
         let bound = score_coefficient(self.master, &self.gekiso, &members, &[], Some(&snaps));
-        if self.local.len() >= 256 {
+        if self.local.len() >= 16384 {
             if let Some(old) = self.local_order.pop_front() {
                 self.local.remove(&old);
             }
