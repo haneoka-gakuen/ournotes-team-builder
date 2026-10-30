@@ -3,6 +3,16 @@ use super::*;
 use crate::{gekiso, gekiso_objective, search};
 
 impl Engine {
+    fn call_view(&self, master: Master) -> Engine {
+        let mut scoped = Engine::from_master(master);
+        scoped.trusted_scores = self.trusted_scores;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            scoped.worker_budget = self.worker_budget;
+        }
+        scoped
+    }
+
     pub(super) fn arena_view(
         &mut self,
         input: &Value,
@@ -82,7 +92,7 @@ impl Engine {
             .zip(&sources)
             .map(|(song, source)| json!({"song":song,"source":source}))
             .collect::<Vec<_>>());
-        Ok((Engine::from_master(master), scoped_input, songs, sources))
+        Ok((self.call_view(master), scoped_input, songs, sources))
     }
 
     pub(super) fn song_rule_view(&mut self, input: &Value) -> Result<(Engine, Value), String> {
@@ -120,7 +130,7 @@ impl Engine {
             charts.push(json!({"song":song,"source":source}));
         }
         scoped["charts"] = json!(charts);
-        Ok((Engine::from_master(master), scoped))
+        Ok((self.call_view(master), scoped))
     }
 
     pub(super) fn run_arena(
@@ -149,7 +159,7 @@ impl Engine {
                 );
             }
             (
-                Engine::from_master(self.master.clone()),
+                self.call_view(self.master.clone()),
                 input.clone(),
                 songs,
                 sources,
