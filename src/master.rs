@@ -353,6 +353,8 @@ pub struct LiveTables {
     pub damage: [f64; 7],
     pub settings: BTreeMap<String, String>,
     pub just_types: BTreeSet<i32>,
+    pub just_windows: BTreeMap<i32, (i32, i32)>,
+    pub miss_windows: BTreeMap<i32, (i32, i32)>,
     pub timing_types: BTreeSet<i32>,
     pub perfect_after_ms: BTreeMap<i32, i32>,
     pub after_ms: f64,
@@ -923,6 +925,16 @@ pub fn compile(data: &Value) -> Result<Master, String> {
                 .iter()
                 .filter(|r| int(&r["noteSimulateJudgement"]) == 6)
                 .map(|r| int(&r["noteJudgementType"]))
+                .collect(),
+            just_windows: timings
+                .iter()
+                .filter(|r| int(&r["assistLevel"]) == 0 && int(&r["noteSimulateJudgement"]) == 6)
+                .map(|r| (int(&r["noteJudgementType"]), (int(&r["beforeMs"]), int(&r["afterMs"]))))
+                .collect(),
+            miss_windows: timings
+                .iter()
+                .filter(|r| int(&r["assistLevel"]) == 0 && int(&r["noteSimulateJudgement"]) == 1)
+                .map(|r| (int(&r["noteJudgementType"]), (int(&r["beforeMs"]), int(&r["afterMs"]))))
                 .collect(),
             timing_types: timings
                 .iter()

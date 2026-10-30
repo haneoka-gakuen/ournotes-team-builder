@@ -418,6 +418,7 @@ pub struct Model<'a> {
     params: Params,
     pub record: Option<LuckRecord>,
     pub record_trace: bool,
+    pub(crate) just_window: Option<crate::just_window::Trace>,
     rush_observers: Vec<ConditionUpdater>,
     combo_observer: Option<ComboObserver>,
     pub(crate) rush_support_commands: Vec<(i32, i32)>,
@@ -578,6 +579,7 @@ impl<'a> Model<'a> {
                 None
             },
             record_trace: false,
+            just_window: None,
             rush_observers: Vec::new(),
             combo_observer: None,
             rush_support_commands: Vec::new(),
@@ -1527,6 +1529,7 @@ impl<'a> Model<'a> {
                     }
                 }
             }
+            4004 => self.update_just_window(&row, &state, key)?,
             _ => return Err(format!("unsupported skill effect type {kind}")),
         }
         let target = self.state_mut(item);
@@ -1746,10 +1749,18 @@ impl<'a> Model<'a> {
                     self.score.disable_note(state.finish_ms, id)?;
                 }
             }
-            4004 => {}
+            4004 => self.update_just_window(row, state, key)?,
             _ => return Ok(false),
         }
         Ok(true)
+    }
+    fn update_just_window(&mut self, row: &Row, state: &State, key: Key) -> Result<(), String> {
+        if let Some(trace) = &mut self.just_window {
+            if row.limit != 0 { return Err("just-window-effect".into()); }
+            if state.state == effects::EXECUTE { trace.enable(self.master, key, row.value, &row.targets); }
+            else if state.state == effects::END { trace.disable(key); }
+        }
+        Ok(())
     }
     fn extend(&mut self, member: usize, ms: f64) {
         for skill in &mut self.live {

@@ -124,6 +124,7 @@ return both payouts using the same values as their objective.
 Finite resource plans preserve snapshot choices and use conservative payout
 bounds when native rewards can wrap or the challenge payout is negative.
 Partial searches retain their candidates without a complete proof.
+Optional `minJustWindowMs` requires the selected half-width on ordinary JUST taps after each range's opening activation; timed effects retain their actual expiry, and fixed-team evaluations report the measured window without changing their scores.
 Gekiso rewards use the score search's default room of five equal-score players.
 Each sampled personal score is compared with the battle rank threshold: both
 the room total and its native five-player threshold scale by five. Rank shares

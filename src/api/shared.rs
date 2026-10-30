@@ -201,6 +201,20 @@ impl Combined<'_> {
     }
 }
 impl Objective for Combined<'_> {
+    fn has_team_filter(&self) -> bool { self.songs.iter().any(|song| song.objective.has_team_filter()) }
+    fn team_filter_impossible(&self) -> bool { self.songs.iter().any(|song| song.objective.team_filter_impossible()) }
+    fn feasible_assignment(&self, members: &[usize], assigned: &[i32], from: usize, options: &[Vec<i32>]) -> bool {
+        self.songs.iter().all(|song| song.objective.feasible_assignment(members, assigned, from, options))
+    }
+    fn feasible_team(&mut self, team: &Team, _power: f64) -> Result<bool, String> {
+        let members: Vec<_> = team.members.iter().map(|&index| self.members[index].clone()).collect();
+        let snaps: Vec<_> = team.snaps.iter().map(|&index| (index >= 0).then(|| self.snaps[index as usize].clone())).collect();
+        for song in &mut self.songs {
+            let power = power::team_power(self.master, self.player, &members, &snaps, 0, Some(&song.music), &[])?.total;
+            if !song.objective.feasible_team(team, power as f64)? { return Ok(false); }
+        }
+        Ok(true)
+    }
     fn prefer_snap(&self, member: usize, snap: i32) -> f64 {
         self.priority
             .get(
@@ -672,6 +686,7 @@ impl Objective for Combined<'_> {
                 / count
         };
         let mut detail = json!({"songs":parts,"otherMean":mean(&["detail","otherMean"]),"scores":{"mean":mean(&["detail","scores","mean"])}});
+        if let Some(window) = crate::just_window::aggregate(parts.iter().map(|part| &part["detail"]["justWindow"])) { detail["justWindow"] = window; }
         let mut key = mean(&["key"]);
         if let Some(plan) = &self.plan {
             let ranks: Vec<_> = (0..plan.levels.len())
@@ -817,8 +832,7 @@ impl Engine {
                         vec![1; 3],
                     )?;
                     gk.music_type = music.music_type;
-                    crate::reward_plan::Source::Gekiso(Box::new(
-                        crate::rewards::RewardObjective::new(
+                    let mut objective = crate::rewards::RewardObjective::new(
                             &self.master,
                             &cards.members,
                             &cards.snaps,
@@ -828,8 +842,9 @@ impl Engine {
                             anchor == Metric::Points,
                             master::int(&goal["gekiso"]["luckSamples"]),
                             exchange,
-                        ),
-                    ))
+                        );
+                    if let Some(minimum) = crate::just_window::target(&goal["gekiso"]["minJustWindowMs"])? { objective.set_min_just_window(minimum)?; }
+                    crate::reward_plan::Source::Gekiso(Box::new(objective))
                 } else {
                     crate::reward_plan::Source::Ordinary(Box::new(EventObjective::new(
                         &self.master,

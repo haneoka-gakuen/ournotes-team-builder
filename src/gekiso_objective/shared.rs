@@ -304,10 +304,11 @@ impl<'k, 'a> Combined<'k, 'a> {
         let mut scores = vec![0.0; self.songs.len()];
         for index in order {
             let song = &mut self.songs[index];
-            let score = song
+            let mut score = song
                 .adapter
                 .kernel
                 .exact(team, powers[index].total as i32, true)?;
+            song.adapter.kernel.decorate_window(team, powers[index].total as i32, &mut score.detail)?;
             scores[index] = score.key;
             bounds[index] = score.key;
             details[index] = json!({"detail":score.detail,"power":powers[index].total,"slotPowers":powers[index].slots});
@@ -325,9 +326,11 @@ impl<'k, 'a> Combined<'k, 'a> {
                 }
             }
         }
+        let mut detail = json!({"songs":details});
+        if let Some(window) = crate::just_window::aggregate(details.iter().map(|detail| &detail["detail"]["justWindow"])) { detail["justWindow"] = window; }
         Ok(search::Evaluation::Exact(Exact {
             key: scores.iter().sum::<f64>() / scores.len() as f64,
-            detail: json!({"songs":details}),
+            detail,
         }))
     }
 
@@ -445,6 +448,21 @@ impl<'k, 'a> Combined<'k, 'a> {
 }
 
 impl Objective for Combined<'_, '_> {
+    fn has_team_filter(&self) -> bool { self.songs.iter().any(|song| song.adapter.has_team_filter()) }
+    fn team_filter_impossible(&self) -> bool { self.songs.iter().any(|song| song.adapter.team_filter_impossible()) }
+    fn feasible_assignment(&self, members: &[usize], assigned: &[i32], from: usize, options: &[Vec<i32>]) -> bool {
+        self.songs.iter().all(|song| song.adapter.feasible_assignment(members, assigned, from, options))
+    }
+    fn feasible_team(&mut self, team: &Team, _power: f64) -> Result<bool, String> {
+        for song in &mut self.songs {
+            let kernel = &song.adapter.kernel;
+            let members: Vec<_> = team.members.iter().map(|&index| kernel.members[index].clone()).collect();
+            let snaps: Vec<_> = team.snaps.iter().map(|&index| (index >= 0).then(|| kernel.snaps[index as usize].clone())).collect();
+            let power = power::team_power(kernel.master, self.player, &members, &snaps, 0, Some(song.music), &[])?.total;
+            if !song.adapter.feasible_team(team, power as f64)? { return Ok(false); }
+        }
+        Ok(true)
+    }
     fn observe_hits(&mut self, hits: &[Hit]) {
         if let Some(hit) = hits.get(self.k - 1) {
             self.floor = self.floor.max(hit.key);
@@ -795,17 +813,28 @@ pub(crate) fn search_shared(input: SharedInput<'_>) -> Result<search::Output, St
         mut on_candidate,
     } = input;
     let started = (env.now)();
+    let mut windows = Vec::with_capacity(charts.len());
+    for chart in charts.iter() {
+        let window = env.min_just_window_ms.map(|minimum| crate::just_window::Prepared::new(env.master, chart, env.members, env.snaps, minimum, &seeds)).transpose()?;
+        if window.as_ref().is_some_and(crate::just_window::Prepared::impossible) {
+            return Ok(search::Output { hits: Vec::new(), proven: true, bound: None, stats: search::Stats::default() });
+        }
+        windows.push(window);
+    }
     let mut kernels: Vec<_> = charts
         .iter_mut()
-        .map(|chart| {
-            Kernel::new(
+        .zip(windows)
+        .map(|(chart, window)| {
+            let mut kernel = Kernel::new(
                 env.master,
                 env.members,
                 env.snaps,
                 chart,
                 seeds.clone(),
                 Criterion::Mean,
-            )
+            );
+            kernel.just_window = window;
+            kernel
         })
         .collect();
     let same_levels = kernels

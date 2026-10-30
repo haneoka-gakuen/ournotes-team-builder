@@ -868,6 +868,7 @@ pub struct Kernel<'a> {
     snaps: &'a [Snap],
     chart: &'a mut Chart,
     seeds: Vec<i32>,
+    just_window: Option<crate::just_window::Prepared>,
     criterion: Criterion,
     read_all: Vec<&'static str>,
     read_members: Vec<&'static str>,
@@ -1717,6 +1718,7 @@ impl<'a> Kernel<'a> {
             cache_order,
             cache_bytes,
             cache_records,
+            just_window: None,
             seeded_contexts: HashMap::default(),
             rush_projections: HashMap::default(),
             rush_projection_order: VecDeque::new(),
@@ -3172,6 +3174,23 @@ impl<'a> Kernel<'a> {
     fn slot_index(&self, m: usize, s: i32) -> usize {
         m * (self.snaps.len() + 1) + (s + 1) as usize
     }
+    fn has_team_filter(&self) -> bool {
+        self.just_window.as_ref().is_some_and(crate::just_window::Prepared::active)
+    }
+    fn feasible_team(&mut self, team: &Team, power: f64) -> Result<bool, String> {
+        match &mut self.just_window {
+            Some(window) => window.allows(self.master, self.chart, team, power as i32),
+            None => Ok(true),
+        }
+    }
+    fn decorate_window(&mut self, team: &Team, power: i32, detail: &mut Value) -> Result<(), String> {
+        if let Some(window) = &mut self.just_window {
+            if let Some(value) = window.measure(self.master, self.chart, team, power)? {
+                detail["justWindow"] = json!(value);
+            }
+        }
+        Ok(())
+    }
     fn slot(&self, m: usize, s: i32) -> &Slot {
         &self.slots[self.slot_index(m, s)]
     }
@@ -4437,7 +4456,10 @@ impl Kernel<'_> {
         Ok(())
     }
     fn complete_hits(&mut self, hits: &[Hit], k: usize) -> Result<Vec<Hit>, String> {
-        let mut tied = hits.to_vec();
+        let mut tied = Vec::new();
+        for hit in hits {
+            if self.feasible_team(&hit.team, hit.power)? { tied.push(hit.clone()); }
+        }
         let primary = ranked(&tied, k);
         if self.criterion != Criterion::Mean {
             let threshold = primary.last().map_or(f64::NEG_INFINITY, |hit| hit.key);
@@ -4454,6 +4476,7 @@ impl Kernel<'_> {
         }
         let mut result = ranked(&tied, k);
         for (index, hit) in result.iter_mut().enumerate() {
+            self.decorate_window(&hit.team, hit.power as i32, &mut hit.detail)?;
             if hit.detail["pendingScores"] == true
                 && self.defer_scores
                 && !(self.seed_preview && index == 0)
@@ -6695,6 +6718,7 @@ pub struct Adapter<'k, 'a> {
     combo_bound: Option<ComboBound>,
     combo_attempted: bool,
     combo_options: Vec<Vec<i32>>,
+    window_options: Vec<Vec<i32>>,
     fixed_no_rng_bound: Option<ComboBound>,
     fixed_no_rng_attempted: bool,
     fixed_region_models: HashMap<(FixedConversionBound, Option<usize>), RegionalBound>,
@@ -6852,6 +6876,7 @@ impl<'k, 'a> Adapter<'k, 'a> {
             combo_bound: None,
             combo_attempted: false,
             combo_options: Vec::new(),
+            window_options: Vec::new(),
             fixed_no_rng_bound: None,
             fixed_no_rng_attempted: false,
             fixed_region_models: HashMap::default(),
@@ -8387,6 +8412,12 @@ impl<'k, 'a> Adapter<'k, 'a> {
     }
 }
 impl Objective for Adapter<'_, '_> {
+    fn has_team_filter(&self) -> bool { self.kernel.has_team_filter() }
+    fn team_filter_impossible(&self) -> bool { self.kernel.just_window.as_ref().is_some_and(crate::just_window::Prepared::impossible) }
+    fn feasible_team(&mut self, team: &Team, power: f64) -> Result<bool, String> { self.kernel.feasible_team(team, power) }
+    fn feasible_assignment(&self, members: &[usize], assigned: &[i32], from: usize, options: &[Vec<i32>]) -> bool {
+        self.kernel.just_window.as_ref().is_none_or(|window| window.possible(members, assigned, from, options))
+    }
     fn live_floor(&self) -> bool {
         self.kernel.live_floor && !self.surrogate && !self.estimate
     }
@@ -8398,7 +8429,7 @@ impl Objective for Adapter<'_, '_> {
     }
 
     fn preserve_snap_options(&self) -> bool {
-        (!self.kernel.chart.luck || !self.kernel.seeds.is_empty())
+        self.kernel.has_team_filter() || (!self.kernel.chart.luck || !self.kernel.seeds.is_empty())
             && !self.surrogate
             && !self.estimate
             && self.deterministic.is_none()
@@ -8638,6 +8669,7 @@ impl Objective for Adapter<'_, '_> {
         from: usize,
         limit: f64,
     ) -> Option<Vec<i32>> {
+        if self.kernel.has_team_filter() { return None; }
         if from != 1
             || !self.kernel.chart.luck
             || self.surrogate
@@ -9054,6 +9086,9 @@ impl Objective for Adapter<'_, '_> {
         assigned: &[i32],
         from: usize,
     ) -> f64 {
+        if self.kernel.just_window.as_ref().is_some_and(|window| !window.possible(members, assigned, from, &self.window_options)) {
+            return f64::NEG_INFINITY;
+        }
         if let Some(bound) = &mut self.deterministic {
             let mut upper =
                 bound.score_ceiling(members, assigned, from, totals.power, self.kernel.criterion);
@@ -9286,6 +9321,7 @@ impl Objective for Adapter<'_, '_> {
         self.fixed_box_complete = complete;
     }
     fn prepare_assignment(&mut self, members: &[usize], options: &[Vec<i32>]) {
+        if self.kernel.has_team_filter() { self.window_options = options.to_vec(); }
         self.nominal_base = if self.kernel.chart.luck
             && self.kernel.seeds.is_empty()
             && self.kernel.criterion != Criterion::Mean
@@ -10032,12 +10068,16 @@ impl Objective for Adapter<'_, '_> {
         if let Some(hit) = self.seed_scores.iter().find(|hit| {
             hit.power == power && hit.team.members == team.members && hit.team.snaps == team.snaps
         }) {
-            return Ok(Exact {
+            let mut exact = Exact {
                 key: hit.key,
                 detail: hit.detail.clone(),
-            });
+            };
+            self.kernel.decorate_window(team, power as i32, &mut exact.detail)?;
+            return Ok(exact);
         }
-        self.kernel.search_exact(team, power as i32, true)
+        let mut exact = self.kernel.search_exact(team, power as i32, true)?;
+        self.kernel.decorate_window(team, power as i32, &mut exact.detail)?;
+        Ok(exact)
     }
     fn evaluate(
         &mut self,
@@ -10069,6 +10109,12 @@ struct WarmProjection<'p, 'k, 'a> {
     mean: bool,
 }
 impl Objective for WarmProjection<'_, '_, '_> {
+    fn has_team_filter(&self) -> bool { self.adapter.has_team_filter() }
+    fn team_filter_impossible(&self) -> bool { self.adapter.team_filter_impossible() }
+    fn feasible_team(&mut self, team: &Team, power: f64) -> Result<bool, String> { self.adapter.feasible_team(team, power) }
+    fn feasible_assignment(&self, members: &[usize], assigned: &[i32], from: usize, options: &[Vec<i32>]) -> bool {
+        self.adapter.feasible_assignment(members, assigned, from, options)
+    }
     fn canonical_leader(&self) -> bool {
         true
     }
@@ -10158,6 +10204,7 @@ pub struct Environment<'a> {
     pub constraints: search::Constraints,
     pub now: &'a dyn Fn() -> f64,
     pub generation: u64,
+    pub min_just_window_ms: Option<f64>,
 }
 struct Run {
     constraints: search::Constraints,
@@ -10282,6 +10329,7 @@ fn refine_seed(
                     }
                 }
                 let power = env.power(&team)?;
+                if !kernel.feasible_team(&team, power.total as f64)? { return Ok(false); }
                 if leader_only && power.total as f64 <= best.power {
                     return Ok(false);
                 }
@@ -10538,6 +10586,7 @@ fn offer_scored(
     members: &[Member],
     mut hit: Hit,
 ) -> Result<(), String> {
+    if !kernel.feasible_team(&hit.team, hit.power)? { return Ok(()); }
     if kernel.criterion != Criterion::Mean {
         let key = hit.key;
         for old in hits.iter_mut().filter(|old| old.key == key) {
@@ -10769,8 +10818,17 @@ struct ReplayObjective<'a> {
     bound: Option<crate::rewards::DeterministicBound>,
     coefficient: f64,
     shapes: HashMap<Performer, u32>,
+    just_window: Option<crate::just_window::Prepared>,
 }
 impl Objective for ReplayObjective<'_> {
+    fn has_team_filter(&self) -> bool { self.just_window.as_ref().is_some_and(crate::just_window::Prepared::active) }
+    fn team_filter_impossible(&self) -> bool { self.just_window.as_ref().is_some_and(crate::just_window::Prepared::impossible) }
+    fn feasible_team(&mut self, team: &Team, power: f64) -> Result<bool, String> {
+        self.just_window.as_mut().map_or(Ok(true), |window| window.allows(self.master, self.chart, team, power as i32))
+    }
+    fn feasible_assignment(&self, members: &[usize], assigned: &[i32], from: usize, options: &[Vec<i32>]) -> bool {
+        self.just_window.as_ref().is_none_or(|window| window.possible(members, assigned, from, options))
+    }
     fn score_ties(&self) -> bool {
         self.criterion != Criterion::Mean
     }
@@ -10876,10 +10934,14 @@ impl Objective for ReplayObjective<'_> {
             .collect();
         let scores =
             gekiso::replay_orders(self.master, self.chart, &deck, self.seeds, power as i32)?;
-        Ok(Exact {
+        let mut result = Exact {
             key: self.criterion.key(&scores.scores),
             detail: json!({"scores":scores,"seeds":self.seeds.len().max(1),"comboBonus":if self.chart.setup.missions.iter().any(|m| *m == 1 || *m == 4) { Some(1 + team.members.iter().map(|&i| self.bonuses[i]).sum::<i32>()) } else { None }}),
-        })
+        };
+        if let Some(window) = &mut self.just_window {
+            if let Some(value) = window.measure(self.master, self.chart, team, power as i32)? { result.detail["justWindow"] = json!(value); }
+        }
+        Ok(result)
     }
 }
 
@@ -11049,6 +11111,7 @@ fn native_levels(
         env.music,
         env.generation,
     );
+    let min_just_window_ms = env.min_just_window_ms;
     std::thread::scope(|scope| {
         for (worker, (levels, mut chart)) in jobs.into_iter().enumerate() {
             let send = send.clone();
@@ -11100,6 +11163,7 @@ fn native_levels(
                                         constraints,
                                         now: &now,
                                         generation,
+                                        min_just_window_ms,
                                     },
                                     chart: &mut chart,
                                     seeds: seed.seeds.clone(),
@@ -11273,6 +11337,10 @@ fn search_levels(
         mut on_candidate,
         mut progress,
     } = input;
+    let just_window = env.min_just_window_ms.map(|minimum| crate::just_window::Prepared::new(env.master, chart, env.members, env.snaps, minimum, &seeds)).transpose()?;
+    if just_window.as_ref().is_some_and(crate::just_window::Prepared::impossible) {
+        return Ok(search::Output { hits: Vec::new(), proven: true, bound: None, stats: search::Stats::default() });
+    }
     if !seed_only && gekiso::uses_full_replay(env.master, chart, &seeds) {
         let bonuses = opening_combo_bonuses(env.master, env.members, &chart.setup.missions);
         let mut constraints = env.constraints.clone();
@@ -11302,6 +11370,7 @@ fn search_levels(
             ),
             bound: replay_bound(env.master, chart, env.members, env.snaps)?,
             shapes: HashMap::default(),
+            just_window,
         };
         let mut candidate = |hits: &[Hit]| {
             if let Some(callback) = on_candidate.as_deref_mut() {
@@ -11346,6 +11415,7 @@ fn search_levels(
     let started = (env.now)();
     let generation = env.generation;
     let mut kernel = Kernel::new(env.master, env.members, env.snaps, chart, seeds, criterion);
+    kernel.just_window = just_window;
     if let Some(bounds) = shared_bounds {
         kernel.global_fixed_preparation = bounds.preparation.clone();
         kernel.global_fixed_luck = bounds.luck.clone();
@@ -11629,8 +11699,9 @@ fn search_levels(
         });
     }
     let seed_key = format!(
-        "{}:{minimum}:{seed_variant:?}",
-        seed_key(&env, criterion, k, &kernel.seeds)
+        "{}:{minimum}:{seed_variant:?}:{:?}",
+        seed_key(&env, criterion, k, &kernel.seeds),
+        env.min_just_window_ms.map(f64::to_bits),
     );
     let cached = if seeded || fixed_assignment {
         Some(Vec::new())

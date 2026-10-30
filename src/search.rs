@@ -40,6 +40,24 @@ pub struct JointTarget {
     pub product: f64,
 }
 pub trait Objective {
+    fn has_team_filter(&self) -> bool {
+        false
+    }
+    fn team_filter_impossible(&self) -> bool {
+        false
+    }
+    fn feasible_team(&mut self, _team: &Team, _power: f64) -> Result<bool, String> {
+        Ok(true)
+    }
+    fn feasible_assignment(
+        &self,
+        _members: &[usize],
+        _assigned: &[i32],
+        _from: usize,
+        _options: &[Vec<i32>],
+    ) -> bool {
+        true
+    }
     fn score_ties(&self) -> bool {
         false
     }
@@ -544,6 +562,7 @@ struct Runner<'a, O: Objective + ?Sized> {
     excluded_members: HashSet<usize>,
     best: Vec<Best>,
     options: Vec<Vec<i32>>,
+    team_filter: bool,
     conditional_dominance: bool,
     dominators: Vec<Vec<Vec<usize>>>,
     exchange_equivalent: HashMap<(usize, usize, usize), bool>,
@@ -656,6 +675,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
     fn new(mut input: Input<'a, O>) -> Self {
         let started = (input.now)();
         let generation = crate::cancellation_generation();
+        let team_filter = input.objective.has_team_filter();
         input.k = input.k.max(1);
         let n = input.members.len();
         let s = input.snaps.len();
@@ -796,6 +816,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             input.objective.prepare_dominance(5.0 * maximum);
         }
         let conditional_dominance = input.objective.conditional_snap_dominance()
+            && !team_filter
             && !input.disable_snap_dominance
             && !input.objective.preserve_snap_options();
         let mut dominators = vec![vec![Vec::new(); width]; n];
@@ -827,7 +848,8 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                     .iter()
                     .enumerate()
                     .filter(|&(a, &j)| {
-                        if input.disable_snap_dominance
+                        if team_filter
+                            || input.disable_snap_dominance
                             || input.objective.preserve_snap_options()
                             || (j >= 0 && required_snaps.contains(&(j as usize)))
                         {
@@ -911,6 +933,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             excluded_members,
             best,
             options,
+            team_filter,
             conditional_dominance,
             dominators,
             exchange_equivalent: HashMap::default(),
@@ -1232,7 +1255,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         }
         (totals, powers)
     }
-    fn evaluate_seed(&mut self, seed: Team) -> Result<(), String> {
+    fn evaluate_seed(&mut self, seed: Team) -> Result<bool, String> {
         let (totals, powers) = self.seed_values(&seed);
         let power = totals.power;
         if self
@@ -1246,7 +1269,10 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                 .max_bonus
                 .is_some_and(|b| totals.bonus > b)
         {
-            return Ok(());
+            return Ok(false);
+        }
+        if self.team_filter && !self.input.objective.feasible_team(&seed, power)? {
+            return Ok(false);
         }
         let exact = self.input.objective.exact(&seed, power, &powers)?;
         self.stats.exact += 1;
@@ -1263,7 +1289,8 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                 high: exact.key,
             },
             exact,
-        )
+        )?;
+        Ok(true)
     }
     fn rematch_seed(
         &mut self,
@@ -1393,23 +1420,23 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             })?;
             self.stats.add(&warm.stats);
             for hit in warm.hits {
-                if self.seed_valid(&hit.team) {
-                    self.evaluate_seed(hit.team.clone())?;
-                    if alternate {
-                        let (totals, powers) = self.seed_values(&hit.team);
-                        let exact = self
-                            .input
-                            .objective
-                            .exact(&hit.team, totals.power, &powers)?;
-                        self.stats.exact += 1;
-                        let rank = [
-                            exact.detail["directMean"].as_f64().unwrap_or(0.0),
-                            exact.detail["otherMean"].as_f64().unwrap_or(0.0),
-                            exact.detail["scores"]["mean"].as_f64().unwrap_or(0.0),
-                        ];
-                        if direct_start.as_ref().is_none_or(|(_, best)| rank > *best) {
-                            direct_start = Some((hit.team, rank));
-                        }
+                if self.seed_valid(&hit.team)
+                    && self.evaluate_seed(hit.team.clone())?
+                    && alternate
+                {
+                    let (totals, powers) = self.seed_values(&hit.team);
+                    let exact = self
+                        .input
+                        .objective
+                        .exact(&hit.team, totals.power, &powers)?;
+                    self.stats.exact += 1;
+                    let rank = [
+                        exact.detail["directMean"].as_f64().unwrap_or(0.0),
+                        exact.detail["otherMean"].as_f64().unwrap_or(0.0),
+                        exact.detail["scores"]["mean"].as_f64().unwrap_or(0.0),
+                    ];
+                    if direct_start.as_ref().is_none_or(|(_, best)| rank > *best) {
+                        direct_start = Some((hit.team, rank));
                     }
                 }
                 if self.hits.first().is_some_and(|hit| {
@@ -1464,6 +1491,9 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                         .max_bonus
                         .is_some_and(|bonus| totals.bonus > bonus)
                 {
+                    continue;
+                }
+                if self.team_filter && !self.input.objective.feasible_team(&origin, totals.power)? {
                     continue;
                 }
                 let initial = self.input.objective.exact(&origin, totals.power, &powers)?;
@@ -1635,6 +1665,11 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                                         .objective
                                         .leaf_bound(&next, totals)
                                         .is_some_and(|upper| upper < next_value.0)
+                            {
+                                continue;
+                            }
+                            if self.team_filter
+                                && !self.input.objective.feasible_team(&next, totals.power)?
                             {
                                 continue;
                             }
@@ -2471,6 +2506,9 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         {
             return Ok(());
         }
+        if self.team_filter && !self.input.objective.feasible_team(&team, totals.power)? {
+            return Ok(());
+        }
         let (low, high) = self.input.objective.interval(&team, totals);
         if high < self.assignment_limit(a) || self.cannot_improve_set(a, high) {
             return Ok(());
@@ -2769,7 +2807,8 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         if upper < self.assignment_limit(&a) || self.cannot_improve_set(&a, upper) {
             return Ok(());
         }
-        if self.input.objective.linear_assignment().is_some()
+        if !self.team_filter
+            && self.input.objective.linear_assignment().is_some()
             && (a.required_snaps.is_empty()
                 || a.required_snaps.len() == 5
                     && a.options.iter().all(|choices| {
@@ -3124,6 +3163,11 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                 0,
             );
             self.unexplored = self.unexplored.max(bound);
+            return Ok(());
+        }
+        if self.team_filter
+            && !self.input.objective.feasible_assignment(&a.team, &a.assigned, slot, &a.options)
+        {
             return Ok(());
         }
         let required_left = a.required_snaps.iter().filter(|&&j| !a.used[j]).count();
@@ -3493,7 +3537,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         });
         let mut leader_group = vec![usize::MAX; n];
         let mut leader_rank = vec![usize::MAX; n];
-        if self.input.objective.canonical_leader() {
+        if !self.team_filter && self.input.objective.canonical_leader() {
             let mut groups = HashMap::default();
             for (rank, &leader) in leaders.iter().enumerate() {
                 let profile = self.profile(leader);
@@ -3609,7 +3653,8 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                     groups.push((ch, vec![i]));
                 }
             }
-            if self.input.objective.needs_power_cap()
+            if !self.team_filter
+                && self.input.objective.needs_power_cap()
                 && !self.input.objective.preserve_snap_options()
             {
                 for (_, list) in &mut groups {
@@ -3992,7 +4037,7 @@ pub(crate) fn search_at<O: Objective + ?Sized>(
             stats: Stats::default(),
         });
     }
-    if !feasible(&input) {
+    if input.objective.team_filter_impossible() || !feasible(&input) {
         return Ok(Output {
             hits: Vec::new(),
             proven: true,

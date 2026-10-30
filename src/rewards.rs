@@ -5884,6 +5884,8 @@ struct RewardGrid {
 }
 pub struct RewardObjective<'a> {
     pub(crate) live_floor: bool,
+    just_window: Option<crate::just_window::Prepared>,
+    just_window_options: Vec<Vec<i32>>,
     exact_cache: HashMap<SettlementKey, (f64, serde_json::Value)>,
     exact_order: VecDeque<SettlementKey>,
     master: &'a Master,
@@ -6032,6 +6034,38 @@ pub struct RewardObjective<'a> {
     member_dominance: HashMap<(usize, usize), MemberDominance>,
 }
 impl<'a> RewardObjective<'a> {
+    pub(crate) fn set_min_just_window(&mut self, minimum: f64) -> Result<(), String> {
+        if !self.gekiso.setup.missions.contains(&3) {
+            return Ok(());
+        }
+        let seeds: Vec<_> = (0..self.samples.max(0)).collect();
+        let prepared = crate::just_window::Prepared::new(
+            self.master,
+            &self.gekiso,
+            self.members,
+            self.snaps,
+            minimum,
+            &seeds,
+        )?;
+        if prepared.active() {
+            self.just_window = Some(prepared);
+            self.allow_dominance = false;
+        }
+        Ok(())
+    }
+    fn with_just_window(&mut self, team: &Team, power: i32, mut exact: Exact) -> Result<Exact, String> {
+        if let Some(prepared) = &mut self.just_window {
+            if let Some(window) = prepared.measure(self.master, &self.gekiso, team, power)? {
+                exact.detail["justWindow"] = json!(window);
+            }
+        }
+        Ok(exact)
+    }
+    fn just_window_possible(&self, members: &[usize], assigned: &[i32], from: usize) -> bool {
+        self.just_window.as_ref().is_none_or(|prepared| {
+            prepared.possible(members, assigned, from, &self.just_window_options)
+        })
+    }
     pub(crate) fn score_upper(&self, totals: Totals) -> f64 {
         up(totals.power * self.coefficient)
     }
@@ -6207,6 +6241,8 @@ impl<'a> RewardObjective<'a> {
         Self {
             exact_cache: HashMap::default(),
             live_floor: false,
+            just_window: None,
+            just_window_options: Vec::new(),
             exact_order: VecDeque::new(),
             master,
             members,
@@ -6366,6 +6402,9 @@ impl<'a> RewardObjective<'a> {
         slots: &[f64],
         cutoff: f64,
     ) -> Result<Option<Exact>, String> {
+        if !self.feasible_team(team, power)? {
+            return Ok(None);
+        }
         let bonus = team
             .members
             .iter()
@@ -6456,7 +6495,7 @@ impl<'a> RewardObjective<'a> {
         self.clear_assignment_certificates();
         self.reward_target = Some(target);
         self.rank_other = true;
-        self.allow_dominance = proven;
+        self.allow_dominance = proven && self.just_window.is_none();
         self.prepare_bonus_ceilings();
         self.combo_member_floor = None;
         self.member_snapshot_floor(f64::NEG_INFINITY);
@@ -6466,7 +6505,7 @@ impl<'a> RewardObjective<'a> {
         self.other_target = Some(target);
         self.other_exchange = exchange;
         self.other_bonus_floors.clear();
-        self.allow_dominance = proven;
+        self.allow_dominance = proven && self.just_window.is_none();
         self.reward_curves.clear();
         self.settlement_values.clear();
         self.prepare_bonus_frontier(target);
@@ -6744,7 +6783,7 @@ impl<'a> RewardObjective<'a> {
         self.reward_target = Some(target);
         self.rank_other = false;
         self.other_target = Some(other);
-        self.allow_dominance = proven;
+        self.allow_dominance = proven && self.just_window.is_none();
         self.prepare_bonus_frontier(other);
         self.prepare_bonus_ceilings();
         self.combo_member_floor = None;
@@ -9950,6 +9989,23 @@ impl<'a> RewardObjective<'a> {
     }
 }
 impl Objective for RewardObjective<'_> {
+    fn feasible_assignment(&self, members: &[usize], assigned: &[i32], from: usize, options: &[Vec<i32>]) -> bool {
+        self.just_window.as_ref().is_none_or(|window| window.possible(members, assigned, from, options))
+    }
+    fn has_team_filter(&self) -> bool {
+        self.just_window.is_some()
+    }
+    fn team_filter_impossible(&self) -> bool {
+        self.just_window
+            .as_ref()
+            .is_some_and(crate::just_window::Prepared::impossible)
+    }
+    fn feasible_team(&mut self, team: &Team, power: f64) -> Result<bool, String> {
+        match &mut self.just_window {
+            Some(prepared) => prepared.allows(self.master, &self.gekiso, team, power as i32),
+            None => Ok(true),
+        }
+    }
     fn live_floor(&self) -> bool {
         self.live_floor
     }
@@ -10569,6 +10625,12 @@ impl Objective for RewardObjective<'_> {
         }
     }
     fn prepare_assignment(&mut self, _members: &[usize], options: &[Vec<i32>]) {
+        if self.just_window.is_some() {
+            self.just_window_options.resize_with(options.len(), Vec::new);
+            for (row, choices) in self.just_window_options.iter_mut().zip(options) {
+                row.clone_from(choices);
+            }
+        }
         self.empty_options = None;
         self.lottery_support.clear();
         self.empty_root_bonus = None;
@@ -10719,6 +10781,9 @@ impl Objective for RewardObjective<'_> {
         assigned: &[i32],
         from: usize,
     ) -> Option<f64> {
+        if !self.just_window_possible(members, assigned, from) {
+            return Some(f64::NEG_INFINITY);
+        }
         if from == 5 && self.member_combo_caps.is_some() {
             let mean = self.assignment_model()?.score_ceiling(
                 members,
@@ -10766,6 +10831,9 @@ impl Objective for RewardObjective<'_> {
         from: usize,
         limit: f64,
     ) -> Option<f64> {
+        if !self.just_window_possible(members, assigned, from) {
+            return Some(f64::NEG_INFINITY);
+        }
         let certificate = (from == 0).then_some(self.assignment_certificate).flatten();
         if from == 0 {
             if let Some(bound) = self.certified_assignment_bound(self.assignment_power, limit) {
@@ -11210,6 +11278,7 @@ impl Objective for RewardObjective<'_> {
         let exact = self
             .settle_cached(team, power as i32, None, None)?
             .ok_or_else(|| "gekiso-reward-unexpected-cutoff".to_owned())?;
+        let exact = self.with_just_window(team, power as i32, exact)?;
         Ok(self.ranked(exact))
     }
     fn evaluate(
@@ -11230,7 +11299,10 @@ impl Objective for RewardObjective<'_> {
             .unwrap_or(cutoff);
         Ok(
             match self.settle_cached(team, power as i32, Some(reward_cutoff), Some(cutoff))? {
-                Some(exact) => Evaluation::Exact(self.ranked(exact)),
+                Some(exact) => {
+                    let exact = self.with_just_window(team, power as i32, exact)?;
+                    Evaluation::Exact(self.ranked(exact))
+                }
                 None if self.reward_target.is_some() => Evaluation::Pruned(-1.0),
                 None => Evaluation::Pruned(if cutoff.prune_equal {
                     cutoff.key

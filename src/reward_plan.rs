@@ -804,6 +804,24 @@ impl<'a> Ranked<'a> {
 }
 
 impl Objective for Ranked<'_> {
+    fn has_team_filter(&self) -> bool {
+        self.source.view().has_team_filter()
+    }
+    fn team_filter_impossible(&self) -> bool {
+        self.source.view().team_filter_impossible()
+    }
+    fn feasible_team(&mut self, team: &Team, power: f64) -> Result<bool, String> {
+        self.source.objective().feasible_team(team, power)
+    }
+    fn feasible_assignment(
+        &self,
+        members: &[usize],
+        assigned: &[i32],
+        from: usize,
+        options: &[Vec<i32>],
+    ) -> bool {
+        self.source.view().feasible_assignment(members, assigned, from, options)
+    }
     fn score_ties(&self) -> bool {
         true
     }

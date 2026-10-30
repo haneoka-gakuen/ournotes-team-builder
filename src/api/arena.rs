@@ -243,7 +243,8 @@ impl Engine {
                 &json!({"song":null,"hits":hits.iter().map(|hit|arena_hit(hit, &songs, &compiled, &cards.members, &cards.snaps)).collect::<Vec<_>>()}),
             );
         };
-        let floor = if self.trusted_scores {
+        let minimum_just_window = crate::just_window::target(&goal["minJustWindowMs"])?;
+        let floor = if self.trusted_scores && minimum_just_window.is_none() {
             request["floors"][format!(
                 "{}:{}",
                 master::int(&songs[0]["songId"]),
@@ -255,6 +256,7 @@ impl Engine {
             f64::NEG_INFINITY
         };
         let seeded = self.trusted_scores
+            && minimum_just_window.is_none()
             && request["seeded"] == true
             && master::number(&request["k"], 1.0) == 1.0;
         if seeded && (!floor.is_finite() || initial.is_empty()) {
@@ -270,6 +272,7 @@ impl Engine {
                 constraints: constraints(&request["constraints"], &cards.members, &cards.snaps),
                 now,
                 generation: crate::cancellation_generation(),
+                min_just_window_ms: minimum_just_window,
             },
             charts: &mut charts,
             music: &music,
@@ -281,6 +284,7 @@ impl Engine {
             min_combo_bonus: master::int(&goal["minComboBonus"]),
             seeded,
             cooperative_floor: self.trusted_scores
+                && minimum_just_window.is_none()
                 && request["cooperativeFloor"] == true
                 && master::number(&request["k"], 1.0) == 1.0,
             floor,

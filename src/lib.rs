@@ -9,6 +9,7 @@ pub mod full;
 pub mod gekiso;
 pub mod gekiso_objective;
 mod just_bound;
+pub(crate) mod just_window;
 pub mod live;
 pub mod luck;
 pub mod master;

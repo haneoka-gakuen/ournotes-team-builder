@@ -475,6 +475,20 @@ impl Engine {
         if let Some(ranges) = range_scores {
             result["score"]["rangeScores"] = ranges;
         }
+        if is_gekiso {
+            if let Some(minimum) = crate::just_window::target(&request["gekiso"]["minJustWindowMs"])? {
+                let source = self.sources.get(&(song_id, difficulty)).ok_or("missing-chart")?;
+                let accuracy = serde_json::from_value(request["gekiso"]["accuracy"].clone()).map_err(|e| e.to_string())?;
+                let mut gk = crate::gekiso::Chart::new(&self.master, source, chart.difficulty.play_level, chart.song.missions.clone(), accuracy, gekiso_ranks(&request["gekiso"]))?;
+                gk.music_type = music.music_type;
+                let selected_snaps: Vec<_> = snaps.iter().flatten().cloned().collect();
+                let mut snap_index = 0;
+                let selected = crate::search::Team { members: (0..5).collect(), snaps: snaps.iter().map(|snap| if snap.is_some() { let index = snap_index; snap_index += 1; index } else { -1 }).collect() };
+                let seeds: Vec<_> = (0..master::int(&request["gekiso"]["seeds"]).max(0)).collect();
+                let mut prepared = crate::just_window::Prepared::new(&self.master, &gk, &members, &selected_snaps, minimum, &seeds)?;
+                if let Some(window) = prepared.measure_full(&self.master, &gk, &selected, power.total as i32)? { result["justWindow"] = json!(window); }
+            }
+        }
         Ok(result)
     }
 }
@@ -1596,9 +1610,10 @@ impl Engine {
             ))
         };
         chart.music_type = music.music_type;
-        let floor = request["floors"][format!("{song_id}:{difficulty}")]
-            .as_f64()
-            .unwrap_or(f64::NEG_INFINITY);
+        let minimum_just_window = crate::just_window::target(&goal["minJustWindowMs"])?;
+        let floor = if minimum_just_window.is_some() { f64::NEG_INFINITY } else {
+            request["floors"][format!("{song_id}:{difficulty}")].as_f64().unwrap_or(f64::NEG_INFINITY)
+        };
         let initial = seed_teams(request, song, &cards.members, &cards.snaps);
         let identity = request["requestId"]
             .as_str()
@@ -1629,6 +1644,7 @@ impl Engine {
             })
             .unwrap_or_default();
         let cooperative_floor = self.trusted_scores
+            && minimum_just_window.is_none()
             && identity.is_some()
             && k == 1
             && criterion == Criterion::Max
@@ -1655,6 +1671,7 @@ impl Engine {
                     constraints: constraints.clone(),
                     now,
                     generation,
+                    min_just_window_ms: minimum_just_window,
                 },
                 chart: &mut chart,
                 seeds: seeds.clone(),
@@ -1713,7 +1730,10 @@ impl Engine {
                 .unwrap(),
             source,
         );
-        let hits:Vec<_>=output.hits.iter().map(|hit|{if hit.detail["pendingScores"] == true { return json!({"comboBonus":hit.detail["comboBonus"],"song":song,"members":hit.team.members.iter().map(|&i|cards.members[i].key.clone()).collect::<Vec<_>>(),"snaps":hit.team.snaps.iter().map(|&j|if j<0{None}else{Some(cards.snaps[j as usize].key.clone())}).collect::<Vec<_>>(),"power":hit.power,"slotPowers":hit.slot_powers,"key":hit.key,"score":null,"pendingScores":true}); } let scores=&hit.detail["scores"];let values:Vec<_>=master::rows(&scores["scores"]).iter().map(|v|master::number(v,0.0)).collect();let mut sorted=values.clone();sorted.sort_by(f64::total_cmp);let mut ranks:BTreeMap<i32,i32>=BTreeMap::new();for &value in &values{*ranks.entry(crate::chart::battle_rank(&compiled,value)).or_default()+=1;}let keys=|order:usize|live::orders()[order].map(|slot|cards.members[hit.team.members[slot]].key.clone());json!({"comboBonus":hit.detail["comboBonus"],"song":song,"members":hit.team.members.iter().map(|&i|cards.members[i].key.clone()).collect::<Vec<_>>(),"snaps":hit.team.snaps.iter().map(|&j|if j<0{None}else{Some(cards.snaps[j as usize].key.clone())}).collect::<Vec<_>>(),"power":hit.power,"slotPowers":hit.slot_powers,"key":hit.key,"score":{"mean":scores["mean"],"min":scores["min"],"max":scores["max"],"median":(sorted[59]+sorted[60])/2.0,"worstOrder":keys(master::int(&scores["minOrder"]) as usize),"bestOrder":keys(master::int(&scores["maxOrder"]) as usize),"orders":values.iter().map(|v|crate::num::round(*v)).collect::<Vec<_>>(),"ranks":ranks,"rangeScores":scores["rangeScores"]}})}).collect();
+        let mut hits:Vec<_>=output.hits.iter().map(|hit|{if hit.detail["pendingScores"] == true { return json!({"comboBonus":hit.detail["comboBonus"],"song":song,"members":hit.team.members.iter().map(|&i|cards.members[i].key.clone()).collect::<Vec<_>>(),"snaps":hit.team.snaps.iter().map(|&j|if j<0{None}else{Some(cards.snaps[j as usize].key.clone())}).collect::<Vec<_>>(),"power":hit.power,"slotPowers":hit.slot_powers,"key":hit.key,"score":null,"pendingScores":true}); } let scores=&hit.detail["scores"];let values:Vec<_>=master::rows(&scores["scores"]).iter().map(|v|master::number(v,0.0)).collect();let mut sorted=values.clone();sorted.sort_by(f64::total_cmp);let mut ranks:BTreeMap<i32,i32>=BTreeMap::new();for &value in &values{*ranks.entry(crate::chart::battle_rank(&compiled,value)).or_default()+=1;}let keys=|order:usize|live::orders()[order].map(|slot|cards.members[hit.team.members[slot]].key.clone());json!({"comboBonus":hit.detail["comboBonus"],"song":song,"members":hit.team.members.iter().map(|&i|cards.members[i].key.clone()).collect::<Vec<_>>(),"snaps":hit.team.snaps.iter().map(|&j|if j<0{None}else{Some(cards.snaps[j as usize].key.clone())}).collect::<Vec<_>>(),"power":hit.power,"slotPowers":hit.slot_powers,"key":hit.key,"score":{"mean":scores["mean"],"min":scores["min"],"max":scores["max"],"median":(sorted[59]+sorted[60])/2.0,"worstOrder":keys(master::int(&scores["minOrder"]) as usize),"bestOrder":keys(master::int(&scores["maxOrder"]) as usize),"orders":values.iter().map(|v|crate::num::round(*v)).collect::<Vec<_>>(),"ranks":ranks,"rangeScores":scores["rangeScores"]}})}).collect();
+        for (hit, row) in output.hits.iter().zip(&mut hits) {
+            if hit.detail["justWindow"].is_object() { row["justWindow"] = hit.detail["justWindow"].clone(); }
+        }
         self.gekiso_cache.replace(Some((cache_key, chart)));
         Ok(
             json!({"results":[{"song":song,"hits":hits,"proven":output.proven,"bound":output.bound,"stats":output.stats}],"overall":hits,"unknownCards":cards.unknown,"elapsedMs":now()-started}),
@@ -2794,6 +2814,9 @@ impl Engine {
             master::int(&goal["gekiso"]["luckSamples"]),
             exchange,
         );
+        if let Some(minimum) = crate::just_window::target(&goal["gekiso"]["minJustWindowMs"])? {
+            objective.set_min_just_window(minimum)?;
+        }
         let deadline = request["deadline"].as_f64().unwrap_or_else(|| {
             request["timeLimitMs"]
                 .as_f64()
@@ -2894,6 +2917,7 @@ impl Engine {
             .to_string()
         });
         objective.live_floor = self.trusted_scores
+            && crate::just_window::target(&goal["gekiso"]["minJustWindowMs"])?.is_none()
             && identity.is_some()
             && (phase.is_some() || single_lex)
             && request["noFloor"] != true
@@ -3380,6 +3404,9 @@ impl Engine {
                     master::int(&goal["gekiso"]["luckSamples"]),
                     None,
                 );
+                if let Some(minimum) = crate::just_window::target(&goal["gekiso"]["minJustWindowMs"])? {
+                    secondary.set_min_just_window(minimum)?;
+                }
                 secondary.constrain_other(target, exchange, output.proven);
                 Some(secondary)
             } else {
@@ -3502,6 +3529,7 @@ fn hit_json(
     battle: bool,
 ) -> Value {
     let mut value = json!({"song":song,"members":hit.team.members.iter().map(|&i|&members[i].key).collect::<Vec<_>>(),"snaps":hit.team.snaps.iter().map(|&j|if j<0{None}else{Some(&snaps[j as usize].key)}).collect::<Vec<_>>(),"power":hit.power,"slotPowers":hit.slot_powers,"key":hit.key,"score":null,"skipScore":null,"event":null,"potential":null});
+    if hit.detail["justWindow"].is_object() { value["justWindow"] = hit.detail["justWindow"].clone(); }
     if let Some(chart) = chart.filter(|_| !hit.detail["scores"].is_null()) {
         let scores = &hit.detail["scores"];
         let values: Vec<_> = master::rows(&scores["scores"])
