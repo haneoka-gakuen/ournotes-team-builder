@@ -2,12 +2,12 @@
 use crate::{
     chart::Source,
     full::{
-        conditions::{Context as CheckContext, Factory, Performer},
+        conditions::{performer_matches, Context as CheckContext, Factory, Performer},
         core::{self, Life, Random},
         gekisou,
         model::{LuckRecord, Model, Params},
         play::{self, Accuracy, LiveNote, Setup},
-        score::note_factor_mill,
+        score::{note_factor_mill, Calculator, FactorCommand, Incremental, ReplayCommand},
     },
     live::{self, Scores, Slot},
     luck,
@@ -89,6 +89,7 @@ pub struct Context {
     pub(crate) factor_commands: usize,
     pub(crate) factor_peak: f64,
     pub(crate) rush_changes: usize,
+    pub(crate) rush_trace: Option<Vec<ReplayCommand>>,
     pub draws: Vec<Arc<Context>>,
     pub nominal: Option<Nominal>,
 }
@@ -103,6 +104,9 @@ impl Context {
             .iter()
             .map(|draw| draw.retained_bytes())
             .sum::<usize>();
+        if let Some(trace) = &self.rush_trace {
+            bytes += trace.capacity() * std::mem::size_of::<ReplayCommand>();
+        }
         if let Some(nominal) = &self.nominal {
             bytes += std::mem::size_of::<Nominal>()
                 + nominal
@@ -581,8 +585,16 @@ pub fn context_fixed(
             batch
                 .iter()
                 .map(|&seed| {
-                    context_fixed_observed(master, chart, deck, &[seed], false, Some(&initial))
-                        .map(|(context, _)| Arc::new(context))
+                    context_fixed_observed(
+                        master,
+                        chart,
+                        deck,
+                        &[seed],
+                        false,
+                        false,
+                        Some(&initial),
+                    )
+                    .map(|(context, _)| Arc::new(context))
                 })
                 .collect::<Result<Vec<_>, String>>()
         })?
@@ -610,12 +622,14 @@ pub fn context_fixed(
                 .map(|draw| draw.factor_peak)
                 .fold(0.0, f64::max),
             rush_changes: draws.iter().map(|draw| draw.rush_changes).sum(),
+            rush_trace: None,
             seeds: draws.len(),
             draws,
             nominal: None,
         });
     }
-    context_fixed_observed(master, chart, deck, seeds, false, None).map(|(context, _)| context)
+    context_fixed_observed(master, chart, deck, seeds, false, false, None)
+        .map(|(context, _)| context)
 }
 pub(crate) fn context_fixed_rush(
     master: &Master,
@@ -623,7 +637,347 @@ pub(crate) fn context_fixed_rush(
     deck: &[Performer],
     seed: i32,
 ) -> Result<(Context, Vec<bool>), String> {
-    context_fixed_observed(master, chart, deck, &[seed], true, None)
+    context_fixed_observed(master, chart, deck, &[seed], true, false, None)
+}
+pub(crate) fn context_fixed_luck_trace(
+    master: &Master,
+    chart: &Chart,
+    deck: &[Performer],
+    seeds: &[i32],
+) -> Result<Context, String> {
+    if seeds.len() == 1 {
+        return context_fixed_observed(master, chart, deck, seeds, false, true, None)
+            .map(|(context, _)| context);
+    }
+    let draws = crate::parallel::map(seeds, |&seed| {
+        context_fixed_observed(master, chart, deck, &[seed], false, true, None)
+            .map(|(context, _)| Arc::new(context))
+    })?;
+    let last = draws.last().unwrap();
+    let average = |select: fn(&Context) -> &[f64]| {
+        (0..chart.notes.len())
+            .map(|i| draws.iter().map(|draw| select(draw)[i]).sum::<f64>() / draws.len() as f64)
+            .collect()
+    };
+    Ok(Context {
+        judgement: last.judgement.clone(),
+        gk: last.gk.clone(),
+        up: average(|draw| &draw.up),
+        luck: average(|draw| &draw.luck),
+        factor_commands: draws
+            .iter()
+            .map(|draw| draw.factor_commands)
+            .max()
+            .unwrap_or(0),
+        factor_peak: draws
+            .iter()
+            .map(|draw| draw.factor_peak)
+            .fold(0.0, f64::max),
+        rush_changes: draws.iter().map(|draw| draw.rush_changes).sum(),
+        rush_trace: None,
+        seeds: draws.len(),
+        draws,
+        nominal: None,
+    })
+}
+pub(crate) struct RushSupportPlan {
+    pub(crate) deck: Vec<Performer>,
+    pub(crate) rows: Vec<(i32, i32)>,
+}
+impl RushSupportPlan {
+    pub(crate) fn new(master: &Master, chart: &Chart, deck: &[Performer]) -> Option<Self> {
+        if !chart.luck
+            || chart.setup.missions.iter().any(|&mission| mission != 2)
+            || chart.accuracy.great != 0.0
+            || chart.accuracy.miss_every != 0
+        {
+            return None;
+        }
+        let mut stripped: Vec<_> = deck.iter().map(Performer::gekiso_only).collect();
+        let mut rows = Vec::new();
+        let mut removed = false;
+        for (slot, actor) in deck.iter().enumerate() {
+            if actor.gekisou_skill.is_none()
+                && actor.mission_only.is_none_or(|mission| mission == 0)
+            {
+                continue;
+            }
+            if let Some((id, level)) = actor.gekisou_skill {
+                let skill = master.gekiso_skills.get(&id)?;
+                if (skill.mission_type == 2 || skill.mission_type == 4)
+                    && !skill
+                        .effects
+                        .iter()
+                        .filter(|row| row.level == level)
+                        .all(|row| lottery_row(master, row))
+                {
+                    return None;
+                }
+            }
+            let mut supports = Vec::new();
+            for &(id, level) in &actor.gekisou_support_skills {
+                let skill = master.gekiso_support_skills.get(&id)?;
+                if skill.mission_type != 2 && skill.mission_type != 4 {
+                    supports.push((id, level));
+                    continue;
+                }
+                let mut effects: Vec<_> = skill
+                    .effects
+                    .iter()
+                    .filter(|row| row.level == level)
+                    .collect();
+                effects.sort_by_key(|row| row.id);
+                effects.sort_by_key(|row| {
+                    row.id
+                        .wrapping_mul(100)
+                        .wrapping_add(50)
+                        .wrapping_add(slot as i32)
+                });
+                if effects.windows(2).any(|pair| {
+                    pair[0]
+                        .id
+                        .wrapping_mul(100)
+                        .wrapping_add(50)
+                        .wrapping_add(slot as i32)
+                        == pair[1]
+                            .id
+                            .wrapping_mul(100)
+                            .wrapping_add(50)
+                            .wrapping_add(slot as i32)
+                }) {
+                    return None;
+                }
+                let compiled = (skill.mission_type == 2)
+                    .then(|| {
+                        effects
+                            .iter()
+                            .map(|row| score_support_row(master, row, actor))
+                            .collect::<Option<Vec<_>>>()
+                    })
+                    .flatten();
+                if let Some(coefficients) = compiled {
+                    removed = true;
+                    rows.extend(
+                        coefficients
+                            .into_iter()
+                            .flatten()
+                            .map(|mill| (slot as i32 * 100 + 2, mill)),
+                    );
+                } else {
+                    if !effects.iter().all(|row| lottery_row(master, row)) {
+                        return None;
+                    }
+                    supports.push((id, level));
+                }
+            }
+            stripped[slot].gekisou_support_skills = supports;
+        }
+        removed.then_some(Self {
+            deck: stripped,
+            rows,
+        })
+    }
+    pub(crate) fn apply(&self, master: &Master, chart: &Chart, base: &Context) -> Option<Context> {
+        if !base.draws.is_empty() {
+            let draws = base
+                .draws
+                .iter()
+                .map(|draw| self.apply(master, chart, draw).map(Arc::new))
+                .collect::<Option<Vec<_>>>()?;
+            let mut result = base.clone();
+            result.up = (0..chart.notes.len())
+                .map(|i| draws.iter().map(|draw| draw.up[i]).sum::<f64>() / draws.len() as f64)
+                .collect();
+            result.factor_commands = draws
+                .iter()
+                .map(|draw| draw.factor_commands)
+                .max()
+                .unwrap_or(0);
+            result.factor_peak = draws
+                .iter()
+                .map(|draw| draw.factor_peak)
+                .fold(0.0, f64::max);
+            result.draws = draws;
+            return Some(result);
+        }
+        if base.factor_commands != 0 {
+            return None;
+        }
+        let trace = base.rush_trace.as_ref()?;
+        let params = chart.params();
+        let mut calculator = Calculator::new(
+            &master.live,
+            params.power,
+            params.level,
+            params.converted,
+            params.assist,
+        );
+        calculator.factors_only = true;
+        let mut score = Incremental::new(calculator, params.music_length);
+        let index: HashMap<_, _> = chart
+            .notes
+            .iter()
+            .enumerate()
+            .map(|(i, note)| (note.id, i))
+            .collect();
+        let combo = core::Combo::default();
+        for command in trace {
+            match command {
+                ReplayCommand::Note(note) => {
+                    score.add_note(note.time, note.life, note.id, note.op, note.score_type)
+                }
+                ReplayCommand::Factor(factor) => score.add_factor(factor.clone()),
+                ReplayCommand::Calculate(time) => {
+                    score.calculate(*time, &combo, None).ok()?;
+                }
+                ReplayCommand::Rush(time, delta) => {
+                    if *time < 0 || core::frame(*time) as usize >= score.max_frame {
+                        return None;
+                    }
+                    for &(owner, mill) in &self.rows {
+                        score.add_factor(FactorCommand {
+                            time: *time,
+                            owner,
+                            note: mill.wrapping_mul(*delta),
+                            ..FactorCommand::default()
+                        });
+                    }
+                }
+            }
+        }
+        let mut result = Context {
+            judgement: base.judgement.clone(),
+            gk: base.gk.clone(),
+            up: base.up.clone(),
+            luck: base.luck.clone(),
+            factor_commands: base.factor_commands,
+            factor_peak: base.factor_peak,
+            rush_changes: base.rush_changes,
+            seeds: base.seeds,
+            draws: Vec::new(),
+            nominal: base.nominal.clone(),
+            rush_trace: None,
+        };
+        for (id, observation) in &score.calculator.observations {
+            let &i = index.get(id)?;
+            result.up[i] = base.luck[i] * observation.note;
+        }
+        let commands = score.note_factor_commands();
+        result.factor_commands = commands.len();
+        result.factor_peak = 0.0;
+        let mut prefix = 1.0;
+        for &(_, mill) in &commands {
+            prefix += f(f(mill as f64) / 100000.0);
+            result.factor_peak = result.factor_peak.max(prefix.abs());
+        }
+        result.rush_trace = None;
+        Some(result)
+    }
+}
+fn lottery_row(master: &Master, row: &crate::master::SkillEffect) -> bool {
+    (11000..=11005).contains(&row.kind)
+        && row.cumulative_id == 0
+        && [
+            row.trigger_group,
+            row.condition_group,
+            row.release_group,
+            row.reset_group,
+        ]
+        .iter()
+        .all(|group| {
+            *group == 0
+                || master.condition_sets.get(group).is_some_and(|sets| {
+                    sets.iter().flatten().all(|id| {
+                        master.conditions.get(id).is_some_and(|condition| {
+                            [
+                                0, 1000, 1010, 1020, 1030, 1040, 2000, 2001, 2002, 2003, 3000,
+                                3001, 4000, 4001, 4002, 4007, 4008, 4009, 4010, 4011, 4012, 5000,
+                                5020, 5021, 7000, 7001, 7002, 7003, 7004, 7005, 7006, 7007, 7010,
+                                7011, 7013, 7020, 7021,
+                            ]
+                            .contains(&condition.kind)
+                        })
+                    })
+                })
+        })
+}
+fn score_support_row(
+    master: &Master,
+    row: &crate::master::SkillEffect,
+    actor: &Performer,
+) -> Option<Option<i32>> {
+    if row.kind != 2000
+        || row.trigger_type != 2
+        || row.seconds != 0.0
+        || row.value < 0
+        || row.execute_limit != 0
+        || row.reset_group != 0
+        || row.release_group != 0
+        || row.cumulative_id != 0
+        || row.limit_count != 0
+        || row.max_value != 0
+        || !row.targets.is_empty()
+    {
+        return None;
+    }
+    let sets = master.condition_sets.get(&row.trigger_group)?;
+    if sets.len() != 1 || sets[0].len() != 1 {
+        return None;
+    }
+    let trigger = master.conditions.get(&sets[0][0])?;
+    if trigger.kind != 7021
+        || !trigger.positive
+        || !trigger.values.is_empty()
+        || !trigger.targets.is_empty()
+    {
+        return None;
+    }
+    let mut active = row.condition_group == 0;
+    if row.condition_group != 0 {
+        let sets = master.condition_sets.get(&row.condition_group)?;
+        if sets.is_empty() || sets.iter().any(Vec::is_empty) {
+            return None;
+        }
+        for set in sets {
+            let mut all = true;
+            for id in set {
+                let condition = master.conditions.get(id)?;
+                if condition.kind != 5000 || !condition.values.is_empty() {
+                    return None;
+                }
+                let mut matches = false;
+                for target in &condition.targets {
+                    matches |= performer_matches(actor, master.targets.get(target)?);
+                }
+                all &= matches == condition.positive;
+            }
+            active |= all;
+        }
+    }
+    Some(active.then(|| note_factor_mill(f(f(row.value as f64) / 10000.0))))
+}
+fn compact_replay(commands: Vec<ReplayCommand>) -> Vec<ReplayCommand> {
+    let mut compact = Vec::with_capacity(commands.len() / 4);
+    for command in commands {
+        if let ReplayCommand::Calculate(time) = command {
+            if compact.len() >= 2 {
+                let n = compact.len();
+                if let (ReplayCommand::Calculate(a), ReplayCommand::Calculate(b)) =
+                    (&compact[n - 2], &compact[n - 1])
+                {
+                    if (*a <= *b && *b <= time) || (*a >= *b && *b >= time) {
+                        compact[n - 1] = ReplayCommand::Calculate(time);
+                        continue;
+                    }
+                }
+            }
+            compact.push(ReplayCommand::Calculate(time));
+        } else {
+            compact.push(command);
+        }
+    }
+    compact.shrink_to_fit();
+    compact
 }
 fn context_fixed_observed<'a>(
     master: &'a Master,
@@ -631,6 +985,7 @@ fn context_fixed_observed<'a>(
     deck: &[Performer],
     seeds: &[i32],
     observe_rush: bool,
+    trace_rush: bool,
     template: Option<&Model<'a>>,
 ) -> Result<(Context, Vec<bool>), String> {
     let n = chart.notes.len();
@@ -654,6 +1009,7 @@ fn context_fixed_observed<'a>(
     let mut factor_commands = 0;
     let mut factor_peak = 0.0_f64;
     let mut rush_changes = 0;
+    let mut rush_trace = None;
     let make_model = |seed| -> Result<Model<'a>, String> {
         let mut model = Model::new(
             master,
@@ -666,6 +1022,10 @@ fn context_fixed_observed<'a>(
         )?;
         if observe_rush {
             model.observe_rush_support()?;
+        }
+        if trace_rush {
+            model.observe_luck_rush_support()?;
+            model.score.score.replay = Some(Vec::new());
         }
         chart.fixed_life(&mut model);
         Ok(model)
@@ -705,6 +1065,9 @@ fn context_fixed_observed<'a>(
                 rush_support[i] |= at > 0 && states[at - 1].1 > 0;
             }
         }
+        if trace_rush {
+            rush_trace = model.score.score.replay.take().map(compact_replay);
+        }
         rush_changes += model.score.score.rush_factor_changes();
         let commands = model.score.score.note_factor_commands();
         factor_commands = factor_commands.max(commands.len());
@@ -741,6 +1104,7 @@ fn context_fixed_observed<'a>(
             factor_commands,
             factor_peak,
             rush_changes,
+            rush_trace,
             seeds: runs.len(),
             draws: Vec::new(),
             nominal: None,
@@ -895,6 +1259,7 @@ fn expected(master: &Master, chart: &mut Chart, deck: &[Performer]) -> Result<Co
         factor_commands: 0,
         factor_peak: 0.0,
         rush_changes: 0,
+        rush_trace: None,
         draws: Vec::new(),
         nominal: Some(Nominal {
             probabilities,
@@ -1054,7 +1419,10 @@ impl Factors {
         }
         let mut index = 0;
         while index < self.climbing.len() {
-            if self.climbing[index].end as i64 > time {index += 1;continue;}
+            if self.climbing[index].end as i64 > time {
+                index += 1;
+                continue;
+            }
             let run = self.climbing.remove(index);
             self.factor = f(self.factor - f(run.applied as f64 / 100000.0));
         }
@@ -1474,7 +1842,12 @@ fn score_orders_selected(
                         }
                     }
                     for factor in &slot.cumulative {
-                        factors.climbing.push(Climbing {end: start + factor.duration_ms(), factor: factor.clone(), count:0, applied:0});
+                        factors.climbing.push(Climbing {
+                            end: start + factor.duration_ms(),
+                            factor: factor.clone(),
+                            count: 0,
+                            applied: 0,
+                        });
                     }
                     if let Some(convert) = &slot.convert {
                         factors.convert_end = Some(
@@ -1496,14 +1869,23 @@ fn score_orders_selected(
             factors.expire(time);
             if prepared <= i {
                 let mut end = i + 1;
-                while end < n && chart.times[end] as i64 == time {end += 1;}
+                while end < n && chart.times[end] as i64 == time {
+                    end += 1;
+                }
                 for judgement in &mut converted[i..end] {
-                    if factors.convert_end.is_some() && factors.convert_left > 0.0 && factors.convert_judgements.contains(judgement) {
-                        *judgement = 5;factors.convert_left -= 1.0;
+                    if factors.convert_end.is_some()
+                        && factors.convert_left > 0.0
+                        && factors.convert_judgements.contains(judgement)
+                    {
+                        *judgement = 5;
+                        factors.convert_left -= 1.0;
                     }
                 }
                 for run in &mut factors.climbing {
-                    run.count += converted[i..end].iter().filter(|j| run.factor.judgements.contains(j)).count() as i32;
+                    run.count += converted[i..end]
+                        .iter()
+                        .filter(|j| run.factor.judgements.contains(j))
+                        .count() as i32;
                     let mill = run.factor.mill(run.count);
                     if mill != run.applied {
                         factors.factor = f(factors.factor - f(run.applied as f64 / 100000.0));

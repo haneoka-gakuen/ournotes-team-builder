@@ -255,12 +255,20 @@ pub struct NoteCommand {
     pub added: i32,
 }
 #[derive(Clone)]
+pub(crate) enum ReplayCommand {
+    Note(NoteCommand),
+    Factor(FactorCommand),
+    Calculate(i32),
+    Rush(i32, i32),
+}
+#[derive(Clone)]
 pub struct Incremental<'a> {
     pub calculator: Calculator<'a>,
     pub max_frame: usize,
     pub notes: Vec<Vec<NoteCommand>>,
     factors: Vec<Vec<FactorCommand>>,
     factor_order: Vec<usize>,
+    pub(crate) replay: Option<Vec<ReplayCommand>>,
     note_order: Vec<usize>,
     diffs: Vec<Diff>,
     previous: i32,
@@ -279,6 +287,7 @@ impl<'a> Incremental<'a> {
             notes: vec![Vec::new(); max_frame],
             factors: vec![Vec::new(); max_frame],
             factor_order: Vec::new(),
+            replay: None,
             note_order: Vec::new(),
             diffs: vec![Diff::default(); max_frame],
             previous: -1,
@@ -335,16 +344,23 @@ impl<'a> Incremental<'a> {
     }
     pub fn add_note(&mut self, time: i32, life: i32, id: i32, op: i32, score_type: i32) {
         let frame = self.file(time);
-        self.notes[frame].push(NoteCommand {
+        let note = NoteCommand {
             time,
             life,
             id,
             op,
             score_type,
             added: 0,
-        });
+        };
+        if let Some(replay) = &mut self.replay {
+            replay.push(ReplayCommand::Note(note.clone()));
+        }
+        self.notes[frame].push(note);
     }
     pub fn add_factor(&mut self, command: FactorCommand) {
+        if let Some(replay) = &mut self.replay {
+            replay.push(ReplayCommand::Factor(command.clone()));
+        }
         let frame = self.file(command.time);
         self.factors[frame].push(command);
     }
@@ -357,6 +373,9 @@ impl<'a> Incremental<'a> {
         combo: &Combo,
         info: Option<&dyn GekisoCombo>,
     ) -> Result<i32, String> {
+        if let Some(replay) = &mut self.replay {
+            replay.push(ReplayCommand::Calculate(time));
+        }
         let to = (core::frame(time).max(0) as usize).min(self.max_frame - 1) as i32;
         let u = if self.added < 0 {
             to

@@ -733,22 +733,29 @@ impl<'a> Model<'a> {
     }
     pub(crate) fn observe_rush_support(&mut self) -> Result<(), String> {
         for gate in [gekisou::MISSION_LUCK, gekisou::MISSION_ALL] {
-            let effect = effects::Effect {
-                id: 0,
-                trigger_type: effects::SUSTAINED,
-                act: 0.0,
-                phase: self.phase(2000),
-                trigger: Some(Checker::new(Test::Rush(false))),
-                condition: None,
-                execute_limit: 0,
-                reset: None,
-                row: 0,
-                cumulative: None,
-                release: None,
-            };
-            self.rush_observers
-                .push(ConditionUpdater::new(vec![effect], Some(gate))?);
+            self.observe_rush_gate(gate)?;
         }
+        Ok(())
+    }
+    pub(crate) fn observe_luck_rush_support(&mut self) -> Result<(), String> {
+        self.observe_rush_gate(gekisou::MISSION_LUCK)
+    }
+    fn observe_rush_gate(&mut self, gate: i32) -> Result<(), String> {
+        let effect = effects::Effect {
+            id: 0,
+            trigger_type: effects::SUSTAINED,
+            act: 0.0,
+            phase: self.phase(2000),
+            trigger: Some(Checker::new(Test::Rush(false))),
+            condition: None,
+            execute_limit: 0,
+            reset: None,
+            row: 0,
+            cumulative: None,
+            release: None,
+        };
+        self.rush_observers
+            .push(ConditionUpdater::new(vec![effect], Some(gate))?);
         Ok(())
     }
     pub(crate) fn observe_combo_support(&mut self) -> Result<bool, String> {
@@ -1108,8 +1115,14 @@ impl<'a> Model<'a> {
                         let state = &observer.updaters[index].state;
                         if state.state == effects::EXECUTE {
                             self.rush_support_commands.push((state.execute_ms, 1));
+                            if let Some(replay) = &mut self.score.score.replay {
+                                replay.push(score::ReplayCommand::Rush(state.execute_ms, 1));
+                            }
                         } else if state.state == effects::END {
                             self.rush_support_commands.push((state.finish_ms, -1));
+                            if let Some(replay) = &mut self.score.score.replay {
+                                replay.push(score::ReplayCommand::Rush(state.finish_ms, -1));
+                            }
                         }
                     }
                 }

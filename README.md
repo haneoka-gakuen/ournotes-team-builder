@@ -358,7 +358,10 @@ caches count allocated capacity and leave oversized projections uncached; every
 requested seed still participates in the settlement.
 
 Context and coefficient caches are local to the search and retain the skill
-programs, owner attributes and random inputs that can affect their values.
+programs, owner attributes and random inputs that can affect their values. Healthy
+all-LUCK fixed-seed score searches cache ordered lottery contexts and unit-Rush
+projections within 18 MiB per kernel; retained teams replay original binary32
+factor operations for every seed and all 120 orders.
 Bounded LUCK caches evict cold entries incrementally. Snapshot choice rows
 are shared across pricing planes; priced frontiers retain their exact plane key.
 

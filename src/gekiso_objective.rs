@@ -1,6 +1,5 @@
 //! Gekiso context caches and safe level/support bounds for exact search.
 mod shared;
-pub(crate) use shared::{search_shared, SharedInput};
 use crate::{
     full::conditions::Performer,
     gekiso::{self, Chart, Context},
@@ -13,6 +12,7 @@ use crate::{
 };
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use serde_json::{json, Value};
+pub(crate) use shared::{search_shared, SharedInput};
 use std::{
     collections::{BTreeSet, VecDeque},
     sync::{
@@ -854,6 +854,14 @@ struct FixedChoice {
     lottery: bool,
     supported: bool,
 }
+type RushContextKey = (usize, Vec<(i32, i32)>);
+type RushContextEntry = (Arc<Context>, Arc<Context>, Arc<Weights>, usize);
+type WeightedContext = (Arc<Context>, Arc<Weights>);
+struct RushProjection {
+    weights: Arc<Weights>,
+    changes: usize,
+    bytes: usize,
+}
 pub struct Kernel<'a> {
     master: &'a Master,
     members: &'a [Member],
@@ -893,6 +901,16 @@ pub struct Kernel<'a> {
     cache_order: VecDeque<(i32, Vec<u32>)>,
     cache_bytes: usize,
     cache_records: HashMap<usize, usize>,
+    seeded_contexts: HashMap<Vec<Performer>, (Arc<Context>, usize)>,
+    rush_projections: HashMap<Vec<Performer>, RushProjection>,
+    rush_projection_order: VecDeque<Vec<Performer>>,
+    rush_projection_bytes: usize,
+    rush_contexts: HashMap<RushContextKey, RushContextEntry>,
+    rush_context_order: VecDeque<RushContextKey>,
+    rush_context_bases: HashMap<usize, (usize, usize)>,
+    rush_context_bytes: usize,
+    seeded_context_order: VecDeque<Vec<Performer>>,
+    seeded_context_bytes: usize,
     levels: HashMap<i32, Arc<Level>>,
     support_high: HashMap<(String, i32), f64>,
     support_low: HashMap<String, f64>,
@@ -1475,23 +1493,25 @@ impl<'a> Kernel<'a> {
                 } else {
                     [band, member.card.card_type, member.card.character_id]
                 };
-                let value = supports.entry((skills.as_slice(), fields)).or_insert_with(|| {
-                    if band_only {
-                        Performer {
-                            band_id: band,
-                            mission_only: Some(1),
-                            gekisou_support_skills: skills.clone(),
-                            ..Performer::default()
+                let value = supports
+                    .entry((skills.as_slice(), fields))
+                    .or_insert_with(|| {
+                        if band_only {
+                            Performer {
+                                band_id: band,
+                                mission_only: Some(1),
+                                gekisou_support_skills: skills.clone(),
+                                ..Performer::default()
+                            }
+                        } else {
+                            let mut p = Performer::from_member(master, member, None);
+                            p.live_skill = None;
+                            p.gekisou_skill = None;
+                            p.gekisou_support_skills = skills.clone();
+                            p.mission_only = Some(1);
+                            p
                         }
-                    } else {
-                        let mut p = Performer::from_member(master, member, None);
-                        p.live_skill = None;
-                        p.gekisou_skill = None;
-                        p.gekisou_support_skills = skills.clone();
-                        p.mission_only = Some(1);
-                        p
-                    }
-                });
+                    });
                 support.push(Some(value.clone()));
             }
         }
@@ -1697,6 +1717,16 @@ impl<'a> Kernel<'a> {
             cache_order,
             cache_bytes,
             cache_records,
+            seeded_contexts: HashMap::default(),
+            rush_projections: HashMap::default(),
+            rush_projection_order: VecDeque::new(),
+            rush_projection_bytes: 0,
+            rush_contexts: HashMap::default(),
+            rush_context_order: VecDeque::new(),
+            rush_context_bases: HashMap::default(),
+            rush_context_bytes: 0,
+            seeded_context_order: VecDeque::new(),
+            seeded_context_bytes: 0,
             levels: HashMap::default(),
             support_high: HashMap::default(),
             support_low: HashMap::default(),
@@ -3240,6 +3270,216 @@ impl<'a> Kernel<'a> {
         self.store_weights(key, Arc::clone(&weights));
         weights
     }
+    fn seeded_context_of(&mut self, deck: &[Performer]) -> Result<Arc<Context>, String> {
+        if let Some(plan) = gekiso::RushSupportPlan::new(self.master, self.chart, deck) {
+            let base = self.seeded_context_raw(&plan.deck, true)?;
+            if let Some((context, _)) = self.rush_context_of(&plan, base)? {
+                return Ok(context);
+            }
+        }
+        self.seeded_context_raw(deck, false)
+    }
+    fn rush_context_of(
+        &mut self,
+        plan: &gekiso::RushSupportPlan,
+        base: Arc<Context>,
+    ) -> Result<Option<WeightedContext>, String> {
+        let key = (Arc::as_ptr(&base) as usize, plan.rows.clone());
+        if let Some((_, context, weights, _)) = self.rush_contexts.get(&key) {
+            return Ok(Some((Arc::clone(context), Arc::clone(weights))));
+        }
+        let generation = crate::cancellation_generation();
+        let Some(context) = plan.apply(self.master, self.chart, &base) else {
+            return Ok(None);
+        };
+        if generation != crate::cancellation_generation() {
+            return Err("cancelled".into());
+        }
+        let context = Arc::new(context);
+        let weights = Arc::new(note_weights(self.master, self.chart, &context));
+        if generation != crate::cancellation_generation() {
+            return Err("cancelled".into());
+        }
+        let weight_bytes = std::mem::size_of::<Weights>()
+            + (weights.general.capacity()
+                + weights.judgements.iter().map(Vec::capacity).sum::<usize>())
+                * 8;
+        let bytes = 128
+            + 2 * key.1.capacity() * std::mem::size_of::<(i32, i32)>()
+            + context.retained_bytes()
+            + weight_bytes;
+        let base_bytes = base.retained_bytes();
+        const LIMIT: usize = 8 * 1024 * 1024;
+        if bytes + base_bytes <= LIMIT {
+            while !self.rush_contexts.is_empty()
+                && (self.rush_context_bytes
+                    + bytes
+                    + if self.rush_context_bases.contains_key(&key.0) {
+                        0
+                    } else {
+                        base_bytes
+                    }
+                    > LIMIT
+                    || self.rush_contexts.len() >= 128)
+            {
+                let old = self.rush_context_order.pop_front().unwrap();
+                let (_, _, _, size) = self.rush_contexts.remove(&old).unwrap();
+                self.rush_context_bytes -= size;
+                let entry = self.rush_context_bases.get_mut(&old.0).unwrap();
+                entry.0 -= 1;
+                if entry.0 == 0 {
+                    let (_, size) = self.rush_context_bases.remove(&old.0).unwrap();
+                    self.rush_context_bytes -= size;
+                }
+            }
+            let entry = self
+                .rush_context_bases
+                .entry(key.0)
+                .or_insert((0, base_bytes));
+            if entry.0 == 0 {
+                self.rush_context_bytes += base_bytes;
+            }
+            entry.0 += 1;
+            self.rush_context_bytes += bytes;
+            self.rush_context_order.push_back(key.clone());
+            self.rush_contexts.insert(
+                key,
+                (base, Arc::clone(&context), Arc::clone(&weights), bytes),
+            );
+        }
+        Ok(Some((context, weights)))
+    }
+    fn seeded_context_key(&mut self, deck: &[Performer], trace: bool) -> Vec<Performer> {
+        let mut key: Vec<_> = deck.iter().map(Performer::gekiso_only).collect();
+        for actor in &mut key {
+            // Match Model's registration guard without hiding unknown-ID errors.
+            actor.gekisou_support_skills.retain(|&(id, _)| {
+                self.master
+                    .gekiso_support_skills
+                    .get(&id)
+                    .is_none_or(|skill| {
+                        skill.mission_type == 4
+                            || self.chart.setup.missions.contains(&skill.mission_type)
+                    })
+            });
+        }
+        if trace {
+            for actor in &mut key {
+                if let Some((id, _)) = actor.gekisou_skill {
+                    if let Some(skill) = self.master.gekiso_skills.get(&id) {
+                        let mission = actor
+                            .mission_only
+                            .filter(|&mission| mission != 0)
+                            .unwrap_or(skill.mission_type);
+                        if (1..=3).contains(&mission)
+                            && !self.chart.setup.missions.contains(&mission)
+                        {
+                            actor.gekisou_skill = None;
+                            actor.mission_only = Some(mission);
+                        }
+                    }
+                }
+            }
+            let skills = key
+                .iter()
+                .flat_map(|actor| {
+                    actor
+                        .gekisou_skill
+                        .map(|(id, _)| (false, id))
+                        .into_iter()
+                        .chain(
+                            actor
+                                .gekisou_support_skills
+                                .iter()
+                                .map(|&(id, _)| (true, id)),
+                        )
+                })
+                .collect();
+            let fields = self.fields_for(skills).0;
+            for actor in &mut key {
+                if !fields.contains(&"bandId") {
+                    actor.band_id = 0;
+                }
+                if !fields.contains(&"cardType") {
+                    actor.card_type = 0;
+                }
+                if !fields.contains(&"characterId") {
+                    actor.character_id = 0;
+                }
+                if !fields.contains(&"tagIds") {
+                    actor.tag_ids.clear();
+                }
+                if !fields.contains(&"liveSkillCategories") {
+                    actor.live_skill_categories.clear();
+                }
+                if !fields.contains(&"gekisouSkillCategories") {
+                    actor.gekisou_skill_categories.clear();
+                }
+                if !fields.contains(&"gekisouMissionType") {
+                    actor.gekisou_mission_type = 0;
+                }
+            }
+        }
+        key
+    }
+    fn seeded_context_raw(
+        &mut self,
+        deck: &[Performer],
+        trace: bool,
+    ) -> Result<Arc<Context>, String> {
+        let key = self.seeded_context_key(deck, trace);
+        if let Some((context, _)) = self.seeded_contexts.get(&key) {
+            let recorded = if context.draws.is_empty() {
+                context.rush_trace.is_some()
+            } else {
+                context.draws.iter().all(|draw| draw.rush_trace.is_some())
+            };
+            if !trace || recorded {
+                return Ok(Arc::clone(context));
+            }
+        }
+        let generation = crate::cancellation_generation();
+        let context = Arc::new(if trace {
+            gekiso::context_fixed_luck_trace(self.master, self.chart, deck, &self.seeds)?
+        } else {
+            gekiso::context(self.master, self.chart, deck, &self.seeds)?
+        });
+        if generation != crate::cancellation_generation() {
+            return Err("cancelled".into());
+        }
+        let key_bytes = key.capacity() * std::mem::size_of::<Performer>()
+            + key
+                .iter()
+                .map(|actor| {
+                    (actor.tag_ids.capacity()
+                        + actor.live_skill_categories.capacity()
+                        + actor.gekisou_skill_categories.capacity())
+                        * std::mem::size_of::<i32>()
+                        + (actor.support_skills.capacity()
+                            + actor.gekisou_support_skills.capacity())
+                            * std::mem::size_of::<(i32, i32)>()
+                })
+                .sum::<usize>();
+        let bytes = 256 + 2 * key_bytes + context.retained_bytes();
+        const LIMIT: usize = 8 * 1024 * 1024;
+        if bytes <= LIMIT {
+            if let Some((_, old)) = self.seeded_contexts.remove(&key) {
+                self.seeded_context_bytes -= old;
+                self.seeded_context_order
+                    .retain(|previous| previous != &key);
+            }
+            while self.seeded_context_bytes + bytes > LIMIT || self.seeded_contexts.len() >= 128 {
+                let old = self.seeded_context_order.pop_front().unwrap();
+                let (_, size) = self.seeded_contexts.remove(&old).unwrap();
+                self.seeded_context_bytes -= size;
+            }
+            self.seeded_context_order.push_back(key.clone());
+            self.seeded_contexts
+                .insert(key, (Arc::clone(&context), bytes));
+            self.seeded_context_bytes += bytes;
+        }
+        Ok(context)
+    }
     fn context_of(
         &mut self,
         deck: &[Performer],
@@ -4113,9 +4353,10 @@ impl Kernel<'_> {
             }
             for factor in &slot.cumulative {
                 let start = self.chart.times.partition_point(|&t| t < time);
-                let end = self.chart.times.partition_point(|&t| {
-                    t < time + factor.duration_ms()
-                });
+                let end = self
+                    .chart
+                    .times
+                    .partition_point(|&t| t < time + factor.duration_ms());
                 let delta = factor.at_cap() as f64 / 100000.0;
                 per_event[event] += delta * (w.general[end] - w.general[start]);
             }
@@ -4566,6 +4807,267 @@ impl Kernel<'_> {
         };
         Some((power * coefficient).next_up() + (self.chart.notes.len() + 4) as f64)
     }
+    fn seeded_rush_bound(
+        &mut self,
+        deck: &[Performer],
+        slots: &[Arc<Slot>],
+        power: i32,
+    ) -> Result<Option<f64>, String> {
+        let Some(plan) = gekiso::RushSupportPlan::new(self.master, self.chart, deck) else {
+            return Ok(None);
+        };
+        if plan.rows.iter().any(|&(_, mill)| mill < 0) {
+            return Ok(None);
+        }
+        let key = self.seeded_context_key(&plan.deck, true);
+        let (weights, changes) = if let Some(projection) = self.rush_projections.get(&key) {
+            (Arc::clone(&projection.weights), projection.changes)
+        } else {
+            let generation = crate::cancellation_generation();
+            let base = self.seeded_context_raw(&plan.deck, true)?;
+            let valid = |draw: &Context| {
+                draw.factor_commands == 0
+                    && draw
+                        .up
+                        .iter()
+                        .chain(&draw.gk)
+                        .chain(&draw.luck)
+                        .all(|value| value.is_finite() && *value >= 0.0)
+            };
+            if !valid(&base) || base.draws.iter().any(|draw| !valid(draw)) {
+                return Ok(None);
+            }
+            let unit = gekiso::RushSupportPlan {
+                deck: Vec::new(),
+                rows: vec![(2, 100000)],
+            };
+            let Some(context) = unit.apply(self.master, self.chart, &base) else {
+                return Ok(None);
+            };
+            let weights = Arc::new(note_weights(self.master, self.chart, &context));
+            if generation != crate::cancellation_generation() {
+                return Err("cancelled".into());
+            }
+            let changes = base
+                .draws
+                .iter()
+                .map(|draw| draw.rush_changes)
+                .max()
+                .unwrap_or(base.rush_changes)
+                + 2 * self.chart.setup.fevers.len();
+            let key_bytes = key.capacity() * std::mem::size_of::<Performer>()
+                + key
+                    .iter()
+                    .map(|actor| {
+                        (actor.tag_ids.capacity()
+                            + actor.live_skill_categories.capacity()
+                            + actor.gekisou_skill_categories.capacity())
+                            * std::mem::size_of::<i32>()
+                            + (actor.support_skills.capacity()
+                                + actor.gekisou_support_skills.capacity())
+                                * std::mem::size_of::<(i32, i32)>()
+                    })
+                    .sum::<usize>();
+            let bytes = 256
+                + 2 * key_bytes
+                + std::mem::size_of::<Weights>()
+                + (weights.general.capacity()
+                    + weights.judgements.iter().map(Vec::capacity).sum::<usize>())
+                    * 8;
+            const LIMIT: usize = 2 * 1024 * 1024;
+            if bytes <= LIMIT {
+                while self.rush_projection_bytes + bytes > LIMIT
+                    || self.rush_projections.len() >= 64
+                {
+                    let old = self.rush_projection_order.pop_front().unwrap();
+                    self.rush_projection_bytes -= self.rush_projections.remove(&old).unwrap().bytes;
+                }
+                self.rush_projection_bytes += bytes;
+                self.rush_projection_order.push_back(key.clone());
+                self.rush_projections.insert(
+                    key,
+                    RushProjection {
+                        weights: Arc::clone(&weights),
+                        changes,
+                        bytes,
+                    },
+                );
+            }
+            (weights, changes)
+        };
+        let Some(ranges) = crate::rewards::deterministic_ranges(self.master, self.chart) else {
+            return Ok(None);
+        };
+        let commands = changes.checked_mul(plan.rows.len());
+        let Some(operations) = commands.and_then(|commands| {
+            crate::rewards::factor_operations(self.chart, ranges).checked_mul(commands)
+        }) else {
+            return Ok(None);
+        };
+        let up = |value: f64| value.next_up();
+        let add = |a: f64, b: f64| up(a + b);
+        let mul = |a: f64, b: f64| up(a * b);
+        let u = 2.0_f64.powi(-24);
+        let n = mul(operations as f64, u);
+        if n >= 0.25 || self.chart.full.converted <= 0 {
+            return Ok(None);
+        }
+        let extra = plan.rows.iter().fold(0.0_f64, |sum, &(_, mill)| {
+            add(sum, crate::num::f(crate::num::f(mill as f64) / 100000.0))
+        });
+        let positive = add(1.0, extra);
+        let error = mul(
+            4.0,
+            mul(mul(n, add(1.0, mul(2.0, positive))), up(1.0 / (1.0 - n))),
+        );
+        let general = weights.general[self.chart.notes.len()];
+        if [general, weights.base]
+            .iter()
+            .any(|value| !value.is_finite() || *value < 0.0)
+        {
+            return Ok(None);
+        }
+        // Both nonnegative sums include per-note products and per-draw means.
+        let q = mul(
+            16.0 * (self.chart.notes.len() + self.seeds.len() + 1) as f64,
+            f64::EPSILON,
+        );
+        if q >= 0.25 {
+            return Ok(None);
+        }
+        let sum_error = mul(add(weights.base, general), up(q / (1.0 - q)));
+        let rush = add(up(weights.base - general), sum_error).max(0.0);
+        let rho = up(1.0 / (1.0 - u));
+        let mut rounding = 1.0_f64;
+        for _ in 0..12 {
+            rounding = mul(rounding, rho);
+        }
+        let offset = up(mul(add(mul(extra, rush), mul(error, general)), rounding)
+            / self.chart.full.converted as f64);
+        let Some(coefficients) = crate::rewards::order_score_coefficients_with_base(
+            self.master,
+            self.chart,
+            &weights,
+            slots,
+            general,
+        ) else {
+            return Ok(None);
+        };
+        if coefficients
+            .iter()
+            .any(|value| !value.is_finite() || *value < 0.0)
+        {
+            return Ok(None);
+        }
+        let coefficient = match self.criterion {
+            Criterion::Mean => (coefficients
+                .iter()
+                .fold(0.0_f64, |sum, value| (sum + value).next_up())
+                / 120.0)
+                .next_up(),
+            Criterion::Min => coefficients.iter().copied().fold(f64::INFINITY, f64::min),
+            Criterion::Max => coefficients
+                .iter()
+                .copied()
+                .fold(f64::NEG_INFINITY, f64::max),
+        };
+        let upper = add(
+            mul(power as f64, add(coefficient, offset)),
+            (self.chart.notes.len() + 4) as f64,
+        );
+        Ok(upper.is_finite().then_some(upper))
+    }
+    fn seeded_evaluate(
+        &mut self,
+        team: &Team,
+        power: i32,
+        cutoff: search::Cutoff,
+    ) -> Result<Option<search::Evaluation>, String> {
+        if !self.chart.luck
+            || self
+                .chart
+                .setup
+                .missions
+                .iter()
+                .any(|&mission| mission != 2)
+            || self.seeds.is_empty()
+            || !self.healthy
+            || !self.owner_local
+            || gekiso::uses_full_replay(self.master, self.chart, &self.seeds)
+            || self.has_converter(team)
+        {
+            return Ok(None);
+        }
+        let slots: Vec<_> = team
+            .members
+            .iter()
+            .enumerate()
+            .map(|(slot, &member)| Arc::new(self.slot(member, team.snaps[slot]).clone()))
+            .collect();
+        if slots.iter().any(|slot| {
+            slot.effects.iter().any(|effect| effect.delta < 0)
+                || slot
+                    .cumulative
+                    .iter()
+                    .any(|factor| factor.requires_unbounded_bounds(self.chart.notes.len()))
+        }) {
+            return Ok(None);
+        }
+        let deck = self.original_deck(team);
+        if let Some(upper) = self.seeded_rush_bound(&deck, &slots, power)? {
+            if upper < cutoff.key || cutoff.prune_equal && upper == cutoff.key {
+                return Ok(Some(search::Evaluation::Pruned(upper)));
+            }
+        }
+        let context = self.seeded_context_of(&deck)?;
+        let valid = |draw: &Context| {
+            draw.up
+                .iter()
+                .chain(&draw.gk)
+                .chain(&draw.luck)
+                .all(|value| value.is_finite() && *value >= 0.0)
+        };
+        if !valid(&context) || context.draws.iter().any(|draw| !valid(draw)) {
+            return Ok(None);
+        }
+        let weights = self
+            .rush_contexts
+            .values()
+            .find(|(_, cached, _, _)| Arc::ptr_eq(cached, &context))
+            .map(|(_, _, weights, _)| Arc::clone(weights))
+            .unwrap_or_else(|| Arc::new(note_weights(self.master, self.chart, &context)));
+        let Some(coefficients) =
+            crate::rewards::order_score_coefficients(self.master, self.chart, &weights, &slots)
+        else {
+            return Ok(None);
+        };
+        let coefficient = match self.criterion {
+            Criterion::Mean => (coefficients
+                .iter()
+                .fold(0.0_f64, |sum, value| (sum + value).next_up())
+                / 120.0)
+                .next_up(),
+            Criterion::Min => coefficients.iter().copied().fold(f64::INFINITY, f64::min),
+            Criterion::Max => coefficients
+                .iter()
+                .copied()
+                .fold(f64::NEG_INFINITY, f64::max),
+        };
+        let upper = (power as f64 * coefficient).next_up() + (self.chart.notes.len() + 4) as f64;
+        if !upper.is_finite() {
+            return Ok(None);
+        }
+        if upper < cutoff.key || cutoff.prune_equal && upper == cutoff.key {
+            return Ok(Some(search::Evaluation::Pruned(upper)));
+        }
+        let slots: Vec<_> = slots.iter().map(|slot| (**slot).clone()).collect();
+        let scores = gekiso::score_orders(self.master, self.chart, &context, power, &slots, true)?;
+        self.exact_calls += 1;
+        Ok(Some(search::Evaluation::Exact(Exact {
+            key: self.criterion.key(&scores),
+            detail: json!({"scores":scores,"seeds":context.seeds,"comboBonus":null}),
+        })))
+    }
     pub fn exact(&mut self, team: &Team, power: i32, settle: bool) -> Result<Exact, String> {
         if !self.chart.luck && self.seeds.is_empty() {
             if let Some(scores) =
@@ -4610,12 +5112,7 @@ impl Kernel<'_> {
                     )
                 })
                 .collect::<Vec<_>>();
-            Arc::new(gekiso::context(
-                self.master,
-                self.chart,
-                &deck,
-                &self.seeds,
-            )?)
+            self.seeded_context_of(&deck)?
         };
         let skills: Vec<_> = team
             .members
@@ -9550,6 +10047,9 @@ impl Objective for Adapter<'_, '_> {
         cutoff: search::Cutoff,
     ) -> Result<search::Evaluation, String> {
         if !self.estimate && !self.surrogate && cutoff.key.is_finite() {
+            if let Some(evaluation) = self.kernel.seeded_evaluate(team, power as i32, cutoff)? {
+                return Ok(evaluation);
+            }
             if let Some(upper) = self
                 .kernel
                 .deterministic_order_bound(team, power, cutoff.key)
