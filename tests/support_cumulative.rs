@@ -1,6 +1,6 @@
 //! Support-skill 2001 (cumulative matching-judgement score) in the ordinary-live model.
 use haneoka_team_engine::{
-    live::{self, Cumulative, Effect, Gate, Input, Slot},
+    live::{self, Conversion, Cumulative, Effect, Gate, Input, Slot},
     model,
 };
 
@@ -123,6 +123,82 @@ fn same_time_notes_agree_with_all_perfect() {
 }
 
 #[test]
+fn cumulative_changes_wait_for_the_judgement_frame() {
+    for times in [vec![101, 201, 301], vec![101, 105, 120]] {
+        let mut all = input(vec![slot(vec![climbing(6, 5.0)])], None, 3);
+        all.times = times;
+        let scores = live::score(&all).unwrap();
+        assert_eq!(scores.scores[0], 3200.0);
+        all.judgements = Some(vec![PERFECT; 3]);
+        assert_eq!(scores.scores, live::score(&all).unwrap().scores);
+    }
+}
+
+#[test]
+fn activation_frame_uses_its_complete_judgement_batch() {
+    let mut all = input(vec![slot(vec![climbing(6, 5.0)])], None, 3);
+    all.skill_times = vec![1];
+    all.times = vec![2, 10, 120];
+    let scores = live::score(&all).unwrap();
+    assert_eq!(scores.scores[0], 3200.0);
+    all.judgements = Some(vec![PERFECT; 3]);
+    assert_eq!(scores.scores, live::score(&all).unwrap().scores);
+}
+
+#[test]
+fn converted_judgements_share_the_cumulative_delivery_frame() {
+    let mut skill = slot(vec![climbing(6, 5.0)]);
+    skill.convert = Some(Conversion {
+        judgements: vec![GREAT],
+        limit: Some(2.0),
+        judgement: PERFECT,
+        seconds: None,
+        at_start: false,
+    });
+    let mut played = input(vec![skill], Some(vec![GREAT, GREAT, PERFECT]), 3);
+    played.times = vec![101, 105, 120];
+    assert_eq!(live::score(&played).unwrap().scores[0], 3200.0);
+}
+
+#[test]
+fn cumulative_expiry_does_not_count_a_later_delivery_frame() {
+    let mut all = input(vec![slot(vec![climbing(6, 0.499)])], None, 2);
+    all.times = vec![101, 498];
+    let scores = live::score(&all).unwrap();
+    assert_eq!(scores.scores[0], 2000.0);
+    all.judgements = Some(vec![PERFECT; 2]);
+    assert_eq!(scores.scores, live::score(&all).unwrap().scores);
+}
+
+#[test]
+fn search_bounds_include_the_delayed_support_window() {
+    let factor = Cumulative {
+        unit: 1,
+        cap: 1,
+        maximum: 2000,
+        ..climbing(1, 0.1)
+    };
+    let mut all = input(vec![slot(vec![factor])], None, 2);
+    all.skill_times = vec![1];
+    all.times = vec![20, 111];
+    all.note_frac = vec![0.0, 1.0];
+    let exact = live::score(&all).unwrap().scores[0];
+    assert_eq!(exact, 1200.0);
+    let upper = model::skill_weights(&model::linear(&all), &all, &all.slots[0], true);
+    assert!(1000.0 + 1000.0 * upper.per_event[0] >= exact);
+    let mut bounds = model::PlayBounds::new(&all, &[PERFECT; 2]);
+    let (_, high) = bounds.order(
+        &all,
+        &[PERFECT; 2],
+        &all.slots,
+        &[0],
+        &[0, 1, 2, 3, 4],
+        1000.0,
+    );
+    assert!(high >= exact);
+}
+
+#[test]
 fn a_miss_does_not_advance_the_counter() {
     let notes = 8;
     let factor = climbing(6, 5.0);
@@ -211,12 +287,94 @@ fn a_score_skill_still_stacks_on_top() {
             positive: true,
         },
         judgements: Vec::new(),
+        release_judgements: Vec::new(),
     };
     let mut with = slot(vec![climbing(6, 5.0)]);
     with.effects.push(effect);
     let plain = live::score(&input(vec![slot(Vec::new())], None, notes)).unwrap();
     let boosted = live::score(&input(vec![with], None, notes)).unwrap();
     assert!(boosted.scores[0] > plain.scores[0]);
+}
+
+fn combo_guard() -> Conversion {
+    Conversion {
+        judgements: vec![MISS, 2],
+        limit: Some(12.0),
+        judgement: 3,
+        seconds: Some(99999.0),
+        at_start: true,
+    }
+}
+
+#[test]
+fn static_combo_guard_preserves_combo_and_life_before_the_live_skill() {
+    let mut skill = slot(Vec::new());
+    skill.convert = Some(combo_guard());
+    let mut played = input(vec![skill], Some(vec![PERFECT, MISS, PERFECT, PERFECT]), 4);
+    played.skill_times = vec![1000];
+    played.judge_frac[MISS] = 0.0;
+    played.judge_frac[3] = 0.5;
+    played.damage[MISS] = 1000.0;
+    played.life_onus = 0.5;
+    played.combo_table = vec![(2, 0.5)];
+    assert_eq!(live::score(&played).unwrap().scores[0], 4500.0);
+    played.slots[0].convert = None;
+    assert_eq!(live::score(&played).unwrap().scores[0], 2000.0);
+}
+
+#[test]
+fn static_conversion_limit_is_not_reset_by_a_live_skill_event() {
+    let mut skill = slot(Vec::new());
+    skill.convert = Some(Conversion { limit: Some(2.0), ..combo_guard() });
+    let mut played = input(vec![skill], Some(vec![MISS; 4]), 4);
+    played.skill_times = vec![250];
+    played.judge_frac[MISS] = 0.0;
+    played.judge_frac[3] = 0.5;
+    assert_eq!(live::score(&played).unwrap().scores[0], 1000.0);
+}
+
+#[test]
+fn conversion_duration_is_independent_of_member_extension() {
+    let mut skill = slot(Vec::new());
+    skill.extension_ms = 5000.0;
+    skill.convert = Some(Conversion { seconds: Some(0.2), at_start: false, ..combo_guard() });
+    let mut played = input(vec![skill], Some(vec![MISS; 2]), 2);
+    played.times = vec![100, 300];
+    played.judge_frac[MISS] = 0.0;
+    played.judge_frac[3] = 0.5;
+    assert_eq!(live::score(&played).unwrap().scores[0], 500.0);
+}
+
+#[test]
+fn low_judgement_releases_extra_score_after_conversion() {
+    let mut skill = slot(Vec::new());
+    skill.effects.push(Effect {
+        kind: 2000, delta: 10000, seconds: 5.0,
+        gate: Gate { kind: 0, value: 0.0, positive: true },
+        judgements: Vec::new(), release_judgements: vec![1, 2, 3],
+    });
+    skill.convert = Some(combo_guard());
+    let mut played = input(vec![skill], Some(vec![PERFECT, MISS, PERFECT, PERFECT]), 4);
+    played.judge_frac[MISS] = 0.0;
+    played.judge_frac[3] = 0.5;
+    assert_eq!(live::score(&played).unwrap().scores[0], 3600.0);
+}
+
+#[test]
+fn release_uses_the_last_matching_judgement_time_of_its_first_frame() {
+    let mut skill = slot(Vec::new());
+    skill.effects.push(Effect {
+        kind: 2000, delta: 10000, seconds: 5.0,
+        gate: Gate { kind: 0, value: 0.0, positive: true },
+        judgements: Vec::new(), release_judgements: vec![1, 2, 3],
+    });
+    let mut played = input(vec![skill], Some(vec![PERFECT, 3, 3, PERFECT]), 4);
+    played.times = vec![100, 201, 202, 300];
+    played.judge_frac[3] = 0.5;
+    assert_eq!(live::score(&played).unwrap().scores[0], 3150.0);
+    let mut bounds = model::PlayBounds::new(&played, played.judgements.as_ref().unwrap());
+    assert_eq!(bounds.order(&played, played.judgements.as_ref().unwrap(), &played.slots,
+        &[0], &[0, 1, 2, 3, 4], 1000.0), (f64::NEG_INFINITY, f64::INFINITY));
 }
 
 #[test]
@@ -313,6 +471,7 @@ fn cumulative_caps_keep_search_bounds_above_replay() {
             seconds: 5.0,
             gate: Gate { kind: 0, value: 0.0, positive: true },
             judgements: Vec::new(),
+            release_judgements: Vec::new(),
         });
         let mut ghost = input(vec![ghost_slot], None, 2);
         ghost.power = 1_000_000;

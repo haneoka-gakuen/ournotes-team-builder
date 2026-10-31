@@ -1105,7 +1105,7 @@ impl Compiler {
         }
         for factor in &choice.slot.cumulative {
             let diff = f(factor.at_cap() as f64 / 100000.0);
-            let duration = factor.duration_ms();
+            let duration = factor.bound_duration_ms();
             for (event, &(_, time)) in chart.full.events.iter().take(5).enumerate() {
                 let start = chart.times.partition_point(|&t| t < time);
                 let end = chart.times.partition_point(|&t| t < time + duration);

@@ -180,7 +180,7 @@ pub(crate) fn prepare(master: &Master, members: &[Member], snaps: &[Snap]) -> Ar
             bytes += slot
                 .effects
                 .iter()
-                .map(|e| e.judgements.capacity() * size_of::<usize>())
+                .map(|e| (e.judgements.capacity() + e.release_judgements.capacity()) * size_of::<usize>())
                 .sum::<usize>();
             if let Some(convert) = &slot.convert {
                 bytes += convert.judgements.capacity() * size_of::<usize>();

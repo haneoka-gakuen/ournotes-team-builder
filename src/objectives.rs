@@ -153,7 +153,7 @@ impl LiveCore {
                 longest = longest.max(window_ms(effect.seconds, slot.extension_ms));
             }
             for factor in &slot.cumulative {
-                longest = longest.max(factor.duration_ms());
+                longest = longest.max(factor.bound_duration_ms());
             }
         }
         let mut overlap = 1;
@@ -207,7 +207,8 @@ impl LiveCore {
             (ids.clone(), *intern_len)
         };
         let unbounded = slots.iter().flat_map(|slot| &slot.cumulative)
-            .any(|factor| factor.requires_unbounded_bounds(input.times.len()));
+            .any(|factor| factor.requires_unbounded_bounds(input.times.len()))
+            || (input.judgements.is_some() && slots.iter().any(Slot::changes_play_timeline));
         let factor_cap = 1.0 + overlap as f64 * raise;
         let high = if let Some(j) = &input.judgements {
             model::linear_play(&input, j, true, 0, 1.0, recovery)

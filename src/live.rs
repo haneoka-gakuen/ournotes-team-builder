@@ -25,12 +25,21 @@ pub struct Effect {
     pub seconds: f64,
     pub gate: Gate,
     pub judgements: Vec<usize>,
+    #[serde(default)]
+    pub release_judgements: Vec<usize>,
 }
 #[derive(Clone, Deserialize, Serialize, PartialEq)]
 pub struct Conversion {
     pub judgements: Vec<usize>,
     pub limit: Option<f64>,
+    #[serde(default = "perfect")]
+    pub judgement: usize,
+    #[serde(default)]
+    pub seconds: Option<f64>,
+    #[serde(default)]
+    pub at_start: bool,
 }
+fn perfect() -> usize { 5 }
 /// A note factor that climbs with the matching judgements inside one activation:
 /// every `unit` judgements add `value/10000`, at most `cap` steps and `maximum` mill.
 #[derive(Clone, Deserialize, Serialize, PartialEq)]
@@ -93,6 +102,11 @@ impl Cumulative {
     pub(crate) fn duration_ms(&self) -> i32 {
         window_ms(self.seconds, 0.0)
     }
+
+    /// Upper bounds start at the nominal event; support activation can be one 60 Hz frame later.
+    pub(crate) fn bound_duration_ms(&self) -> i32 {
+        self.duration_ms().saturating_add(17)
+    }
 }
 #[derive(Clone, Deserialize, Serialize, PartialEq)]
 pub struct Slot {
@@ -113,13 +127,13 @@ impl Slot {
     pub(crate) fn write_signature(&self, out: &mut Vec<u64>) {
         out.clear();
         let len = 4
-            + self.effects.iter().map(|e| 7 + e.judgements.len()).sum::<usize>()
+            + self.effects.iter().map(|e| 8 + e.judgements.len() + e.release_judgements.len()).sum::<usize>()
             + self
                 .cumulative
                 .iter()
                 .map(|c| 6 + c.judgements.len())
                 .sum::<usize>()
-            + self.convert.as_ref().map_or(1, |c| 2 + c.judgements.len());
+            + self.convert.as_ref().map_or(1, |c| 5 + c.judgements.len());
         out.reserve(len);
         out.extend([
             self.extension_ms.to_bits(),
@@ -136,8 +150,10 @@ impl Slot {
                 e.gate.value.to_bits(),
                 e.gate.positive as u64,
                 e.judgements.len() as u64,
+                e.release_judgements.len() as u64,
             ]);
             out.extend(e.judgements.iter().map(|&j| j as u64));
+            out.extend(e.release_judgements.iter().map(|&j| j as u64));
         }
         for c in &self.cumulative {
             out.extend([
@@ -156,10 +172,20 @@ impl Slot {
                 out.extend([
                     c.judgements.len() as u64,
                     c.limit.map_or(u64::MAX - 1, f64::to_bits),
+                    c.judgement as u64,
+                    c.seconds.map_or(u64::MAX - 2, f64::to_bits),
+                    c.at_start as u64,
                 ]);
                 out.extend(c.judgements.iter().map(|&j| j as u64));
             }
         }
+    }
+    pub(crate) fn changes_play_timeline(&self) -> bool {
+        self.effects.iter().any(|effect| !effect.release_judgements.is_empty())
+            || self.convert.as_ref().is_some_and(|convert| {
+                convert.at_start || convert.judgement != 5
+                    || convert.judgements.iter().any(|&judgement| judgement <= 2)
+            })
     }
 }
 pub(crate) fn rounding_profile(slot: &Slot, life: Option<f64>) -> (usize, f64) {
@@ -347,6 +373,89 @@ struct Command {
     channel: usize,
     delta: i32,
 }
+fn effect_end(input: &Input, slot: &Slot, effect: &Effect, start: i32, judgements: Option<&[usize]>) -> i32 {
+    let end = start + window_ms(effect.seconds, slot.extension_ms);
+    if effect.release_judgements.is_empty() { return end; }
+    let after_execute = frame_time(frame_time(start).saturating_add(1));
+    let deadline = frame_time(end.saturating_add(1));
+    let mut first = input.times.partition_point(|&time| frame_time(time) <= after_execute);
+    while first < input.times.len() {
+        let frame = frame_time(input.times[first]);
+        if frame > deadline { break; }
+        let after = input.times.partition_point(|&time| frame_time(time) <= frame);
+        if let Some(index) = (first..after).rfind(|&index| {
+            effect.release_judgements.contains(&judgements.map_or(5, |grades| grades[index]))
+        }) {
+            return end.min(input.times[index]);
+        }
+        first = after;
+    }
+    end
+}
+fn cumulative_commands(
+    input: &Input,
+    order: &[usize; 5],
+    judgements: Option<&[usize]>,
+) -> Vec<Command> {
+    let mut commands = Vec::new();
+    for (event, &start) in input.skill_times.iter().take(5).enumerate() {
+        let Some(slot) = input.slots.get(order[event]) else {
+            continue;
+        };
+        for factor in &slot.cumulative {
+            let activation = frame_time(start);
+            let end = activation + factor.duration_ms();
+            let (mut count, mut applied) = (0, 0);
+            let mut first = input
+                .times
+                .partition_point(|&time| frame_time(time) < activation);
+            while first < input.times.len() {
+                let frame = frame_time(input.times[first]);
+                if frame > end {
+                    break;
+                }
+                let after = input
+                    .times
+                    .partition_point(|&time| frame_time(time) <= frame);
+                count += (first..after)
+                    .filter(|&i| {
+                        factor
+                            .judgements
+                            .contains(&judgements.map_or(5, |grades| grades[i]))
+                    })
+                    .count() as i32;
+                let mill = factor.mill(count);
+                if mill != applied {
+                    let time = frame;
+                    commands.push(Command {
+                        time,
+                        owner: event,
+                        channel: 0,
+                        delta: applied.wrapping_neg(),
+                    });
+                    commands.push(Command {
+                        time,
+                        owner: event,
+                        channel: 0,
+                        delta: mill,
+                    });
+                    applied = mill;
+                }
+                first = after;
+            }
+            if applied != 0 {
+                commands.push(Command {
+                    time: end,
+                    owner: event,
+                    channel: 0,
+                    delta: applied.wrapping_neg(),
+                });
+            }
+        }
+    }
+    commands.sort_by_key(|command| (command.time, command.owner));
+    commands
+}
 fn commands(input: &Input, order: &[usize; 5]) -> Vec<Command> {
     let mut commands = Vec::new();
     for (event, &start) in input.skill_times.iter().take(5).enumerate() {
@@ -357,7 +466,7 @@ fn commands(input: &Input, order: &[usize; 5]) -> Vec<Command> {
             if effect.gate.blocks(input.life_base) {
                 continue;
             }
-            let end = start + window_ms(effect.seconds, slot.extension_ms);
+            let end = effect_end(input, slot, effect, start, None);
             let channels = if effect.kind == 2000 {
                 vec![0]
             } else {
@@ -378,42 +487,8 @@ fn commands(input: &Input, order: &[usize; 5]) -> Vec<Command> {
                 });
             }
         }
-        for factor in &slot.cumulative {
-            // Every note of the all-perfect path is a Perfect judgement.
-            if !factor.judgements.contains(&5) {
-                continue;
-            }
-            let end = start + factor.duration_ms();
-            let (mut count, mut applied) = (0, 0);
-            for &time in &input.times {
-                if time < start {
-                    continue;
-                }
-                if time >= end {
-                    break;
-                }
-                count += 1;
-                let mill = factor.mill(count);
-                if mill != applied {
-                    commands.push(Command {
-                        time,
-                        owner: event,
-                        channel: 0,
-                        delta: mill - applied,
-                    });
-                    applied = mill;
-                }
-            }
-            if applied != 0 {
-                commands.push(Command {
-                    time: end,
-                    owner: event,
-                    channel: 0,
-                    delta: -applied,
-                });
-            }
-        }
     }
+    commands.extend(cumulative_commands(input, order, None));
     commands.sort_by_key(|c| (c.time, c.owner));
     commands
 }
@@ -653,12 +728,73 @@ struct Convert {
     until: i32,
     judgements: Vec<usize>,
     left: f64,
+    judgement: usize,
 }
-struct Climbing {
-    end: i32,
-    factor: Cumulative,
-    count: i32,
-    applied: i32,
+fn conversion(slot: &Slot, convert: &Conversion, start: i32) -> Convert {
+    let from = frame_time(start);
+    let duration = convert.seconds.map_or_else(
+        || window_ms(slot.effects.first().map(|effect| effect.seconds).unwrap_or(5.0), slot.extension_ms),
+        |seconds| window_ms(seconds, 0.0),
+    );
+    Convert {
+        from,
+        until: frame_time(from + duration),
+        judgements: convert.judgements.clone(),
+        left: convert.limit.unwrap_or(f64::INFINITY),
+        judgement: convert.judgement,
+    }
+}
+fn converted_judgements(input: &Input, order: &[usize; 5], judgements: &[usize]) -> Vec<usize> {
+    let mut converted = judgements.to_vec();
+    if input.slots.iter().all(|slot| slot.convert.is_none()) {
+        return converted;
+    }
+    let firing = firing(input);
+    let mut cursor = 0;
+    let mut converts: Vec<Convert> = Vec::new();
+    for slot in &input.slots {
+        if let Some(convert) = &slot.convert {
+            if convert.at_start { converts.insert(0, conversion(slot, convert, 0)); }
+        }
+    }
+    let mut first = 0;
+    while first < input.times.len() {
+        let time = input.times[first];
+        while cursor < firing.len() && input.skill_times[firing[cursor]] <= time {
+            let event = firing[cursor];
+            let start = input.skill_times[event];
+            if let Some(slot) = input.slots.get(order[event]) {
+                if let Some(convert) = &slot.convert {
+                    if !convert.at_start { converts.insert(0, conversion(slot, convert, start)); }
+                }
+            }
+            cursor += 1;
+        }
+        let after = input.times.partition_point(|&t| t <= time);
+        for target in &mut converted[first..after] {
+            let mut c = 0;
+            while c < converts.len() {
+                let conv = &mut converts[c];
+                if conv.until < time {
+                    converts.remove(c);
+                    continue;
+                }
+                if time <= conv.from || !conv.judgements.contains(target) {
+                    c += 1;
+                    continue;
+                }
+                if *target == conv.judgement { c += 1; continue; }
+                *target = conv.judgement;
+                conv.left -= 1.0;
+                if conv.left <= 0.0 {
+                    converts.remove(c);
+                }
+                break;
+            }
+        }
+        first = after;
+    }
+    converted
 }
 struct Factors {
     general: f64,
@@ -681,31 +817,12 @@ impl Factors {
     }
 }
 fn play(input: &Input, judgements: &[usize]) -> Result<Scores, String> {
-    if input.slots.iter().any(|s| {
-        s.convert
-            .as_ref()
-            .is_some_and(|c| c.judgements.iter().any(|&j| j <= 2))
-    }) || input.damage[3] != 0.0
-        || input.damage[4] != 0.0
-    {
-        return Err("conversions that change damage need the full simulation".into());
-    }
     let generation = crate::cancellation_generation();
     let n = input.times.len();
     let t = f(f(input.adjustment * input.power as f64) * input.difficulty_factor);
     let luck = f(input.luck_percent.min(200.0) / 100.0);
     let assist = f(input.assist);
     let note: Vec<_> = input.note_frac.iter().map(|&v| f(v * t)).collect();
-    let mut combos = Vec::with_capacity(n);
-    let (mut pending, mut before, mut last) = (0, 0, -1);
-    for (i, &judgement) in judgements.iter().enumerate().take(n) {
-        if input.times[i] != last {
-            before = pending;
-            last = input.times[i];
-        }
-        combos.push(combo(&input.combo_table, before));
-        pending = if judgement <= 2 { 0 } else { pending + 1 };
-    }
     let firing = firing(input);
     let mut scores = vec![0.0; 120];
     let plan = plan(&input.slots);
@@ -716,19 +833,25 @@ fn play(input: &Input, judgements: &[usize]) -> Result<Scores, String> {
         }
         let order = &orders()[index];
         let recoveries = order.map(|slot| input.slots.get(slot).map(|s| s.recovery).unwrap_or(0));
+        let converted = converted_judgements(input, order, judgements);
         let lives = life_cache
-            .entry(recoveries)
-            .or_insert_with(|| lives(input, judgements, order, &input.slots));
+            .entry((recoveries, converted.clone()))
+            .or_insert_with(|| lives(input, &converted, order, &input.slots));
+        let mut combos = Vec::with_capacity(n);
+        let (mut pending_combo, mut before, mut last) = (0, 0, -1);
+        for (i, &judgement) in converted.iter().enumerate() {
+            if input.times[i] != last { before = pending_combo; last = input.times[i]; }
+            combos.push(combo(&input.combo_table, before));
+            pending_combo = if judgement <= 2 { 0 } else { pending_combo + 1 };
+        }
         let mut factors = Factors {
             general: f(1.0),
             channel: [0.0; 7],
             active: Vec::new(),
         };
         let mut cursor = 0;
-        let mut converts: Vec<Convert> = Vec::new();
-        let mut climbing: Vec<Climbing> = Vec::new();
-        let mut converted = judgements.to_vec();
-        let mut prepared = 0;
+        let cumulative = cumulative_commands(input, order, Some(&converted));
+        let mut pending = cumulative.into_iter().peekable();
         let mut score = 0.0;
         for i in 0..=n {
             let time = if i < n {
@@ -739,13 +862,17 @@ fn play(input: &Input, judgements: &[usize]) -> Result<Scores, String> {
             while cursor < firing.len() && input.skill_times[firing[cursor]] as i64 <= time {
                 let event = firing[cursor];
                 let start = input.skill_times[event];
+                while pending.peek().is_some_and(|command| command.time <= start) {
+                    let command = pending.next().unwrap();
+                    factors.general = f(factors.general + f(command.delta as f64 / 100000.0));
+                }
                 factors.expire(start as i64);
                 if let Some(slot) = input.slots.get(order[event]) {
                     for effect in &slot.effects {
                         if effect.gate.blocks(lives.gate[&event]) {
                             continue;
                         }
-                        let end = start + window_ms(effect.seconds, slot.extension_ms);
+                        let end = effect_end(input, slot, effect, start, Some(&converted));
                         let diff = f(effect.delta as f64 / 100000.0);
                         let channels = if effect.kind == 2000 {
                             vec![0]
@@ -765,31 +892,6 @@ fn play(input: &Input, judgements: &[usize]) -> Result<Scores, String> {
                             });
                         }
                     }
-                    for factor in &slot.cumulative {
-                        climbing.push(Climbing {
-                            end: start + factor.duration_ms(),
-                            factor: factor.clone(),
-                            count: 0,
-                            applied: 0,
-                        });
-                    }
-                    if let Some(convert) = &slot.convert {
-                        converts.insert(
-                            0,
-                            Convert {
-                                from: frame_time(start),
-                                until: frame_time(
-                                    start
-                                        + window_ms(
-                                            slot.effects.first().map(|e| e.seconds).unwrap_or(5.0),
-                                            slot.extension_ms,
-                                        ),
-                                ),
-                                judgements: convert.judgements.clone(),
-                                left: convert.limit.unwrap_or(f64::INFINITY),
-                            },
-                        );
-                    }
                 }
                 cursor += 1;
             }
@@ -797,57 +899,12 @@ fn play(input: &Input, judgements: &[usize]) -> Result<Scores, String> {
                 break;
             }
             factors.expire(time);
-            let mut r = 0;
-            while r < climbing.len() {
-                if (climbing[r].end as i64) > time {
-                    r += 1;
-                    continue;
-                }
-                let run = climbing.remove(r);
-                if run.applied != 0 {
-                    factors.general = f(factors.general - f(run.applied as f64 / 100000.0));
-                }
-            }
-            if prepared <= i {
-                let mut end = i + 1;
-                while end < n && input.times[end] as i64 == time {
-                    end += 1;
-                }
-                for target in &mut converted[i..end] {
-                    let mut c = 0;
-                    while c < converts.len() {
-                        let conv = &mut converts[c];
-                        if (conv.until as i64) < time {
-                            converts.remove(c);
-                            continue;
-                        }
-                        if time <= conv.from as i64 || !conv.judgements.contains(target) {
-                            c += 1;
-                            continue;
-                        }
-                        *target = 5;
-                        conv.left -= 1.0;
-                        if conv.left <= 0.0 {
-                            converts.remove(c);
-                        }
-                        break;
-                    }
-                }
-                for run in &mut climbing {
-                    for &judgement in &converted[i..end] {
-                        if run.factor.judgements.contains(&judgement) {
-                            run.count += 1;
-                        }
-                    }
-                    let mill = run.factor.mill(run.count);
-                    if mill != run.applied {
-                        factors.general =
-                            f(factors.general - f(run.applied as f64 / 100000.0));
-                        factors.general = f(factors.general + f(mill as f64 / 100000.0));
-                        run.applied = mill;
-                    }
-                }
-                prepared = end;
+            while pending
+                .peek()
+                .is_some_and(|command| command.time as i64 <= time)
+            {
+                let command = pending.next().unwrap();
+                factors.general = f(factors.general + f(command.delta as f64 / 100000.0));
             }
             let judgement = converted[i];
             let up = f(factors.general + factors.channel[judgement]);
@@ -884,10 +941,15 @@ pub fn score(input: &Input) -> Result<Scores, String> {
         .slots
         .iter()
         .flat_map(|s| &s.effects)
-        .flat_map(|e| &e.judgements)
+        .flat_map(|e| e.judgements.iter().chain(&e.release_judgements))
         .any(|&j| j >= 7)
     {
         return Err("invalid effect judgement".into());
+    }
+    if input.slots.iter().filter_map(|slot| slot.convert.as_ref()).any(|convert| {
+        !(1..=6).contains(&convert.judgement) || convert.judgements.iter().any(|&j| !(1..=6).contains(&j))
+    }) {
+        return Err("invalid conversion judgement".into());
     }
     if let Some(judgements) = &input.judgements {
         if judgements.len() != n || judgements.iter().any(|&j| !(1..=6).contains(&j)) {

@@ -2345,6 +2345,7 @@ impl Engine {
                     positive: false,
                 },
                 judgements: Vec::new(),
+                release_judgements: Vec::new(),
             }],
             extension_ms: 0.0,
             recovery: 0,
