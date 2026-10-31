@@ -4375,7 +4375,7 @@ impl Kernel<'_> {
                 let end = self
                     .chart
                     .times
-                    .partition_point(|&t| t < time + factor.duration_ms());
+                    .partition_point(|&t| t < time + factor.bound_duration_ms());
                 let delta = factor.at_cap() as f64 / 100000.0;
                 per_event[event] += delta * (w.general[end] - w.general[start]);
             }

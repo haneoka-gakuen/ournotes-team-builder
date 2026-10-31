@@ -63,12 +63,26 @@ fn judgements(master: &Master, ids: &[i32]) -> Vec<usize> {
     ids.iter()
         .filter_map(|id| master.targets.get(id))
         .map(|r| r.judgement)
-        .filter(|j| (3..=6).contains(j))
+        .filter(|j| (1..=6).contains(j))
         .map(|j| j as usize)
         .collect()
 }
 fn at_level(rows: Option<&Vec<SkillEffect>>, level: i32) -> impl Iterator<Item = &SkillEffect> {
     rows.into_iter().flatten().filter(move |r| r.level == level)
+}
+fn release_judgements(master: &Master, id: i32) -> Option<Vec<usize>> {
+    if id <= 0 { return Some(Vec::new()); }
+    let sets = master.condition_sets.get(&id)?;
+    if sets.len() != 1 || sets[0].len() != 1 { return None; }
+    let row = master.conditions.get(&sets[0][0])?;
+    if row.kind != 1020 || !row.positive { return None; }
+    let targets = judgements(master, &row.targets);
+    Some((1..=6).filter(|judgement| targets.iter().any(|target| judgement <= target)).collect())
+}
+fn starts_with_live(master: &Master, id: i32) -> bool {
+    master.condition_sets.get(&id).into_iter().flatten().flatten()
+        .filter_map(|id| master.conditions.get(id))
+        .any(|row| matches!(row.kind, 4010 | 5020))
 }
 /// 2001 scores every `unit` matching judgements inside the activation, capped by
 /// the cumulative counter and the effect maximum.
@@ -113,6 +127,10 @@ pub fn resolve(
         if !holds {
             continue;
         }
+        let Some(release_judgements) = release_judgements(master, row.release_group) else {
+            unsupported.push(format!("live-release:{}", row.release_group));
+            continue;
+        };
         effects.push(Effect {
             kind: row.kind,
             delta: if row.kind == 2000 {
@@ -137,6 +155,7 @@ pub fn resolve(
             } else {
                 Vec::new()
             },
+            release_judgements,
         });
     }
     let mut extension_ms = f(0.0);
@@ -151,17 +170,21 @@ pub fn resolve(
             for row in at_level(master.support_skills.get(&id), snap.skill_levels[slot]) {
                 let enabled = group(master, row.condition_group, member);
                 let trigger = group(master, row.trigger_group, member);
-                let (Some((enabled, _)), Some(_)) = (enabled, trigger) else {
+                let (Some((enabled, _)), Some((triggered, _))) = (enabled, trigger) else {
                     unsupported.push(format!("support-condition:{id}"));
                     continue;
                 };
-                if !enabled {
+                if !enabled || !triggered {
                     continue;
                 }
                 match row.kind {
                     15000 => extension_ms = f(extension_ms + f(row.value as f64)),
                     3001 => recovery += row.value,
                     12006 => {
+                        if !(1..=6).contains(&row.value) {
+                            unsupported.push(format!("support-conversion:{id}:{}", row.value));
+                            continue;
+                        }
                         convert = Some(Conversion {
                             judgements: judgements(master, &row.targets),
                             limit: if row.limit_count != 0 {
@@ -169,6 +192,9 @@ pub fn resolve(
                             } else {
                                 None
                             },
+                            judgement: row.value as usize,
+                            seconds: Some(f(row.seconds)),
+                            at_start: !starts_with_live(master, row.trigger_group),
                         })
                     }
                     3003 => {}
