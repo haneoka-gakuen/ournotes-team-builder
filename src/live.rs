@@ -1098,80 +1098,88 @@ pub fn judgements(count: usize, play: &serde_json::Value) -> Option<Vec<usize>> 
     Some(out)
 }
 
-/// A timing offset that keeps every note in its judgement: negative is early.
+/// One step of a counting window and the chart notes that complete it.
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct Shift {
-    pub score: f64,
-    pub offset_ms: i32,
-    /// Offsets around `offset_ms` that reach the same score.
-    pub from_ms: i32,
-    pub to_ms: i32,
+pub struct TimingStep {
+    pub step: i32,
+    pub time_ms: i32,
+    pub notes: usize,
+    pub gain: f64,
 }
+/// A cumulative snapshot's counting window: its counted notes and steps.
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct WindowShift {
-    pub events: Vec<usize>,
+pub struct TimingWindow {
+    pub event: usize,
     pub start_ms: i32,
     pub end_ms: i32,
-    pub offset_ms: i32,
-    pub from_ms: i32,
-    pub to_ms: i32,
+    pub unit: i32,
+    pub notes: Vec<i32>,
+    pub steps: Vec<TimingStep>,
 }
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Timing {
     pub score: f64,
-    pub uniform: Shift,
     pub best: f64,
-    pub windows: Vec<WindowShift>,
+    pub advance_ms: i32,
+    pub windows: Vec<TimingWindow>,
 }
-/// Every offset stays inside the narrowest Perfect window (Tap, ±50 ms).
-pub const TIMING_LIMIT_MS: i32 = 50;
+/// One 60 Hz frame: hitting a note this much early always crosses the frame
+/// boundary before it, whatever the phase of the frame clock.
+pub const TIMING_ADVANCE_MS: i32 = 17;
 
-/// Cumulative support skills count judgements per delivered frame and apply each
-/// step from that frame, while notes score at their chart time. Hitting the notes
-/// of a counting window slightly early or late moves the steps; this finds the
-/// best common offset and the best offset per window for one order.
+/// Cumulative snapshots count judgements in the frame that delivers them and
+/// raise each step from that frame, while notes score at their chart time, so
+/// the notes completing a step never get that step themselves. Hitting just
+/// those notes one frame early gives them the step at every frame phase;
+/// moving the window's first notes early would drop them before it opens.
 pub fn timing(input: &Input, order_index: usize) -> Option<Timing> {
     let order = orders().get(order_index)?;
     let n = input.times.len();
-    let mut spans: Vec<(i32, i32, Vec<usize>)> = Vec::new();
-    for (event, &start) in input.skill_times.iter().take(5).enumerate() {
-        let Some(slot) = input.slots.get(order[event]) else { continue };
-        for factor in slot.cumulative.iter().filter(|factor| !factor.judgements.is_empty()) {
-            let activation = frame_time(start);
-            spans.push((activation, activation + factor.duration_ms(), vec![event]));
-        }
-    }
-    if spans.is_empty() {
-        return None;
-    }
-    spans.sort_by_key(|span| span.0);
-    let reach = TIMING_LIMIT_MS + 17;
-    let mut merged: Vec<(i32, i32, Vec<usize>)> = Vec::new();
-    for span in spans {
-        match merged.last_mut() {
-            Some(last) if span.0 - reach <= last.1 + reach => {
-                last.1 = last.1.max(span.1);
-                for event in span.2 {
-                    if !last.2.contains(&event) {
-                        last.2.push(event);
-                    }
-                }
-            }
-            _ => merged.push(span),
-        }
-    }
-    let notes: Vec<Vec<usize>> = merged
-        .iter()
-        .map(|&(from, to, _)| (0..n).filter(|&i| input.times[i] >= from - reach && input.times[i] <= to + reach).collect())
-        .collect();
     let judgements = match &input.judgements {
         Some(grades) => Some(grades.clone()),
         None if input.slots.iter().flat_map(|slot| &slot.cumulative).any(|factor| factor.requires_unbounded_bounds(n)) => Some(vec![5; n]),
         None => None,
     };
+    let converted = judgements.as_ref().map(|grades| converted_judgements(input, order, grades));
+    let grade = |i: usize| converted.as_ref().map_or(5, |grades| grades[i]);
+    let mut windows = Vec::new();
+    let mut groups: Vec<(usize, usize, Vec<usize>)> = Vec::new();
+    for (event, &start) in input.skill_times.iter().take(5).enumerate() {
+        let Some(slot) = input.slots.get(order[event]) else { continue };
+        for factor in slot.cumulative.iter().filter(|factor| !factor.judgements.is_empty()) {
+            let activation = frame_time(start);
+            let end = activation + factor.duration_ms();
+            let mut window = TimingWindow { event, start_ms: activation, end_ms: end, unit: factor.unit, notes: Vec::new(), steps: Vec::new() };
+            let (mut count, mut applied) = (0, 0);
+            let mut first = input.times.partition_point(|&time| frame_time(time) < activation);
+            while first < n {
+                let frame = frame_time(input.times[first]);
+                if frame > end {
+                    break;
+                }
+                let after = input.times.partition_point(|&time| frame_time(time) <= frame);
+                let matching: Vec<usize> = (first..after).filter(|&i| factor.judgements.contains(&grade(i))).collect();
+                window.notes.extend(matching.iter().map(|&i| input.times[i]));
+                count += matching.len() as i32;
+                let mill = factor.mill(count);
+                if mill != applied && frame > input.times[after - 1] {
+                    let last = input.times[after - 1];
+                    let chord: Vec<usize> = (first..after).collect();
+                    groups.push((windows.len(), window.steps.len(), chord.clone()));
+                    window.steps.push(TimingStep { step: (count / factor.unit).min(factor.cap), time_ms: last, notes: chord.len(), gain: 0.0 });
+                }
+                applied = mill;
+                first = after;
+            }
+            windows.push(window);
+        }
+    }
+    if windows.is_empty() {
+        return None;
+    }
     enum Scorer<'a> {
         Ap(ApScorer<'a>),
         Play(PlayScorer<'a>),
@@ -1180,70 +1188,32 @@ pub fn timing(input: &Input, order_index: usize) -> Option<Timing> {
         Some(grades) => Scorer::Play(PlayScorer::new(input, grades)),
         None => Scorer::Ap(ApScorer::new(input)),
     };
-    let mut evaluate = |shifts: &[i32]| {
-        let mut offsets = vec![0; n];
-        for (segment, &shift) in notes.iter().zip(shifts) {
-            for &i in segment {
-                offsets[i] = shift;
-            }
-        }
-        let delivery = Delivery::new(&input.times, &offsets);
+    let mut evaluate = |offsets: &[i32]| {
+        let delivery = Delivery::new(&input.times, offsets);
         match &mut scorer {
             Scorer::Ap(scorer) => scorer.order(order, Some(&delivery)),
             Scorer::Play(scorer) => scorer.order(order, Some(&delivery)),
         }
     };
-    let candidates: Vec<i32> = (-TIMING_LIMIT_MS..=TIMING_LIMIT_MS).collect();
-    // Ties prefer the smaller offset, then the earlier one.
-    let choose = |values: &[f64]| -> Shift {
-        let mut best = 0;
-        for (k, &value) in values.iter().enumerate() {
-            let (offset, current) = (candidates[k], candidates[best]);
-            if value > values[best] || value == values[best] && (offset.abs(), offset) < (current.abs(), current) {
-                best = k;
+    let mut offsets = vec![0; n];
+    let score = evaluate(&offsets);
+    let mut best = score;
+    for (window, step, chord) in groups {
+        for &i in &chord {
+            offsets[i] = -TIMING_ADVANCE_MS;
+        }
+        let value = evaluate(&offsets);
+        if value > best {
+            windows[window].steps[step].gain = value - best;
+            best = value;
+        } else {
+            for &i in &chord {
+                offsets[i] = 0;
             }
         }
-        let (mut from, mut to) = (best, best);
-        while from > 0 && values[from - 1] == values[best] {
-            from -= 1;
-        }
-        while to + 1 < values.len() && values[to + 1] == values[best] {
-            to += 1;
-        }
-        Shift { score: values[best], offset_ms: candidates[best], from_ms: candidates[from], to_ms: candidates[to] }
-    };
-    let segments = merged.len();
-    let score = evaluate(&vec![0; segments]);
-    let uniform_values: Vec<f64> = candidates.iter().map(|&d| evaluate(&vec![d; segments])).collect();
-    let uniform = choose(&uniform_values);
-    let mut shifts = vec![uniform.offset_ms; segments];
-    let mut ranges = vec![(uniform.from_ms, uniform.to_ms); segments];
-    let mut best = uniform.score;
-    for _ in 0..3 {
-        let mut improved = false;
-        for segment in 0..segments {
-            let values: Vec<f64> = candidates
-                .iter()
-                .map(|&d| {
-                    let mut trial = shifts.clone();
-                    trial[segment] = d;
-                    evaluate(&trial)
-                })
-                .collect();
-            let choice = choose(&values);
-            improved |= choice.score > best;
-            best = choice.score;
-            shifts[segment] = choice.offset_ms;
-            ranges[segment] = (choice.from_ms, choice.to_ms);
-        }
-        if !improved {
-            break;
-        }
     }
-    let windows = merged
-        .into_iter()
-        .zip(shifts.iter().zip(&ranges))
-        .map(|((start, end, events), (&offset, &(from, to)))| WindowShift { events, start_ms: start, end_ms: end, offset_ms: offset, from_ms: from, to_ms: to })
-        .collect();
-    Some(Timing { score, uniform, best, windows })
+    for window in &mut windows {
+        window.steps.retain(|step| step.gain > 0.0);
+    }
+    Some(Timing { score, best, advance_ms: TIMING_ADVANCE_MS, windows })
 }

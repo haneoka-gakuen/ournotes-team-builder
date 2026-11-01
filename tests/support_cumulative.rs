@@ -492,19 +492,24 @@ fn timing_keeps_the_scored_order() {
         let input = input(vec![slot(vec![climbing(6, 5.0)])], judgements, notes);
         let timing = live::timing(&input, 0).unwrap();
         assert_eq!(timing.score, live::score(&input).unwrap().scores[0]);
-        assert!(timing.best >= timing.score && timing.best >= timing.uniform.score);
+        assert!(timing.best >= timing.score);
     }
     assert!(live::timing(&input(vec![slot(Vec::new())], None, notes), 0).is_none());
 }
 
-/// A step reached in an earlier frame applies to the note that reached it.
+/// A step reached in an earlier frame applies to the notes that reached it,
+/// at every phase of the frame clock.
 #[test]
-fn early_delivery_moves_steps_before_their_notes() {
+fn step_notes_one_frame_early_get_their_step() {
     let notes = 12;
-    let mut timed = input(vec![slot(vec![climbing(6, 5.0)])], None, notes);
-    timed.times = (0..notes).map(|i| 105 + i as i32 * 100).collect();
-    let timing = live::timing(&timed, 0).unwrap();
-    assert!(timing.best > timing.score);
-    assert!(timing.uniform.offset_ms < 0 && timing.uniform.from_ms <= timing.uniform.to_ms);
-    assert!(timing.uniform.from_ms >= -live::TIMING_LIMIT_MS);
+    for phase in 0..17 {
+        let mut timed = input(vec![slot(vec![climbing(6, 5.0)])], None, notes);
+        timed.times = (0..notes).map(|i| 105 + phase + i as i32 * 100).collect();
+        timed.skill_times = vec![phase];
+        let timing = live::timing(&timed, 0).unwrap();
+        let steps: Vec<_> = timing.windows.iter().flat_map(|w| &w.steps).collect();
+        assert!(steps.iter().all(|step| step.gain > 0.0 && step.notes == 1));
+        assert_eq!(timing.best - timing.score, steps.iter().map(|step| step.gain).sum::<f64>());
+        assert_eq!(timing.windows[0].notes.len(), timing.windows[0].notes.iter().filter(|&&t| t >= timing.windows[0].start_ms).count());
+    }
 }
