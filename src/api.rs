@@ -221,13 +221,14 @@ impl Engine {
         }
         Ok((cap, seeds, result.stats))
     }
-    pub fn evaluate(
+    /// The team of `team` from the request's box, leader first, with its power
+    /// and resolved normal-live skills on `song_id`.
+    fn resolve_team(
         &self,
         request: &Value,
         team: &Value,
         song_id: i32,
-        difficulty: i32,
-    ) -> Result<Value, String> {
+    ) -> Result<ResolvedTeam, String> {
         let inputs: Vec<MemberInput> =
             serde_json::from_value(request["members"].clone()).map_err(|e| e.to_string())?;
         let snaps: Vec<SnapInput> =
@@ -312,13 +313,24 @@ impl Engine {
             effects,
         )?;
         let mut unsupported = Vec::new();
-        let slots = members
+        let slots: Vec<live::Slot> = members
             .iter()
             .zip(&snaps)
             .map(|(member, snap)| {
                 skills::resolve(&self.master, member, snap.as_ref(), &mut unsupported)
             })
             .collect();
+        Ok(ResolvedTeam { cards, members, snaps, music, power, unsupported, slots })
+    }
+    pub fn evaluate(
+        &self,
+        request: &Value,
+        team: &Value,
+        song_id: i32,
+        difficulty: i32,
+    ) -> Result<Value, String> {
+        let ResolvedTeam { cards, members, snaps, music, power, unsupported, slots } =
+            self.resolve_team(request, team, song_id)?;
         let chart = self
             .charts
             .get(&(song_id, difficulty))
@@ -491,6 +503,16 @@ impl Engine {
         }
         Ok(result)
     }
+}
+
+struct ResolvedTeam {
+    cards: power::BoxCards,
+    members: Vec<power::Member>,
+    snaps: Vec<Option<power::Snap>>,
+    music: power::Music,
+    power: power::TeamPower,
+    unsupported: Vec<String>,
+    slots: Vec<live::Slot>,
 }
 
 struct PowerObjective;
@@ -4080,9 +4102,37 @@ impl Engine {
             let start = chart.skill_times[event];
             windows.push(json!({"member":member.key,"event":event,"startMs":start,"endMs":start as i64+length as i64,"percent":percent,"perfectPercent":perfect,"extensionMs":skill.extension_ms}));
         }
-        Ok(
-            json!({"durationMs":duration,"density":density,"fever":chart.fevers,"windows":windows,"cachedCharts":self.cached_chart_keys()}),
-        )
+        let mut out = json!({"durationMs":duration,"density":density,"fever":chart.fevers,"windows":windows,"cachedCharts":self.cached_chart_keys()});
+        if request["timing"].is_object() {
+            out["timing"] = self.order_timing(request, &song["songId"], &song["difficulty"])?;
+        }
+        Ok(out)
+    }
+}
+
+impl Engine {
+    /// Best judgement timing of one normal-live order (`live::timing`), from the
+    /// evaluation context in `request.timing`.
+    fn order_timing(&self, request: &Value, song_id: &Value, difficulty: &Value) -> Result<Value, String> {
+        let (song_id, difficulty) = (master::int(song_id), master::int(difficulty));
+        let context = &request["timing"];
+        let mut evaluation = context.clone();
+        for key in ["members", "snaps", "unknownPolicy"] {
+            evaluation[key] = request[key].clone();
+        }
+        let team = json!({"members": request["memberKeys"], "snaps": request["snapKeys"], "leader": request["memberKeys"][0]});
+        let resolved = self.resolve_team(&evaluation, &team, song_id)?;
+        let order: Vec<usize> = master::integers(&request["order"]).into_iter().map(|slot| slot as usize).collect();
+        let Some(index) = live::orders().iter().position(|row| row[..] == order[..]) else {
+            return Ok(Value::Null);
+        };
+        let chart = self
+            .charts
+            .get(&(song_id, difficulty))
+            .ok_or_else(|| format!("missing-chart:{song_id}:{difficulty}"))?;
+        let judgements = live::judgements(chart.times.len(), &context["play"]);
+        let input = chart::prepare(&self.master, chart, resolved.power.total as i32, resolved.slots, judgements, 1.0, 100.0);
+        Ok(live::timing(&input, index).map_or(Value::Null, |timing| json!(timing)))
     }
 }
 

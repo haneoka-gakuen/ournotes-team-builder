@@ -484,3 +484,27 @@ fn cumulative_caps_keep_search_bounds_above_replay() {
         assert!(high >= exact, "signed-factor residue: bound {high} < replay {exact}");
     }
 }
+
+#[test]
+fn timing_keeps_the_scored_order() {
+    let notes = 12;
+    for judgements in [None, Some(vec![PERFECT; notes])] {
+        let input = input(vec![slot(vec![climbing(6, 5.0)])], judgements, notes);
+        let timing = live::timing(&input, 0).unwrap();
+        assert_eq!(timing.score, live::score(&input).unwrap().scores[0]);
+        assert!(timing.best >= timing.score && timing.best >= timing.uniform.score);
+    }
+    assert!(live::timing(&input(vec![slot(Vec::new())], None, notes), 0).is_none());
+}
+
+/// A step reached in an earlier frame applies to the note that reached it.
+#[test]
+fn early_delivery_moves_steps_before_their_notes() {
+    let notes = 12;
+    let mut timed = input(vec![slot(vec![climbing(6, 5.0)])], None, notes);
+    timed.times = (0..notes).map(|i| 105 + i as i32 * 100).collect();
+    let timing = live::timing(&timed, 0).unwrap();
+    assert!(timing.best > timing.score);
+    assert!(timing.uniform.offset_ms < 0 && timing.uniform.from_ms <= timing.uniform.to_ms);
+    assert!(timing.uniform.from_ms >= -live::TIMING_LIMIT_MS);
+}

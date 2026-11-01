@@ -392,11 +392,48 @@ fn effect_end(input: &Input, slot: &Slot, effect: &Effect, start: i32, judgement
     }
     end
 }
+/// Notes in judgement-delivery order: each note's frame and chart index. Without
+/// offsets this is chart order, because frames never decrease with note time.
+struct Delivery {
+    frames: Vec<i32>,
+    notes: Vec<usize>,
+}
+impl Delivery {
+    fn new(times: &[i32], offsets: &[i32]) -> Self {
+        let mut rows: Vec<_> = times
+            .iter()
+            .zip(offsets)
+            .enumerate()
+            .map(|(i, (&time, &offset))| (frame_time(time.saturating_add(offset)), i))
+            .collect();
+        rows.sort_unstable();
+        Self {
+            frames: rows.iter().map(|row| row.0).collect(),
+            notes: rows.iter().map(|row| row.1).collect(),
+        }
+    }
+}
+fn partition(len: usize, mut below: impl FnMut(usize) -> bool) -> usize {
+    let (mut low, mut high) = (0, len);
+    while low < high {
+        let middle = (low + high) / 2;
+        if below(middle) {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    low
+}
 fn cumulative_commands(
     input: &Input,
     order: &[usize; 5],
     judgements: Option<&[usize]>,
+    delivery: Option<&Delivery>,
 ) -> Vec<Command> {
+    let n = input.times.len();
+    let frame_at = |k: usize| delivery.map_or_else(|| frame_time(input.times[k]), |d| d.frames[k]);
+    let note_at = |k: usize| delivery.map_or(k, |d| d.notes[k]);
     let mut commands = Vec::new();
     for (event, &start) in input.skill_times.iter().take(5).enumerate() {
         let Some(slot) = input.slots.get(order[event]) else {
@@ -406,22 +443,18 @@ fn cumulative_commands(
             let activation = frame_time(start);
             let end = activation + factor.duration_ms();
             let (mut count, mut applied) = (0, 0);
-            let mut first = input
-                .times
-                .partition_point(|&time| frame_time(time) < activation);
-            while first < input.times.len() {
-                let frame = frame_time(input.times[first]);
+            let mut first = partition(n, |k| frame_at(k) < activation);
+            while first < n {
+                let frame = frame_at(first);
                 if frame > end {
                     break;
                 }
-                let after = input
-                    .times
-                    .partition_point(|&time| frame_time(time) <= frame);
+                let after = first + partition(n - first, |k| frame_at(first + k) <= frame);
                 count += (first..after)
-                    .filter(|&i| {
+                    .filter(|&k| {
                         factor
                             .judgements
-                            .contains(&judgements.map_or(5, |grades| grades[i]))
+                            .contains(&judgements.map_or(5, |grades| grades[note_at(k)]))
                     })
                     .count() as i32;
                 let mill = factor.mill(count);
@@ -456,7 +489,7 @@ fn cumulative_commands(
     commands.sort_by_key(|command| (command.time, command.owner));
     commands
 }
-fn commands(input: &Input, order: &[usize; 5]) -> Vec<Command> {
+fn commands(input: &Input, order: &[usize; 5], delivery: Option<&Delivery>) -> Vec<Command> {
     let mut commands = Vec::new();
     for (event, &start) in input.skill_times.iter().take(5).enumerate() {
         let Some(slot) = input.slots.get(order[event]) else {
@@ -488,7 +521,7 @@ fn commands(input: &Input, order: &[usize; 5]) -> Vec<Command> {
             }
         }
     }
-    commands.extend(cumulative_commands(input, order, None));
+    commands.extend(cumulative_commands(input, order, None, delivery));
     commands.sort_by_key(|c| (c.time, c.owner));
     commands
 }
@@ -515,31 +548,44 @@ fn prefix<'a>(
         out
     })
 }
-fn ap(input: &Input) -> Scores {
-    let n = input.times.len();
-    let t = f(f(input.adjustment * input.power as f64) * input.difficulty_factor);
-    let perfect = input.judge_frac[5];
-    let base: Vec<_> = (0..n)
-        .map(|i| f(f(perfect * f(input.note_frac[i] * t)) * input.ap_combo[i]))
-        .collect();
-    let luck = f(input.luck_percent.min(200.0) / 100.0);
-    let assist = f(input.assist);
-    let mut prefixes: HashMap<u64, Vec<f64>> = HashMap::new();
-    let mut scores = vec![0.0; 120];
-    let plan = plan(&input.slots);
-    for &index in &plan.representatives {
+/// All-perfect scoring with the factor prefix sums shared across orders.
+struct ApScorer<'a> {
+    input: &'a Input,
+    base: Vec<f64>,
+    luck: f64,
+    assist: f64,
+    prefixes: HashMap<u64, Vec<f64>>,
+}
+impl<'a> ApScorer<'a> {
+    fn new(input: &'a Input) -> Self {
+        let n = input.times.len();
+        let t = f(f(input.adjustment * input.power as f64) * input.difficulty_factor);
+        let perfect = input.judge_frac[5];
+        Self {
+            input,
+            base: (0..n)
+                .map(|i| f(f(perfect * f(input.note_frac[i] * t)) * input.ap_combo[i]))
+                .collect(),
+            luck: f(input.luck_percent.min(200.0) / 100.0),
+            assist: f(input.assist),
+            prefixes: HashMap::new(),
+        }
+    }
+    fn order(&mut self, order: &[usize; 5], delivery: Option<&Delivery>) -> f64 {
+        let input = self.input;
+        let n = input.times.len();
         let (mut general, mut perfect_up) = (f(1.0), f(0.0));
         let mut at = 0;
         let mut score = 0.0;
-        for command in commands(input, &orders()[index]) {
+        for command in commands(input, order, delivery) {
             let end = input.times.partition_point(|&time| time < command.time);
             if end > at {
                 let sums = prefix(
-                    &mut prefixes,
-                    &base,
+                    &mut self.prefixes,
+                    &self.base,
                     f(general + perfect_up),
-                    luck,
-                    assist,
+                    self.luck,
+                    self.assist,
                     input.converted_count,
                 );
                 score += sums[end] - sums[at];
@@ -554,16 +600,24 @@ fn ap(input: &Input) -> Scores {
         }
         if at < n {
             let sums = prefix(
-                &mut prefixes,
-                &base,
+                &mut self.prefixes,
+                &self.base,
                 f(general + perfect_up),
-                luck,
-                assist,
+                self.luck,
+                self.assist,
                 input.converted_count,
             );
             score += sums[n] - sums[at];
         }
-        scores[index] = score;
+        score
+    }
+}
+fn ap(input: &Input) -> Scores {
+    let mut scorer = ApScorer::new(input);
+    let mut scores = vec![0.0; 120];
+    let plan = plan(&input.slots);
+    for &index in &plan.representatives {
+        scores[index] = scorer.order(&orders()[index], None);
     }
     for (index, &source) in plan.sources.iter().enumerate() {
         scores[index] = scores[source];
@@ -816,112 +870,135 @@ impl Factors {
         }
     }
 }
+/// Custom-judgement scoring of one order; life replays are shared across calls.
+struct PlayScorer<'a> {
+    input: &'a Input,
+    judgements: &'a [usize],
+    note: Vec<f64>,
+    firing: Vec<usize>,
+    luck: f64,
+    assist: f64,
+    life_cache: HashMap<([i32; 5], Vec<usize>), Lives>,
+}
+impl<'a> PlayScorer<'a> {
+    fn new(input: &'a Input, judgements: &'a [usize]) -> Self {
+        let t = f(f(input.adjustment * input.power as f64) * input.difficulty_factor);
+        Self {
+            input,
+            judgements,
+            note: input.note_frac.iter().map(|&v| f(v * t)).collect(),
+            firing: firing(input),
+            luck: f(input.luck_percent.min(200.0) / 100.0),
+            assist: f(input.assist),
+            life_cache: HashMap::new(),
+        }
+    }
+    fn order(&mut self, order: &[usize; 5], delivery: Option<&Delivery>) -> f64 {
+        let (input, judgements, firing, note) = (self.input, self.judgements, &self.firing, &self.note);
+        let (luck, assist) = (self.luck, self.assist);
+        let n = input.times.len();
+    let recoveries = order.map(|slot| input.slots.get(slot).map(|s| s.recovery).unwrap_or(0));
+    let converted = converted_judgements(input, order, judgements);
+    let lives = self.life_cache
+        .entry((recoveries, converted.clone()))
+        .or_insert_with(|| lives(input, &converted, order, &input.slots));
+    let mut combos = Vec::with_capacity(n);
+    let (mut pending_combo, mut before, mut last) = (0, 0, -1);
+    for (i, &judgement) in converted.iter().enumerate() {
+        if input.times[i] != last { before = pending_combo; last = input.times[i]; }
+        combos.push(combo(&input.combo_table, before));
+        pending_combo = if judgement <= 2 { 0 } else { pending_combo + 1 };
+    }
+    let mut factors = Factors {
+        general: f(1.0),
+        channel: [0.0; 7],
+        active: Vec::new(),
+    };
+    let mut cursor = 0;
+    let cumulative = cumulative_commands(input, order, Some(&converted), delivery);
+    let mut pending = cumulative.into_iter().peekable();
+    let mut score = 0.0;
+    for i in 0..=n {
+        let time = if i < n {
+            input.times[i] as i64
+        } else {
+            1 << 53
+        };
+        while cursor < firing.len() && input.skill_times[firing[cursor]] as i64 <= time {
+            let event = firing[cursor];
+            let start = input.skill_times[event];
+            while pending.peek().is_some_and(|command| command.time <= start) {
+                let command = pending.next().unwrap();
+                factors.general = f(factors.general + f(command.delta as f64 / 100000.0));
+            }
+            factors.expire(start as i64);
+            if let Some(slot) = input.slots.get(order[event]) {
+                for effect in &slot.effects {
+                    if effect.gate.blocks(lives.gate[&event]) {
+                        continue;
+                    }
+                    let end = effect_end(input, slot, effect, start, Some(&converted));
+                    let diff = f(effect.delta as f64 / 100000.0);
+                    let channels = if effect.kind == 2000 {
+                        vec![0]
+                    } else {
+                        effect.judgements.clone()
+                    };
+                    for which in channels {
+                        if which == 0 {
+                            factors.general = f(factors.general + diff);
+                        } else {
+                            factors.channel[which] = f(factors.channel[which] + diff);
+                        }
+                        factors.active.push(Active {
+                            end,
+                            channel: which,
+                            delta: effect.delta,
+                        });
+                    }
+                }
+            }
+            cursor += 1;
+        }
+        if i == n {
+            break;
+        }
+        factors.expire(time);
+        while pending
+            .peek()
+            .is_some_and(|command| command.time as i64 <= time)
+        {
+            let command = pending.next().unwrap();
+            factors.general = f(factors.general + f(command.delta as f64 / 100000.0));
+        }
+        let judgement = converted[i];
+        let up = f(factors.general + factors.channel[judgement]);
+        let mut x = f(
+            f(luck * f(f(f(input.judge_frac[judgement] * note[i]) * combos[i]) * up))
+                / input.converted_count as f64,
+        )
+        .floor();
+        if lives.note[i] <= 0.0 {
+            x = f(input.life_onus * x).floor();
+        }
+        if assist != 1.0 {
+            x = f(assist * x).floor();
+        }
+        score += x;
+    }
+        score
+    }
+}
 fn play(input: &Input, judgements: &[usize]) -> Result<Scores, String> {
     let generation = crate::cancellation_generation();
-    let n = input.times.len();
-    let t = f(f(input.adjustment * input.power as f64) * input.difficulty_factor);
-    let luck = f(input.luck_percent.min(200.0) / 100.0);
-    let assist = f(input.assist);
-    let note: Vec<_> = input.note_frac.iter().map(|&v| f(v * t)).collect();
-    let firing = firing(input);
+    let mut scorer = PlayScorer::new(input, judgements);
     let mut scores = vec![0.0; 120];
     let plan = plan(&input.slots);
-    let mut life_cache = HashMap::new();
     for &index in &plan.representatives {
         if generation != crate::cancellation_generation() {
             return Err("cancelled".into());
         }
-        let order = &orders()[index];
-        let recoveries = order.map(|slot| input.slots.get(slot).map(|s| s.recovery).unwrap_or(0));
-        let converted = converted_judgements(input, order, judgements);
-        let lives = life_cache
-            .entry((recoveries, converted.clone()))
-            .or_insert_with(|| lives(input, &converted, order, &input.slots));
-        let mut combos = Vec::with_capacity(n);
-        let (mut pending_combo, mut before, mut last) = (0, 0, -1);
-        for (i, &judgement) in converted.iter().enumerate() {
-            if input.times[i] != last { before = pending_combo; last = input.times[i]; }
-            combos.push(combo(&input.combo_table, before));
-            pending_combo = if judgement <= 2 { 0 } else { pending_combo + 1 };
-        }
-        let mut factors = Factors {
-            general: f(1.0),
-            channel: [0.0; 7],
-            active: Vec::new(),
-        };
-        let mut cursor = 0;
-        let cumulative = cumulative_commands(input, order, Some(&converted));
-        let mut pending = cumulative.into_iter().peekable();
-        let mut score = 0.0;
-        for i in 0..=n {
-            let time = if i < n {
-                input.times[i] as i64
-            } else {
-                1 << 53
-            };
-            while cursor < firing.len() && input.skill_times[firing[cursor]] as i64 <= time {
-                let event = firing[cursor];
-                let start = input.skill_times[event];
-                while pending.peek().is_some_and(|command| command.time <= start) {
-                    let command = pending.next().unwrap();
-                    factors.general = f(factors.general + f(command.delta as f64 / 100000.0));
-                }
-                factors.expire(start as i64);
-                if let Some(slot) = input.slots.get(order[event]) {
-                    for effect in &slot.effects {
-                        if effect.gate.blocks(lives.gate[&event]) {
-                            continue;
-                        }
-                        let end = effect_end(input, slot, effect, start, Some(&converted));
-                        let diff = f(effect.delta as f64 / 100000.0);
-                        let channels = if effect.kind == 2000 {
-                            vec![0]
-                        } else {
-                            effect.judgements.clone()
-                        };
-                        for which in channels {
-                            if which == 0 {
-                                factors.general = f(factors.general + diff);
-                            } else {
-                                factors.channel[which] = f(factors.channel[which] + diff);
-                            }
-                            factors.active.push(Active {
-                                end,
-                                channel: which,
-                                delta: effect.delta,
-                            });
-                        }
-                    }
-                }
-                cursor += 1;
-            }
-            if i == n {
-                break;
-            }
-            factors.expire(time);
-            while pending
-                .peek()
-                .is_some_and(|command| command.time as i64 <= time)
-            {
-                let command = pending.next().unwrap();
-                factors.general = f(factors.general + f(command.delta as f64 / 100000.0));
-            }
-            let judgement = converted[i];
-            let up = f(factors.general + factors.channel[judgement]);
-            let mut x = f(
-                f(luck * f(f(f(input.judge_frac[judgement] * note[i]) * combos[i]) * up))
-                    / input.converted_count as f64,
-            )
-            .floor();
-            if lives.note[i] <= 0.0 {
-                x = f(input.life_onus * x).floor();
-            }
-            if assist != 1.0 {
-                x = f(assist * x).floor();
-            }
-            score += x;
-        }
-        scores[index] = score;
+        scores[index] = scorer.order(&orders()[index], None);
     }
     for (index, &source) in plan.sources.iter().enumerate() {
         scores[index] = scores[source];
@@ -1019,4 +1096,154 @@ pub fn judgements(count: usize, play: &serde_json::Value) -> Option<Vec<usize>> 
         }
     }
     Some(out)
+}
+
+/// A timing offset that keeps every note in its judgement: negative is early.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Shift {
+    pub score: f64,
+    pub offset_ms: i32,
+    /// Offsets around `offset_ms` that reach the same score.
+    pub from_ms: i32,
+    pub to_ms: i32,
+}
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowShift {
+    pub events: Vec<usize>,
+    pub start_ms: i32,
+    pub end_ms: i32,
+    pub offset_ms: i32,
+    pub from_ms: i32,
+    pub to_ms: i32,
+}
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Timing {
+    pub score: f64,
+    pub uniform: Shift,
+    pub best: f64,
+    pub windows: Vec<WindowShift>,
+}
+/// Every offset stays inside the narrowest Perfect window (Tap, ±50 ms).
+pub const TIMING_LIMIT_MS: i32 = 50;
+
+/// Cumulative support skills count judgements per delivered frame and apply each
+/// step from that frame, while notes score at their chart time. Hitting the notes
+/// of a counting window slightly early or late moves the steps; this finds the
+/// best common offset and the best offset per window for one order.
+pub fn timing(input: &Input, order_index: usize) -> Option<Timing> {
+    let order = orders().get(order_index)?;
+    let n = input.times.len();
+    let mut spans: Vec<(i32, i32, Vec<usize>)> = Vec::new();
+    for (event, &start) in input.skill_times.iter().take(5).enumerate() {
+        let Some(slot) = input.slots.get(order[event]) else { continue };
+        for factor in slot.cumulative.iter().filter(|factor| !factor.judgements.is_empty()) {
+            let activation = frame_time(start);
+            spans.push((activation, activation + factor.duration_ms(), vec![event]));
+        }
+    }
+    if spans.is_empty() {
+        return None;
+    }
+    spans.sort_by_key(|span| span.0);
+    let reach = TIMING_LIMIT_MS + 17;
+    let mut merged: Vec<(i32, i32, Vec<usize>)> = Vec::new();
+    for span in spans {
+        match merged.last_mut() {
+            Some(last) if span.0 - reach <= last.1 + reach => {
+                last.1 = last.1.max(span.1);
+                for event in span.2 {
+                    if !last.2.contains(&event) {
+                        last.2.push(event);
+                    }
+                }
+            }
+            _ => merged.push(span),
+        }
+    }
+    let notes: Vec<Vec<usize>> = merged
+        .iter()
+        .map(|&(from, to, _)| (0..n).filter(|&i| input.times[i] >= from - reach && input.times[i] <= to + reach).collect())
+        .collect();
+    let judgements = match &input.judgements {
+        Some(grades) => Some(grades.clone()),
+        None if input.slots.iter().flat_map(|slot| &slot.cumulative).any(|factor| factor.requires_unbounded_bounds(n)) => Some(vec![5; n]),
+        None => None,
+    };
+    enum Scorer<'a> {
+        Ap(ApScorer<'a>),
+        Play(PlayScorer<'a>),
+    }
+    let mut scorer = match &judgements {
+        Some(grades) => Scorer::Play(PlayScorer::new(input, grades)),
+        None => Scorer::Ap(ApScorer::new(input)),
+    };
+    let mut evaluate = |shifts: &[i32]| {
+        let mut offsets = vec![0; n];
+        for (segment, &shift) in notes.iter().zip(shifts) {
+            for &i in segment {
+                offsets[i] = shift;
+            }
+        }
+        let delivery = Delivery::new(&input.times, &offsets);
+        match &mut scorer {
+            Scorer::Ap(scorer) => scorer.order(order, Some(&delivery)),
+            Scorer::Play(scorer) => scorer.order(order, Some(&delivery)),
+        }
+    };
+    let candidates: Vec<i32> = (-TIMING_LIMIT_MS..=TIMING_LIMIT_MS).collect();
+    // Ties prefer the smaller offset, then the earlier one.
+    let choose = |values: &[f64]| -> Shift {
+        let mut best = 0;
+        for (k, &value) in values.iter().enumerate() {
+            let (offset, current) = (candidates[k], candidates[best]);
+            if value > values[best] || value == values[best] && (offset.abs(), offset) < (current.abs(), current) {
+                best = k;
+            }
+        }
+        let (mut from, mut to) = (best, best);
+        while from > 0 && values[from - 1] == values[best] {
+            from -= 1;
+        }
+        while to + 1 < values.len() && values[to + 1] == values[best] {
+            to += 1;
+        }
+        Shift { score: values[best], offset_ms: candidates[best], from_ms: candidates[from], to_ms: candidates[to] }
+    };
+    let segments = merged.len();
+    let score = evaluate(&vec![0; segments]);
+    let uniform_values: Vec<f64> = candidates.iter().map(|&d| evaluate(&vec![d; segments])).collect();
+    let uniform = choose(&uniform_values);
+    let mut shifts = vec![uniform.offset_ms; segments];
+    let mut ranges = vec![(uniform.from_ms, uniform.to_ms); segments];
+    let mut best = uniform.score;
+    for _ in 0..3 {
+        let mut improved = false;
+        for segment in 0..segments {
+            let values: Vec<f64> = candidates
+                .iter()
+                .map(|&d| {
+                    let mut trial = shifts.clone();
+                    trial[segment] = d;
+                    evaluate(&trial)
+                })
+                .collect();
+            let choice = choose(&values);
+            improved |= choice.score > best;
+            best = choice.score;
+            shifts[segment] = choice.offset_ms;
+            ranges[segment] = (choice.from_ms, choice.to_ms);
+        }
+        if !improved {
+            break;
+        }
+    }
+    let windows = merged
+        .into_iter()
+        .zip(shifts.iter().zip(&ranges))
+        .map(|((start, end, events), (&offset, &(from, to)))| WindowShift { events, start_ms: start, end_ms: end, offset_ms: offset, from_ms: from, to_ms: to })
+        .collect();
+    Some(Timing { score, uniform, best, windows })
 }
