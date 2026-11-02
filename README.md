@@ -58,6 +58,14 @@ cargo run --release --example bench -- input.json
 
 `cancel()` stops running searches. For other languages, the same engine is exposed as C functions that take and return JSON strings, such as `haneoka_context_json`.
 
+## Cumulative judgement timing
+
+Ordinary score requests can set `goal.play.cumulativeTiming` to `"best"` or `"worst"` with `criterion: "max"`. Evaluation uses the same field on `request.play`. Each of the 120 skill orders receives its own timing maximum or minimum, then the best order determines the team's score. Omitting the field preserves nominal scoring.
+
+These modes vary cumulative-counter delivery within each input's base-judgement windows at 60 Hz. Automatic ticks stay fixed. Chart-time scoring, ordinary combo, conversions and member-skill windows retain their existing contracts. Monotone delivery dominance must hold for every affected counter; conflicting timing choices are enumerated. Numeric card dominance based on the nominal model is disabled in these modes.
+
+An ordinary `timeline` request with a `timing` context returns `worst` and `optimal` alongside nominal `score` and the attainable 17 ms guide's `best`. Each guide step's `noteIndices` addresses the canonical judged-note stream; co-timed automatic notes are not additional inputs.
+
 ## Build
 
 ```sh

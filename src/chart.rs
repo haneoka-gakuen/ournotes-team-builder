@@ -205,6 +205,51 @@ pub fn prepare(
         luck_percent,
     }
 }
+/// Reachable 60 Hz delivery frames, keeping each input's base judgement.
+/// Automatic ticks retain chart time; ordinary lives do not enable JUST.
+pub fn timing_frames(master: &Master, chart: &Chart, grades: Option<&[usize]>) -> Vec<Vec<i32>> {
+    chart.times.iter().enumerate().map(|(i, &time)| {
+        let kind = chart.judgement_types[i];
+        if !matches!(kind, 1 | 2 | 5 | 10 | 11 | 12 | 15) {
+            return vec![live::frame_time(time)];
+        }
+        let grade = grades.map_or(5, |rows| rows[i]) as i32;
+        let Some(&before) = master.live.judgement_before_ms.get(&(kind, grade)) else { return Vec::new() };
+        let Some(&after) = master.live.judgement_after_ms.get(&(kind, grade)) else { return Vec::new() };
+        let stricter: Vec<_> = ((grade + 1)..=5).filter_map(|g| {
+            Some((*master.live.judgement_before_ms.get(&(kind, g))?, *master.live.judgement_after_ms.get(&(kind, g))?))
+        }).collect();
+        let intervals = if stricter.is_empty() {
+            vec![(-before, after)]
+        } else {
+            let strict_before = stricter.iter().map(|r| r.0).max().unwrap();
+            let strict_after = stricter.iter().map(|r| r.1).max().unwrap();
+            vec![(-before, after.min(-strict_before - 1)), ((strict_after + 1).max(-before), after)]
+        };
+        let mut frames = Vec::new();
+        for (low, high) in intervals.into_iter().filter(|(low, high)| low <= high) {
+            let end = live::frame_time(time.saturating_add(high));
+            let mut frame = live::frame_time(time.saturating_add(low));
+            loop {
+                frames.push(frame);
+                if frame >= end { break; }
+                frame = live::frame_time(frame + 1);
+            }
+        }
+        frames.sort_unstable();
+        frames.dedup();
+        frames
+    }).collect()
+}
+
+pub fn timing_mode(play: &serde_json::Value) -> Option<bool> {
+    match play["cumulativeTiming"].as_str() {
+        Some("best") => Some(true),
+        Some("worst") => Some(false),
+        _ => None,
+    }
+}
+
 pub fn skip_score(master: &Master, chart: &Chart, power: i32) -> i64 {
     let t = f(f(master.live.adjustment * power as f64) * chart.difficulty_factor);
     let great = f(master.live.judge_percent.get(&3).copied().unwrap_or(80.0) / 100.0);

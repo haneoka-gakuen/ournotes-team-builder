@@ -394,9 +394,111 @@ fn effect_end(input: &Input, slot: &Slot, effect: &Effect, start: i32, judgement
 }
 /// Notes in judgement-delivery order: each note's frame and chart index. Without
 /// offsets this is chart order, because frames never decrease with note time.
+#[derive(Clone)]
 struct Delivery {
     frames: Vec<i32>,
     notes: Vec<usize>,
+}
+
+/// Extremize cumulative delivery timing for each skill order. Ordinary score,
+/// combo, conversions and member-skill windows retain their chart-time contract.
+pub fn score_timed(input: &Input, frames: &[Vec<i32>], best: bool) -> Result<Scores, String> {
+    let nominal = score(input)?;
+    if input.slots.iter().all(|slot| slot.cumulative.is_empty()) { return Ok(nominal); }
+    if frames.len() != input.times.len() || frames.iter().any(Vec::is_empty) {
+        return Err("missing ordinary judgement timing".into());
+    }
+    // (activation, expiry, judgement mask, monotonicity of the native counter).
+    type Window = (i32, i32, u64, i8);
+    fn dominates(a: i32, b: i32, windows: &[Window], best: bool) -> bool {
+        windows.iter().all(|&(start, end, _, trend)| {
+            if trend == 0 { return false; }
+            let (inside_a, inside_b) = (start <= a && a <= end, start <= b && b <= end);
+            let earlier = (trend > 0) == best;
+            match (inside_a, inside_b, earlier) {
+                (true, true, true) => a <= b,
+                (true, true, false) => a >= b,
+                (false, false, _) => true,
+                (_, _, true) => inside_a,
+                (_, _, false) => !inside_a,
+            }
+        })
+    }
+    fn deliveries(input: &Input, frames: &[Vec<i32>], windows: &[Window], grades: &[usize], best: bool) -> Vec<Delivery> {
+        let mut selected = Vec::with_capacity(frames.len());
+        let mut choices = Vec::new();
+        for (i, allowed) in frames.iter().enumerate() {
+            let applicable: Vec<_> = windows.iter().copied().filter(|w| w.2 & (1 << grades[i]) != 0).collect();
+            if applicable.is_empty() {
+                selected.push(frame_time(input.times[i]));
+                continue;
+            }
+            // Earlier/later delivery dominates only when every affected counter
+            // agrees. Keep all remaining choices, including overlapping windows.
+            let options: Vec<_> = allowed.iter().copied().filter(|&frame| {
+                !allowed.iter().any(|&other| other != frame && dominates(other, frame, &applicable, best)
+                    && (!dominates(frame, other, &applicable, best) || other < frame))
+            }).collect();
+            selected.push(options[0]);
+            if options.len() > 1 { choices.push((i, options)); }
+        }
+        fn visit(at: usize, choices: &[(usize, Vec<i32>)], selected: &mut [i32], out: &mut Vec<Delivery>) {
+            if at == choices.len() {
+                let mut rows: Vec<_> = selected.iter().copied().enumerate().map(|(i, f)| (f, i)).collect();
+                rows.sort_unstable();
+                out.push(Delivery { frames: rows.iter().map(|r| r.0).collect(), notes: rows.iter().map(|r| r.1).collect() });
+                return;
+            }
+            let (i, options) = &choices[at];
+            for &frame in options {
+                selected[*i] = frame;
+                visit(at + 1, choices, selected, out);
+            }
+        }
+        let mut out = Vec::new();
+        visit(0, &choices, &mut selected, &mut out);
+        out
+    }
+    let n = input.times.len();
+    let mut schedules = HashMap::<Vec<i64>, Vec<Delivery>>::new();
+    let mut ap = input.judgements.is_none().then(|| ApScorer::new(input));
+    let mut played = input.judgements.as_ref().map(|grades| PlayScorer::new(input, grades));
+    let mut scores = vec![0.0; 120];
+    let plan = plan(&input.slots);
+    for &index in &plan.representatives {
+        let order = &orders()[index];
+        let grades = input.judgements.as_ref().map_or_else(|| vec![5; n], |g| converted_judgements(input, order, g));
+        let mut windows = Vec::<Window>::new();
+        for (event, &start) in input.skill_times.iter().take(5).enumerate() {
+            let Some(slot) = input.slots.get(order[event]) else { continue };
+            for factor in &slot.cumulative {
+                if factor.judgements.is_empty() || factor.value == 0 { continue; }
+                let values: Vec<_> = (0..=n).map(|count| factor.mill(count as i32)).collect();
+                let trend = if values.windows(2).all(|w| w[0] <= w[1]) { 1 }
+                    else if values.windows(2).all(|w| w[0] >= w[1]) { -1 } else { 0 };
+                let start = frame_time(start);
+                let mask = factor.judgements.iter().fold(0, |mask, &g| mask | (1u64 << g));
+                windows.push((start, start + factor.duration_ms(), mask, trend));
+            }
+        }
+        windows.sort_unstable();
+        windows.dedup();
+        let mut key: Vec<_> = grades.iter().map(|&g| g as i64).collect();
+        for &(start, end, mask, trend) in &windows { key.extend([start as i64, end as i64, mask as i64, trend as i64]); }
+        let candidates = schedules.entry(key).or_insert_with(|| deliveries(input, frames, &windows, &grades, best));
+        let mut extreme = if best { f64::NEG_INFINITY } else { f64::INFINITY };
+        for delivery in candidates {
+            let value = match (&mut ap, &mut played) {
+                (Some(scorer), _) => scorer.order(order, Some(delivery)),
+                (_, Some(scorer)) => scorer.order(order, Some(delivery)),
+                _ => unreachable!(),
+            };
+            extreme = if best { extreme.max(value) } else { extreme.min(value) };
+        }
+        scores[index] = extreme;
+    }
+    for (index, &source) in plan.sources.iter().enumerate() { scores[index] = scores[source]; }
+    Ok(summarize(input.power, scores))
 }
 impl Delivery {
     fn new(times: &[i32], offsets: &[i32]) -> Self {
@@ -1105,6 +1207,7 @@ pub struct TimingStep {
     pub step: i32,
     pub time_ms: i32,
     pub notes: usize,
+    pub note_indices: Vec<usize>,
     pub gain: f64,
 }
 /// A cumulative snapshot's counting window: its counted notes and steps.
@@ -1135,7 +1238,8 @@ pub const TIMING_ADVANCE_MS: i32 = 17;
 /// the notes completing a step never get that step themselves. Hitting just
 /// those notes one frame early gives them the step at every frame phase;
 /// moving the window's first notes early would drop them before it opens.
-pub fn timing(input: &Input, order_index: usize) -> Option<Timing> {
+/// `before_ms` follows `input.times` and allows only inputs retaining their base judgement.
+pub fn timing(input: &Input, order_index: usize, before_ms: &[i32]) -> Option<Timing> {
     let order = orders().get(order_index)?;
     let n = input.times.len();
     let judgements = match &input.judgements {
@@ -1165,11 +1269,11 @@ pub fn timing(input: &Input, order_index: usize) -> Option<Timing> {
                 window.notes.extend(matching.iter().map(|&i| input.times[i]));
                 count += matching.len() as i32;
                 let mill = factor.mill(count);
-                if mill != applied && frame > input.times[after - 1] {
-                    let last = input.times[after - 1];
-                    let chord: Vec<usize> = (first..after).collect();
+                let chord: Vec<usize> = (first..after).filter(|&i| before_ms[i] >= TIMING_ADVANCE_MS).collect();
+                if mill != applied && !chord.is_empty() {
+                    let last = input.times[*chord.last().unwrap()];
                     groups.push((windows.len(), window.steps.len(), chord.clone()));
-                    window.steps.push(TimingStep { step: (count / factor.unit).min(factor.cap), time_ms: last, notes: chord.len(), gain: 0.0 });
+                    window.steps.push(TimingStep { step: (count / factor.unit).min(factor.cap), time_ms: last, notes: chord.len(), note_indices: chord, gain: 0.0 });
                 }
                 applied = mill;
                 first = after;
@@ -1199,6 +1303,7 @@ pub fn timing(input: &Input, order_index: usize) -> Option<Timing> {
     let score = evaluate(&offsets);
     let mut best = score;
     for (window, step, chord) in groups {
+        let previous: Vec<_> = chord.iter().map(|&i| offsets[i]).collect();
         for &i in &chord {
             offsets[i] = -TIMING_ADVANCE_MS;
         }
@@ -1207,8 +1312,8 @@ pub fn timing(input: &Input, order_index: usize) -> Option<Timing> {
             windows[window].steps[step].gain = value - best;
             best = value;
         } else {
-            for &i in &chord {
-                offsets[i] = 0;
+            for (&i, offset) in chord.iter().zip(previous) {
+                offsets[i] = offset;
             }
         }
     }
@@ -1216,4 +1321,35 @@ pub fn timing(input: &Input, order_index: usize) -> Option<Timing> {
         window.steps.retain(|step| step.gain > 0.0);
     }
     Some(Timing { score, best, advance_ms: TIMING_ADVANCE_MS, windows })
+}
+#[cfg(test)]
+mod delivery_extremes_tests {
+    use super::*;
+    fn input(value: i32, overlap: bool) -> Input {
+        let factor = Cumulative { judgements: vec![5], unit: 2, value, maximum: 0, cap: 3, seconds: 0.2 };
+        let slot = Slot { effects: vec![], cumulative: vec![factor], extension_ms: 0.0, recovery: 0, convert: None };
+        Input { times: vec![105, 155, 205, 255], note_frac: vec![1.0, 0.1, 1.0, 1.0], ap_combo: vec![1.0; 4], combo_table: vec![], judge_frac: [0.0, 0.0, 0.0, 0.0, 0.8, 1.0, 1.0], converted_count: 4, difficulty_factor: 1.0, adjustment: 1.0, skill_times: if overlap { vec![100, 160] } else { vec![100, 400] }, life_base: 1000.0, life_onus: 1.0, damage: [0.0; 7], power: 1373, slots: vec![slot.clone(), slot], judgements: None, assist: 1.0, luck_percent: 100.0 }
+    }
+    #[test]
+    fn timing_extremes_match_every_schedule_including_overlaps_and_negative_counters() {
+        for overlap in [false, true] {
+            for value in [1, 2000, -2000, 12345] {
+                let input = input(value, overlap);
+                let frames: Vec<Vec<i32>> = input.times.iter().enumerate().map(|(i, &t)| if i == 1 { vec![frame_time(t)] } else { vec![frame_time(t - 40), frame_time(t), frame_time(t + 40)] }).collect();
+                let low = score_timed(&input, &frames, false).unwrap();
+                let high = score_timed(&input, &frames, true).unwrap();
+                let mut scorer = ApScorer::new(&input);
+                for (index, order) in orders().iter().enumerate() {
+                    let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+                    for &a in &frames[0] { for &b in &frames[1] { for &c in &frames[2] { for &d in &frames[3] {
+                        let offsets: Vec<_> = [a,b,c,d].iter().zip(&input.times).map(|(f,t)| f-t).collect();
+                        let score = scorer.order(order, Some(&Delivery::new(&input.times, &offsets)));
+                        lo = lo.min(score); hi = hi.max(score);
+                    }}}}
+                    assert_eq!(low.scores[index], lo, "minimum, overlap={overlap}, value={value}, order={index}");
+                    assert_eq!(high.scores[index], hi, "maximum, overlap={overlap}, value={value}, order={index}");
+                }
+            }
+        }
+    }
 }
