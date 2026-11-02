@@ -490,11 +490,11 @@ fn timing_keeps_the_scored_order() {
     let notes = 12;
     for judgements in [None, Some(vec![PERFECT; notes])] {
         let input = input(vec![slot(vec![climbing(6, 5.0)])], judgements, notes);
-        let timing = live::timing(&input, 0).unwrap();
+        let timing = live::timing(&input, 0, &vec![50; notes]).unwrap();
         assert_eq!(timing.score, live::score(&input).unwrap().scores[0]);
         assert!(timing.best >= timing.score);
     }
-    assert!(live::timing(&input(vec![slot(Vec::new())], None, notes), 0).is_none());
+    assert!(live::timing(&input(vec![slot(Vec::new())], None, notes), 0, &vec![50; notes]).is_none());
 }
 
 /// A step reached in an earlier frame applies to the notes that reached it,
@@ -506,10 +506,42 @@ fn step_notes_one_frame_early_get_their_step() {
         let mut timed = input(vec![slot(vec![climbing(6, 5.0)])], None, notes);
         timed.times = (0..notes).map(|i| 105 + phase + i as i32 * 100).collect();
         timed.skill_times = vec![phase];
-        let timing = live::timing(&timed, 0).unwrap();
+        let timing = live::timing(&timed, 0, &vec![50; notes]).unwrap();
         let steps: Vec<_> = timing.windows.iter().flat_map(|w| &w.steps).collect();
         assert!(steps.iter().all(|step| step.gain > 0.0 && step.notes == 1));
         assert_eq!(timing.best - timing.score, steps.iter().map(|step| step.gain).sum::<f64>());
         assert_eq!(timing.windows[0].notes.len(), timing.windows[0].notes.iter().filter(|&&t| t >= timing.windows[0].start_ms).count());
     }
+}
+
+#[test]
+fn automatic_notes_and_short_windows_cannot_advance() {
+    let mut timed = input(vec![slot(vec![climbing(1, 5.0)])], None, 2);
+    timed.times = vec![105, 105];
+    for before in [vec![0, 0], vec![16, 16], vec![50, 0]] {
+        let result = live::timing(&timed, 0, &before).unwrap();
+        assert_eq!(result.best, result.score);
+        assert!(result.windows.iter().all(|window| window.steps.is_empty()));
+    }
+}
+
+#[test]
+fn mixed_chords_return_only_the_movable_notes() {
+    let mut timed = input(vec![slot(vec![climbing(1, 5.0)])], None, 3);
+    timed.times = vec![105, 105, 105];
+    let result = live::timing(&timed, 0, &[0, 50, 50]).unwrap();
+    assert!(result.best > result.score);
+    let steps = &result.windows[0].steps;
+    assert_eq!(steps.len(), 1);
+    assert_eq!(steps[0].notes, 2);
+    assert_eq!(steps[0].note_indices, vec![1, 2]);
+}
+
+#[test]
+fn a_repeated_step_keeps_the_previous_advance() {
+    let mut timed = input(vec![slot(vec![climbing(1, 5.0), climbing(1, 5.0)])], None, 4);
+    timed.times = vec![105, 105, 205, 205];
+    let result = live::timing(&timed, 0, &[50; 4]).unwrap();
+    assert_eq!(result.best - result.score, result.windows.iter().flat_map(|w| &w.steps).map(|s| s.gain).sum::<f64>());
+    assert_eq!(result.windows.iter().flat_map(|w| &w.steps).count(), 1);
 }

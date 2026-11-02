@@ -43,6 +43,7 @@ pub(crate) struct Pair {
 }
 pub struct LiveCore {
     pub input: Input,
+    timing: Option<(bool, Vec<Vec<i32>>)>,
     pub high: Linear,
     pub low: Linear,
     pub factor_cap: f64,
@@ -132,6 +133,7 @@ impl LiveCore {
         let mut slots = table.slots.clone();
         let judgements = live::judgements(chart.times.len(), play);
         let input = chart::prepare(master, chart, 0, Vec::new(), judgements, 1.0, 100.0);
+        let timing = chart::timing_mode(play).map(|best| (best, chart::timing_frames(master, chart, input.judgements.as_deref())));
         let mut raise = 0.0_f64;
         let mut recovery = 0;
         let mut longest = 0;
@@ -229,6 +231,7 @@ impl LiveCore {
             .is_some_and(|b| b.damage.iter().fold(0.0, |sum, r| sum + r.1) >= input.life_base);
         Self {
             input,
+            timing,
             high,
             low,
             factor_cap,
@@ -323,7 +326,10 @@ impl LiveCore {
             .enumerate()
             .map(|(slot, &m)| self.slot(m, team.snaps[slot]).clone())
             .collect();
-        let scores = Arc::new(live::score(&self.input)?);
+        let scores = Arc::new(match &self.timing {
+            Some((best, frames)) => live::score_timed(&self.input, frames, *best)?,
+            None => live::score(&self.input)?,
+        });
         if self.scores.len() >= 4096 {
             if let Some(old) = self.score_order.pop_front() {
                 self.scores.remove(&old);
@@ -386,7 +392,7 @@ impl LiveCore {
         (lows, highs)
     }
     pub(crate) fn prepare_dominance(&mut self, power_cap: f64) {
-        if self.unbounded { return; }
+        if self.unbounded || self.timing.is_some() { return; }
 
         if self.input.judgements.is_none()
             && self

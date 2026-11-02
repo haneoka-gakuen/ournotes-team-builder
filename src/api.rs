@@ -428,7 +428,7 @@ impl Engine {
             range_scores = result.get("rangeScores").cloned();
             serde_json::from_value::<live::Scores>(result).map_err(|e| e.to_string())?
         } else {
-            live::score(&chart::prepare(
+            let input = chart::prepare(
                 &self.master,
                 chart,
                 power.total as i32,
@@ -436,7 +436,11 @@ impl Engine {
                 judgements,
                 1.0,
                 100.0,
-            ))?
+            );
+            match chart::timing_mode(play) {
+                Some(best) => live::score_timed(&input, &chart::timing_frames(&self.master, chart, input.judgements.as_deref()), best)?,
+                None => live::score(&input)?,
+            }
         };
         let mut ranks: BTreeMap<i32, i32> = BTreeMap::new();
         for &value in &scores.scores {
@@ -4132,7 +4136,21 @@ impl Engine {
             .ok_or_else(|| format!("missing-chart:{song_id}:{difficulty}"))?;
         let judgements = live::judgements(chart.times.len(), &context["play"]);
         let input = chart::prepare(&self.master, chart, resolved.power.total as i32, resolved.slots, judgements, 1.0, 100.0);
-        Ok(live::timing(&input, index).map_or(Value::Null, |timing| json!(timing)))
+        let before_ms: Vec<_> = chart.judgement_types.iter().enumerate().map(|(i, &kind)| {
+            // Held ticks and traces are delivered at chart time, independently of their timing windows.
+            if !matches!(kind, 1 | 2 | 5 | 10 | 11 | 12 | 15) { return 0; }
+            let grade = input.judgements.as_ref().map_or(5, |grades| grades[i]) as i32;
+            let early_grade = (1..=5).rev().find(|&candidate| {
+                self.master.live.judgement_before_ms.get(&(kind, candidate)).copied().unwrap_or(0) >= live::TIMING_ADVANCE_MS
+            });
+            if early_grade == Some(grade) { live::TIMING_ADVANCE_MS } else { 0 }
+        }).collect();
+        let Some(timing) = live::timing(&input, index, &before_ms) else { return Ok(Value::Null) };
+        let frames = chart::timing_frames(&self.master, chart, input.judgements.as_deref());
+        let mut output = json!(timing);
+        output["worst"] = json!(live::score_timed(&input, &frames, false)?.scores[index]);
+        output["optimal"] = json!(live::score_timed(&input, &frames, true)?.scores[index]);
+        Ok(output)
     }
 }
 

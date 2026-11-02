@@ -357,6 +357,8 @@ pub struct LiveTables {
     pub miss_windows: BTreeMap<i32, (i32, i32)>,
     pub timing_types: BTreeSet<i32>,
     pub perfect_after_ms: BTreeMap<i32, i32>,
+    pub judgement_before_ms: BTreeMap<(i32, i32), i32>,
+    pub judgement_after_ms: BTreeMap<(i32, i32), i32>,
     pub after_ms: f64,
     pub phases: BTreeMap<i32, i32>,
     pub gekiso: GekisoTables,
@@ -949,6 +951,16 @@ pub fn compile(data: &Value) -> Result<Master, String> {
                         int(field(r, "afterMs", "after")),
                     )
                 })
+                .collect(),
+            judgement_before_ms: timings
+                .iter()
+                .filter(|r| int(&r["assistLevel"]) == 0)
+                .map(|r| ((int(&r["noteJudgementType"]), int(&r["noteSimulateJudgement"])), int(&r["beforeMs"])))
+                .collect(),
+            judgement_after_ms: timings
+                .iter()
+                .filter(|r| int(&r["assistLevel"]) == 0)
+                .map(|r| ((int(&r["noteJudgementType"]), int(&r["noteSimulateJudgement"])), int(&r["afterMs"])))
                 .collect(),
             after_ms: timings
                 .iter()
