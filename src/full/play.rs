@@ -216,10 +216,13 @@ pub fn judgement_stream(
         })
         .collect();
     let mut grade = vec![5; rows.len()];
+    let great_eligible: Vec<_> = rows.iter().enumerate()
+        .filter(|(_, row)| crate::live::native_judgement(row.1.judgement_type, 4) == 4)
+        .map(|(i, _)| i).collect();
     choose(
-        rows.len(),
-        round(rows.len() as f64 * accuracy.great) as i64,
-        |i| grade[i] = 4,
+        great_eligible.len(),
+        (round(rows.len() as f64 * accuracy.great) as i64).min(great_eligible.len() as i64),
+        |i| grade[great_eligible[i]] = 4,
     );
     let eligible: Vec<_> = rows
         .iter()

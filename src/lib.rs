@@ -11,6 +11,7 @@ pub mod gekiso_objective;
 mod just_bound;
 pub(crate) mod just_window;
 pub mod live;
+pub mod input_timing;
 pub mod luck;
 pub mod master;
 pub mod model;

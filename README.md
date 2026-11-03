@@ -62,9 +62,13 @@ cargo run --release --example bench -- input.json
 
 Ordinary score requests can set `goal.play.cumulativeTiming` to `"best"` or `"worst"` with `criterion: "max"`. Evaluation uses the same field on `request.play`. Each of the 120 skill orders receives its own timing maximum or minimum, then the best order determines the team's score. Omitting the field preserves nominal scoring.
 
-These modes vary cumulative-counter delivery within each input's base-judgement windows at 60 Hz. Automatic ticks stay fixed. Chart-time scoring, ordinary combo, conversions and member-skill windows retain their existing contracts. Monotone delivery dominance must hold for every affected counter; conflicting timing choices are enumerated. Numeric card dominance based on the nominal model is disabled in these modes.
+These modes optimize cumulative-counter delivery at 60 Hz with the existing base-judgement pattern, chart-time score ledger, ordinary combo, conversion windows and member-skill schedule. Canonical charts retain native input geometry and line ownership. The release document supplies `liveTools.judgementAreaOffsets` from the same release's options resource.
 
-An ordinary `timeline` request with a `timing` context returns `worst` and `optimal` alongside nominal `score` and the attainable 17 ms guide's `best`. Each guide step's `noteIndices` addresses the canonical judged-note stream; co-timed automatic notes are not additional inputs.
+Whole-frame input-unit replay applies native touch selection, synchronous priority, asynchronous delivery and press-enter claims. Taps require a press enter. Early Trace and normal slide-tail delivery require a release; held late delivery writes the nominal judgement time. Flicks retain the actual flick event's time and begin position, including reserved delivery on a later frame. Line completion can force an unjudged head to Miss. Combo and connection notes follow the Trace path. Unscored guide and hidden nodes produce Pass, rather than independent cumulative inputs. Critical and Trace judgement types accept only their native grade sets.
+
+Monotone delivery dominance must hold for every affected counter. Equivalent choices prefer nominal timing; conflicting windows remain enumerated. A selected optimum must pass input replay. Necessary local input conflicts partition the remaining domains; bounded caches and search queues return an error when their budget is exhausted. Numeric card dominance based on the nominal model is disabled in these modes.
+
+An ordinary `timeline` request with a `timing` context returns `worst` and `optimal` alongside nominal `score` and the input-checked 17 ms guide's `best`. Each guide step's `noteIndices` addresses the canonical judged-note stream; unchanged co-timed notes remain outside that guide step.
 
 ## Build
 
