@@ -340,7 +340,7 @@ impl Engine {
         } else {
             &request["play"]
         };
-        let judgements = live::judgements(chart.times.len(), play);
+        let judgements = live::judgements_for_types(&chart.judgement_types, play);
         let is_gekiso = request["gekiso"].is_object();
         let event_route = if request["event"].is_null() {
             None
@@ -438,8 +438,8 @@ impl Engine {
                 100.0,
             );
             match chart::timing_mode(play) {
-                Some(best) => live::score_timed(&input, &chart::timing_frames(&self.master, chart, input.judgements.as_deref()), best)?,
-                None => live::score(&input)?,
+                Some(best) if input.slots.iter().any(|slot| !slot.cumulative.is_empty()) => live::score_reachable(&input, &crate::input_timing::InputTiming::new(&self.master, chart, input.judgements.as_deref())?, best)?,
+                _ => live::score(&input)?,
             }
         };
         let mut ranks: BTreeMap<i32, i32> = BTreeMap::new();
@@ -4134,10 +4134,10 @@ impl Engine {
             .charts
             .get(&(song_id, difficulty))
             .ok_or_else(|| format!("missing-chart:{song_id}:{difficulty}"))?;
-        let judgements = live::judgements(chart.times.len(), &context["play"]);
+        let judgements = live::judgements_for_types(&chart.judgement_types, &context["play"]);
         let input = chart::prepare(&self.master, chart, resolved.power.total as i32, resolved.slots, judgements, 1.0, 100.0);
         let before_ms: Vec<_> = chart.judgement_types.iter().enumerate().map(|(i, &kind)| {
-            // Held ticks and traces are delivered at chart time, independently of their timing windows.
+            // This guide uses taps, flicks and tail releases, rather than early Trace contacts.
             if !matches!(kind, 1 | 2 | 5 | 10 | 11 | 12 | 15) { return 0; }
             let grade = input.judgements.as_ref().map_or(5, |grades| grades[i]) as i32;
             let early_grade = (1..=5).rev().find(|&candidate| {
@@ -4145,11 +4145,12 @@ impl Engine {
             });
             if early_grade == Some(grade) { live::TIMING_ADVANCE_MS } else { 0 }
         }).collect();
-        let Some(timing) = live::timing(&input, index, &before_ms) else { return Ok(Value::Null) };
-        let frames = chart::timing_frames(&self.master, chart, input.judgements.as_deref());
+        if input.slots.iter().all(|slot| slot.cumulative.is_empty()) { return Ok(Value::Null); }
+        let timing_inputs = crate::input_timing::InputTiming::new(&self.master, chart, input.judgements.as_deref())?;
+        let Some(timing) = live::timing_with_inputs(&input, index, &before_ms, Some(&timing_inputs)) else { return Ok(Value::Null) };
         let mut output = json!(timing);
-        output["worst"] = json!(live::score_timed(&input, &frames, false)?.scores[index]);
-        output["optimal"] = json!(live::score_timed(&input, &frames, true)?.scores[index]);
+        output["worst"] = json!(live::score_reachable(&input, &timing_inputs, false)?.scores[index]);
+        output["optimal"] = json!(live::score_reachable(&input, &timing_inputs, true)?.scores[index]);
         Ok(output)
     }
 }

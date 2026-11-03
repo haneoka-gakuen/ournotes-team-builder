@@ -3,7 +3,7 @@
 use crate::num::{f, window_ms};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{BinaryHeap, HashMap},
     sync::{Arc, Mutex, OnceLock},
 };
 
@@ -403,6 +403,12 @@ struct Delivery {
 /// Extremize cumulative delivery timing for each skill order. Ordinary score,
 /// combo, conversions and member-skill windows retain their chart-time contract.
 pub fn score_timed(input: &Input, frames: &[Vec<i32>], best: bool) -> Result<Scores, String> {
+    score_timed_inputs(input, frames, best, None)
+}
+pub fn score_reachable(input: &Input, timing: &crate::input_timing::InputTiming, best: bool) -> Result<Scores, String> {
+    score_timed_inputs(input, &timing.frames, best, Some(timing))
+}
+fn score_timed_inputs(input: &Input, frames: &[Vec<i32>], best: bool, timing: Option<&crate::input_timing::InputTiming>) -> Result<Scores, String> {
     let nominal = score(input)?;
     if input.slots.iter().all(|slot| slot.cumulative.is_empty()) { return Ok(nominal); }
     if frames.len() != input.times.len() || frames.iter().any(Vec::is_empty) {
@@ -430,14 +436,15 @@ pub fn score_timed(input: &Input, frames: &[Vec<i32>], best: bool) -> Result<Sco
         for (i, allowed) in frames.iter().enumerate() {
             let applicable: Vec<_> = windows.iter().copied().filter(|w| w.2 & (1 << grades[i]) != 0).collect();
             if applicable.is_empty() {
-                selected.push(frame_time(input.times[i]));
+                selected.push(*allowed.iter().min_by_key(|&&frame| (frame as i64 - frame_time(input.times[i]) as i64).abs()).unwrap());
                 continue;
             }
             // Earlier/later delivery dominates only when every affected counter
             // agrees. Keep all remaining choices, including overlapping windows.
+            let equivalent_key = |frame: i32| ((i64::from(frame) - i64::from(frame_time(input.times[i]))).abs(), frame);
             let options: Vec<_> = allowed.iter().copied().filter(|&frame| {
                 !allowed.iter().any(|&other| other != frame && dominates(other, frame, &applicable, best)
-                    && (!dominates(frame, other, &applicable, best) || other < frame))
+                    && (!dominates(frame, other, &applicable, best) || equivalent_key(other) < equivalent_key(frame)))
             }).collect();
             selected.push(options[0]);
             if options.len() > 1 { choices.push((i, options)); }
@@ -486,21 +493,124 @@ pub fn score_timed(input: &Input, frames: &[Vec<i32>], best: bool) -> Result<Sco
         let mut key: Vec<_> = grades.iter().map(|&g| g as i64).collect();
         for &(start, end, mask, trend) in &windows { key.extend([start as i64, end as i64, mask as i64, trend as i64]); }
         let candidates = schedules.entry(key).or_insert_with(|| deliveries(input, frames, &windows, &grades, best));
+        let mut evaluate = |delivery: &Delivery| match (&mut ap, &mut played) {
+            (Some(scorer), _) => scorer.order(order, Some(delivery)),
+            (_, Some(scorer)) => scorer.order(order, Some(delivery)),
+            _ => unreachable!(),
+        };
         let mut extreme = if best { f64::NEG_INFINITY } else { f64::INFINITY };
+        let mut chosen = candidates[0].clone();
         for delivery in candidates {
-            let value = match (&mut ap, &mut played) {
-                (Some(scorer), _) => scorer.order(order, Some(delivery)),
-                (_, Some(scorer)) => scorer.order(order, Some(delivery)),
-                _ => unreachable!(),
-            };
-            extreme = if best { extreme.max(value) } else { extreme.min(value) };
+            let value = evaluate(delivery);
+            if if best { value > extreme } else { value < extreme } {
+                extreme = value;
+                chosen = delivery.clone();
+            }
         }
-        scores[index] = extreme;
+        scores[index] = if let Some(timing) = timing {
+            reachable_extreme(input, timing, frames, best, (extreme, chosen),
+                |domains, evaluate| {
+                    let mut value = if best { f64::NEG_INFINITY } else { f64::INFINITY };
+                    let mut selected = None;
+                    for delivery in deliveries(input, domains, &windows, &grades, best) {
+                        let score = evaluate(&delivery);
+                        if if best { score > value } else { score < value } {
+                            value = score;
+                            selected = Some(delivery);
+                        }
+                    }
+                    (value, selected.unwrap())
+                }, &mut evaluate)?
+        } else { extreme };
     }
     for (index, &source) in plan.sources.iter().enumerate() { scores[index] = scores[source]; }
     Ok(summarize(input.power, scores))
 }
+struct TimingNode {
+    priority: f64,
+    serial: usize,
+    bound: f64,
+    domains: Vec<Vec<i32>>,
+    delivery: Delivery,
+}
+impl PartialEq for TimingNode {
+    fn eq(&self, other: &Self) -> bool { self.serial == other.serial && self.priority.to_bits() == other.priority.to_bits() }
+}
+impl Eq for TimingNode {}
+impl PartialOrd for TimingNode {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) }
+}
+impl Ord for TimingNode {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.priority.total_cmp(&other.priority).then_with(|| other.serial.cmp(&self.serial))
+    }
+}
+fn reachable_extreme<E: FnMut(&Delivery) -> f64>(
+    input: &Input,
+    timing: &crate::input_timing::InputTiming,
+    frames: &[Vec<i32>],
+    best: bool,
+    initial: (f64, Delivery),
+    mut relax: impl FnMut(&[Vec<i32>], &mut E) -> (f64, Delivery),
+    evaluate: &mut E,
+) -> Result<f64, String> {
+    let (bound, delivery) = initial;
+    let generation = crate::cancellation_generation();
+    if timing.conflict(&delivery.selected())?.is_none() { return Ok(bound); }
+    let mut incumbent = if best { f64::NEG_INFINITY } else { f64::INFINITY };
+    let nominal: Vec<_> = input.times.iter().map(|&time| frame_time(time)).collect();
+    if timing.conflict(&nominal)?.is_none() {
+        let value = evaluate(&Delivery::from_frames(&nominal));
+        incumbent = if best { incumbent.max(value) } else { incumbent.min(value) };
+    }
+    let priority = |score: f64| if best { score } else { -score };
+    let storage = |domains: &[Vec<i32>]| domains.len() * (std::mem::size_of::<Vec<i32>>() + 12)
+        + domains.iter().map(|domain| domain.len() * 4).sum::<usize>();
+    let mut queue = BinaryHeap::new();
+    let domains = frames.to_vec();
+    let mut queue_bytes = storage(&domains);
+    queue.push(TimingNode { priority: priority(bound), serial: 0, bound, domains, delivery });
+    let mut serial = 0;
+    while let Some(node) = queue.pop() {
+        queue_bytes -= storage(&node.domains);
+        crate::clock::milliseconds();
+        if generation != crate::cancellation_generation() { return Err("cancelled".into()); }
+        if if best { node.bound <= incumbent } else { node.bound >= incumbent } { continue; }
+        let selected = node.delivery.selected();
+        let Some(conflict) = timing.conflict(&selected)? else {
+            incumbent = node.bound;
+            continue;
+        };
+        let mut prefix = node.domains.clone();
+        for note in conflict.notes {
+            let same = |frame: i32| conflict.interval.map_or(frame == selected[note], |(start, end)| {
+                frame < start && selected[note] < start || frame > end && selected[note] > end || frame == selected[note]
+            });
+            let mut domains = prefix.clone();
+            domains[note].retain(|&frame| !same(frame));
+            prefix[note].retain(|&frame| same(frame));
+            if domains[note].is_empty() { continue; }
+            let (bound, delivery) = relax(&domains, evaluate);
+            if if best { bound <= incumbent } else { bound >= incumbent } { continue; }
+            queue_bytes += storage(&domains);
+            if queue_bytes > 16 * 1_048_576 { return Err("native timing search budget exceeded".into()); }
+            serial += 1;
+            queue.push(TimingNode { priority: priority(bound), serial, bound, domains, delivery });
+        }
+    }
+    if incumbent.is_finite() { Ok(incumbent) } else { Err("unreachable native input sequence".into()) }
+}
 impl Delivery {
+    fn from_frames(frames: &[i32]) -> Self {
+        let mut rows: Vec<_> = frames.iter().copied().enumerate().map(|(i, frame)| (frame, i)).collect();
+        rows.sort_unstable();
+        Self { frames: rows.iter().map(|row| row.0).collect(), notes: rows.iter().map(|row| row.1).collect() }
+    }
+    fn selected(&self) -> Vec<i32> {
+        let mut selected = vec![0; self.frames.len()];
+        for (&frame, &note) in self.frames.iter().zip(&self.notes) { selected[note] = frame; }
+        selected
+    }
     fn new(times: &[i32], offsets: &[i32]) -> Self {
         let mut rows: Vec<_> = times
             .iter()
@@ -1151,7 +1261,16 @@ pub fn score(input: &Input) -> Result<Scores, String> {
 
 /// Evenly distribute custom judgements in chart order with the same priority
 /// and open-note selection as the native accuracy builder.
+pub fn native_judgement(kind: i32, grade: usize) -> usize {
+    if matches!(kind, 2 | 15 | 21 | 22) && matches!(grade, 2..=4) { 5 } else { grade }
+}
 pub fn judgements(count: usize, play: &serde_json::Value) -> Option<Vec<usize>> {
+    judgement_pattern(count, play, None)
+}
+pub fn judgements_for_types(kinds: &[i32], play: &serde_json::Value) -> Option<Vec<usize>> {
+    judgement_pattern(kinds.len(), play, Some(kinds))
+}
+fn judgement_pattern(count: usize, play: &serde_json::Value, kinds: Option<&[i32]>) -> Option<Vec<usize>> {
     let number = |key: &str| crate::master::number(&play[key], 0.0);
     let (great, good, bad, miss, every) = (
         number("great"),
@@ -1179,12 +1298,11 @@ pub fn judgements(count: usize, play: &serde_json::Value) -> Option<Vec<usize>> 
     let mut out = vec![5; count];
     let wanted =
         |fraction: f64| crate::num::round(fraction.clamp(0.0, 1.0) * count as f64) as usize;
-    choose(count, wanted(great), |i| out[i] = 4);
-    for (judgement, fraction) in [(3, good), (2, bad), (1, miss)] {
+    for (judgement, fraction) in [(4, great), (3, good), (2, bad), (1, miss)] {
         let open: Vec<_> = out
             .iter()
             .enumerate()
-            .filter(|(_, j)| **j == 5)
+            .filter(|(i, j)| **j == 5 && kinds.is_none_or(|types| native_judgement(types[*i], judgement) == judgement))
             .map(|(i, _)| i)
             .collect();
         choose(open.len(), wanted(fraction).min(open.len()), |i| {
@@ -1240,6 +1358,9 @@ pub const TIMING_ADVANCE_MS: i32 = 17;
 /// moving the window's first notes early would drop them before it opens.
 /// `before_ms` follows `input.times` and allows only inputs retaining their base judgement.
 pub fn timing(input: &Input, order_index: usize, before_ms: &[i32]) -> Option<Timing> {
+    timing_with_inputs(input, order_index, before_ms, None)
+}
+pub fn timing_with_inputs(input: &Input, order_index: usize, before_ms: &[i32], inputs: Option<&crate::input_timing::InputTiming>) -> Option<Timing> {
     let order = orders().get(order_index)?;
     let n = input.times.len();
     let judgements = match &input.judgements {
@@ -1294,20 +1415,26 @@ pub fn timing(input: &Input, order_index: usize, before_ms: &[i32]) -> Option<Ti
     };
     let mut evaluate = |offsets: &[i32]| {
         let delivery = Delivery::new(&input.times, offsets);
-        match &mut scorer {
+        if let Some(inputs) = inputs {
+            if !matches!(inputs.conflict(&delivery.selected()), Ok(None)) { return None; }
+        }
+        Some(match &mut scorer {
             Scorer::Ap(scorer) => scorer.order(order, Some(&delivery)),
             Scorer::Play(scorer) => scorer.order(order, Some(&delivery)),
-        }
+        })
     };
     let mut offsets = vec![0; n];
-    let score = evaluate(&offsets);
+    let score = evaluate(&offsets)?;
     let mut best = score;
     for (window, step, chord) in groups {
         let previous: Vec<_> = chord.iter().map(|&i| offsets[i]).collect();
         for &i in &chord {
             offsets[i] = -TIMING_ADVANCE_MS;
         }
-        let value = evaluate(&offsets);
+        let Some(value) = evaluate(&offsets) else {
+            for (&i, offset) in chord.iter().zip(previous) { offsets[i] = offset; }
+            continue;
+        };
         if value > best {
             windows[window].steps[step].gain = value - best;
             best = value;

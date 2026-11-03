@@ -1,6 +1,6 @@
 //! Native chart conversion, including endpoint merging and client combo notes.
 use crate::{
-    chart::{EnumerationNote, Note, Source},
+    chart::{EnumerationNote, Note, NoteInput, Source},
     num::f,
 };
 use serde_json::Value;
@@ -41,6 +41,17 @@ fn judgement_type(op: i32, critical: bool) -> i32 {
         62 => 22,
         123 => 0,
         _ => 1,
+    }
+}
+fn judgement_area_offset_type(op: i32, critical: bool) -> i32 {
+    match op {
+        1 => if critical { 8 } else { 0 },
+        20 => if critical { 9 } else { 2 },
+        21 | 120 | 121 => 1,
+        22 => 3,
+        40..=42 => 4,
+        60..=63 | 80 | 82 | 104 | 105 => 5,
+        _ => 0,
     }
 }
 fn round_int(x: f64) -> i32 {
@@ -590,6 +601,11 @@ struct RuntimeNote {
     pos: Position,
     op: i32,
     critical: bool,
+    lane: f64,
+    width: f64,
+    direction: i32,
+    ease: i32,
+    ease_right: i32,
     lines: Vec<i32>,
     view: Vec<usize>,
     combo: Vec<usize>,
@@ -606,6 +622,24 @@ struct Creator {
     bars: Vec<(f64, Position)>,
 }
 impl Creator {
+    fn line_shape(&self, begin: usize, points: &[usize], at: Position) -> (f64, f64) {
+        let mut previous = &self.arena[begin];
+        for &index in points {
+            let next = &self.arena[index];
+            if key(next.pos) < key(at) {
+                previous = next;
+                continue;
+            }
+            let span = f(key(next.pos) - key(previous.pos));
+            let t = if span > 0.0 { f(f(key(at) - key(previous.pos)) / span) } else { 0.0 };
+            let left = f(previous.lane + f(ease(t, previous.ease) * f(next.lane - previous.lane)));
+            let right_a = f(previous.lane + previous.width);
+            let right_b = f(next.lane + next.width);
+            let right = f(right_a + f(ease(t, previous.ease_right) * f(right_b - right_a)));
+            return (left, f(right - left));
+        }
+        (previous.lane, previous.width)
+    }
     fn eighths(&self, start: Position, end: Position) -> Vec<Position> {
         let mut out = Vec::new();
         let (mut bar, mut progress) = (start.bar, start.progress);
@@ -691,10 +725,16 @@ impl Creator {
                     skip = true;
                 }
                 let combo = self.arena.len();
+                let (lane, width) = self.line_shape(begin, &line_notes, beat);
                 self.arena.push(RuntimeNote {
                     pos: beat,
                     op: if skip { 121 } else { 120 },
                     critical: false,
+                    lane,
+                    width,
+                    direction: 0,
+                    ease: 0,
+                    ease_right: 0,
                     lines: vec![line_id],
                     view: Vec::new(),
                     combo: Vec::new(),
@@ -793,6 +833,11 @@ impl Creator {
             pos,
             op,
             critical: info.critical,
+            lane: info.lane as f64,
+            width: info.width as f64,
+            direction: info.direction,
+            ease: info.ease,
+            ease_right: info.ease_r,
             lines,
             view: Vec::new(),
             combo: Vec::new(),
@@ -907,6 +952,15 @@ pub fn convert(root: &Value) -> Result<Source, String> {
                 operate_type: n.op,
                 judgement_type: judgement_type(n.op, n.critical),
                 judged: judged(n.op),
+                input: Some(NoteInput {
+                    judgement_area_offset_type: judgement_area_offset_type(n.op, n.critical),
+                    lane: n.lane,
+                    width: n.width,
+                    direction: n.direction,
+                    ease: n.ease,
+                    ease_right: n.ease_right,
+                    lines: n.lines.clone(),
+                }),
             }
         })
         .collect();

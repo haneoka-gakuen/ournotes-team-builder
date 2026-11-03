@@ -357,6 +357,7 @@ pub struct LiveTables {
     pub miss_windows: BTreeMap<i32, (i32, i32)>,
     pub timing_types: BTreeSet<i32>,
     pub perfect_after_ms: BTreeMap<i32, i32>,
+    pub judgement_area_offsets: BTreeMap<i32, f64>,
     pub judgement_before_ms: BTreeMap<(i32, i32), i32>,
     pub judgement_after_ms: BTreeMap<(i32, i32), i32>,
     pub after_ms: f64,
@@ -951,6 +952,12 @@ pub fn compile(data: &Value) -> Result<Master, String> {
                         int(field(r, "afterMs", "after")),
                     )
                 })
+                .collect(),
+            judgement_area_offsets: rows(&tools["judgementAreaOffsets"])
+                .into_iter()
+                .map(native)
+                .filter(|row| int(&row["assistLevel"]) == 0)
+                .map(|row| (int(&row["offsetType"]), f(number(&row["x"], 0.0))))
                 .collect(),
             judgement_before_ms: timings
                 .iter()

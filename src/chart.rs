@@ -7,11 +7,24 @@ use crate::{
 use serde::{Deserialize, Serialize};
 #[derive(Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
+pub struct NoteInput {
+    pub judgement_area_offset_type: i32,
+    pub lane: f64,
+    pub width: f64,
+    pub direction: i32,
+    pub ease: i32,
+    pub ease_right: i32,
+    pub lines: Vec<i32>,
+}
+#[derive(Clone, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct Note {
     pub time_ms: i32,
     pub operate_type: i32,
     pub judgement_type: i32,
     pub judged: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<NoteInput>,
 }
 #[derive(Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -38,6 +51,8 @@ pub struct Chart {
     pub times: Vec<i32>,
     pub note_types: Vec<i32>,
     pub judgement_types: Vec<i32>,
+    pub notes: Vec<Note>,
+    pub judged_indices: Vec<usize>,
     pub note_frac: Vec<f64>,
     pub converted_count: usize,
     pub difficulty_factor: f64,
@@ -114,6 +129,8 @@ pub fn compile(master: &Master, song: &Song, difficulty: &Difficulty, source: &S
         times,
         note_types: judged.iter().map(|n| n.operate_type).collect(),
         judgement_types: judged.iter().map(|n| n.judgement_type).collect(),
+        notes: source.notes.clone(),
+        judged_indices: source.notes.iter().enumerate().filter_map(|(i, n)| n.judged.then_some(i)).collect(),
         note_frac,
         converted_count: (f(percent_sum as f64 / 100.0).ceil() as usize).max(1),
         difficulty_factor: difficulty_factor(difficulty.play_level),
@@ -205,43 +222,6 @@ pub fn prepare(
         luck_percent,
     }
 }
-/// Reachable 60 Hz delivery frames, keeping each input's base judgement.
-/// Automatic ticks retain chart time; ordinary lives do not enable JUST.
-pub fn timing_frames(master: &Master, chart: &Chart, grades: Option<&[usize]>) -> Vec<Vec<i32>> {
-    chart.times.iter().enumerate().map(|(i, &time)| {
-        let kind = chart.judgement_types[i];
-        if !matches!(kind, 1 | 2 | 5 | 10 | 11 | 12 | 15) {
-            return vec![live::frame_time(time)];
-        }
-        let grade = grades.map_or(5, |rows| rows[i]) as i32;
-        let Some(&before) = master.live.judgement_before_ms.get(&(kind, grade)) else { return Vec::new() };
-        let Some(&after) = master.live.judgement_after_ms.get(&(kind, grade)) else { return Vec::new() };
-        let stricter: Vec<_> = ((grade + 1)..=5).filter_map(|g| {
-            Some((*master.live.judgement_before_ms.get(&(kind, g))?, *master.live.judgement_after_ms.get(&(kind, g))?))
-        }).collect();
-        let intervals = if stricter.is_empty() {
-            vec![(-before, after)]
-        } else {
-            let strict_before = stricter.iter().map(|r| r.0).max().unwrap();
-            let strict_after = stricter.iter().map(|r| r.1).max().unwrap();
-            vec![(-before, after.min(-strict_before - 1)), ((strict_after + 1).max(-before), after)]
-        };
-        let mut frames = Vec::new();
-        for (low, high) in intervals.into_iter().filter(|(low, high)| low <= high) {
-            let end = live::frame_time(time.saturating_add(high));
-            let mut frame = live::frame_time(time.saturating_add(low));
-            loop {
-                frames.push(frame);
-                if frame >= end { break; }
-                frame = live::frame_time(frame + 1);
-            }
-        }
-        frames.sort_unstable();
-        frames.dedup();
-        frames
-    }).collect()
-}
-
 pub fn timing_mode(play: &serde_json::Value) -> Option<bool> {
     match play["cumulativeTiming"].as_str() {
         Some("best") => Some(true),

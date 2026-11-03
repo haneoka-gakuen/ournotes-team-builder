@@ -43,7 +43,7 @@ pub(crate) struct Pair {
 }
 pub struct LiveCore {
     pub input: Input,
-    timing: Option<(bool, Vec<Vec<i32>>)>,
+    timing: Option<(bool, Result<crate::input_timing::InputTiming, String>)>,
     pub high: Linear,
     pub low: Linear,
     pub factor_cap: f64,
@@ -131,9 +131,9 @@ impl LiveCore {
         let width = snaps.len() + 1;
         let table = slot_table(master, members, snaps);
         let mut slots = table.slots.clone();
-        let judgements = live::judgements(chart.times.len(), play);
+        let judgements = live::judgements_for_types(&chart.judgement_types, play);
         let input = chart::prepare(master, chart, 0, Vec::new(), judgements, 1.0, 100.0);
-        let timing = chart::timing_mode(play).map(|best| (best, chart::timing_frames(master, chart, input.judgements.as_deref())));
+        let timing = chart::timing_mode(play).map(|best| (best, crate::input_timing::InputTiming::new(master, chart, input.judgements.as_deref())));
         let mut raise = 0.0_f64;
         let mut recovery = 0;
         let mut longest = 0;
@@ -327,8 +327,8 @@ impl LiveCore {
             .map(|(slot, &m)| self.slot(m, team.snaps[slot]).clone())
             .collect();
         let scores = Arc::new(match &self.timing {
-            Some((best, frames)) => live::score_timed(&self.input, frames, *best)?,
-            None => live::score(&self.input)?,
+            Some((best, timing)) if self.input.slots.iter().any(|slot| !slot.cumulative.is_empty()) => live::score_reachable(&self.input, timing.as_ref().map_err(Clone::clone)?, *best)?,
+            _ => live::score(&self.input)?,
         });
         if self.scores.len() >= 4096 {
             if let Some(old) = self.score_order.pop_front() {
