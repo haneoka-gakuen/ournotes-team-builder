@@ -103,9 +103,8 @@ impl Cumulative {
         window_ms(self.seconds, 0.0)
     }
 
-    /// Upper bounds start at the nominal event; support activation can be one 60 Hz frame later.
     pub(crate) fn bound_duration_ms(&self) -> i32 {
-        self.duration_ms().saturating_add(17)
+        self.duration_ms()
     }
 }
 #[derive(Clone, Deserialize, Serialize, PartialEq)]
@@ -229,8 +228,40 @@ pub(crate) fn rounding_profile(slot: &Slot, life: Option<f64>) -> (usize, f64) {
         absolute.into_iter().fold(0.0, f64::max),
     )
 }
+#[derive(Clone, Copy, Deserialize)]
+#[serde(from = "u16")]
+pub struct FrameClock(u16);
+
+impl Default for FrameClock {
+    fn default() -> Self { Self(60) }
+}
+
+impl From<u16> for FrameClock {
+    fn from(hz: u16) -> Self {
+        Self(if matches!(hz, 30 | 60 | 90 | 120) { hz } else { 60 })
+    }
+}
+
+impl FrameClock {
+    pub fn for_play(play: &serde_json::Value) -> Self {
+        Self::from(play["frameRate"].as_u64().filter(|hz| matches!(hz, 30 | 60 | 90 | 120)).unwrap_or(60) as u16)
+    }
+
+    pub fn frame_time(self, time: i32) -> i32 {
+        let hz = i64::from(self.0);
+        let time = i64::from(time.max(0));
+        let mut frame = ((time * hz + 999) / 1000 - 1).max(0);
+        while frame * 1000 / hz < time { frame += 1; }
+        (frame * 1000 / hz).min(i64::from(i32::MAX)) as i32
+    }
+
+    pub fn advance_ms(self) -> i32 { (1000 + i32::from(self.0) - 1) / i32::from(self.0) }
+}
+
 #[derive(Deserialize)]
 pub struct Input {
+    #[serde(default, rename = "frameRate", alias = "frame_rate")]
+    pub clock: FrameClock,
     pub times: Vec<i32>,
     pub note_frac: Vec<f64>,
     pub ap_combo: Vec<f64>,
@@ -248,6 +279,9 @@ pub struct Input {
     pub judgements: Option<Vec<usize>>,
     pub assist: f64,
     pub luck_percent: f64,
+}
+impl Input {
+    fn frame_time(&self, time: i32) -> i32 { self.clock.frame_time(time) }
 }
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -376,13 +410,13 @@ struct Command {
 fn effect_end(input: &Input, slot: &Slot, effect: &Effect, start: i32, judgements: Option<&[usize]>) -> i32 {
     let end = start + window_ms(effect.seconds, slot.extension_ms);
     if effect.release_judgements.is_empty() { return end; }
-    let after_execute = frame_time(frame_time(start).saturating_add(1));
-    let deadline = frame_time(end.saturating_add(1));
-    let mut first = input.times.partition_point(|&time| frame_time(time) <= after_execute);
+    let after_execute = input.frame_time(input.frame_time(start).saturating_add(1));
+    let deadline = input.frame_time(end.saturating_add(1));
+    let mut first = input.times.partition_point(|&time| input.frame_time(time) <= after_execute);
     while first < input.times.len() {
-        let frame = frame_time(input.times[first]);
+        let frame = input.frame_time(input.times[first]);
         if frame > deadline { break; }
-        let after = input.times.partition_point(|&time| frame_time(time) <= frame);
+        let after = input.times.partition_point(|&time| input.frame_time(time) <= frame);
         if let Some(index) = (first..after).rfind(|&index| {
             effect.release_judgements.contains(&judgements.map_or(5, |grades| grades[index]))
         }) {
@@ -439,12 +473,12 @@ fn timed_scores(input: &Input, frames: &[Vec<i32>], best: bool, timing: Option<&
         for (i, allowed) in frames.iter().enumerate() {
             let applicable: Vec<_> = windows.iter().copied().filter(|w| w.2 & (1 << grades[i]) != 0).collect();
             if applicable.is_empty() {
-                selected.push(*allowed.iter().min_by_key(|&&frame| (frame as i64 - frame_time(input.times[i]) as i64).abs()).unwrap());
+                selected.push(*allowed.iter().min_by_key(|&&frame| (frame as i64 - input.frame_time(input.times[i]) as i64).abs()).unwrap());
                 continue;
             }
             // Earlier/later delivery dominates only when every affected counter
             // agrees. Keep all remaining choices, including overlapping windows.
-            let equivalent_key = |frame: i32| ((i64::from(frame) - i64::from(frame_time(input.times[i]))).abs(), frame);
+            let equivalent_key = |frame: i32| ((i64::from(frame) - i64::from(input.frame_time(input.times[i]))).abs(), frame);
             let options: Vec<_> = allowed.iter().copied().filter(|&frame| {
                 !allowed.iter().any(|&other| other != frame && dominates(other, frame, &applicable, best)
                     && (!dominates(frame, other, &applicable, best) || equivalent_key(other) < equivalent_key(frame)))
@@ -487,9 +521,9 @@ fn timed_scores(input: &Input, frames: &[Vec<i32>], best: bool, timing: Option<&
                 let values: Vec<_> = (0..=n).map(|count| factor.mill(count as i32)).collect();
                 let trend = if values.windows(2).all(|w| w[0] <= w[1]) { 1 }
                     else if values.windows(2).all(|w| w[0] >= w[1]) { -1 } else { 0 };
-                let start = frame_time(start);
+                let activation = input.frame_time(start);
                 let mask = factor.judgements.iter().fold(0, |mask, &g| mask | (1u64 << g));
-                windows.push((start, start + factor.duration_ms(), mask, trend));
+                windows.push((activation, start + factor.duration_ms(), mask, trend));
             }
         }
         windows.sort_unstable();
@@ -562,7 +596,7 @@ fn reachable_extreme<E: FnMut(&Delivery) -> f64>(
     let generation = crate::cancellation_generation();
     if timing.conflict(&delivery.selected())?.is_none() { return Ok(bound); }
     let mut incumbent = if best { f64::NEG_INFINITY } else { f64::INFINITY };
-    let nominal: Vec<_> = input.times.iter().map(|&time| frame_time(time)).collect();
+    let nominal: Vec<_> = input.times.iter().map(|&time| input.frame_time(time)).collect();
     if timing.conflict(&nominal)?.is_none() {
         let value = evaluate(&Delivery::from_frames(&nominal));
         incumbent = if best { incumbent.max(value) } else { incumbent.min(value) };
@@ -615,12 +649,13 @@ impl Delivery {
         for (&frame, &note) in self.frames.iter().zip(&self.notes) { selected[note] = frame; }
         selected
     }
-    fn new(times: &[i32], offsets: &[i32]) -> Self {
+    fn new(input: &Input, offsets: &[i32]) -> Self {
+        let times = &input.times;
         let mut rows: Vec<_> = times
             .iter()
             .zip(offsets)
             .enumerate()
-            .map(|(i, (&time, &offset))| (frame_time(time.saturating_add(offset)), i))
+            .map(|(i, (&time, &offset))| (input.frame_time(time.saturating_add(offset)), i))
             .collect();
         rows.sort_unstable();
         Self {
@@ -648,7 +683,7 @@ fn cumulative_commands(
     delivery: Option<&Delivery>,
 ) -> Vec<Command> {
     let n = input.times.len();
-    let frame_at = |k: usize| delivery.map_or_else(|| frame_time(input.times[k]), |d| d.frames[k]);
+    let frame_at = |k: usize| delivery.map_or_else(|| input.frame_time(input.times[k]), |d| d.frames[k]);
     let note_at = |k: usize| delivery.map_or(k, |d| d.notes[k]);
     let mut commands = Vec::new();
     for (event, &start) in input.skill_times.iter().take(5).enumerate() {
@@ -656,8 +691,8 @@ fn cumulative_commands(
             continue;
         };
         for factor in &slot.cumulative {
-            let activation = frame_time(start);
-            let end = activation + factor.duration_ms();
+            let activation = input.frame_time(start);
+            let end = start + factor.duration_ms();
             let (mut count, mut applied) = (0, 0);
             let mut first = partition(n, |k| frame_at(k) < activation);
             while first < n {
@@ -675,7 +710,7 @@ fn cumulative_commands(
                     .count() as i32;
                 let mill = factor.mill(count);
                 if mill != applied {
-                    let time = frame;
+                    let time = if frame == activation { start } else { frame };
                     commands.push(Command {
                         time,
                         owner: event,
@@ -841,11 +876,7 @@ fn ap(input: &Input) -> Scores {
     summarize(input.power, scores)
 }
 pub fn frame_time(time: i32) -> i32 {
-    let mut k = ((time as f64 * 60.0 / 1000.0).ceil() as i32 - 1).max(0);
-    while (k as f64 * 1000.0 / 60.0).floor() < (time as f64) {
-        k += 1;
-    }
-    (k as f64 * 1000.0 / 60.0).floor() as i32
+    FrameClock::default().frame_time(time)
 }
 #[derive(Clone)]
 struct Recovery {
@@ -933,11 +964,11 @@ pub(crate) fn lives(
             if recovery != 0 {
                 replay.pending.push(Recovery {
                     time: start,
-                    frame: frame_time(start),
+                    frame: input.frame_time(start),
                     amount: recovery,
                 });
             }
-            let frame = frame_time(start);
+            let frame = input.frame_time(start);
             replay.settle(frame as i64);
             let mut due: Vec<_> = replay
                 .pending
@@ -1000,15 +1031,15 @@ struct Convert {
     left: f64,
     judgement: usize,
 }
-fn conversion(slot: &Slot, convert: &Conversion, start: i32) -> Convert {
-    let from = frame_time(start);
+fn conversion(input: &Input, slot: &Slot, convert: &Conversion, start: i32) -> Convert {
+    let from = input.frame_time(start);
     let duration = convert.seconds.map_or_else(
         || window_ms(slot.effects.first().map(|effect| effect.seconds).unwrap_or(5.0), slot.extension_ms),
         |seconds| window_ms(seconds, 0.0),
     );
     Convert {
         from,
-        until: frame_time(from + duration),
+        until: input.frame_time(from + duration),
         judgements: convert.judgements.clone(),
         left: convert.limit.unwrap_or(f64::INFINITY),
         judgement: convert.judgement,
@@ -1024,7 +1055,7 @@ fn converted_judgements(input: &Input, order: &[usize; 5], judgements: &[usize])
     let mut converts: Vec<Convert> = Vec::new();
     for slot in &input.slots {
         if let Some(convert) = &slot.convert {
-            if convert.at_start { converts.insert(0, conversion(slot, convert, 0)); }
+            if convert.at_start { converts.insert(0, conversion(input, slot, convert, 0)); }
         }
     }
     let mut first = 0;
@@ -1035,7 +1066,7 @@ fn converted_judgements(input: &Input, order: &[usize; 5], judgements: &[usize])
             let start = input.skill_times[event];
             if let Some(slot) = input.slots.get(order[event]) {
                 if let Some(convert) = &slot.convert {
-                    if !convert.at_start { converts.insert(0, conversion(slot, convert, start)); }
+                    if !convert.at_start { converts.insert(0, conversion(input, slot, convert, start)); }
                 }
             }
             cursor += 1;
@@ -1355,11 +1386,11 @@ pub struct Timing {
 /// boundary before it, whatever the phase of the frame clock.
 pub const TIMING_ADVANCE_MS: i32 = 17;
 
-/// Cumulative snapshots count judgements in the frame that delivers them and
-/// raise each step from that frame, while notes score at their chart time, so
-/// the notes completing a step never get that step themselves. Hitting just
-/// those notes one frame early gives them the step at every frame phase;
-/// moving the window's first notes early would drop them before it opens.
+/// Cumulative snapshots count judgements in the frame that delivers them.
+/// The first frame's factor starts at the skill event's chart time; later
+/// changes start at their delivery frame. Notes score at their chart time.
+/// Moving a completing note one frame early can put its score after the change;
+/// moving the window's first notes early can drop them before activation.
 /// `before_ms` follows `input.times` and allows only inputs retaining their base judgement.
 pub fn timing(input: &Input, order_index: usize, before_ms: &[i32]) -> Option<Timing> {
     timing_with_inputs(input, order_index, before_ms, None)
@@ -1367,6 +1398,7 @@ pub fn timing(input: &Input, order_index: usize, before_ms: &[i32]) -> Option<Ti
 pub fn timing_with_inputs(input: &Input, order_index: usize, before_ms: &[i32], inputs: Option<&crate::input_timing::InputTiming>) -> Option<Timing> {
     let order = orders().get(order_index)?;
     let n = input.times.len();
+    let advance_ms = input.clock.advance_ms();
     let judgements = match &input.judgements {
         Some(grades) => Some(grades.clone()),
         None if input.slots.iter().flat_map(|slot| &slot.cumulative).any(|factor| factor.requires_unbounded_bounds(n)) => Some(vec![5; n]),
@@ -1379,22 +1411,22 @@ pub fn timing_with_inputs(input: &Input, order_index: usize, before_ms: &[i32], 
     for (event, &start) in input.skill_times.iter().take(5).enumerate() {
         let Some(slot) = input.slots.get(order[event]) else { continue };
         for factor in slot.cumulative.iter().filter(|factor| !factor.judgements.is_empty()) {
-            let activation = frame_time(start);
-            let end = activation + factor.duration_ms();
+            let activation = input.frame_time(start);
+            let end = start + factor.duration_ms();
             let mut window = TimingWindow { event, start_ms: activation, end_ms: end, unit: factor.unit, notes: Vec::new(), steps: Vec::new() };
             let (mut count, mut applied) = (0, 0);
-            let mut first = input.times.partition_point(|&time| frame_time(time) < activation);
+            let mut first = input.times.partition_point(|&time| input.frame_time(time) < activation);
             while first < n {
-                let frame = frame_time(input.times[first]);
+                let frame = input.frame_time(input.times[first]);
                 if frame > end {
                     break;
                 }
-                let after = input.times.partition_point(|&time| frame_time(time) <= frame);
+                let after = input.times.partition_point(|&time| input.frame_time(time) <= frame);
                 let matching: Vec<usize> = (first..after).filter(|&i| factor.judgements.contains(&grade(i))).collect();
                 window.notes.extend(matching.iter().map(|&i| input.times[i]));
                 count += matching.len() as i32;
                 let mill = factor.mill(count);
-                let chord: Vec<usize> = (first..after).filter(|&i| before_ms[i] >= TIMING_ADVANCE_MS).collect();
+                let chord: Vec<usize> = (first..after).filter(|&i| before_ms[i] >= advance_ms).collect();
                 if mill != applied && !chord.is_empty() {
                     let last = input.times[*chord.last().unwrap()];
                     groups.push((windows.len(), window.steps.len(), chord.clone()));
@@ -1418,7 +1450,7 @@ pub fn timing_with_inputs(input: &Input, order_index: usize, before_ms: &[i32], 
         None => Scorer::Ap(ApScorer::new(input)),
     };
     let mut evaluate = |offsets: &[i32]| {
-        let delivery = Delivery::new(&input.times, offsets);
+        let delivery = Delivery::new(input, offsets);
         if let Some(inputs) = inputs {
             if !matches!(inputs.conflict(&delivery.selected()), Ok(None)) { return None; }
         }
@@ -1433,7 +1465,7 @@ pub fn timing_with_inputs(input: &Input, order_index: usize, before_ms: &[i32], 
     for (window, step, chord) in groups {
         let previous: Vec<_> = chord.iter().map(|&i| offsets[i]).collect();
         for &i in &chord {
-            offsets[i] = -TIMING_ADVANCE_MS;
+            offsets[i] = -advance_ms;
         }
         let Some(value) = evaluate(&offsets) else {
             for (&i, offset) in chord.iter().zip(previous) { offsets[i] = offset; }
@@ -1451,7 +1483,7 @@ pub fn timing_with_inputs(input: &Input, order_index: usize, before_ms: &[i32], 
     for window in &mut windows {
         window.steps.retain(|step| step.gain > 0.0);
     }
-    Some(Timing { score, best, advance_ms: TIMING_ADVANCE_MS, windows })
+    Some(Timing { score, best, advance_ms, windows })
 }
 #[cfg(test)]
 mod delivery_extremes_tests {
@@ -1459,7 +1491,7 @@ mod delivery_extremes_tests {
     fn input(value: i32, overlap: bool) -> Input {
         let factor = Cumulative { judgements: vec![5], unit: 2, value, maximum: 0, cap: 3, seconds: 0.2 };
         let slot = Slot { effects: vec![], cumulative: vec![factor], extension_ms: 0.0, recovery: 0, convert: None };
-        Input { times: vec![105, 155, 205, 255], note_frac: vec![1.0, 0.1, 1.0, 1.0], ap_combo: vec![1.0; 4], combo_table: vec![], judge_frac: [0.0, 0.0, 0.0, 0.0, 0.8, 1.0, 1.0], converted_count: 4, difficulty_factor: 1.0, adjustment: 1.0, skill_times: if overlap { vec![100, 160] } else { vec![100, 400] }, life_base: 1000.0, life_onus: 1.0, damage: [0.0; 7], power: 1373, slots: vec![slot.clone(), slot], judgements: None, assist: 1.0, luck_percent: 100.0 }
+        Input { clock: FrameClock::default(), times: vec![105, 155, 205, 255], note_frac: vec![1.0, 0.1, 1.0, 1.0], ap_combo: vec![1.0; 4], combo_table: vec![], judge_frac: [0.0, 0.0, 0.0, 0.0, 0.8, 1.0, 1.0], converted_count: 4, difficulty_factor: 1.0, adjustment: 1.0, skill_times: if overlap { vec![100, 160] } else { vec![100, 400] }, life_base: 1000.0, life_onus: 1.0, damage: [0.0; 7], power: 1373, slots: vec![slot.clone(), slot], judgements: None, assist: 1.0, luck_percent: 100.0 }
     }
     #[test]
     fn timing_extremes_match_every_schedule_including_overlaps_and_negative_counters() {
@@ -1474,7 +1506,7 @@ mod delivery_extremes_tests {
                     let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
                     for &a in &frames[0] { for &b in &frames[1] { for &c in &frames[2] { for &d in &frames[3] {
                         let offsets: Vec<_> = [a,b,c,d].iter().zip(&input.times).map(|(f,t)| f-t).collect();
-                        let score = scorer.order(order, Some(&Delivery::new(&input.times, &offsets)));
+                        let score = scorer.order(order, Some(&Delivery::new(&input, &offsets)));
                         lo = lo.min(score); hi = hi.max(score);
                     }}}}
                     assert_eq!(low.scores[index], lo, "minimum, overlap={overlap}, value={value}, order={index}");

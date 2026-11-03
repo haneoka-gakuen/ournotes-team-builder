@@ -101,6 +101,7 @@ impl Note {
 #[derive(Clone)]
 pub struct InputTiming {
     pub frames: Vec<Vec<i32>>,
+    clock: live::FrameClock,
     notes: Vec<Note>,
     checked: Arc<Mutex<InputChecks>>,
     local_checked: Arc<Mutex<LocalChecks>>,
@@ -114,16 +115,16 @@ pub struct Conflict {
     pub interval: Option<(i32, i32)>,
 }
 
-fn input_times(frame: i32) -> std::ops::RangeInclusive<i32> {
-    let mut first = (frame - 17).max(0);
-    while live::frame_time(first) < frame {
+fn input_times(clock: live::FrameClock, frame: i32) -> std::ops::RangeInclusive<i32> {
+    let mut first = (frame - clock.advance_ms()).max(0);
+    while clock.frame_time(first) < frame {
         first += 1;
     }
     first..=frame
 }
 
 impl InputTiming {
-    pub fn new(master: &Master, chart: &Chart, grades: Option<&[usize]>) -> Result<Self, String> {
+    pub fn new(master: &Master, chart: &Chart, grades: Option<&[usize]>, clock: live::FrameClock) -> Result<Self, String> {
         let mut notes = Vec::with_capacity(chart.times.len());
         let mut frames: Vec<Vec<i32>> = Vec::with_capacity(chart.times.len());
         let mut line_ends = HashMap::new();
@@ -188,13 +189,13 @@ impl InputTiming {
             };
             let end = f(f(geometry.lane + geometry.width) - 1.0);
             let last_phase =
-                live::frame_time(source.time_ms.saturating_add(max_after).saturating_add(1));
-            let auto_frame = live::frame_time(last_phase.saturating_add(1));
+                clock.frame_time(source.time_ms.saturating_add(max_after).saturating_add(1));
+            let auto_frame = clock.frame_time(last_phase.saturating_add(1));
             let mut forced_frame = i32::MAX;
             if matches!(source.operate_type, 20 | 41 | 61 | 101 | 102 | 104) {
                 for line in &geometry.lines {
                     if let Some(&end) = line_ends.get(line) {
-                        forced_frame = forced_frame.min(live::frame_time(end.saturating_add(1)));
+                        forced_frame = forced_frame.min(clock.frame_time(end.saturating_add(1)));
                     }
                 }
             }
@@ -208,7 +209,7 @@ impl InputTiming {
                 body_right: f(end + 0.5),
                 before,
                 after,
-                first: live::frame_time(source.time_ms.saturating_sub(max_before)),
+                first: clock.frame_time(source.time_ms.saturating_sub(max_before)),
                 last: source.time_ms.saturating_add(max_after),
                 last_phase,
                 auto_frame,
@@ -216,7 +217,7 @@ impl InputTiming {
             };
             let mut allowed = BTreeSet::new();
             for time in source.time_ms.saturating_sub(max_before).max(0)..=note.last {
-                let frame = live::frame_time(time);
+                let frame = clock.frame_time(time);
                 if note
                     .actions()
                     .iter()
@@ -227,7 +228,7 @@ impl InputTiming {
             }
             if (note.trace() || note.tail()) && note.grade == 5 {
                 for time in source.time_ms.max(0)..=note.last {
-                    let frame = live::frame_time(time);
+                    let frame = clock.frame_time(time);
                     if note.hit(frame, time, Action::Hold) == Some(5) {
                         allowed.insert(frame);
                     }
@@ -245,11 +246,11 @@ impl InputTiming {
         for (i, note) in notes.iter().enumerate().filter(|(_, note)| note.flick()) {
             let mut allowed: BTreeSet<_> = frames[i].iter().copied().collect();
             for &at in &frames[i] {
-                let next = live::frame_time(at.saturating_add(1));
+                let next = clock.frame_time(at.saturating_add(1));
                 if next >= note.auto_frame || next > note.forced_frame || allowed.contains(&next) {
                     continue;
                 }
-                let reserved = input_times(at).any(|time| {
+                let reserved = input_times(clock, at).any(|time| {
                     if note.hit(at, time, Action::Exit) != Some(note.grade) {
                         return false;
                     }
@@ -274,6 +275,7 @@ impl InputTiming {
         }
         Ok(Self {
             frames,
+            clock,
             notes,
             checked: Arc::new(Mutex::new(HashMap::new())),
             local_checked: Arc::new(Mutex::new(HashMap::new())),
@@ -296,6 +298,7 @@ impl InputTiming {
 
     fn check_inputs(&self, selected: &[i32]) -> Result<Option<Conflict>, String> {
         use frame::State;
+        let clock = self.clock;
         for (i, &at) in selected.iter().enumerate() {
             if !self.frames[i].contains(&at) {
                 return Ok(Some(Conflict {
@@ -315,7 +318,7 @@ impl InputTiming {
                 let mut at = note.first;
                 while at <= selected[i] {
                     frames.insert(at);
-                    at = live::frame_time(at.saturating_add(1));
+                    at = clock.frame_time(at.saturating_add(1));
                 }
             }
         }
@@ -332,13 +335,13 @@ impl InputTiming {
         for (i, note) in self.notes.iter().enumerate() {
             if note.flick() && selected[i] > note.time {
                 let at = selected[i];
-                let before = *input_times(at).start() - 1;
+                let before = *input_times(clock, at).start() - 1;
                 if let Some(conflict) = self.local_conflict(selected, before, at)? {
                     return Ok(Some(conflict));
                 }
             }
         }
-        if replay(&self.notes, &frames, selected, &initial)? {
+        if replay(clock, &self.notes, &frames, selected, &initial)? {
             Ok(None)
         } else {
             Ok(Some(Conflict {
@@ -432,6 +435,7 @@ impl InputTiming {
             choices.push((i, options));
         }
         fn possible(
+            clock: live::FrameClock,
             notes: &[Note],
             frames: &[i32],
             selected: &[i32],
@@ -440,12 +444,12 @@ impl InputTiming {
             state: &mut State,
         ) -> Result<bool, String> {
             let Some((index, options)) = choices.get(step) else {
-                return replay(notes, frames, selected, state);
+                return replay(clock, notes, frames, selected, state);
             };
             let mut unresolved = None;
             for &option in options {
                 state.flicks[*index] = option;
-                match possible(notes, frames, selected, choices, step + 1, state) {
+                match possible(clock, notes, frames, selected, choices, step + 1, state) {
                     Ok(true) => return Ok(true),
                     Ok(false) => {}
                     Err(error) => unresolved = Some(error),
@@ -459,9 +463,10 @@ impl InputTiming {
         }
         let mut frames = vec![start];
         while *frames.last().unwrap() < end {
-            frames.push(live::frame_time(frames.last().unwrap().saturating_add(1)));
+            frames.push(self.clock.frame_time(frames.last().unwrap().saturating_add(1)));
         }
         let possible = possible(
+            self.clock,
             &notes,
             &frames,
             &selected,
@@ -479,6 +484,7 @@ impl InputTiming {
 }
 
 fn replay(
+    clock: live::FrameClock,
     notes: &[Note],
     frames: &[i32],
     selected: &[i32],
@@ -563,7 +569,7 @@ fn replay(
                     notes: indices,
                     incoming: saved.clone(),
                     key,
-                    search: search::Search::new(local_notes, at, due, local),
+                    search: search::Search::new(local_notes, at, due, local, clock),
                     complete,
                 });
             }

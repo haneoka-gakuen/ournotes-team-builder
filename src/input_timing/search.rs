@@ -105,7 +105,7 @@ fn atom_key(notes: &[Note], touch: Touch) -> Vec<u8> {
     key
 }
 
-fn atoms(notes: &[Note], at: i32) -> Vec<Touch> {
+fn atoms(notes: &[Note], at: i32, clock: crate::live::FrameClock) -> Vec<Touch> {
     let points = positions(notes);
     let mut seen = HashSet::new();
     let mut out = Vec::new();
@@ -115,7 +115,7 @@ fn atoms(notes: &[Note], at: i32) -> Vec<Touch> {
         }
     };
     for state in [TouchState::Enter, TouchState::Hold, TouchState::Exit] {
-        for time in input_times(at) {
+        for time in input_times(clock, at) {
             for &lane in &points {
                 add(Touch {
                     state,
@@ -142,7 +142,7 @@ fn atoms(notes: &[Note], at: i32) -> Vec<Touch> {
             })
             .collect();
         for state in [TouchState::Hold, TouchState::Exit] {
-            for time in input_times(at) {
+            for time in input_times(clock, at) {
                 for &lane in &points {
                     for &begin in &begins {
                         add(Touch {
@@ -211,6 +211,7 @@ fn irreversible(
     automatic: &State,
     inputs: &[Touch],
     judged: &[frame::Judgement],
+    clock: crate::live::FrameClock,
 ) -> bool {
     for (i, note) in notes.iter().enumerate() {
         if automatic.done[i] {
@@ -231,7 +232,7 @@ fn irreversible(
             if due[i] && input.state == TouchState::Hold && at < note.time {
                 return true;
             }
-            let times = input_times(at);
+            let times = input_times(clock, at);
             if actual.is_some()
                 && at >= note.time
                 && frame::permitted_time(note, *times.start())
@@ -250,6 +251,7 @@ type Word = (isize, Reverse<usize>, Reverse<usize>, Vec<usize>);
 pub(super) struct Search {
     notes: Vec<Note>,
     at: i32,
+    clock: crate::live::FrameClock,
     due: Vec<bool>,
     initial: State,
     automatic: State,
@@ -266,7 +268,7 @@ pub(super) struct Search {
 }
 
 impl Search {
-    pub fn new(notes: Vec<Note>, at: i32, due: Vec<bool>, initial: State) -> Self {
+    pub fn new(notes: Vec<Note>, at: i32, due: Vec<bool>, initial: State, clock: crate::live::FrameClock) -> Self {
         let mut automatic = initial.clone();
         let invalid = frame::run(&notes, at, &[], &mut automatic)
             .iter()
@@ -278,6 +280,7 @@ impl Search {
         Self {
             notes,
             at,
+            clock,
             due,
             initial,
             automatic,
@@ -300,7 +303,7 @@ impl Search {
         }
         let atoms = self
             .atoms
-            .get_or_insert_with(|| atoms(&self.notes, self.at));
+            .get_or_insert_with(|| atoms(&self.notes, self.at, self.clock));
         for index in 0..atoms.len() {
             let mut next = word.to_vec();
             next.push(index);
@@ -318,6 +321,7 @@ impl Search {
                 &self.automatic,
                 &inputs,
                 &judged,
+                self.clock,
             ) {
                 continue;
             }

@@ -203,6 +203,7 @@ pub fn prepare(
             / 100.0);
     }
     live::Input {
+        clock: live::FrameClock::default(),
         times: chart.times.clone(),
         note_frac: chart.note_frac.clone(),
         ap_combo,

@@ -428,7 +428,7 @@ impl Engine {
             range_scores = result.get("rangeScores").cloned();
             serde_json::from_value::<live::Scores>(result).map_err(|e| e.to_string())?
         } else {
-            let input = chart::prepare(
+            let mut input = chart::prepare(
                 &self.master,
                 chart,
                 power.total as i32,
@@ -437,8 +437,9 @@ impl Engine {
                 1.0,
                 100.0,
             );
+            input.clock = live::FrameClock::for_play(play);
             match chart::timing_mode(play) {
-                Some(best) if input.slots.iter().any(|slot| !slot.cumulative.is_empty()) => live::score_reachable(&input, &crate::input_timing::InputTiming::new(&self.master, chart, input.judgements.as_deref())?, best)?,
+                Some(best) if input.slots.iter().any(|slot| !slot.cumulative.is_empty()) => live::score_reachable(&input, &crate::input_timing::InputTiming::new(&self.master, chart, input.judgements.as_deref(), input.clock)?, best)?,
                 _ => live::score(&input)?,
             }
         };
@@ -4135,18 +4136,20 @@ impl Engine {
             .get(&(song_id, difficulty))
             .ok_or_else(|| format!("missing-chart:{song_id}:{difficulty}"))?;
         let judgements = live::judgements_for_types(&chart.judgement_types, &context["play"]);
-        let input = chart::prepare(&self.master, chart, resolved.power.total as i32, resolved.slots, judgements, 1.0, 100.0);
+        let mut input = chart::prepare(&self.master, chart, resolved.power.total as i32, resolved.slots, judgements, 1.0, 100.0);
+        input.clock = live::FrameClock::for_play(&context["play"]);
+        let advance_ms = input.clock.advance_ms();
         let before_ms: Vec<_> = chart.judgement_types.iter().enumerate().map(|(i, &kind)| {
             // This guide uses taps, flicks and tail releases, rather than early Trace contacts.
             if !matches!(kind, 1 | 2 | 5 | 10 | 11 | 12 | 15) { return 0; }
             let grade = input.judgements.as_ref().map_or(5, |grades| grades[i]) as i32;
             let early_grade = (1..=5).rev().find(|&candidate| {
-                self.master.live.judgement_before_ms.get(&(kind, candidate)).copied().unwrap_or(0) >= live::TIMING_ADVANCE_MS
+                self.master.live.judgement_before_ms.get(&(kind, candidate)).copied().unwrap_or(0) >= advance_ms
             });
-            if early_grade == Some(grade) { live::TIMING_ADVANCE_MS } else { 0 }
+            if early_grade == Some(grade) { advance_ms } else { 0 }
         }).collect();
         if input.slots.iter().all(|slot| slot.cumulative.is_empty()) { return Ok(Value::Null); }
-        let timing_inputs = crate::input_timing::InputTiming::new(&self.master, chart, input.judgements.as_deref())?;
+        let timing_inputs = crate::input_timing::InputTiming::new(&self.master, chart, input.judgements.as_deref(), input.clock)?;
         let Some(timing) = live::timing_with_inputs(&input, index, &before_ms, Some(&timing_inputs)) else { return Ok(Value::Null) };
         let mut output = json!(timing);
         output["worst"] = json!(live::score_reachable_order(&input, &timing_inputs, false, index)?);

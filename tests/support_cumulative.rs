@@ -38,6 +38,7 @@ fn climbing(cap: i32, seconds: f64) -> Cumulative {
 fn input(slots: Vec<Slot>, judgements: Option<Vec<usize>>, notes: usize) -> Input {
     let judge_frac = [0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
     Input {
+        clock: live::FrameClock::default(),
         times: (0..notes).map(|i| 100 + i as i32 * 100).collect(),
         note_frac: vec![1.0; notes],
         ap_combo: vec![1.0; notes],
@@ -140,7 +141,7 @@ fn activation_frame_uses_its_complete_judgement_batch() {
     all.skill_times = vec![1];
     all.times = vec![2, 10, 120];
     let scores = live::score(&all).unwrap();
-    assert_eq!(scores.scores[0], 3200.0);
+    assert_eq!(scores.scores[0], 3600.0);
     all.judgements = Some(vec![PERFECT; 3]);
     assert_eq!(scores.scores, live::score(&all).unwrap().scores);
 }
@@ -171,7 +172,7 @@ fn cumulative_expiry_does_not_count_a_later_delivery_frame() {
 }
 
 #[test]
-fn search_bounds_include_the_delayed_support_window() {
+fn search_bounds_end_at_the_nominal_support_expiry() {
     let factor = Cumulative {
         unit: 1,
         cap: 1,
@@ -183,7 +184,7 @@ fn search_bounds_include_the_delayed_support_window() {
     all.times = vec![20, 111];
     all.note_frac = vec![0.0, 1.0];
     let exact = live::score(&all).unwrap().scores[0];
-    assert_eq!(exact, 1200.0);
+    assert_eq!(exact, 1000.0);
     let upper = model::skill_weights(&model::linear(&all), &all, &all.slots[0], true);
     assert!(1000.0 + 1000.0 * upper.per_event[0] >= exact);
     let mut bounds = model::PlayBounds::new(&all, &[PERFECT; 2]);

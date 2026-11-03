@@ -132,8 +132,9 @@ impl LiveCore {
         let table = slot_table(master, members, snaps);
         let mut slots = table.slots.clone();
         let judgements = live::judgements_for_types(&chart.judgement_types, play);
-        let input = chart::prepare(master, chart, 0, Vec::new(), judgements, 1.0, 100.0);
-        let timing = chart::timing_mode(play).map(|best| (best, crate::input_timing::InputTiming::new(master, chart, input.judgements.as_deref())));
+        let mut input = chart::prepare(master, chart, 0, Vec::new(), judgements, 1.0, 100.0);
+        input.clock = live::FrameClock::for_play(play);
+        let timing = chart::timing_mode(play).map(|best| (best, crate::input_timing::InputTiming::new(master, chart, input.judgements.as_deref(), input.clock)));
         let mut raise = 0.0_f64;
         let mut recovery = 0;
         let mut longest = 0;
