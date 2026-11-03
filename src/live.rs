@@ -403,14 +403,17 @@ struct Delivery {
 /// Extremize cumulative delivery timing for each skill order. Ordinary score,
 /// combo, conversions and member-skill windows retain their chart-time contract.
 pub fn score_timed(input: &Input, frames: &[Vec<i32>], best: bool) -> Result<Scores, String> {
-    score_timed_inputs(input, frames, best, None)
+    Ok(summarize(input.power, timed_scores(input, frames, best, None, None)?))
 }
 pub fn score_reachable(input: &Input, timing: &crate::input_timing::InputTiming, best: bool) -> Result<Scores, String> {
-    score_timed_inputs(input, &timing.frames, best, Some(timing))
+    Ok(summarize(input.power, timed_scores(input, &timing.frames, best, Some(timing), None)?))
 }
-fn score_timed_inputs(input: &Input, frames: &[Vec<i32>], best: bool, timing: Option<&crate::input_timing::InputTiming>) -> Result<Scores, String> {
+pub(crate) fn score_reachable_order(input: &Input, timing: &crate::input_timing::InputTiming, best: bool, index: usize) -> Result<f64, String> {
+    Ok(timed_scores(input, &timing.frames, best, Some(timing), Some(index))?[index])
+}
+fn timed_scores(input: &Input, frames: &[Vec<i32>], best: bool, timing: Option<&crate::input_timing::InputTiming>, only_order: Option<usize>) -> Result<Vec<f64>, String> {
     let nominal = score(input)?;
-    if input.slots.iter().all(|slot| slot.cumulative.is_empty()) { return Ok(nominal); }
+    if input.slots.iter().all(|slot| slot.cumulative.is_empty()) { return Ok(nominal.scores); }
     if frames.len() != input.times.len() || frames.iter().any(Vec::is_empty) {
         return Err("missing ordinary judgement timing".into());
     }
@@ -473,6 +476,7 @@ fn score_timed_inputs(input: &Input, frames: &[Vec<i32>], best: bool, timing: Op
     let mut scores = vec![0.0; 120];
     let plan = plan(&input.slots);
     for &index in &plan.representatives {
+        if only_order.is_some_and(|only| plan.sources[only] != index) { continue; }
         let order = &orders()[index];
         let grades = input.judgements.as_ref().map_or_else(|| vec![5; n], |g| converted_judgements(input, order, g));
         let mut windows = Vec::<Window>::new();
@@ -524,7 +528,7 @@ fn score_timed_inputs(input: &Input, frames: &[Vec<i32>], best: bool, timing: Op
         } else { extreme };
     }
     for (index, &source) in plan.sources.iter().enumerate() { scores[index] = scores[source]; }
-    Ok(summarize(input.power, scores))
+    Ok(scores)
 }
 struct TimingNode {
     priority: f64,
