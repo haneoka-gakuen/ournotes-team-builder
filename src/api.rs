@@ -4149,8 +4149,8 @@ impl Engine {
         let timing_inputs = crate::input_timing::InputTiming::new(&self.master, chart, input.judgements.as_deref())?;
         let Some(timing) = live::timing_with_inputs(&input, index, &before_ms, Some(&timing_inputs)) else { return Ok(Value::Null) };
         let mut output = json!(timing);
-        output["worst"] = json!(live::score_reachable(&input, &timing_inputs, false)?.scores[index]);
-        output["optimal"] = json!(live::score_reachable(&input, &timing_inputs, true)?.scores[index]);
+        output["worst"] = json!(live::score_reachable_order(&input, &timing_inputs, false, index)?);
+        output["optimal"] = json!(live::score_reachable_order(&input, &timing_inputs, true, index)?);
         Ok(output)
     }
 }

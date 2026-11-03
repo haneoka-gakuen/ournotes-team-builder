@@ -68,7 +68,7 @@ Whole-frame input-unit replay applies native touch selection, synchronous priori
 
 Monotone delivery dominance must hold for every affected counter. Equivalent choices prefer nominal timing; conflicting windows remain enumerated. A selected optimum must pass input replay. Necessary local input conflicts partition the remaining domains; bounded caches and search queues return an error when their budget is exhausted. Numeric card dominance based on the nominal model is disabled in these modes.
 
-An ordinary `timeline` request with a `timing` context returns `worst` and `optimal` alongside nominal `score` and the input-checked 17 ms guide's `best`. Each guide step's `noteIndices` addresses the canonical judged-note stream; unchanged co-timed notes remain outside that guide step.
+An ordinary `timeline` request with a `timing` context returns `worst` and `optimal` alongside nominal `score` and the input-checked 17 ms guide's `best`. Timeline bounds evaluate only the selected order's equivalence class; full-team evaluation still returns all 120 orders. Each guide step's `noteIndices` addresses the canonical judged-note stream; unchanged co-timed notes remain outside that guide step.
 
 ## Build
 
