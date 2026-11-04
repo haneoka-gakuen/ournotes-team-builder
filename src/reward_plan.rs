@@ -241,6 +241,12 @@ impl<'a> Source<'a> {
             Self::Gekiso(value) => value.as_ref(),
         }
     }
+    fn maximum_assignment_score(&mut self, members: &[usize], assigned: &[i32], from: usize, power: f64) -> f64 {
+        match self {
+            Self::Ordinary(value) => value.score_upper_orders(members, assigned, from, power).map(|scores| scores.into_iter().fold(f64::NEG_INFINITY, f64::max)),
+            Self::Gekiso(value) => value.maximum_assignment_score(members, assigned, from, power),
+        }.unwrap_or(f64::INFINITY)
+    }
     fn score_upper(&self, totals: Totals) -> f64 {
         match self {
             Self::Ordinary(value) => value.score_upper(totals),
@@ -519,12 +525,15 @@ impl<'a> Ranked<'a> {
             .fold(2, i32::max)
     }
     fn raw_upper(&mut self, totals: Totals, bonuses: [f64; 2], anchor_upper: f64) -> [f64; 3] {
+        self.raw_upper_at(totals, bonuses, anchor_upper, f64::INFINITY)
+    }
+    fn raw_upper_at(&mut self, totals: Totals, bonuses: [f64; 2], anchor_upper: f64, score_cap: f64) -> [f64; 3] {
         if self.source_lex && self.source_incumbent.is_some_and(|key| anchor_upper < key) {
             let mut result = [0.0; 3];
             result[self.context.plan.levels[0][0].metric.index()] = f64::NEG_INFINITY;
             return result;
         }
-        let rank = self.rank_cap(self.source.score_upper(totals));
+        let rank = self.rank_cap(self.source.score_upper(totals).min(score_cap));
         let mut result = [0.0_f64; 3];
         for (kind, &bonus) in bonuses.iter().enumerate() {
             if self.payout_cache[kind].len() >= 4096 {
@@ -800,9 +809,15 @@ impl<'a> Ranked<'a> {
             }
         }
     }
+    fn assignment_upper(&mut self, members: &[usize], totals: Totals, assigned: &[i32], from: usize, anchor_upper: f64) -> [f64; 3] {
+        let bonuses = self.bonuses(members, assigned, from);
+        let score = if self.context.plan.criterion == Aggregation::Max {
+            self.source.maximum_assignment_score(members, assigned, from, totals.power)
+        } else { f64::INFINITY };
+        self.raw_upper_at(totals, bonuses, anchor_upper, score)
+    }
     fn team_upper(&mut self, team: &Team, totals: Totals, anchor_upper: f64) -> [f64; 3] {
-        let bonuses = self.bonuses(&team.members, &team.snaps, 5);
-        let mut result = self.raw_upper(totals, bonuses, anchor_upper);
+        let mut result = self.assignment_upper(&team.members, totals, &team.snaps, 5, anchor_upper);
         self.cp_assignment(&mut result, &team.members, &team.snaps, 5, totals.power);
         self.last = Some((Self::key(team, totals.power), result));
         result
@@ -1010,8 +1025,7 @@ impl Objective for Ranked<'_> {
             .source
             .objective()
             .cheap_assignment_bound(members, totals, assigned, from);
-        let bonuses = self.bonuses(members, assigned, from);
-        let mut rewards = self.raw_upper(totals, bonuses, raw);
+        let mut rewards = self.assignment_upper(members, totals, assigned, from, raw);
         self.cp_assignment(&mut rewards, members, assigned, from, totals.power);
         self.upper(rewards)
     }
@@ -1064,7 +1078,13 @@ impl Objective for Ranked<'_> {
                 + self.member_suffix[kind][from][left]
                 + self.snap_top[kind]
         });
-        let mut rewards = self.raw_upper(totals, bonuses, raw);
+        let score = if self.context.plan.criterion == Aggregation::Max {
+            match &mut self.source {
+                Source::Gekiso(source) => source.maximum_member_score(members, from, totals.power).unwrap_or(f64::INFINITY),
+                Source::Ordinary(_) => f64::INFINITY,
+            }
+        } else { f64::INFINITY };
+        let mut rewards = self.raw_upper_at(totals, bonuses, raw, score);
         self.cp_members(&mut rewards, members, from, totals.power);
         Some(self.upper(rewards))
     }
@@ -1184,8 +1204,7 @@ impl Objective for Ranked<'_> {
             .objective()
             .assignment_order_bound(members, totals, assigned, from, floor)
             .unwrap_or_else(|| self.source.objective().bound(totals));
-        let bonuses = self.bonuses(members, assigned, from);
-        let mut rewards = self.raw_upper(totals, bonuses, raw);
+        let mut rewards = self.assignment_upper(members, totals, assigned, from, raw);
         self.cp_assignment(&mut rewards, members, assigned, from, totals.power);
         Some(self.upper(rewards))
     }

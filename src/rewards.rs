@@ -5398,7 +5398,9 @@ impl DeterministicBound {
         let coefficient = self.with_normal_error(coefficient, self.assignment_normal_error);
         let deduction = self.conversion_overlap(members, assigned, from);
         let original = mul(power, (coefficient - deduction).next_up().max(0.0));
-        self.window_score_bound.as_ref().map_or(original, |bound| original.min(bound.upper(assigned, from)))
+        if criterion == crate::objectives::Criterion::Mean {
+            self.window_score_bound.as_ref().map_or(original, |bound| original.min(bound.upper(assigned, from)))
+        } else { original }
     }
     fn repeated_order_floor(&mut self, mut ids: [u32; 5]) -> Option<(f64, usize)> {
         ids.sort_unstable();
@@ -6288,6 +6290,12 @@ impl<'a> RewardObjective<'a> {
     }
     pub(crate) fn score_upper(&self, totals: Totals) -> f64 {
         up(totals.power * self.coefficient)
+    }
+    pub(crate) fn maximum_assignment_score(&mut self, members: &[usize], assigned: &[i32], from: usize, power: f64) -> Option<f64> {
+        Some(self.assignment_model()?.score_ceiling(members, assigned, from, power, crate::objectives::Criterion::Max))
+    }
+    pub(crate) fn maximum_member_score(&mut self, members: &[usize], from: usize, power: f64) -> Option<f64> {
+        Some(self.deterministic.as_mut()?.member_score_ceiling(members, from, power, crate::objectives::Criterion::Max))
     }
     pub(crate) fn reward_ceiling(&self) -> f64 {
         self.ceiling(f64::INFINITY, self.bonus_max, self.coefficient)
