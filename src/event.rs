@@ -395,6 +395,7 @@ pub struct Route {
     pub kind: RouteKind,
     pub rate: f64,
     pub reward_rate: f64,
+    cp_rate: Option<i32>,
     pub points: BTreeMap<i32, i32>,
     pub rewards: Vec<Reward>,
     pub item_id: i32,
@@ -447,15 +448,15 @@ impl Route {
             .ok_or_else(|| format!("unknown-event:{event_id}"))?;
         let challenge =
             kind == RouteKind::Challenge || (kind == RouteKind::Skip && consumption > 10);
-        if !challenge && ![0, 1, 2, 3, 4, 5, 10].contains(&consumption) {
-            return Err("unsupported-live-boost-cost".into());
-        }
         let table = if challenge {
             &master.challenge_boosts
         } else {
             &master.boosts
         };
         let boost = table.iter().find(|row| row.consumed == consumption);
+        if consumption < 0 || consumption != 0 && boost.is_none() || challenge && consumption == 0 {
+            return Err("unsupported-live-boost-cost".into());
+        }
         let rate = if !challenge && consumption < 1 {
             1.0
         } else {
@@ -470,6 +471,7 @@ impl Route {
             kind,
             rate,
             reward_rate,
+            cp_rate: (!challenge).then(|| i32(rate)),
             points: if challenge {
                 event.challenge_points.clone()
             } else {
@@ -516,29 +518,27 @@ impl Route {
     }
     pub fn points(&self, bonus: f64, rank: i32) -> f64 {
         let value = self.rank_row(rank).map_or(0, |row| row.points);
-        event_bonus(value, bonus, self.rate) as f64
+        event_points(value, bonus, self.rate) as f64
     }
     pub fn items(&self, bonus: f64, rank: i32) -> f64 {
         let Some(row) = self.rank_row(rank) else {
             return 0.0;
         };
         row.items.iter().fold(0.0, |sum, &(count, probability)| {
-            sum + event_bonus(count, bonus, self.reward_rate) as f64 * probability / 10000.0
+            sum + event_items(count, bonus, self.reward_rate) as f64 * probability / 10000.0
         })
     }
     pub fn cp(&self, rank: i32) -> f64 {
-        if self.kind == RouteKind::Live {
-            self.rank_row(rank).map_or(0, |row| row.challenge_points) as f64 * self.rate
-        } else {
-            0.0
-        }
+        self.cp_rate.map_or(0.0, |rate| {
+            self.rank_row(rank).map_or(0, |row| row.challenge_points).wrapping_mul(rate) as f64
+        })
     }
     pub(crate) fn reward_units(&self, points: f64, items: f64, rank: i32) -> [i128; 3] {
         let badges = self.rank_row(rank).map_or(0, |row| {
             row.items
                 .iter()
                 .map(|&(count, probability)| {
-                    let count = event_bonus(count, items, self.reward_rate);
+                    let count = event_items(count, items, self.reward_rate);
                     count as i128 * probability as i128
                 })
                 .sum()
@@ -557,8 +557,12 @@ impl Route {
     }
 }
 
-// LiveItemRewardService.ApplyEventBonus widens before multiplying, then caps each reward row.
-fn event_bonus(count: i32, bonus: f64, rate: f64) -> i32 {
+// CalculateEventPoint multiplies as Int32; ApplyEventBonus widens the item product.
+fn event_points(count: i32, bonus: f64, rate: f64) -> i32 {
+    i32(bonus + 10_000.0).wrapping_mul(count).wrapping_mul(i32(rate)) / 10_000
+}
+
+fn event_items(count: i32, bonus: f64, rate: f64) -> i32 {
     let product = (i32(bonus + 10_000.0) as i64)
         .wrapping_mul(count as i64)
         .wrapping_mul(i32(rate) as i64);
@@ -585,7 +589,7 @@ impl BonusEnvelope {
             let safe = |value: i32, rate: f64| {
                 let product = value as i128 * i32(rate) as i128 * basis;
                 (0..=i32::MAX as i128).contains(&basis)
-                    && (0..=i64::MAX as i128).contains(&product)
+                    && (0..=if points { i32::MAX as i128 } else { i64::MAX as i128 }).contains(&product)
             };
             if points {
                 !safe(row.points, route.rate)
@@ -1361,6 +1365,7 @@ impl EventObjective {
     }
 }
 impl Objective for EventObjective {
+    fn generic_assignment_product(&self) -> bool { self.core.is_some() }
     fn seed_objective(&self) -> Option<Box<dyn Objective>> {
         (!self.points_measure
             && self
@@ -1416,7 +1421,7 @@ impl Objective for EventObjective {
         self.nonmonotone()
     }
     fn conditional_snap_dominance(&self) -> bool {
-        !self.nonmonotone()
+        self.core.is_some() && !self.nonmonotone()
     }
     fn canonical_leader(&self) -> bool {
         !self.core.as_ref().is_some_and(|core| core.unbounded)
@@ -1767,7 +1772,7 @@ impl Objective for EventObjective {
             let other_mean = self.other(other, self.skip_rank);
             return Ok(Exact {
                 key: mean + self.tie * other_mean,
-                detail: json!({"mean":mean,"bonus":bonus,"directMean":direct,"otherMean":other_mean,"directMin":direct,"directMax":direct}),
+                detail: json!({"mean":mean,"bonus":bonus,"directMean":direct,"otherMean":other_mean,"directMin":direct,"directMax":direct,"challengePoints":self.route.cp(self.skip_rank)}),
             });
         };
         let scores = core.evaluate(team, power as i32)?;

@@ -157,11 +157,37 @@ pub fn score_rank(chart: &Chart, score: f64) -> i32 {
         .unwrap_or(2)
         .max(2)
 }
+/// Project room grading onto the player's score once; replay and all reward bounds share it.
+pub(crate) fn reward_chart<'a>(chart: &'a Chart, room: &serde_json::Value) -> Result<std::borrow::Cow<'a, Chart>, String> {
+    use std::borrow::Cow;
+    if room.is_null() { return Ok(Cow::Borrowed(chart)); }
+    let solo = room["mode"] == "solo";
+    let players = room["players"].as_u64().unwrap_or(5);
+    let others = room["otherAverageScore"].as_f64();
+    if !solo && (room["mode"] != "battle" || !(1..=5).contains(&players)
+        || others.is_some_and(|score| !score.is_finite() || score < 0.0 || score.fract() != 0.0 || score > i32::MAX as f64)) {
+        return Err("reward-room".into());
+    }
+    if !solo && players == 5 && others.is_none() { return Ok(Cow::Borrowed(chart)); }
+    let mut projected = chart.clone();
+    for row in &mut projected.ranks {
+        let required = if solo { row.required as f64 } else {
+            if row.battle_required == 0 { continue; }
+            let total = ((5.0 / players as f64).sqrt() * row.battle_required as f64 * players as f64).trunc();
+            if let Some(average) = others { total - average * (players - 1) as f64 }
+            else { (total / players as f64).ceil() }
+        };
+        if required > i32::MAX as f64 { return Err("reward-room-score".into()); }
+        // Zero denotes a disabled battle grade; -1 denotes a grade already earned by the room.
+        row.battle_required = if required <= 0.0 { -1 } else { required as i32 };
+    }
+    Ok(Cow::Owned(projected))
+}
 pub fn battle_rank(chart: &Chart, score: f64) -> i32 {
     chart
         .ranks
         .iter()
-        .filter(|r| r.battle_required > 0 && r.battle_required as f64 <= score)
+        .filter(|r| r.battle_required != 0 && r.battle_required as f64 <= score)
         .map(|r| r.rank)
         .max()
         .unwrap_or(2)

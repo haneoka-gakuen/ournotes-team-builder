@@ -6310,7 +6310,7 @@ impl<'a> RewardObjective<'a> {
                 chart
                     .ranks
                     .iter()
-                    .filter(|r| r.battle_required > 0)
+                    .filter(|r| r.battle_required != 0)
                     .map(|r| r.rank),
             )
             .collect::<BTreeSet<_>>()
@@ -7039,7 +7039,7 @@ impl<'a> RewardObjective<'a> {
             .filter(|&&rank| {
                 rank == 2
                     || self.chart.ranks.iter().any(|r| {
-                        r.rank == rank && r.battle_required > 0 && r.battle_required as f64 <= upper
+                        r.rank == rank && r.battle_required != 0 && r.battle_required as f64 <= upper
                     })
             })
             .map(|&rank| self.other(bonus, rank))
@@ -8046,7 +8046,7 @@ impl<'a> RewardObjective<'a> {
                     rank == 2
                         || self.chart.ranks.iter().any(|r| {
                             r.rank == rank
-                                && r.battle_required > 0
+                                && r.battle_required != 0
                                 && r.battle_required as f64 <= score
                         })
                 })
@@ -8065,7 +8065,7 @@ impl<'a> RewardObjective<'a> {
                     rank == 2
                         || self.chart.ranks.iter().any(|r| {
                             r.rank == rank
-                                && r.battle_required > 0
+                                && r.battle_required != 0
                                 && r.battle_required as f64 <= score
                         })
                 })
@@ -8231,7 +8231,7 @@ impl<'a> RewardObjective<'a> {
             .filter(|&&rank| {
                 rank == 2
                     || self.chart.ranks.iter().any(|r| {
-                        r.rank == rank && r.battle_required > 0 && r.battle_required as f64 <= upper
+                        r.rank == rank && r.battle_required != 0 && r.battle_required as f64 <= upper
                     })
             })
             .map(|&rank| self.value(bonus, rank))
@@ -10110,8 +10110,7 @@ impl<'a> RewardObjective<'a> {
                 if self.exchange.is_some() && !self.route.challenge_points.contains_key(&rank) {
                     return Err(format!("gekiso-reward-cp:{rank}"));
                 }
-                let cp =
-                    *self.route.challenge_points.get(&rank).unwrap_or(&0) as f64 * self.route.rate;
+                let cp = self.route.cp(rank);
                 let reward = self.direct(bonus, rank);
                 reward_sum += reward;
                 other_sum += self.other(other_bonus, rank);

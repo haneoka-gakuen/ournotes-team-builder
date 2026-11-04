@@ -805,6 +805,11 @@ impl Engine {
             .transpose()?;
         let k = master::number(&request["k"], 1.0).max(1.0) as usize;
         let battle = goal["gekiso"].is_object();
+        if battle {
+            for chart in &mut charts {
+                if let std::borrow::Cow::Owned(projected) = crate::chart::reward_chart(chart, &goal["rewardRoom"])? { *chart = projected; }
+            }
+        }
         let mut objectives = Vec::new();
         for ((song, chart), source) in songs.iter().zip(&charts).zip(&sources) {
             let music = power::music_view(&self.master, master::int(&song["songId"]), challenge)?;

@@ -58,6 +58,18 @@ cargo run --release --example bench -- input.json
 
 `cancel()` stops running searches. For other languages, the same engine is exposed as C functions that take and return JSON strings, such as `haneoka_context_json`.
 
+## Event reward settlement
+
+Normal lives and normal skips earn CP from the rank's CP value and the Live Boost event-point multiplier. Challenge lives and challenge skips consume CP and earn none. Boost multipliers come from the selected release's matching consumption row; an unboosted normal live uses 1×.
+
+PT follows `CalculateEventPoint`: add 10000 to the bonus basis points, multiply the base rank points and event-point multiplier with signed Int32 wrapping, then divide by 10000 toward zero. Item rewards follow `ApplyEventBonus`: multiply the signed Int32 inputs in signed Int64, divide toward zero and cap each reward row at Int32 maximum. Each item's selection probability is applied after that row settles. Search bounds enumerate reachable bonus totals when native wrapping breaks monotonicity.
+
+An event goal can set `rewardPlan: {unit: 1, criterion: "mean", levels: [[{metric: "points", weight: 1}]]}`. Each outcome settles before averaging; fractions and ordered tie levels are compared exactly. `criterion: "max"` selects the lexicographically greatest reward tuple among the observed outcomes, including all 120 skill orders. It uses score ceilings and reachable grade payouts for pruning; mean-reward bounds never exclude a maximum-reward candidate. Unlisted rewards do not participate in comparison.
+
+Gekiso event goals accept `rewardRoom: {mode: "battle", players: 5, otherAverageScore: 10000000}` or `{mode: "solo"}`. Battle room thresholds use `trunc(sqrt(5 / players) * battleRequiredScore * players)`. An explicit other-player average is subtracted for the other `players - 1` players; otherwise everyone is assumed to score equally. Solo Mission uses the personal score thresholds. Thresholds are projected once per request and shared by settlement and search bounds; the default five-player equal-score room retains the existing chart without copying it. Fixed-team evaluation accepts the same option under `request.event.rewardRoom`.
+
+LUCK uses the requested seeds 0 through `luckSamples - 1`. A completed search proves the optimum for those samples and orders. The response retains its sample count and `sampled` flag; it does not turn the finite sample into a full-distribution expectation.
+
 ## Cumulative judgement timing
 
 Ordinary score requests can set `goal.play.cumulativeTiming` to `"best"` or `"worst"` with `criterion: "max"`. Evaluation uses the same field on `request.play`. Each of the 120 skill orders receives its own timing maximum or minimum, then the best order determines the team's score. Omitting the field preserves nominal scoring.

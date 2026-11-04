@@ -397,6 +397,8 @@ impl Engine {
                         })
                         .collect(),
                 };
+                let reward_chart = chart::reward_chart(chart, &request["event"]["rewardRoom"])?;
+                let chart = reward_chart.as_ref();
                 let mut objective = crate::rewards::RewardObjective::new(
                     &self.master,
                     &members,
@@ -1969,7 +1971,11 @@ impl Engine {
                     None => objective,
                 }
             };
-            let plan = (!goal["rewardPlan"].is_null()).then(|| crate::reward_plan::Plan::parse(&goal["rewardPlan"])).transpose()?;
+            let plan = if kind == RouteKind::Skip && goal["measure"] == "challenge-points" && goal["rewardPlan"].is_null() {
+                Some(crate::reward_plan::Plan::parse(&json!({"unit":1,"levels":[[{"metric":"challenge-points","weight":1}]]}))?)
+            } else {
+                (!goal["rewardPlan"].is_null()).then(|| crate::reward_plan::Plan::parse(&goal["rewardPlan"])).transpose()?
+            };
             let cp_measure = plan.is_none() &&
                 goal["measure"] == "challenge-points" && chart.is_some() && kind != RouteKind::Skip;
             let phase = request["rewardPhase"]["kind"].as_str();
@@ -2779,6 +2785,8 @@ impl Engine {
             return Err(format!("gekiso-chart-unsupported:{id}:{difficulty}"));
         }
         let chart = self.charts.get(&(id, difficulty)).ok_or("missing-chart")?;
+        let reward_chart = chart::reward_chart(chart, &goal["rewardRoom"])?;
+        let chart = reward_chart.as_ref();
         let music = power::music_view(&self.master, id, None)?;
         let route = Route::for_goal(
             &self.master,

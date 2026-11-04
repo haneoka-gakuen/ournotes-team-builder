@@ -47,10 +47,16 @@ pub(crate) struct AutoCp {
     pub songs: Vec<Song>,
     pub consumption: i32,
 }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum Aggregation { #[default] Mean, Max }
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Plan {
     pub unit: u32,
+    #[serde(default)]
+    pub criterion: Aggregation,
     pub levels: Vec<Vec<Term>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_cp: Option<AutoCp>,
@@ -361,7 +367,7 @@ impl<'a> Ranked<'a> {
         let cp_only = context.plan.levels[0].len() == 1 && cp.is_some();
         let mut composite = None;
         let mut source_cap = caps[anchor_metric.index()].upper();
-        if let (Source::Gekiso(inner), Some(cp)) = (&mut source, cp) {
+        if let (Source::Gekiso(inner), Some(cp)) = (&mut source, cp.filter(|_| context.plan.criterion == Aggregation::Mean)) {
             if own.is_some() || cp_only {
                 let own_weight = own.map_or(0, |term| term.weight);
                 let cap = ((source_cap * own_weight as f64).next_up()
@@ -414,7 +420,8 @@ impl<'a> Ranked<'a> {
                     <= (1u64 << 52) as f64
             })
             && (!prefix_items || !context.route.fractional_items());
-        let source_lex = matches!(source, Source::Gekiso(_))
+        let source_lex = context.plan.criterion == Aggregation::Mean
+            && matches!(source, Source::Gekiso(_))
             && lex_precision
             && secondary_matches
             && (context.plan.levels[0].len() == 1 && (own.is_some() || composite.is_some())
@@ -546,6 +553,7 @@ impl<'a> Ranked<'a> {
         result[1] = (2..=rank)
             .map(|grade| self.context.route.cp(grade))
             .fold(0.0, f64::max);
+        if self.context.plan.criterion == Aggregation::Max { return result; }
         let at = if self.anchor == 0 { 0 } else { 2 };
         let source = if self.integer_rewards && anchor_upper.fract() == 0.0 {
             anchor_upper
@@ -587,7 +595,7 @@ impl<'a> Ranked<'a> {
         values[0]
     }
     fn primary_floor(&self, value: f64) -> f64 {
-        if !value.is_finite() {
+        if self.context.plan.criterion == Aggregation::Max || !value.is_finite() {
             return f64::NEG_INFINITY;
         }
         let Some(value) = Fraction::from_value(value.next_down()) else {
@@ -617,6 +625,7 @@ impl<'a> Ranked<'a> {
         Fraction((value.0 - others) / BigInt::from(own.weight)).lower() - self.rounding
     }
     fn update_floor(&mut self) {
+        if self.context.plan.criterion == Aggregation::Max { return; }
         self.raw_floor = self.primary_floor(self.context.floor);
         let Some(incumbent) = &self.incumbent else {
             return;
@@ -673,18 +682,28 @@ impl<'a> Ranked<'a> {
         } else if let Some(rows) = ranks.filter(|rows| rows.iter().any(|&(_, count)| count > 0)) {
             let mut totals = [0i128; 3];
             let mut observations = 0i128;
+            let mut maximum: Option<(Vec<Fraction>, [i128; 3], i32)> = None;
             for (rank, count) in rows {
                 let units = self
                     .context
                     .route
                     .reward_units(bonuses[0], bonuses[1], rank);
+                if count > 0 && self.context.plan.criterion == Aggregation::Max {
+                    let rank_values = units.map(|value| Fraction::new(value, 10_000));
+                    let key = self.context.plan.rank(&rank_values);
+                    if maximum.as_ref().is_none_or(|old| key > old.0) { maximum = Some((key, units, rank)); }
+                }
                 for (total, value) in totals.iter_mut().zip(units) {
                     *total += value * count as i128;
                 }
                 observations += count as i128;
             }
-            totals.map(|total| Fraction::new(total, observations * 10_000))
+            if let Some((_, values, rank)) = maximum {
+                exact.detail["rewardRank"] = json!(rank);
+                values.map(|value| Fraction::new(value, 10_000))
+            } else { totals.map(|total| Fraction::new(total, observations * 10_000)) }
         } else {
+            if self.context.plan.criterion == Aggregation::Max { return Err("reward-plan-ranks".into()); }
             let (direct, other, cp) = if gekiso {
                 let count = settlement["observations"]
                     .as_f64()
@@ -749,7 +768,7 @@ impl<'a> Ranked<'a> {
         Ok(exact)
     }
     fn cp_members(&mut self, rewards: &mut [f64; 3], members: &[usize], from: usize, power: f64) {
-        if self.context.plan.uses(Metric::ChallengePoints) {
+        if self.context.plan.criterion == Aggregation::Mean && self.context.plan.uses(Metric::ChallengePoints) {
             if let Source::Ordinary(source) = &mut self.source {
                 if let Some(bound) = source.cp_member_upper(members, from, power) {
                     rewards[1] = rewards[1].min(if bound.fract() == 0.0 {
@@ -769,7 +788,7 @@ impl<'a> Ranked<'a> {
         from: usize,
         power: f64,
     ) {
-        if self.context.plan.uses(Metric::ChallengePoints) {
+        if self.context.plan.criterion == Aggregation::Mean && self.context.plan.uses(Metric::ChallengePoints) {
             if let Source::Ordinary(source) = &mut self.source {
                 if let Some(bound) = source.cp_assignment_upper(members, assigned, from, power) {
                     rewards[1] = rewards[1].min(if bound.fract() == 0.0 {
@@ -1251,6 +1270,9 @@ impl Objective for Ranked<'_> {
         if upper < cutoff.key {
             return Ok(Evaluation::Pruned(upper));
         }
+        if self.context.plan.criterion == Aggregation::Max {
+            return self.exact(team, power, slots).map(Evaluation::Exact);
+        }
         let floor = self.raw_floor.max(self.primary_floor(cutoff.key));
         match self.source.objective().evaluate(
             team,
@@ -1290,4 +1312,5 @@ pub(crate) fn decorate(value: &mut Value, detail: &Value) {
     value["event"]["rewardValues"] = detail["rewardValues"].clone();
     value["event"]["rewardPlan"] = detail["rewardPlan"].clone();
     value["event"]["mean"] = detail["planMean"].clone();
+    if !detail["rewardRank"].is_null() { value["event"]["rewardRank"] = detail["rewardRank"].clone(); }
 }

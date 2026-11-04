@@ -368,8 +368,6 @@ pub fn validate(master: &Master, request: &Value) -> Result<Vec<String>, String>
             .iter()
             .find(|b| b.consumed == consumption)
             .cloned()
-    } else if ![0, 1, 2, 3, 4, 5, 10].contains(&consumption) {
-        None
     } else if consumption == 0 {
         Some(master::Boost {
             consumed: 0,
@@ -574,12 +572,11 @@ pub fn validate(master: &Master, request: &Value) -> Result<Vec<String>, String>
         } else {
             boost.event_point_rate
         };
-        // Settlement widens the product before dividing and caps the final row
-        // at i32::MAX. Only an overflowing i64 product invalidates monotonicity.
+        // PT wraps at Int32; item settlement widens to Int64 before division.
         let product = (bonus as i128 + 10000)
             * crate::num::i32(rate) as i128
             * max_base as i128;
-        if bonus > 1000000.0 || product > i64::MAX as i128 {
+        if bonus > 1000000.0 || product > if items { i64::MAX as i128 } else { i32::MAX as i128 } {
             add(&mut issues, "rules", "settlement-range")
         }
         if has_cp {
