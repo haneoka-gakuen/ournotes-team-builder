@@ -25,9 +25,9 @@ struct SongObjective<'k, 'a> {
     weights: Vec<f64>,
     power_cap: f64,
     base: f64,
-    slots: Vec<Vec<f64>>,
+    slots: Arc<Vec<Vec<f64>>>,
     domain_power: Vec<f64>,
-    power_choices: Vec<Vec<(i32, f64)>>,
+    power_choices: Arc<Vec<Vec<(i32, f64)>>>,
     skill_choices: Vec<Vec<(i32, f64)>>,
 }
 
@@ -62,6 +62,7 @@ struct Combined<'k, 'a> {
     songs: Vec<SongObjective<'k, 'a>>,
     player: &'a Player,
     same_levels: bool,
+    same_power: bool,
     min_combo: i32,
     roster: Vec<usize>,
     affine: Option<(f64, f64, Vec<f64>)>,
@@ -162,9 +163,9 @@ impl<'k, 'a> Combined<'k, 'a> {
                     weights,
                     power_cap,
                     base: 0.0,
-                    slots: Vec::new(),
+                    slots: Arc::new(Vec::new()),
                     domain_power: Vec::new(),
-                    power_choices: Vec::new(),
+                    power_choices: Arc::new(Vec::new()),
                     skill_choices: Vec::new(),
                 }
             })
@@ -211,6 +212,7 @@ impl<'k, 'a> Combined<'k, 'a> {
             songs,
             player,
             same_levels,
+            same_power: equal_power,
             min_combo,
             roster: Vec::new(),
             affine,
@@ -248,6 +250,7 @@ impl<'k, 'a> Combined<'k, 'a> {
         let powers: Vec<_> = self
             .songs
             .iter()
+            .take(if self.same_power { 1 } else { self.songs.len() })
             .map(|song| {
                 power::team_power(
                     song.adapter.kernel.master,
@@ -271,7 +274,7 @@ impl<'k, 'a> Combined<'k, 'a> {
             for (index, song) in self.songs.iter_mut().enumerate() {
                 let width = song.adapter.kernel.snaps.len() + 1;
                 let t = Totals {
-                    power: powers[index].total as f64,
+                    power: powers[if self.same_power { 0 } else { index }].total as f64,
                     skill: team
                         .members
                         .iter()
@@ -307,11 +310,11 @@ impl<'k, 'a> Combined<'k, 'a> {
             let mut score = song
                 .adapter
                 .kernel
-                .exact(team, powers[index].total as i32, true)?;
-            song.adapter.kernel.decorate_window(team, powers[index].total as i32, &mut score.detail)?;
+                .exact(team, powers[if self.same_power { 0 } else { index }].total as i32, true)?;
+            song.adapter.kernel.decorate_window(team, powers[if self.same_power { 0 } else { index }].total as i32, &mut score.detail)?;
             scores[index] = score.key;
             bounds[index] = score.key;
-            details[index] = json!({"detail":score.detail,"power":powers[index].total,"slotPowers":powers[index].slots});
+            details[index] = json!({"detail":score.detail,"power":powers[if self.same_power { 0 } else { index }].total,"slotPowers":powers[if self.same_power { 0 } else { index }].slots});
             if let Some(cutoff) = cutoff {
                 let upper = (bounds.iter().fold(0.0_f64, |sum, v| (sum + v).next_up())
                     / bounds.len() as f64)
@@ -635,32 +638,29 @@ impl Objective for Combined<'_, '_> {
     }
     fn prepare_assignment(&mut self, members: &[usize], options: &[Vec<i32>]) {
         self.roster = members.to_vec();
-        for song in &mut self.songs {
-            let kernel = &song.adapter.kernel;
-            let master = kernel.master;
-            let roster: Vec<_> = members.iter().map(|&m| kernel.members[m].clone()).collect();
-            let profile = power::leader_profile(master, &roster[0]);
-            let percents = power::leader_percents(master, &profile, &roster, 0, Some(song.music));
-            let width = kernel.snaps.len() + 1;
-            let base: Vec<_> = members
-                .iter()
-                .enumerate()
-                .map(|(i, &m)| {
-                    (song.bases[m].fixed_points
-                        + power::leader_points(&song.bases[m], &percents[i]))
-                        as f64
-                })
-                .collect();
-            song.base = base.iter().sum();
-            song.slots = members
-                .iter()
-                .enumerate()
-                .map(|(slot, &m)| {
-                    (0..width)
-                        .map(|j| base[slot] + song.snap_power[m * width + j])
-                        .collect()
-                })
-                .collect();
+        let master = self.songs[0].adapter.kernel.master;
+        let roster: Vec<_> = members.iter().map(|&m| self.songs[0].adapter.kernel.members[m].clone()).collect();
+        let profile = power::leader_profile(master, &roster[0]);
+        for index in 0..self.songs.len() {
+            if self.same_power && index > 0 {
+                self.songs[index].slots = Arc::clone(&self.songs[0].slots);
+                self.songs[index].base = self.songs[0].base;
+                self.songs[index].power_choices = Arc::clone(&self.songs[0].power_choices);
+            } else {
+                let song = &mut self.songs[index];
+                let kernel = &song.adapter.kernel;
+                let percents = power::leader_percents(master, &profile, &roster, 0, Some(song.music));
+                let width = kernel.snaps.len() + 1;
+                let base: Vec<_> = members.iter().enumerate().map(|(i, &m)| {
+                    (song.bases[m].fixed_points + power::leader_points(&song.bases[m], &percents[i])) as f64
+                }).collect();
+                song.base = base.iter().sum();
+                song.slots = Arc::new(members.iter().enumerate().map(|(slot, &m)| {
+                    (0..width).map(|j| base[slot] + song.snap_power[m * width + j]).collect()
+                }).collect());
+            }
+            let song = &mut self.songs[index];
+            let width = song.adapter.kernel.snaps.len() + 1;
             let best_five = |slot: usize, values: &[f64]| {
                 let mut choices: Vec<_> = options[slot]
                     .iter()
@@ -671,14 +671,15 @@ impl Objective for Combined<'_, '_> {
                         )
                     })
                     .collect();
-                choices.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+                if choices.len() > 5 { choices.select_nth_unstable_by(4, |a, b| b.1.total_cmp(&a.1)); }
                 // At most four distinct snapshots are occupied before an unassigned slot.
                 choices.truncate(5);
+                choices.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
                 choices
             };
-            song.power_choices = (0..5)
-                .map(|slot| best_five(slot, &song.slots[slot]))
-                .collect();
+            if !self.same_power || index == 0 {
+                song.power_choices = Arc::new((0..5).map(|slot| best_five(slot, &song.slots[slot])).collect());
+            }
             song.skill_choices = members
                 .iter()
                 .enumerate()

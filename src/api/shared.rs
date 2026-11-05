@@ -16,13 +16,15 @@ struct SongObjective<'a> {
     cap: f64,
     linear: Option<(f64, f64)>,
     unbounded: bool,
-    slots: Vec<Vec<f64>>,
+    slots: Arc<Vec<Vec<f64>>>,
+    base_power: f64,
     opening: Vec<i32>,
     member_base: Vec<f64>,
     domain_power: Vec<f64>,
 }
 struct LinearGroup {
     song: usize,
+    songs: Vec<usize>,
     base: f64,
     skills: Vec<f64>,
 }
@@ -43,7 +45,6 @@ fn linear_groups(songs: &[SongObjective<'_>]) -> Vec<LinearGroup> {
         let group = groups.iter_mut().find(|group| {
             let other = &songs[group.song];
             song.music.music_type == other.music.music_type
-                && song.music.best_tags == other.music.best_tags
                 && song.snap_power == other.snap_power
                 && song.bases.iter().zip(&other.bases).all(|(a, b)| {
                     a.common == b.common && a.fixed_points == b.fixed_points
@@ -52,10 +53,11 @@ fn linear_groups(songs: &[SongObjective<'_>]) -> Vec<LinearGroup> {
         let group = match group {
             Some(group) => group,
             None => {
-                groups.push(LinearGroup { song: index, base: 0.0, skills: vec![0.0; song.skills.len()] });
+                groups.push(LinearGroup { song: index, songs: Vec::new(), base: 0.0, skills: vec![0.0; song.skills.len()] });
                 groups.last_mut().unwrap()
             }
         };
+        group.songs.push(index);
         group.base = (group.base + base).next_up();
         for (total, skill) in group.skills.iter_mut().zip(&song.skills) {
             *total = (*total + (scale * skill.1.max(0.0)).next_up()).next_up();
@@ -71,6 +73,7 @@ struct Combined<'a> {
     effects: &'a [master::EventEffect],
     songs: Vec<SongObjective<'a>>,
     linear_groups: Vec<LinearGroup>,
+    power_groups: Vec<usize>,
     leader_profiles: Vec<power::LeaderProfile>,
     options: Vec<Vec<i32>>,
     min_combo: i32,
@@ -286,6 +289,14 @@ impl Combined<'_> {
     }
 }
 impl Objective for Combined<'_> {
+    fn prefer_member(&self, member: usize) -> f64 {
+        if self.needs_power_cap() && self.filter_permutation_invariant() { self.prefer_leader(member) } else { 0.0 }
+    }
+    fn prefer_leader(&self, member: usize) -> f64 {
+        if self.event || self.priority.is_empty() { return 0.0; }
+        let width = self.snaps.len() + 1;
+        self.priority[member * width..(member + 1) * width].iter().copied().fold(f64::NEG_INFINITY, f64::max)
+    }
     fn prepare_leader(&mut self, leader: usize) { self.leader = leader; }
     fn needs_power_cap(&self) -> bool {
         self.joint_linear() && self.songs.iter().all(|song| song.objective.needs_power_cap())
@@ -635,7 +646,10 @@ impl Objective for Combined<'_> {
     fn early_member_bound(&mut self, members: &[usize], from: usize, _limit: f64) -> Option<f64> {
         self.joint_member_bound(members, from, 5 - members.len())
     }
-    fn roster_bound(&mut self, members: &[usize], _totals: Totals, _limit: f64) -> Option<f64> {
+    fn roster_bound(&mut self, members: &[usize], _totals: Totals, limit: f64) -> Option<f64> {
+        if let Some(bound) = self.partial_member_bound(members, self.member_groups.len(), 0) {
+            if bound < limit { return Some(bound); }
+        }
         if !self.joint_linear() || self.domains.len() != self.members.len()
             || self.songs.iter().any(|song| song.domain_power.len() != self.members.len()) {
             return None;
@@ -663,52 +677,62 @@ impl Objective for Combined<'_> {
     fn prepare_assignment(&mut self, members: &[usize], options: &[Vec<i32>]) {
         self.options = options.to_vec();
         let roster: Vec<_> = members.iter().map(|&m| self.members[m].clone()).collect();
-        let profile = power::leader_profile(self.master, &roster[0]);
+        let profile = &self.leader_profiles[members[0]];
         let width = self.snaps.len() + 1;
-        for song in &mut self.songs {
-            let percents =
-                power::leader_percents(self.master, &profile, &roster, 0, Some(&song.music));
-            let bases: Vec<_> = members
-                .iter()
-                .enumerate()
-                .map(|(slot, &m)| {
-                    (song.bases[m].fixed_points
-                        + power::leader_points(&song.bases[m], &percents[slot]))
-                        as f64
-                })
-                .collect();
-            song.slots = members
-                .iter()
-                .enumerate()
-                .map(|(slot, &m)| {
-                    (0..width)
-                        .map(|s| bases[slot] + song.snap_power[m * width + s])
-                        .collect()
-                })
-                .collect();
+        for index in 0..self.songs.len() {
+            let representative = self.power_groups[index];
+            if representative != index {
+                self.songs[index].slots = Arc::clone(&self.songs[representative].slots);
+                self.songs[index].base_power = self.songs[representative].base_power;
+            } else {
+                let song = &mut self.songs[index];
+                let percents =
+                    power::leader_percents(self.master, profile, &roster, 0, Some(&song.music));
+                let bases: Vec<_> = members
+                    .iter()
+                    .enumerate()
+                    .map(|(slot, &m)| {
+                        (song.bases[m].fixed_points
+                            + power::leader_points(&song.bases[m], &percents[slot]))
+                            as f64
+                    })
+                    .collect();
+                song.base_power = bases.iter().sum();
+                song.slots = Arc::new(members
+                    .iter()
+                    .enumerate()
+                    .map(|(slot, &m)| {
+                        (0..width)
+                            .map(|s| bases[slot] + song.snap_power[m * width + s])
+                            .collect()
+                    })
+                    .collect());
+            }
+            let song = &mut self.songs[index];
             song.objective
                 .prepare_power(Arc::clone(&song.snap_power), width);
-            song.objective.prepare_assignment_power(bases.iter().sum());
+            song.objective.prepare_assignment_power(song.base_power);
             song.objective.prepare_assignment(members, options);
         }
         self.joint_slots.clear();
         if self.joint_linear() {
-            if self.songs.iter().any(|song| {
+            let finite_skills = !self.linear_groups.is_empty();
+            if self.songs.iter().enumerate().any(|(index, song)| {
+                if self.power_groups[index] != index { return false; }
                 options.iter().enumerate().any(|(slot, options)| {
                     options.iter().any(|&snap| {
                         let col = if snap < 0 { width - 1 } else { snap as usize };
                         !(0.0..=i32::MAX as f64).contains(&song.slots[slot][col])
-                            || !song.skills[members[slot] * width + col].1.is_finite()
+                            || !finite_skills && !song.skills[members[slot] * width + col].1.is_finite()
                     })
                 })
             }) {
                 self.joint_zero = false;
                 return;
             }
-            let caps: Vec<_> = self
-                .songs
-                .iter()
-                .map(|song| {
+            let mut caps: Vec<f64> = Vec::with_capacity(self.songs.len());
+            for (index, song) in self.songs.iter().enumerate() {
+                let cap = if self.power_groups[index] != index { caps[self.power_groups[index]] } else {
                     options
                         .iter()
                         .enumerate()
@@ -722,8 +746,9 @@ impl Objective for Combined<'_> {
                                 .fold(f64::NEG_INFINITY, f64::max))
                             .next_up()
                         })
-                })
-                .collect();
+                };
+                caps.push(cap);
+            }
             if caps
                 .iter()
                 .any(|cap| !(0.0..=i32::MAX as f64).contains(cap))
@@ -826,8 +851,9 @@ impl Objective for Combined<'_> {
             .map(|&s| (s >= 0).then(|| self.snaps[s as usize].clone()))
             .collect();
         let mut parts = Vec::new();
-        for song in &mut self.songs {
-            let p = power::team_power(
+        let mut powers: Vec<Arc<power::TeamPower>> = Vec::with_capacity(self.songs.len());
+        for (index, song) in self.songs.iter_mut().enumerate() {
+            let p = if self.power_groups[index] == index { Arc::new(power::team_power(
                 self.master,
                 self.player,
                 &members,
@@ -835,7 +861,8 @@ impl Objective for Combined<'_> {
                 0,
                 Some(&song.music),
                 self.effects,
-            )?;
+            )?) } else { Arc::clone(&powers[self.power_groups[index]]) };
+            powers.push(Arc::clone(&p));
             let mut exact = song.objective.exact(
                 team,
                 p.total as f64,
@@ -899,11 +926,12 @@ impl Objective for Combined<'_> {
         }
         let members: Vec<_> = team.members.iter().map(|&member| self.members[member].clone()).collect();
         let snaps: Vec<_> = team.snaps.iter().map(|&snap| (snap >= 0).then(|| self.snaps[snap as usize].clone())).collect();
-        let mut powers = Vec::with_capacity(self.songs.len());
+        let mut powers: Vec<Arc<power::TeamPower>> = Vec::with_capacity(self.songs.len());
         let mut upper = Vec::with_capacity(self.songs.len());
         let width = self.snaps.len() + 1;
-        for song in &mut self.songs {
-            let power = power::team_power(self.master, self.player, &members, &snaps, 0, Some(&song.music), self.effects)?;
+        for (index, song) in self.songs.iter_mut().enumerate() {
+            let power = if self.power_groups[index] == index { Arc::new(power::team_power(self.master, self.player, &members, &snaps, 0, Some(&song.music), self.effects)?) }
+                else { Arc::clone(&powers[self.power_groups[index]]) };
             let mut totals = Totals { power: power.total as f64, ..Totals::default() };
             for (&member, &snap) in team.members.iter().zip(&team.snaps) {
                 let skill = song.skills[member * width + if snap < 0 { width - 1 } else { snap as usize }];
@@ -1232,7 +1260,8 @@ impl Engine {
                 cap,
                 linear,
                 unbounded,
-                slots: Vec::new(),
+                slots: Arc::new(Vec::new()),
+                base_power: 0.0,
                 opening,
                 member_base: Vec::new(),
                 domain_power: Vec::new(),
@@ -1285,6 +1314,10 @@ impl Engine {
             Vec::new()
         };
         let linear_groups = linear_groups(&objectives);
+        let mut power_groups: Vec<_> = (0..objectives.len()).collect();
+        for group in &linear_groups {
+            for &song in &group.songs { power_groups[song] = group.song; }
+        }
         let mut combined = Combined {
             master: &self.master,
             player: &player,
@@ -1293,6 +1326,7 @@ impl Engine {
             effects: &effects,
             songs: objectives,
             linear_groups,
+            power_groups,
             leader_profiles: profiles,
             options: Vec::new(),
             min_combo: master::int(&goal["gekiso"]["minComboBonus"]).max(1),

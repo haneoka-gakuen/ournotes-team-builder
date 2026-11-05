@@ -40,6 +40,7 @@ pub struct JointTarget {
     pub product: f64,
 }
 pub trait Objective {
+    fn prefer_leader(&self, leader: usize) -> f64 { self.prefer_member(leader) }
     fn has_team_filter(&self) -> bool {
         false
     }
@@ -3541,7 +3542,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             .collect();
         leaders.sort_by(|&a, &b| {
             let hint =
-                self.input.objective.prefer_member(b) - self.input.objective.prefer_member(a);
+                self.input.objective.prefer_leader(b) - self.input.objective.prefer_leader(a);
             if hint != 0.0 {
                 hint.total_cmp(&0.0)
             } else {

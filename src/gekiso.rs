@@ -2279,6 +2279,12 @@ fn replay_selected_orders(
         indices.push(index);
     }
     let mut chronological: Vec<_> = (0..chart.full.events.len()).collect();
+    let mut live_capacity = [0; 5];
+    for events in &event_orders {
+        let mut counts = [0; 5];
+        for &(member, _) in events { counts[member] += 1; }
+        for (maximum, count) in live_capacity.iter_mut().zip(counts) { *maximum = (*maximum).max(count); }
+    }
     chronological.sort_by_key(|&event| (chart.full.events[event].1, event));
     let mut multiplicities = vec![0; event_orders.len()];
     for &index in &indices {
@@ -2319,14 +2325,14 @@ fn replay_selected_orders(
             let mut params = chart.params();
             params.power = power;
             params.music_type = chart.music_type;
-            let mut model = Model::new(
+            let mut model = Model::with_live_capacity(
                 master,
                 deck,
                 &chart.full.notes,
                 &event_orders[orders[0]],
                 params,
                 Some(&chart.setup),
-                (seed, false),
+                (seed, false, Some(&live_capacity)),
             )?;
             chart.fixed_life(&mut model);
             let mut values = vec![(0.0, [0.0; 3]); event_orders.len()];

@@ -1,7 +1,7 @@
 //! Score-factor frame logging with native binary32 undo and replay.
 use super::core::{self, Combo};
 use crate::{master::LiveTables, num::f};
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, rc::Rc};
 #[derive(Clone, Default)]
 pub struct FactorCommand {
     pub time: i32,
@@ -266,13 +266,14 @@ pub struct Incremental<'a> {
     pub calculator: Calculator<'a>,
     pub max_frame: usize,
     pub notes: Vec<Vec<NoteCommand>>,
-    factors: Vec<Vec<FactorCommand>>,
+    factors: Vec<Rc<Vec<FactorCommand>>>,
     factor_order: Vec<usize>,
     pub(crate) replay: Option<Vec<ReplayCommand>>,
     note_order: Vec<usize>,
-    diffs: Vec<Diff>,
+    diffs: Vec<Rc<[Diff; 64]>>,
     previous: i32,
     added: i32,
+    last_command: i32,
     pub score: i32,
     fixed: BTreeMap<i32, i32>,
     pending_fixed: Option<(i32, i32)>,
@@ -281,17 +282,20 @@ pub struct Incremental<'a> {
 impl<'a> Incremental<'a> {
     pub fn new(calculator: Calculator<'a>, music_length: i32) -> Self {
         let max_frame = (core::frame(music_length) + 50).max(1) as usize;
+        let empty_factors = Rc::new(Vec::new());
+        let empty_diffs = Rc::new(std::array::from_fn(|_| Diff::default()));
         Self {
             calculator,
             max_frame,
             notes: vec![Vec::new(); max_frame],
-            factors: vec![Vec::new(); max_frame],
+            factors: vec![empty_factors; max_frame],
             factor_order: Vec::new(),
             replay: None,
             note_order: Vec::new(),
-            diffs: vec![Diff::default(); max_frame],
+            diffs: vec![empty_diffs; max_frame.div_ceil(64)],
             previous: -1,
             added: -1,
+            last_command: -1,
             score: 0,
             fixed: BTreeMap::new(),
             pending_fixed: None,
@@ -301,7 +305,7 @@ impl<'a> Incremental<'a> {
     pub(crate) fn note_factor_commands(&self) -> Vec<(i32, i32)> {
         self.factors
             .iter()
-            .flatten()
+            .flat_map(|commands| commands.iter())
             .filter(|c| c.note != 0)
             .map(|c| (c.time, c.note))
             .collect()
@@ -311,7 +315,7 @@ impl<'a> Incremental<'a> {
     ) -> impl Iterator<Item = (i32, i32, i32)> + '_ {
         self.factors
             .iter()
-            .flatten()
+            .flat_map(|commands| commands.iter())
             .filter(|c| c.note != 0)
             .map(|c| (c.owner, c.time, c.note))
     }
@@ -319,7 +323,7 @@ impl<'a> Incremental<'a> {
         let mut commands: Vec<_> = self
             .factors
             .iter()
-            .flatten()
+            .flat_map(|commands| commands.iter())
             .filter(|command| command.luck != 0)
             .map(|command| (command.time, command.luck))
             .collect();
@@ -329,12 +333,13 @@ impl<'a> Incremental<'a> {
     pub(crate) fn rush_factor_changes(&self) -> usize {
         self.factors
             .iter()
-            .flatten()
+            .flat_map(|commands| commands.iter())
             .filter(|command| command.luck != 0)
             .count()
     }
     fn file(&mut self, time: i32) -> usize {
         let frame = (core::frame(time) as usize).min(self.max_frame - 1);
+        self.last_command = self.last_command.max(frame as i32);
         self.added = if self.added < 0 {
             frame as i32
         } else {
@@ -362,7 +367,7 @@ impl<'a> Incremental<'a> {
             replay.push(ReplayCommand::Factor(command.clone()));
         }
         let frame = self.file(command.time);
-        self.factors[frame].push(command);
+        Rc::make_mut(&mut self.factors[frame]).push(command);
     }
     pub fn add_fixed(&mut self, time: i32, score: i32) {
         self.pending_fixed = Some((time, score));
@@ -377,21 +382,19 @@ impl<'a> Incremental<'a> {
             replay.push(ReplayCommand::Calculate(time));
         }
         let to = (core::frame(time).max(0) as usize).min(self.max_frame - 1) as i32;
-        let u = if self.added < 0 {
-            to
-        } else {
-            to.min(self.added - 1)
-        };
-        let start = if u < self.previous {
-            for frame in (u + 1..=self.previous).rev() {
-                self.undo(frame as usize);
+        if self.added >= 0 || to < self.previous || self.previous < self.last_command {
+            let u = if self.added < 0 { to } else { to.min(self.added - 1) };
+            let start = if u < self.previous {
+                for frame in (u + 1..=self.previous).rev() {
+                    self.undo(frame as usize);
+                }
+                u + 1
+            } else {
+                self.previous + 1
+            };
+            for frame in start..=to {
+                self.execute(frame as usize, combo, info)?;
             }
-            u + 1
-        } else {
-            self.previous + 1
-        };
-        for frame in start..=to {
-            self.execute(frame as usize, combo, info)?;
         }
         if let Some((time, score)) = self.pending_fixed.take() {
             let frame = core::frame(time);
@@ -399,6 +402,7 @@ impl<'a> Incremental<'a> {
                 return Err("two fixed scores in one frame".into());
             }
             self.fixed.insert(frame, score);
+            self.last_command = self.last_command.max(frame);
             self.score = self.score.wrapping_add(score);
         }
         self.previous = to;
@@ -412,7 +416,9 @@ impl<'a> Incremental<'a> {
         if let Some(&value) = self.fixed.get(&(frame as i32)) {
             self.score = self.score.wrapping_sub(value);
         }
-        self.diffs[frame].undo(&mut self.calculator.factors);
+        if !self.factors[frame].is_empty() {
+            Rc::make_mut(&mut self.diffs[frame / 64])[frame % 64].undo(&mut self.calculator.factors);
+        }
     }
     fn execute(
         &mut self,
@@ -455,7 +461,7 @@ impl<'a> Incremental<'a> {
             {
                 let c = &self.factors[frame][factor_order[a]];
                 self.calculator.factors.apply(c);
-                self.diffs[frame].add(c);
+                Rc::make_mut(&mut self.diffs[frame / 64])[frame % 64].add(c);
                 a += 1;
             } else {
                 let n = &mut self.notes[frame][note_order[b]];

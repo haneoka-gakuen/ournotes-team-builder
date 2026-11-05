@@ -23,10 +23,18 @@ pub(super) struct ReservedFlick {
     pub begin: f64,
 }
 
-#[derive(Clone)]
 pub(super) struct State {
     pub done: Vec<bool>,
     pub flicks: Vec<Option<ReservedFlick>>,
+}
+impl Clone for State {
+    fn clone(&self) -> Self {
+        Self { done: self.done.clone(), flicks: self.flicks.clone() }
+    }
+    fn clone_from(&mut self, source: &Self) {
+        self.done.clone_from(&source.done);
+        self.flicks.clone_from(&source.flicks);
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -44,6 +52,14 @@ struct Candidate {
 struct Claim {
     note: usize,
     input: Option<usize>,
+}
+#[derive(Default)]
+pub(super) struct Scratch {
+    results: Vec<Judgement>,
+    synchronous: Vec<Vec<Candidate>>,
+    asynchronous: Vec<Vec<Candidate>>,
+    claims: Vec<Claim>,
+    claimed: Vec<Option<usize>>,
 }
 
 pub(super) fn in_area(note: &Note, lane: f64) -> bool {
@@ -152,6 +168,23 @@ fn judge_input(
     }
     (input.state == TouchState::Enter).then_some(input.time)
 }
+pub(super) fn may_receive_grade(note: &Note, frame: i32, clock: crate::live::FrameClock, saved: Option<ReservedFlick>) -> bool {
+    // Relax touch position and competition; they can only remove choices.
+    for time in super::input_times(clock, frame) {
+        if !permitted_time(note, time) { continue; }
+        for state in [TouchState::Enter, TouchState::Hold, TouchState::Exit] {
+            for flick_begin in [None, Some(note.left)] {
+                if flick_begin.is_some() && !note.flick() { continue; }
+                let mut reserved = saved;
+                let input = Touch { state, lane: note.left, time, flick_begin };
+                if judge_input(note, frame, input, &mut reserved).is_some_and(|time| note.grade_at(time) == note.grade) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
 
 pub(super) fn run(
     notes: &[Note],
@@ -159,7 +192,19 @@ pub(super) fn run(
     inputs: &[Touch],
     state: &mut State,
 ) -> Vec<Judgement> {
-    let mut results = Vec::new();
+    run_cached(notes, frame, inputs, state, &mut Scratch::default()).to_vec()
+}
+pub(super) fn run_cached<'a>(
+    notes: &[Note], frame: i32, inputs: &[Touch], state: &mut State, scratch: &'a mut Scratch,
+) -> &'a [Judgement] {
+    let Scratch { results, synchronous, asynchronous, claims, claimed } = scratch;
+    results.clear();
+    if synchronous.len() < inputs.len() { synchronous.resize_with(inputs.len(), Vec::new); }
+    if asynchronous.len() < inputs.len() { asynchronous.resize_with(inputs.len(), Vec::new); }
+    for row in synchronous.iter_mut().chain(asynchronous.iter_mut()) { row.clear(); }
+    claims.clear();
+    claimed.resize(inputs.len(), None);
+    claimed.fill(None);
     for (index, note) in notes.iter().enumerate() {
         if state.done[index] || frame < note.first {
             continue;
@@ -191,9 +236,6 @@ pub(super) fn run(
         }
     }
 
-    let mut synchronous = vec![Vec::new(); inputs.len()];
-    let mut asynchronous = vec![Vec::new(); inputs.len()];
-    let mut claims = Vec::new();
     for (index, note) in notes.iter().enumerate() {
         if state.done[index] || frame < note.first {
             continue;
@@ -224,8 +266,7 @@ pub(super) fn run(
         }
     }
 
-    let mut claimed = vec![None; inputs.len()];
-    for claim in claims {
+    for claim in claims.iter() {
         for (unit, input) in inputs.iter().enumerate() {
             if claim.input.is_some_and(|index| index != unit)
                 || input.state != TouchState::Enter

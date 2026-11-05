@@ -477,7 +477,18 @@ impl<'a> Model<'a> {
         setup: Option<&Setup>,
         mode: (i32, bool),
     ) -> Result<Self, String> {
-        let (seed, record) = mode;
+        Self::with_live_capacity(master, deck, notes, events, params, setup, (mode.0, mode.1, None))
+    }
+    pub(crate) fn with_live_capacity(
+        master: &'a Master,
+        deck: &[Performer],
+        notes: &[LiveNote],
+        events: &[(usize, i32)],
+        params: Params,
+        setup: Option<&Setup>,
+        mode: (i32, bool, Option<&[usize]>),
+    ) -> Result<Self, String> {
+        let (seed, record, live_capacity) = mode;
         let mut by_time: Vec<_> = (0..events.len()).collect();
         by_time.sort_by_key(|&i| (events[i].1, i));
         let live = &master.live;
@@ -614,34 +625,34 @@ impl<'a> Model<'a> {
                 .wrapping_add(100)
                 .wrapping_add(k as i32);
             let mut pool = Vec::new();
-            for index in 0..5 {
-                pool.push(model.live.len());
-                let mut effects = Vec::new();
-                for (i, row) in rows.iter().enumerate() {
-                    let cumulative = factory.cumulative(row.cumulative_id, k)?;
-                    let mut state = State::default();
-                    if let Some(c) = &cumulative {
-                        state.cumulative_count = c.initial();
-                        state.cumulative_unit = c.unit();
-                        state.cumulative_max = c.maximum();
-                    }
-                    effects.push(LiveEffect {
-                        row: row_indexes[i],
-                        act: f(row.seconds),
-                        phase: model.phase(row.kind),
-                        state,
-                        condition: factory.group(row.condition_group, k)?,
-                        release: factory.group(row.release_group, k)?,
-                        cumulative,
-                    });
+            let mut effects = Vec::new();
+            for (i, row) in rows.iter().enumerate() {
+                let cumulative = factory.cumulative(row.cumulative_id, k)?;
+                let mut state = State::default();
+                if let Some(c) = &cumulative {
+                    state.cumulative_count = c.initial();
+                    state.cumulative_unit = c.unit();
+                    state.cumulative_max = c.maximum();
                 }
+                effects.push(LiveEffect {
+                    row: row_indexes[i],
+                    act: f(row.seconds),
+                    phase: model.phase(row.kind),
+                    state,
+                    condition: factory.group(row.condition_group, k)?,
+                    release: factory.group(row.release_group, k)?,
+                    cumulative,
+                });
+            }
+            for index in 0..live_capacity.map_or(5, |counts| counts[k]) {
+                pool.push(model.live.len());
                 model.live.push(LiveSkill {
                     key,
                     member: k,
                     index,
                     parent: effects::STAY,
                     trigger: Trigger::default(),
-                    effects,
+                    effects: effects.clone(),
                 });
             }
             model.pools.push(LivePool {

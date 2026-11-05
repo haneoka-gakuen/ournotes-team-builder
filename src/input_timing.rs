@@ -432,6 +432,10 @@ impl InputTiming {
                     }));
                 }
             }
+            options.sort_by_key(|saved| saved.map_or(3, |saved| {
+                if !frame::in_area(note, saved.begin) { return 1; }
+                if selected[i] == start && note.grade_at(saved.time) == note.grade { 0 } else { 2 }
+            }));
             choices.push((i, options));
         }
         fn possible(
