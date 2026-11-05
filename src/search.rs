@@ -168,6 +168,7 @@ pub trait Objective {
         None
     }
     fn prepare_members(&mut self, _characters: &[Vec<usize>]) {}
+    fn prepare_leader(&mut self, _leader: usize) {}
     fn prepare_member_domains(&mut self, _power: &[f64], _options: &[Vec<i32>]) {}
     fn prepare_member_domains_at(&mut self, _leader: usize, power: &[f64], options: &[Vec<i32>]) {
         self.prepare_member_domains(power, options);
@@ -273,6 +274,9 @@ pub trait Objective {
     }
     fn interval(&mut self, team: &Team, totals: Totals) -> (f64, f64);
     fn exact(&mut self, team: &Team, power: f64, slot_powers: &[f64]) -> Result<Exact, String>;
+    fn exact_value(&mut self, team: &Team, power: f64, slot_powers: &[f64]) -> Result<f64, String> {
+        self.exact(team, power, slot_powers).map(|value| value.key)
+    }
     fn evaluate(
         &mut self,
         team: &Team,
@@ -3634,6 +3638,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             }) {
                 continue;
             }
+            self.input.objective.prepare_leader(leader);
             let slot_power: Vec<_> = (0..n)
                 .map(|i| {
                     self.bases[i].fixed_points as f64

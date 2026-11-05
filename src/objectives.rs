@@ -876,6 +876,10 @@ impl Objective for LiveObjective {
             detail: json!({"scores":&*scores}),
         })
     }
+    fn exact_value(&mut self, team: &Team, power: f64, _slots: &[f64]) -> Result<f64, String> {
+        let scores = self.core.evaluate(team, power as i32)?;
+        Ok(self.target.map_or_else(|| self.criterion.key(&scores), |target| target.value(&scores.scores)))
+    }
 }
 pub struct Potential {
     areas: Vec<f64>,

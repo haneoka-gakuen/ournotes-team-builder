@@ -409,7 +409,11 @@ struct Command {
 }
 fn effect_end(input: &Input, slot: &Slot, effect: &Effect, start: i32, judgements: Option<&[usize]>) -> i32 {
     let end = start + window_ms(effect.seconds, slot.extension_ms);
-    if effect.release_judgements.is_empty() { return end; }
+    if effect.release_judgements.is_empty()
+        || judgements.is_none() && !effect.release_judgements.contains(&5)
+    {
+        return end;
+    }
     let after_execute = input.frame_time(input.frame_time(start).saturating_add(1));
     let deadline = input.frame_time(end.saturating_add(1));
     let mut first = input.times.partition_point(|&time| input.frame_time(time) <= after_execute);
@@ -800,27 +804,134 @@ fn prefix<'a>(
     })
 }
 /// All-perfect scoring with the factor prefix sums shared across orders.
+type ApBlockScores = rustc_hash::FxHashMap<(usize, u64, u64), (f64, f64, f64)>;
+struct ApBlocks {
+    events: Vec<usize>,
+    starts: Vec<usize>,
+    ends: Vec<usize>,
+    scores: Vec<ApBlockScores>,
+}
 struct ApScorer<'a> {
     input: &'a Input,
     base: Vec<f64>,
     luck: f64,
     assist: f64,
     prefixes: HashMap<u64, Vec<f64>>,
+    commands: Option<Vec<Vec<Vec<Command>>>>,
+    ranges: rustc_hash::FxHashMap<(u64, usize, usize), f64>,
+    magnitude: f64,
+    blocks: Option<ApBlocks>,
+    blocks_checked: bool,
 }
 impl<'a> ApScorer<'a> {
     fn new(input: &'a Input) -> Self {
         let n = input.times.len();
         let t = f(f(input.adjustment * input.power as f64) * input.difficulty_factor);
         let perfect = input.judge_frac[5];
+        let base: Vec<_> = (0..n)
+            .map(|i| f(f(perfect * f(input.note_frac[i] * t)) * input.ap_combo[i]))
+            .collect();
+        let magnitude = base.iter().fold(0.0_f64, |value, note| {
+            if note.is_finite() { value.max(note.abs()) } else { f64::INFINITY }
+        });
         Self {
             input,
-            base: (0..n)
-                .map(|i| f(f(perfect * f(input.note_frac[i] * t)) * input.ap_combo[i]))
-                .collect(),
+            base,
             luck: f(input.luck_percent.min(200.0) / 100.0),
             assist: f(input.assist),
             prefixes: HashMap::new(),
+            commands: None,
+            ranges: rustc_hash::FxHashMap::default(),
+            magnitude,
+            blocks: None,
+            blocks_checked: false,
         }
+    }
+    fn integer_bound(&self, factor: f64) -> f64 {
+        (f(self.assist.abs() * (f(f(self.luck.abs()
+            * f(self.magnitude * factor.abs())) / self.input.converted_count as f64).abs()
+            + 1.0)).abs() + 1.0) * self.base.len() as f64
+    }
+    fn sum(&mut self, start: usize, end: usize, factor: f64) -> f64 {
+        // Below the integer precision limit, summing a range is identical to
+        // subtracting full-chart prefixes. Large inputs retain prefix order.
+        if self.integer_bound(factor) < (1u64 << 52) as f64 {
+            if self.ranges.len() >= 4096 { self.ranges.clear(); }
+            *self.ranges.entry((factor.to_bits(), start, end)).or_insert_with(|| {
+                self.base[start..end].iter().map(|&note| {
+                    let score = f(f(self.luck * f(note * factor)) / self.input.converted_count as f64).floor();
+                    if self.assist == 1.0 { score } else { f(self.assist * score).floor() }
+                }).sum()
+            })
+        } else {
+            let sums = prefix(&mut self.prefixes, &self.base, factor, self.luck, self.assist, self.input.converted_count);
+            sums[end] - sums[start]
+        }
+    }
+    fn prepare_blocks(&mut self) {
+        self.blocks_checked = true;
+        let table = self.commands.as_ref().unwrap();
+        if table.is_empty() { return; }
+        let mut events: Vec<_> = (0..table.len()).collect();
+        events.sort_by_key(|&event| (self.input.skill_times[event], event));
+        for (position, &event) in events.iter().enumerate() {
+            let start = self.input.skill_times[event];
+            let next = events.get(position + 1).map(|&next| self.input.skill_times[next]);
+            if next.is_some_and(|next| next <= start) || table[event].iter().any(|commands| {
+                commands.first().is_some_and(|command| command.time < start)
+                    || next.is_some_and(|next| commands.last().is_some_and(|command| command.time >= next))
+            }) {
+                return;
+            }
+        }
+        let factor = table.iter().flatten().flatten().fold(1.0_f32, |factor, command| {
+            (factor + (command.delta as f32 / 100000.0_f32).abs()).next_up()
+        }).next_up() as f64;
+        let bound = self.integer_bound(factor);
+        if !bound.is_finite() || bound >= (1u64 << 50) as f64 { return; }
+        let starts: Vec<_> = events.iter().map(|&event| {
+            self.input.times.partition_point(|&time| time < self.input.skill_times[event])
+        }).collect();
+        let ends = starts.iter().copied().skip(1).chain(std::iter::once(self.base.len())).collect();
+        let scores = (0..events.len()).map(|_| rustc_hash::FxHashMap::default()).collect();
+        self.blocks = Some(ApBlocks { events, starts, ends, scores });
+    }
+    fn block_order(&mut self, order: &[usize; 5]) -> f64 {
+        let mut blocks = self.blocks.take().unwrap();
+        let mut score = self.sum(0, blocks.starts[0], 1.0);
+        let (mut general, mut perfect) = (1.0_f64, 0.0_f64);
+        for (position, &event) in blocks.events.iter().enumerate() {
+            let slot = order[event];
+            let key = (slot, general.to_bits(), perfect.to_bits());
+            let (value, next_general, next_perfect) = if let Some(&cached) = blocks.scores[position].get(&key) {
+                cached
+            } else {
+                let commands = self.commands.as_ref().unwrap()[event].get(slot).cloned().unwrap_or_default();
+                let mut at = blocks.starts[position];
+                let mut value = 0.0;
+                for command in commands {
+                    let end = self.input.times.partition_point(|&time| time < command.time);
+                    if end > at {
+                        value += self.sum(at, end, f(general + perfect));
+                        at = end;
+                    }
+                    let delta = f(command.delta as f64 / 100000.0);
+                    if command.channel == 0 { general = f(general + delta); }
+                    else if command.channel == 5 { perfect = f(perfect + delta); }
+                }
+                if at < blocks.ends[position] {
+                    value += self.sum(at, blocks.ends[position], f(general + perfect));
+                }
+                let cached = (value, general, perfect);
+                blocks.scores[position].insert(key, cached);
+                cached
+            };
+            score += value;
+            general = next_general;
+            perfect = next_perfect;
+        }
+        self.blocks = Some(blocks);
+        score
     }
     fn order(&mut self, order: &[usize; 5], delivery: Option<&Delivery>) -> f64 {
         let input = self.input;
@@ -828,18 +939,34 @@ impl<'a> ApScorer<'a> {
         let (mut general, mut perfect_up) = (f(1.0), f(0.0));
         let mut at = 0;
         let mut score = 0.0;
-        for command in commands(input, order, delivery) {
+        let commands = if delivery.is_some() {
+            commands(input, order, delivery)
+        } else {
+            self.commands.get_or_insert_with(|| {
+                input.skill_times.iter().take(5).enumerate().map(|(event, _)| {
+                    (0..input.slots.len()).map(|slot| {
+                        let mut order = [usize::MAX; 5];
+                        order[event] = slot;
+                        commands(input, &order, None)
+                    }).collect()
+                }).collect()
+            });
+            if !self.blocks_checked { self.prepare_blocks(); }
+            if self.blocks.is_some() { return self.block_order(order); }
+            let table = self.commands.as_ref().unwrap();
+            let mut combined = Vec::new();
+            for (event, &slot) in order.iter().enumerate().take(table.len()) {
+                if let Some(commands) = table[event].get(slot) {
+                    combined.extend_from_slice(commands);
+                }
+            }
+            combined.sort_by_key(|command| (command.time, command.owner));
+            combined
+        };
+        for command in commands {
             let end = input.times.partition_point(|&time| time < command.time);
             if end > at {
-                let sums = prefix(
-                    &mut self.prefixes,
-                    &self.base,
-                    f(general + perfect_up),
-                    self.luck,
-                    self.assist,
-                    input.converted_count,
-                );
-                score += sums[end] - sums[at];
+                score += self.sum(at, end, f(general + perfect_up));
                 at = end;
             }
             let diff = f(command.delta as f64 / 100000.0);
@@ -850,15 +977,7 @@ impl<'a> ApScorer<'a> {
             }
         }
         if at < n {
-            let sums = prefix(
-                &mut self.prefixes,
-                &self.base,
-                f(general + perfect_up),
-                self.luck,
-                self.assist,
-                input.converted_count,
-            );
-            score += sums[n] - sums[at];
+            score += self.sum(at, n, f(general + perfect_up));
         }
         score
     }

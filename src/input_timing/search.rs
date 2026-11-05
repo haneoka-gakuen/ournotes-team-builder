@@ -169,17 +169,22 @@ fn compact(notes: &[Note], atoms: &[Touch], word: &[usize]) -> (Vec<usize>, Vec<
     used.sort_unstable();
     used.dedup();
     let word: Vec<_> = used.iter().map(|&index| word[index]).collect();
+    // Independent touches can appear in any order. Future input selection and
+    // whole-frame replay depend on their per-note claims and shared unit, so
+    // name units in note order instead of retaining every input permutation.
+    let mut units = vec![usize::MAX; inputs.len()];
+    let mut next = 0;
     let key = selected
         .iter()
         .flat_map(|selected| {
             selected.map_or([usize::MAX; 2], |index| {
-                [
-                    used.binary_search(&index).unwrap(),
-                    inputs[index].state as usize,
-                ]
+                if units[index] == usize::MAX {
+                    units[index] = next;
+                    next += 1;
+                }
+                [units[index], word[used.binary_search(&index).unwrap()]]
             })
         })
-        .chain(word.iter().copied())
         .collect();
     (word, key)
 }
