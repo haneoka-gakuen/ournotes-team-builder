@@ -12,6 +12,7 @@ const BONUS: u64 = 1 << 23;
 const SKILL: u64 = 1 << 24;
 const SKILL_PREV: u64 = 1 << 25;
 const FLAGS: u64 = MISS_USED | PREV_MISS | FRAME_LOT | FRAME_MISS | BONUS | SKILL | SKILL_PREV;
+const CARRIED: u64 = (FLAGS & !BONUS) >> 8;
 fn lots(s: u64) -> usize {
     ((s >> 8) & 7) as usize
 }
@@ -313,8 +314,14 @@ impl<'a> Engine<'a> {
         let into = self.rows.at(key, self.width, &mut self.pool);
         let from = (a as i64 + offset) as usize;
         let to = (b as i64 + offset) as usize;
-        for (out, value) in into.values[from..to].iter_mut().zip(&row.values[a..b]) {
-            *out += value * scale;
+        if scale == 1.0 {
+            for (out, value) in into.values[from..to].iter_mut().zip(&row.values[a..b]) {
+                *out += value;
+            }
+        } else {
+            for (out, value) in into.values[from..to].iter_mut().zip(&row.values[a..b]) {
+                *out += value * scale;
+            }
         }
         into.low = into.low.min(from);
         into.high = into.high.max(to);
@@ -394,6 +401,8 @@ impl<'a> Engine<'a> {
         out
     }
     fn lot_rows(&mut self, high: u64, buff: i32) -> usize {
+        // Frame and skill flags pass through a draw without changing its lottery.
+        let high = high & !CARRIED;
         if let Some((previous_high, previous_buff, index)) = self.last_transition {
             if high == previous_high && buff == previous_buff {
                 return index;
@@ -469,7 +478,7 @@ impl<'a> Engine<'a> {
         let list = self.lot_rows(key & HIGH, buff);
         for k in 0..self.transitions.lists[list].len() {
             let (next, chance, after) = self.transitions.lists[list][k];
-            let to = (key & !HIGH) + next;
+            let to = (key & !HIGH) + (next | (key & CARRIED));
             let q = chance * scale;
             if q <= 0.0 {
                 continue;
@@ -483,22 +492,24 @@ impl<'a> Engine<'a> {
             if split > a {
                 self.block(to, row, a, split, offset, q);
             }
-            let l = to & 7;
-            for g in split..b {
-                let value = row.values[g];
-                if value == 0.0 {
-                    continue;
+            let mut start = split;
+            while start < b {
+                let overflow = (start as i64 + offset) as usize / after;
+                let end = b.min((((overflow + 1) * after) as i64 - offset) as usize);
+                let values = &row.values[start..end];
+                if let Some(first) = values.iter().position(|&value| value != 0.0) {
+                    let last = values.iter().rposition(|&value| value != 0.0).unwrap();
+                    let l = to & 7;
+                    self.block(
+                        to - l + (l + overflow as u64).min(7),
+                        row,
+                        start + first,
+                        start + last + 1,
+                        offset - (overflow * after) as i64,
+                        q,
+                    );
                 }
-                let gauge = (g as i64 + offset) as usize;
-                let into = self.rows.at(
-                    to - l + (l + (gauge / after) as u64).min(7),
-                    self.width,
-                    &mut self.pool,
-                );
-                let rem = gauge % after;
-                into.values[rem] += value * q;
-                into.low = into.low.min(rem);
-                into.high = into.high.max(rem + 1);
+                start = end;
             }
         }
     }

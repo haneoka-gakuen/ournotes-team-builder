@@ -1098,6 +1098,10 @@ pub(crate) struct LifeProgram {
     boundaries: [usize; 5],
     delivered: [usize; 5],
 }
+pub(crate) struct LifeSummary {
+    pub(crate) first_dead: usize,
+    pub(crate) gates: [f64; 5],
+}
 impl LifeProgram {
     pub(crate) fn new(input: &Input, grades: &[usize]) -> Option<Self> {
         if !input.life_base.is_finite()
@@ -1151,6 +1155,50 @@ impl LifeProgram {
             boundaries,
             delivered,
         })
+    }
+    pub(crate) fn summary(&self, input: &Input, recoveries: [i32; 5]) -> Option<LifeSummary> {
+        if recoveries.iter().any(|&value| value < 0)
+            || input.life_base * 2.0
+                + self.prefix.last().unwrap()
+                + recoveries.iter().map(|&value| value as f64).sum::<f64>()
+                >= (1u64 << 52) as f64
+        {
+            return None;
+        }
+        let mut out = LifeSummary {
+            first_dead: input.times.len(),
+            gates: [0.0; 5],
+        };
+        if input.life_base == 0.0 {
+            out.first_dead = 0;
+            return Some(out);
+        }
+        let (mut damage, mut life) = (0, input.life_base);
+        for event in self
+            .events
+            .iter()
+            .copied()
+            .map(Some)
+            .chain(std::iter::once(None))
+        {
+            let boundary = event.map_or(input.times.len(), |event| self.boundaries[event]);
+            let end = self.damage.partition_point(|&(index, _)| index < boundary);
+            let loss = self.prefix[end] - self.prefix[damage];
+            if life <= loss {
+                let target = self.prefix[damage] + life;
+                let index = self.prefix[damage + 1..=end].partition_point(|&value| value < target);
+                out.first_dead = self.damage[damage + index].0;
+                return Some(out);
+            }
+            life -= loss;
+            damage = end;
+            if let Some(event) = event {
+                life = (input.life_base * 2.0).min(life + recoveries[event] as f64);
+                out.gates[event] =
+                    (life - (self.prefix[self.delivered[event]] - self.prefix[damage])).max(0.0);
+            }
+        }
+        Some(out)
     }
     pub(crate) fn play(&self, input: &Input, recoveries: [i32; 5]) -> Option<Lives> {
         if recoveries.iter().any(|&value| value < 0)

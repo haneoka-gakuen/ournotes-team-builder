@@ -1286,19 +1286,22 @@ impl LiveCore {
                 .as_ref()
                 .is_some_and(|convert| convert.at_start)
         };
-        let mut registration: Vec<_> = physical
-            .iter()
-            .copied()
-            .filter(|&program| at_start(program))
-            .collect();
-        let mut remainder: Vec<_> = physical
-            .iter()
-            .copied()
-            .filter(|&program| !at_start(program))
-            .collect();
-        remainder.sort_unstable();
-        registration.extend(remainder);
-        let key: [usize; 5] = registration.try_into().unwrap();
+        let mut key = [0; 5];
+        let mut registered = 0;
+        for &program in &physical {
+            if at_start(program) {
+                key[registered] = program;
+                registered += 1;
+            }
+        }
+        let mut rest = registered;
+        for &program in &physical {
+            if !at_start(program) {
+                key[rest] = program;
+                rest += 1;
+            }
+        }
+        key[registered..].sort_unstable();
         let positions: [usize; 5] = std::array::from_fn(|index| {
             key.iter()
                 .position(|&program| program == physical[index])
@@ -1383,26 +1386,28 @@ impl LiveCore {
                     .played_lives
                     .entry((trajectory.id, recoveries, relaxed))
                     .or_insert_with(|| {
-                        let lives = trajectory
+                        let life = trajectory
                             .life
                             .as_ref()
-                            .and_then(|program| program.play(&input, recoveries))
+                            .and_then(|program| program.summary(&input, recoveries))
                             .unwrap_or_else(|| {
-                                live::lives(&input, &trajectory.grades, order, &input.slots)
+                                let lives = live::lives(&input, &trajectory.grades, order, &input.slots);
+                                live::LifeSummary {
+                                    first_dead: lives.note.iter().position(|&life| life <= 0.0)
+                                        .unwrap_or(input.times.len()),
+                                    gates: std::array::from_fn(|event| {
+                                        lives.gate.get(&event).copied().unwrap_or(0.0)
+                                    }),
+                                }
                             });
-                        let first_dead = lives
-                            .note
-                            .iter()
-                            .position(|&life| life <= 0.0)
-                            .unwrap_or(input.times.len());
                         let gates = std::array::from_fn(|event| {
-                            let life = lives.gate.get(&event).copied().unwrap_or(0.0);
+                            let life = life.gates[event];
                             self.life_gates
                                 .partition_point(|&threshold| threshold <= life)
                         });
                         Arc::clone(
                             self.played_models
-                                .entry((trajectory.id, first_dead, gates, relaxed))
+                                .entry((trajectory.id, life.first_dead, gates, relaxed))
                                 .or_insert_with(|| {
                                     self.next_model += 1;
                                     Arc::new(PlayedModel {
@@ -1412,7 +1417,7 @@ impl LiveCore {
                                             let mut linear = model::played_linear(
                                                 &input,
                                                 &trajectory.grades,
-                                                &lives,
+                                                &life,
                                             );
                                             linear.ignore_gates = relaxed;
                                             linear
@@ -1432,17 +1437,22 @@ impl LiveCore {
                 order_models.push(context);
             }
             let frequencies: [Vec<(usize, usize, u32)>; 5] = std::array::from_fn(|position| {
-                let mut counts = FxHashMap::default();
+                let mut counts = vec![[0u32; 5]; models.len()];
                 for (order, &context) in live::orders().iter().zip(&order_models) {
                     let event = order.iter().position(|&index| index == position).unwrap();
                     if event >= input.skill_times.len() {
                         continue;
                     }
-                    *counts.entry((context, event)).or_insert(0u32) += 1;
+                    counts[context][event] += 1;
                 }
                 counts
                     .into_iter()
-                    .map(|((context, event), count)| (context, event, count))
+                    .enumerate()
+                    .flat_map(|(context, events)| {
+                        events.into_iter().enumerate().filter_map(move |(event, count)| {
+                            (count != 0).then_some((context, event, count))
+                        })
+                    })
                     .collect()
             });
             let error = (self.high.total - self.high.prefix[self.input.times.len()]).max(0.0);
@@ -1835,6 +1845,9 @@ impl Objective for LiveObjective {
         if self.max_bounds() {
             self.core.prepare_max(members, options);
         }
+    }
+    fn partial_assignment_domains(&self) -> bool {
+        !self.core.broad_play || self.max_bounds()
     }
     fn assignment_order_bound(
         &mut self,

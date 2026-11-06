@@ -855,7 +855,7 @@ impl PlayBounds {
     }
 }
 
-pub(crate) fn played_linear(input: &Input, grades: &[usize], lives: &live::Lives) -> Linear {
+pub(crate) fn played_linear(input: &Input, grades: &[usize], life: &live::LifeSummary) -> Linear {
     let n = input.times.len();
     let mut prefix = vec![0.0; n + 1];
     let mut perfect_prefix = vec![0.0; n + 1];
@@ -865,7 +865,7 @@ pub(crate) fn played_linear(input: &Input, grades: &[usize], lives: &live::Lives
             before = pending;
             last = input.times[index];
         }
-        let penalty = if lives.note[index] > 0.0 {
+        let penalty = if index < life.first_dead {
             1.0
         } else {
             input.life_onus
@@ -884,7 +884,13 @@ pub(crate) fn played_linear(input: &Input, grades: &[usize], lives: &live::Lives
         total: prefix[n],
         prefix,
         perfect_prefix,
-        life_at: lives.gate.clone(),
+        life_at: input
+            .skill_times
+            .iter()
+            .take(5)
+            .enumerate()
+            .map(|(event, _)| (event, life.gates[event]))
+            .collect(),
         absolute_error: n as f64 + 1.0,
         ignore_gates: false,
         nominal_cumulative: false,
@@ -917,10 +923,30 @@ pub(crate) fn played_weight(
         let end = live::effect_end(input, slot, effect, start, Some(grades));
         let first = input.times.partition_point(|&time| time < start);
         let last = input.times.partition_point(|&time| time < end);
-        for (index, &grade) in grades.iter().enumerate().take(last).skip(first) {
-            if effect.kind == 2000 || effect.judgements.contains(&grade) {
-                contribution += f(effect.delta as f64 / 100000.0)
-                    * (model.prefix[index + 1] - model.prefix[index]);
+        let prefix = if effect.kind == 2000 {
+            Some(&model.prefix)
+        } else if effect.judgements == [5] {
+            Some(&model.perfect_prefix)
+        } else {
+            None
+        };
+        if let Some(prefix) = prefix.filter(|_| {
+            last >= first
+                && input.adjustment >= 0.0
+                && input.difficulty_factor >= 0.0
+                && model.prefix[last].is_finite()
+                && model.prefix[last] >= 0.0
+        }) {
+            // Cover each subtraction and accumulation in the per-note coefficient.
+            let error = 4.0 * grades.len() as f64 * f64::EPSILON * model.prefix[last];
+            let mass = ((prefix[last] - prefix[first]).next_up() + error).next_up();
+            contribution = (f(effect.delta as f64 / 100000.0) * mass).next_up();
+        } else {
+            for (index, &grade) in grades.iter().enumerate().take(last).skip(first) {
+                if effect.kind == 2000 || effect.judgements.contains(&grade) {
+                    contribution += f(effect.delta as f64 / 100000.0)
+                        * (model.prefix[index + 1] - model.prefix[index]);
+                }
             }
         }
         if model.ignore_gates && effect.gate.kind == 1 {

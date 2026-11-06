@@ -1403,9 +1403,13 @@ struct Factors {
     convert_end: Option<i32>,
     convert_judgements: Vec<usize>,
     convert_left: f64,
+    next_expiry: i64,
 }
 impl Factors {
     fn expire(&mut self, time: i64) {
+        if time < self.next_expiry {
+            return;
+        }
         for i in (0..self.active.len()).rev() {
             if self.active[i].end as i64 <= time {
                 let active = self.active.remove(i);
@@ -1429,6 +1433,14 @@ impl Factors {
         if self.convert_end.is_some_and(|end| end as i64 <= time) {
             self.convert_end = None;
         }
+        self.next_expiry = self
+            .active
+            .iter()
+            .map(|active| active.end)
+            .chain(self.climbing.iter().map(|run| run.end))
+            .chain(self.convert_end)
+            .min()
+            .map_or(i64::MAX, i64::from);
     }
 }
 type ScoreRuns = Vec<(usize, usize, usize)>;
@@ -1468,6 +1480,7 @@ impl NoteScorePlan {
                 convert_end: None,
                 convert_judgements: Vec::new(),
                 convert_left: 0.0,
+                next_expiry: i64::MAX,
             };
             let (mut cursor, mut at) = (0, 0);
             let mut runs = Vec::new();
@@ -1497,6 +1510,7 @@ impl NoteScorePlan {
                                 channel,
                                 delta: effect.delta,
                             });
+                            factors.next_expiry = factors.next_expiry.min(end as i64);
                         }
                     }
                     cursor += 1;
@@ -1797,6 +1811,7 @@ fn score_orders_selected(
             convert_end: None,
             convert_judgements: Vec::new(),
             convert_left: 0.0,
+            next_expiry: i64::MAX,
         };
         let mut converted = ctx.judgement.clone();
         let mut prepared = 0;
@@ -1839,6 +1854,7 @@ fn score_orders_selected(
                                 channel,
                                 delta: effect.delta,
                             });
+                            factors.next_expiry = factors.next_expiry.min(end as i64);
                         }
                     }
                     for factor in &slot.cumulative {
@@ -1848,6 +1864,9 @@ fn score_orders_selected(
                             count: 0,
                             applied: 0,
                         });
+                        factors.next_expiry = factors
+                            .next_expiry
+                            .min((start + factor.duration_ms()) as i64);
                     }
                     if let Some(convert) = &slot.convert {
                         factors.convert_end = Some(
@@ -1857,6 +1876,9 @@ fn score_orders_selected(
                                     slot.extension_ms,
                                 ),
                         );
+                        factors.next_expiry = factors
+                            .next_expiry
+                            .min(factors.convert_end.unwrap() as i64);
                         factors.convert_judgements = convert.judgements.clone();
                         factors.convert_left = convert.limit.unwrap_or(f64::INFINITY);
                     }

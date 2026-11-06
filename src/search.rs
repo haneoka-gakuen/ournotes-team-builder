@@ -214,6 +214,10 @@ pub trait Objective {
     ) {
         self.prepare_assignment(members, options);
     }
+    /// False defers domain preparation until all five program groups are selected.
+    fn partial_assignment_domains(&self) -> bool {
+        true
+    }
     fn roster_bound(&mut self, _members: &[usize], _totals: Totals, _limit: f64) -> Option<f64> {
         None
     }
@@ -2984,6 +2988,8 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             if self.stats.snap_nodes & 1023 == 0 {
                 self.report_pending();
             }
+        }
+        if slot > 0 && (slot == domains.len() || self.input.objective.partial_assignment_domains()) {
             let fixed = selected
                 .iter()
                 .filter_map(|domain| (domain.len() == 1 && domain[0] >= 0).then_some(domain[0]))
@@ -3011,19 +3017,6 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                 return Ok(());
             }
             a.options = options;
-            a.allowed = a
-                .options
-                .iter()
-                .map(|list| {
-                    let mut row = vec![false; self.width];
-                    for &snap in list {
-                        if snap >= 0 {
-                            row[snap as usize] = true;
-                        }
-                    }
-                    row
-                })
-                .collect();
             a.max_power = a
                 .team
                 .iter()
@@ -3141,6 +3134,14 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         Ok(())
     }
     fn walk_domain(&mut self, a: &mut Assignment, totals: Totals) -> Result<(), String> {
+        for (allowed, choices) in a.allowed.iter_mut().zip(&a.options) {
+            allowed.fill(false);
+            for &snap in choices {
+                if snap >= 0 {
+                    allowed[snap as usize] = true;
+                }
+            }
+        }
         let ordered = |values: &[f64]| {
             a.team
                 .iter()
