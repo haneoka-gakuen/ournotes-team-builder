@@ -10,7 +10,7 @@ use crate::{
     live,
     master::{Master, SkillEffect},
     power::{Member, Snap},
-    search::Team,
+    search::{Constraints, Team},
 };
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use serde::Serialize;
@@ -637,16 +637,78 @@ impl Prepared {
         )
     }
     pub(crate) fn impossible(&self) -> bool {
-        self.phases
-            .iter()
-            .zip(&self.phase_values)
-            .any(|(phase, values)| {
-                let ceiling = values.iter().copied().fold(f64::NEG_INFINITY, f64::max) * 5.0;
-                ceiling >= i32::MIN as f64
-                    && ceiling <= i32::MAX as f64
-                    && (phase.before as f64 + ceiling < self.minimum
-                        || phase.after as f64 + ceiling < self.minimum)
-            })
+        self.impossible_with(&Constraints::default())
+    }
+    pub(crate) fn impossible_with(&self, constraints: &Constraints) -> bool {
+        if self.phases.is_empty() { return false; }
+        let mut fixed: HashSet<_> = constraints.required_members.iter().copied()
+            .chain(constraints.bindings.keys().copied()).collect();
+        if let Some(leader) = constraints.leader {
+            if leader < 0 { return true; }
+            fixed.insert(leader as usize);
+        }
+        let characters: HashSet<_> = fixed.iter().map(|&member| self.members[member].card.character_id).collect();
+        if fixed.len() > 5 || characters.len() != fixed.len()
+            || fixed.iter().any(|member| constraints.excluded_members.contains(member)) { return true; }
+        for (phase, values) in self.phases.iter().zip(&self.phase_values) {
+            if (phase.cap_before as f64) < self.minimum || (phase.cap_after as f64) < self.minimum { return true; }
+            let mut fixed_upper = 0.0;
+            let mut free = HashMap::<i32, f64>::default();
+            let mut fixed_base = 0.0;
+            let mut free_base = HashMap::<i32, f64>::default();
+            let mut gains = vec![0.0_f64; self.width - 1];
+            let mut finite_gains = true;
+            for (member, card) in self.members.iter().enumerate() {
+                if constraints.excluded_members.contains(&member) { continue; }
+                let value = |snap: i32| {
+                    if snap >= 0 && (constraints.no_snaps
+                        || constraints.excluded_snaps.contains(&(snap as usize))) { return f64::NEG_INFINITY; }
+                    values[member * self.width + if snap < 0 { self.width - 1 } else { snap as usize }]
+                };
+                let high = constraints.bindings.get(&member).map_or_else(|| {
+                    (0..self.width).filter_map(|column| {
+                        let snap = if column == self.width - 1 { -1 } else { column as i32 };
+                        (!constraints.bindings.values().any(|&bound| bound >= 0 && bound == snap)).then(|| value(snap))
+                    }).fold(f64::NEG_INFINITY, f64::max)
+                }, |&snap| value(snap));
+                let base = if constraints.bindings.contains_key(&member) { high } else { value(-1) };
+                if fixed.contains(&member) {
+                    if high == f64::NEG_INFINITY { return true; }
+                    fixed_upper += high;
+                    fixed_base += base;
+                } else if high != f64::NEG_INFINITY && !characters.contains(&card.card.character_id) {
+                    let best = free.entry(card.card.character_id).or_insert(f64::NEG_INFINITY);
+                    *best = best.max(high);
+                    let best = free_base.entry(card.card.character_id).or_insert(f64::NEG_INFINITY);
+                    *best = best.max(base);
+                }
+                if !constraints.no_snaps && !constraints.bindings.contains_key(&member) {
+                    for (snap, gain) in gains.iter_mut().enumerate() {
+                        if constraints.excluded_snaps.contains(&snap)
+                            || constraints.bindings.values().any(|&bound| bound == snap as i32) { continue; }
+                        let extra = value(snap as i32) - base;
+                        if extra.is_finite() { *gain = gain.max(extra); } else { finite_gains = false; }
+                    }
+                }
+            }
+            let remaining = 5 - fixed.len();
+            if free.len() < remaining { return true; }
+            let mut best: Vec<_> = free.into_values().collect();
+            best.sort_unstable_by(|a, b| b.total_cmp(a));
+            let mut ceiling = best.into_iter().take(remaining).fold(fixed_upper, |sum, value| sum + value);
+            if finite_gains {
+                // Separate character bases and distinct snapshot gains relax the same legal formation.
+                let mut bases: Vec<_> = free_base.into_values().collect();
+                bases.sort_unstable_by(|a, b| b.total_cmp(a));
+                gains.sort_unstable_by(|a, b| b.total_cmp(a));
+                let base = bases.into_iter().take(remaining).fold(fixed_base, |sum, value| sum + value);
+                let snaps = gains.into_iter().take(5 - constraints.bindings.len()).sum::<f64>();
+                ceiling = ceiling.min(base + snaps);
+            }
+            if ceiling >= i32::MIN as f64 && ceiling <= i32::MAX as f64
+                && (phase.before as f64 + ceiling < self.minimum || phase.after as f64 + ceiling < self.minimum) { return true; }
+        }
+        false
     }
     pub(crate) fn prepare_assignment(&mut self, members: &[usize], options: &[Vec<i32>]) {
         self.assignment = None;

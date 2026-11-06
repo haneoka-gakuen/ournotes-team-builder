@@ -823,7 +823,7 @@ pub(crate) fn search_shared(input: SharedInput<'_>) -> Result<search::Output, St
     let mut windows = Vec::with_capacity(charts.len());
     for chart in charts.iter() {
         let window = env.min_just_window_ms.map(|minimum| crate::just_window::Prepared::new(env.master, chart, env.members, env.snaps, minimum, &seeds)).transpose()?;
-        if window.as_ref().is_some_and(crate::just_window::Prepared::impossible) {
+        if window.as_ref().is_some_and(|window| window.impossible_with(&env.constraints)) {
             return Ok(search::Output { hits: Vec::new(), proven: true, bound: None, stats: search::Stats::default() });
         }
         windows.push(window);

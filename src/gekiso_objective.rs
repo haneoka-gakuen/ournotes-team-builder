@@ -11364,7 +11364,7 @@ fn search_levels(
         mut progress,
     } = input;
     let just_window = env.min_just_window_ms.map(|minimum| crate::just_window::Prepared::new(env.master, chart, env.members, env.snaps, minimum, &seeds)).transpose()?;
-    if just_window.as_ref().is_some_and(crate::just_window::Prepared::impossible) {
+    if just_window.as_ref().is_some_and(|window| window.impossible_with(&env.constraints)) {
         return Ok(search::Output { hits: Vec::new(), proven: true, bound: None, stats: search::Stats::default() });
     }
     if !seed_only && gekiso::uses_full_replay(env.master, chart, &seeds) {

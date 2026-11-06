@@ -21,6 +21,17 @@ mod reward_plan;
 use gekiso_result_cache::CompletedGekiso;
 
 type CachedScoreCap = (String, f64, Vec<crate::search::Team>);
+fn validate_gekiso_counts(options: &Value) -> Result<(), String> {
+    for (field, minimum) in [("seeds", 0.0), ("luckSamples", 0.0), ("minComboBonus", 1.0)] {
+        let value = &options[field];
+        if value.is_null() { continue; }
+        if !value.as_f64().is_some_and(|value| value.is_finite() && value.fract() == 0.0
+            && value >= minimum && value <= i32::MAX as f64) {
+            return Err(if field == "minComboBonus" { "combo-input" } else { "luck-samples-input" }.into());
+        }
+    }
+    Ok(())
+}
 #[derive(Clone, Serialize, Deserialize)]
 struct ScoredSeeds {
     scope: String,
@@ -329,6 +340,7 @@ impl Engine {
         song_id: i32,
         difficulty: i32,
     ) -> Result<Value, String> {
+        validate_gekiso_counts(&request["gekiso"])?;
         let ResolvedTeam { cards, members, snaps, music, power, unsupported, slots } =
             self.resolve_team(request, team, song_id)?;
         let chart = self
@@ -2533,6 +2545,7 @@ impl Engine {
     ) -> Result<Value, String> {
         let request = &input["request"];
         let goal = &request["goal"];
+        validate_gekiso_counts(if goal["kind"] == "gekiso" { goal } else { &goal["gekiso"] })?;
         if matches!(goal["kind"].as_str(), Some("score" | "event" | "gekiso"))
             && (request["aggregation"] == "mean" || goal["arena"]["mode"] == "shared")
         {
