@@ -13,6 +13,7 @@ pub struct Linear {
     pub life_at: HashMap<usize, f64>,
     pub absolute_error: f64,
     pub ignore_gates: bool,
+    pub nominal_cumulative: bool,
     pub conversion_combo: Vec<f64>,
     pub release_windows: Vec<ReleaseWindow>,
 }
@@ -183,6 +184,7 @@ pub fn linear(input: &Input) -> Linear {
             .collect(),
         absolute_error: input.times.len() as f64 + 1.0,
         ignore_gates: false,
+        nominal_cumulative: false,
         conversion_combo: Vec::new(),
         release_windows: Vec::new(),
     }
@@ -248,6 +250,7 @@ pub fn linear_play(
         life_at,
         absolute_error: n as f64 + 1.0,
         ignore_gates: false,
+        nominal_cumulative: false,
         conversion_combo: Vec::new(),
         release_windows: Vec::new(),
     }
@@ -390,6 +393,7 @@ pub(crate) fn relaxed_play_limits(
         life_at,
         absolute_error: n as f64 + 1.0,
         ignore_gates: true,
+        nominal_cumulative: false,
         conversion_combo,
         release_windows: Vec::new(),
     }
@@ -453,14 +457,21 @@ pub fn skill_weights(
     include_cumulative: bool,
 ) -> Weights {
     let mut per_event = [0.0; 5];
-    for effect in &skill.effects {
+    let mut gated = Vec::new();
+    for (index, effect) in skill.effects.iter().enumerate() {
+        let mut contribution = [0.0; 5];
         if effect.kind == 2004 && !effect.judgements.contains(&5) && !model.ignore_gates {
             continue;
         }
         let factor = f(effect.delta as f64 / 100000.0);
         let length = window_ms(effect.seconds, skill.extension_ms);
-        let prefix = if effect.kind == 2004 && (!model.ignore_gates || effect.judgements.iter()
-            .all(|&grade| grade==5 || grade==6 || input.judge_frac[grade]==0.0)) {
+        let prefix = if effect.kind == 2004
+            && (!model.ignore_gates
+                || effect
+                    .judgements
+                    .iter()
+                    .all(|&grade| grade == 5 || grade == 6 || input.judge_frac[grade] == 0.0))
+        {
             &model.perfect_prefix
         } else {
             &model.prefix
@@ -469,10 +480,51 @@ pub fn skill_weights(
             if !model.ignore_gates && effect.gate.blocks(model.life_at[&event]) {
                 continue;
             }
-            if model.ignore_gates && effect.gate.kind==1 && effect.gate.positive
-                && effect.gate.blocks(model.life_at[&event]) { continue; }
-            let length=if model.ignore_gates {release_end(model,input,skill,effect,event,start,length)-start}else{length};
-            per_event[event] += factor * window_weight(prefix, input, start, length);
+            if model.ignore_gates
+                && effect.gate.kind == 1
+                && effect.gate.positive
+                && effect.gate.blocks(model.life_at[&event])
+            {
+                continue;
+            }
+            let length = if model.ignore_gates {
+                release_end(model, input, skill, effect, event, start, length) - start
+            } else {
+                length
+            };
+            contribution[event] = factor * window_weight(prefix, input, start, length);
+        }
+        if model.ignore_gates && effect.gate.kind == 1 {
+            gated.push((index, contribution));
+        } else {
+            for event in 0..5 {
+                per_event[event] += contribution[event];
+            }
+        }
+    }
+    if !gated.is_empty() {
+        for (event, total) in per_event
+            .iter_mut()
+            .enumerate()
+            .take(input.skill_times.len())
+        {
+            let upper = model.life_at[&event];
+            let values = std::iter::once(0.0).chain(
+                gated
+                    .iter()
+                    .map(|&(index, _)| skill.effects[index].gate.value)
+                    .filter(|&value| value >= 0.0 && value <= upper),
+            );
+            let best = values
+                .map(|life| {
+                    gated
+                        .iter()
+                        .filter(|&&(index, _)| !skill.effects[index].gate.blocks(life))
+                        .map(|(_, values)| values[event])
+                        .fold(0.0_f64, |sum, value| (sum + value).next_up())
+                })
+                .fold(0.0_f64, f64::max);
+            *total = (*total + best).next_up();
         }
     }
     if include_cumulative {
@@ -480,9 +532,17 @@ pub fn skill_weights(
             let delta = f(factor.at_cap() as f64 / 100000.0);
             let length = factor.bound_duration_ms();
             for (event, &start) in input.skill_times.iter().enumerate().take(5) {
-                per_event[event] += if model.ignore_gates {
+                per_event[event] += if model.nominal_cumulative {
+                    if factor.judgements.contains(&5) {
+                        cumulative_upper(&model.prefix, input, factor, start, None)
+                    } else {
+                        0.0
+                    }
+                } else if model.ignore_gates {
                     cumulative_upper(&model.prefix, input, factor, start, None)
-                } else { delta * window_weight(&model.prefix, input, start, length) };
+                } else {
+                    delta * window_weight(&model.prefix, input, start, length)
+                };
             }
         }
     }
@@ -795,30 +855,6 @@ impl PlayBounds {
     }
 }
 
-/// Disjoint activations cannot exchange conversions or affect each other's counters.
-pub(crate) fn isolated_play_weights(
-    input: &Input,
-    slot: &Slot,
-    events: &[bool; 5],
-    original: &Linear,
-) -> [Option<f64>; 5] {
-    std::array::from_fn(|event| {
-        if !events[event] || event >= input.skill_times.len() {
-            return None;
-        }
-        let original_grades = input.judgements.as_ref().unwrap();
-        if slot.convert.is_none() {
-            return Some(played_weight(input, original, original_grades, slot, event));
-        }
-        let grades = live::isolated_judgements(input, slot, event, original_grades);
-        let model = linear_play(input, &grades, true, 0, 1.0, 0);
-        Some(
-            model.total - original.prefix[input.times.len()]
-                + played_weight(input, &model, &grades, slot, event),
-        )
-    })
-}
-
 pub(crate) fn played_linear(input: &Input, grades: &[usize], lives: &live::Lives) -> Linear {
     let n = input.times.len();
     let mut prefix = vec![0.0; n + 1];
@@ -851,6 +887,7 @@ pub(crate) fn played_linear(input: &Input, grades: &[usize], lives: &live::Lives
         life_at: lives.gate.clone(),
         absolute_error: n as f64 + 1.0,
         ignore_gates: false,
+        nominal_cumulative: false,
         conversion_combo: Vec::new(),
         release_windows: Vec::new(),
     }
@@ -864,7 +901,9 @@ pub(crate) fn played_weight(
 ) -> f64 {
     let start = input.skill_times[event];
     let mut value = 0.0;
-    for effect in &slot.effects {
+    let mut gated = Vec::new();
+    for (effect_index, effect) in slot.effects.iter().enumerate() {
+        let mut contribution = 0.0;
         if !model.ignore_gates && effect.gate.blocks(model.life_at[&event]) {
             continue;
         }
@@ -880,10 +919,34 @@ pub(crate) fn played_weight(
         let last = input.times.partition_point(|&time| time < end);
         for (index, &grade) in grades.iter().enumerate().take(last).skip(first) {
             if effect.kind == 2000 || effect.judgements.contains(&grade) {
-                value += f(effect.delta as f64 / 100000.0)
+                contribution += f(effect.delta as f64 / 100000.0)
                     * (model.prefix[index + 1] - model.prefix[index]);
             }
         }
+        if model.ignore_gates && effect.gate.kind == 1 {
+            gated.push((effect_index, contribution));
+        } else {
+            value += contribution;
+        }
+    }
+    if !gated.is_empty() {
+        let upper = model.life_at[&event];
+        let values = std::iter::once(0.0).chain(
+            gated
+                .iter()
+                .map(|&(index, _)| slot.effects[index].gate.value)
+                .filter(|&value| value >= 0.0 && value <= upper),
+        );
+        let best = values
+            .map(|life| {
+                gated
+                    .iter()
+                    .filter(|&&(index, _)| !slot.effects[index].gate.blocks(life))
+                    .map(|&(_, value)| value)
+                    .fold(0.0_f64, |sum, value| (sum + value).next_up())
+            })
+            .fold(0.0_f64, f64::max);
+        value = (value + best).next_up();
     }
     for factor in &slot.cumulative {
         value += cumulative_upper(&model.prefix, input, factor, start, Some(grades));

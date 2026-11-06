@@ -197,6 +197,15 @@ pub trait Objective {
     ) -> Option<Vec<Vec<Vec<i32>>>> {
         None
     }
+    /// A surviving complete domain may be partitioned again. Each row must
+    /// cover its supplied options with disjoint groups.
+    fn refine_assignment_domains(
+        &mut self,
+        _members: &[usize],
+        _options: &[Vec<i32>],
+    ) -> Option<Vec<Vec<Vec<i32>>>> {
+        None
+    }
     fn prepare_assignment_domain(
         &mut self,
         members: &[usize],
@@ -3103,6 +3112,9 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                 return Ok(());
             }
             if slot == domains.len() {
+                if let Some(refined) = self.input.objective.refine_assignment_domains(&a.team, &a.options) {
+                    return self.snap_domains(a, &refined, 0, &mut Vec::new(), totals);
+                }
                 let upper = self.remaining_bound(a, 0, totals);
                 if upper < self.assignment_limit(a) || self.cannot_improve_set(a, upper) {
                     return Ok(());

@@ -1,13 +1,14 @@
 //! One bounded raw skill table per native library / WASM instance.
-//! Master table identities keep unrelated releases isolated.
+//! Master table identities keep unrelated releases isolated. Weak play views
+//! share normalized slot programs across charts without retaining old calls.
 use super::resolve;
 use crate::{
-    live::Slot,
+    live::{Input, Slot},
     master::*,
     power::{Member, Snap},
 };
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::BTreeMap,
     mem::size_of,
     sync::{Arc, Mutex, OnceLock, Weak},
 };
@@ -111,33 +112,321 @@ impl Key {
     }
 }
 
+#[derive(PartialEq, Eq)]
+struct PlayKey {
+    ap: bool,
+    grades: u8,
+    life: u64,
+    damage: [u64; 7],
+    total_damage: u64,
+    short_windows: [u64; 7],
+    short_assist: u64,
+}
+pub(crate) struct Played {
+    pub(crate) slots: Arc<Vec<Slot>>,
+    pub(crate) ids: Vec<usize>,
+    pub(crate) shapes: usize,
+    pub(crate) healthy: bool,
+    pub(crate) converters: Vec<usize>,
+}
 pub(crate) struct Prepared {
     pub(crate) slots: Vec<Slot>,
-    // Gekiso never needs these ids, so do not intern shapes on its cold path.
-    shapes: OnceLock<(Vec<usize>, usize)>,
+    // Ordinary scoring prepares projections lazily; Gekiso keeps the raw programs.
+    played: Mutex<Vec<(PlayKey, Weak<Played>)>>,
+    converter_limits: OnceLock<([Vec<f64>; 7], Vec<f64>)>,
     bytes: usize,
 }
 impl Prepared {
-    pub(crate) fn shapes(&self) -> &(Vec<usize>, usize) {
-        self.shapes.get_or_init(|| {
-            let mut intern = HashMap::new();
-            let mut signature = Vec::new();
-            let ids = self
-                .slots
-                .iter()
-                .map(|slot| {
-                    slot.write_signature(&mut signature);
-                    if let Some(&id) = intern.get(signature.as_slice()) {
-                        id
-                    } else {
-                        let id = intern.len();
-                        intern.insert(std::mem::take(&mut signature), id);
-                        id
+    pub(crate) fn for_play(&self, input: &Input) -> Arc<Played> {
+        let ap = input.judgements.is_none();
+        let perfect;
+        let grades = if let Some(grades) = &input.judgements {
+            grades.as_slice()
+        } else {
+            perfect = vec![5; input.times.len()];
+            &perfect
+        };
+        let mask = grades.iter().fold(0u8, |mask, &grade| mask | (1 << grade));
+        let total_damage = if ap {
+            0.0
+        } else {
+            grades.iter().map(|&grade| input.damage[grade]).sum::<f64>()
+        };
+        let (window_limits, assist_limits) = self.converter_limits.get_or_init(|| {
+            let mut limits: [Vec<f64>; 7] = std::array::from_fn(|_| Vec::new());
+            let mut assists = Vec::new();
+            for slot in &self.slots {
+                if let Some(convert) = &slot.convert {
+                    let Some(limit) = convert
+                        .limit
+                        .filter(|limit| limit.is_finite() && *limit > 0.0)
+                    else {
+                        continue;
+                    };
+                    if !convert.at_start
+                        && convert
+                            .seconds
+                            .is_some_and(|seconds| crate::num::window_ms(seconds, 0.0) == 5000)
+                    {
+                        limits[convert.judgement].push(limit);
+                    } else if convert.at_start
+                        && convert.judgement >= 3
+                        && convert.judgements.iter().all(|&grade| grade <= 2)
+                    {
+                        assists.push(limit);
                     }
+                }
+            }
+            for values in limits.iter_mut().chain(std::iter::once(&mut assists)) {
+                values.sort_by(f64::total_cmp);
+                values.dedup();
+            }
+            (limits, assists)
+        });
+        let mut maximum = [0usize; 7];
+        for &start in input.skill_times.iter().take(5) {
+            let from = input.clock.frame_time(start);
+            let until = input.clock.frame_time(from.saturating_add(5000));
+            let first = input.times.partition_point(|&time| time <= from);
+            let after = input.times.partition_point(|&time| time <= until);
+            let mut counts = [0; 7];
+            for &grade in &grades[first..after] {
+                counts[grade] += 1;
+            }
+            for grade in 1..7 {
+                maximum[grade] = maximum[grade].max(after - first - counts[grade]);
+            }
+        }
+        // Counters that cover every possible window are interchangeable.
+        let short_windows = if ap {
+            [0; 7]
+        } else {
+            std::array::from_fn(|grade| {
+                window_limits[grade]
+                    .iter()
+                    .copied()
+                    .find(|&limit| limit >= maximum[grade] as f64)
+                    .map_or(0, f64::to_bits)
+            })
+        };
+        let failures = grades.iter().filter(|&&grade| grade <= 2).count();
+        let short_assist = if ap {
+            0
+        } else {
+            assist_limits
+                .iter()
+                .copied()
+                .find(|&limit| limit >= failures as f64)
+                .map_or(0, f64::to_bits)
+        };
+        let key = PlayKey {
+            ap,
+            grades: mask,
+            life: input.life_base.to_bits(),
+            damage: input.damage.map(f64::to_bits),
+            total_damage: if total_damage < input.life_base {
+                total_damage.to_bits()
+            } else {
+                u64::MAX
+            },
+            short_windows,
+            short_assist,
+        };
+        let mut cache = self.played.lock().expect("prepared-play-cache-poisoned");
+        cache.retain(|(_, profile)| profile.strong_count() > 0);
+        if let Some(profile) = cache
+            .iter()
+            .find_map(|(prior, profile)| (prior == &key).then(|| profile.upgrade()).flatten())
+        {
+            return profile;
+        }
+        let mut slots = self.slots.clone();
+        for slot in &mut slots {
+            if slot.convert.as_ref().is_some_and(|convert| {
+                !convert
+                    .judgements
+                    .iter()
+                    .any(|&grade| grade != convert.judgement && mask & (1 << grade) != 0)
+            }) {
+                slot.convert = None;
+            }
+            if let Some(convert) = &mut slot.convert {
+                let cap = if !convert.at_start
+                    && short_windows[convert.judgement] != 0
+                    && convert
+                        .seconds
+                        .is_some_and(|seconds| crate::num::window_ms(seconds, 0.0) == 5000)
+                {
+                    Some(f64::from_bits(short_windows[convert.judgement]))
+                } else if convert.at_start
+                    && short_assist != 0
+                    && convert.judgement >= 3
+                    && convert.judgements.iter().all(|&grade| grade <= 2)
+                {
+                    Some(f64::from_bits(short_assist))
+                } else {
+                    None
+                };
+                if let Some(cap) = cap {
+                    if convert.limit.is_none_or(|limit| limit >= cap) {
+                        convert.limit = Some(cap);
+                    }
+                }
+            }
+        }
+        if ap {
+            for slot in &mut slots {
+                slot.recovery = 0;
+                slot.convert = None;
+                slot.cumulative
+                    .retain(|factor| factor.value != 0 && factor.judgements.contains(&5));
+                slot.effects
+                    .retain(|effect| !effect.gate.blocks(input.life_base));
+                for effect in &mut slot.effects {
+                    effect.gate = crate::live::Gate {
+                        kind: 0,
+                        value: 0.0,
+                        positive: true,
+                    };
+                }
+                if slot.effects.is_empty() && slot.cumulative.is_empty() {
+                    slot.extension_ms = 0.0;
+                }
+            }
+        }
+        let healthy = input.life_base.is_finite()
+            && input.life_base >= 0.0
+            && (0..7)
+                .filter(|grade| mask & (1 << grade) != 0)
+                .all(|grade| (3..=5).contains(&grade) && input.damage[grade] == 0.0)
+            && slots.iter().all(|slot| {
+                slot.recovery >= 0
+                    && slot.convert.as_ref().is_none_or(|convert| {
+                        convert.judgement >= 3 && input.damage[convert.judgement] == 0.0
+                    })
+            });
+        if healthy {
+            for slot in &mut slots {
+                slot.effects.retain(|effect| {
+                    !(effect.gate.blocks(input.life_base)
+                        && effect.gate.blocks(input.life_base * 2.0))
+                });
+                for effect in &mut slot.effects {
+                    if !effect.gate.blocks(input.life_base)
+                        && !effect.gate.blocks(input.life_base * 2.0)
+                    {
+                        effect.gate = crate::live::Gate {
+                            kind: 0,
+                            value: 0.0,
+                            positive: true,
+                        };
+                    }
+                }
+            }
+            if slots
+                .iter()
+                .all(|slot| slot.effects.iter().all(|effect| effect.gate.kind == 0))
+            {
+                for slot in &mut slots {
+                    slot.recovery = 0;
+                }
+            }
+            for slot in &mut slots {
+                if slot.effects.is_empty() && slot.cumulative.is_empty() && slot.convert.is_none() {
+                    slot.extension_ms = 0.0;
+                }
+            }
+        }
+        let survives = input.life_base.is_finite()
+            && input.life_base >= 0.0
+            && input.life_base.fract() == 0.0
+            && total_damage >= 0.0
+            && total_damage < input.life_base
+            && total_damage <= i32::MAX as f64
+            && input
+                .damage
+                .iter()
+                .all(|damage| damage.is_finite() && *damage >= 0.0 && damage.fract() == 0.0)
+            && input.life_base * 2.0 + total_damage < (1u64 << 52) as f64
+            && slots.iter().all(|slot| {
+                slot.recovery >= 0
+                    && slot
+                        .convert
+                        .as_ref()
+                        .is_none_or(|convert| input.damage[convert.judgement] == 0.0)
+            });
+        if survives {
+            let minimum = input.life_base - total_damage;
+            for slot in &mut slots {
+                slot.effects.retain(|effect| {
+                    !(effect.gate.blocks(minimum) && effect.gate.blocks(input.life_base * 2.0))
+                });
+                for effect in &mut slot.effects {
+                    if !effect.gate.blocks(minimum) && !effect.gate.blocks(input.life_base * 2.0) {
+                        effect.gate = crate::live::Gate {
+                            kind: 0,
+                            value: 0.0,
+                            positive: true,
+                        };
+                    }
+                }
+            }
+            if slots.iter().all(|slot| {
+                slot.effects
+                    .iter()
+                    .all(|effect| effect.gate.kind == 0 || effect.gate.value == input.life_base)
+            }) {
+                // With no death and only the base-LIFE gate, covering the full
+                // damage budget makes larger recovery amounts unobservable.
+                let observes_life = slots
+                    .iter()
+                    .any(|slot| slot.effects.iter().any(|effect| effect.gate.kind != 0));
+                for slot in &mut slots {
+                    slot.recovery = if observes_life {
+                        slot.recovery.min(total_damage as i32)
+                    } else {
+                        0
+                    };
+                }
+            }
+        }
+        let mut intern = rustc_hash::FxHashMap::default();
+        let mut signature = Vec::new();
+        let ids = slots
+            .iter()
+            .map(|slot| {
+                slot.write_signature(&mut signature);
+                if let Some(&id) = intern.get(signature.as_slice()) {
+                    id
+                } else {
+                    let id = intern.len();
+                    intern.insert(std::mem::take(&mut signature), id);
+                    id
+                }
+            })
+            .collect();
+        let mut programs = rustc_hash::FxHashMap::default();
+        let converters = slots
+            .iter()
+            .map(|slot| {
+                slot.conversion_signature().map_or(0, |signature| {
+                    let next = programs.len() + 1;
+                    *programs.entry(signature).or_insert(next)
                 })
-                .collect();
-            (ids, intern.len())
-        })
+            })
+            .collect();
+        let profile = Arc::new(Played {
+            slots: Arc::new(slots),
+            ids,
+            shapes: intern.len(),
+            healthy,
+            converters,
+        });
+        if cache.len() >= 8 {
+            cache.remove(0);
+        }
+        cache.push((key, Arc::downgrade(&profile)));
+        profile
     }
     /// Move an uncached oversized table; shared tables remain immutable.
     pub(crate) fn into_slots(self: Arc<Self>) -> Vec<Slot> {
@@ -146,7 +435,7 @@ impl Prepared {
             Err(table) => table.slots.clone(),
         }
     }
-    /// Upper bound on retained table/key payload, including lazy shape ids.
+    /// Upper bound on retained table/key payload, including scoring-view bookkeeping.
     pub(crate) fn retained_bytes(&self) -> usize {
         self.bytes
     }
@@ -180,7 +469,9 @@ pub(crate) fn prepare(master: &Master, members: &[Member], snaps: &[Snap]) -> Ar
             bytes += slot
                 .effects
                 .iter()
-                .map(|e| (e.judgements.capacity() + e.release_judgements.capacity()) * size_of::<usize>())
+                .map(|e| {
+                    (e.judgements.capacity() + e.release_judgements.capacity()) * size_of::<usize>()
+                })
                 .sum::<usize>();
             if let Some(convert) = &slot.convert {
                 bytes += convert.judgements.capacity() * size_of::<usize>();
@@ -190,7 +481,8 @@ pub(crate) fn prepare(master: &Master, members: &[Member], snaps: &[Snap]) -> Ar
     }
     let table = Arc::new(Prepared {
         slots,
-        shapes: OnceLock::new(),
+        played: Mutex::new(Vec::new()),
+        converter_limits: OnceLock::new(),
         bytes,
     });
     if table.retained_bytes() <= CACHE_BYTES {

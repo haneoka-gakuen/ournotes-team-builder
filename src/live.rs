@@ -117,6 +117,28 @@ pub struct Slot {
     pub convert: Option<Conversion>,
 }
 impl Slot {
+    pub(crate) fn conversion_signature(&self) -> Option<Vec<u64>> {
+        let convert = self.convert.as_ref()?;
+        let mut signature = vec![
+            convert.at_start as u64,
+            convert.judgement as u64,
+            convert.limit.map_or(u64::MAX, f64::to_bits),
+            convert.seconds.map_or_else(
+                || {
+                    window_ms(
+                        self.effects
+                            .first()
+                            .map(|effect| effect.seconds)
+                            .unwrap_or(5.0),
+                        self.extension_ms,
+                    )
+                },
+                |seconds| window_ms(seconds, 0.0),
+            ) as u64,
+        ];
+        signature.extend(convert.judgements.iter().map(|&grade| grade as u64));
+        Some(signature)
+    }
     /// Identifies equal skill shapes: the same fields with the same float bits.
     pub fn signature(&self) -> Vec<u64> {
         let mut out = Vec::new();
@@ -680,70 +702,85 @@ fn partition(len: usize, mut below: impl FnMut(usize) -> bool) -> usize {
     }
     low
 }
+fn slot_cumulative_commands(
+    input: &Input,
+    slot: &Slot,
+    event: usize,
+    judgements: Option<&[usize]>,
+    delivery: Option<&Delivery>,
+) -> Vec<Command> {
+    let n = input.times.len();
+    let start = input.skill_times[event];
+    let frame_at =
+        |k: usize| delivery.map_or_else(|| input.frame_time(input.times[k]), |d| d.frames[k]);
+    let note_at = |k: usize| delivery.map_or(k, |d| d.notes[k]);
+    let mut commands = Vec::new();
+    for factor in &slot.cumulative {
+        let activation = input.frame_time(start);
+        let end = start + factor.duration_ms();
+        let (mut count, mut applied) = (0, 0);
+        let mut first = partition(n, |k| frame_at(k) < activation);
+        while first < n {
+            let frame = frame_at(first);
+            if frame > end {
+                break;
+            }
+            let after = first + partition(n - first, |k| frame_at(first + k) <= frame);
+            count += (first..after)
+                .filter(|&k| {
+                    factor
+                        .judgements
+                        .contains(&judgements.map_or(5, |grades| grades[note_at(k)]))
+                })
+                .count() as i32;
+            let mill = factor.mill(count);
+            if mill != applied {
+                let time = if frame == activation { start } else { frame };
+                commands.push(Command {
+                    time,
+                    owner: event,
+                    channel: 0,
+                    delta: applied.wrapping_neg(),
+                });
+                commands.push(Command {
+                    time,
+                    owner: event,
+                    channel: 0,
+                    delta: mill,
+                });
+                applied = mill;
+            }
+            first = after;
+        }
+        if applied != 0 {
+            commands.push(Command {
+                time: end,
+                owner: event,
+                channel: 0,
+                delta: applied.wrapping_neg(),
+            });
+        }
+    }
+    commands
+}
 fn cumulative_commands(
     input: &Input,
     order: &[usize; 5],
     judgements: Option<&[usize]>,
     delivery: Option<&Delivery>,
 ) -> Vec<Command> {
-    let n = input.times.len();
-    let frame_at = |k: usize| delivery.map_or_else(|| input.frame_time(input.times[k]), |d| d.frames[k]);
-    let note_at = |k: usize| delivery.map_or(k, |d| d.notes[k]);
     let mut commands = Vec::new();
-    for (event, &start) in input.skill_times.iter().take(5).enumerate() {
-        let Some(slot) = input.slots.get(order[event]) else {
-            continue;
-        };
-        for factor in &slot.cumulative {
-            let activation = input.frame_time(start);
-            let end = start + factor.duration_ms();
-            let (mut count, mut applied) = (0, 0);
-            let mut first = partition(n, |k| frame_at(k) < activation);
-            while first < n {
-                let frame = frame_at(first);
-                if frame > end {
-                    break;
-                }
-                let after = first + partition(n - first, |k| frame_at(first + k) <= frame);
-                count += (first..after)
-                    .filter(|&k| {
-                        factor
-                            .judgements
-                            .contains(&judgements.map_or(5, |grades| grades[note_at(k)]))
-                    })
-                    .count() as i32;
-                let mill = factor.mill(count);
-                if mill != applied {
-                    let time = if frame == activation { start } else { frame };
-                    commands.push(Command {
-                        time,
-                        owner: event,
-                        channel: 0,
-                        delta: applied.wrapping_neg(),
-                    });
-                    commands.push(Command {
-                        time,
-                        owner: event,
-                        channel: 0,
-                        delta: mill,
-                    });
-                    applied = mill;
-                }
-                first = after;
-            }
-            if applied != 0 {
-                commands.push(Command {
-                    time: end,
-                    owner: event,
-                    channel: 0,
-                    delta: applied.wrapping_neg(),
-                });
-            }
+    for (event, &position) in order.iter().enumerate().take(input.skill_times.len()) {
+        if let Some(slot) = input.slots.get(position) {
+            commands.extend(slot_cumulative_commands(
+                input, slot, event, judgements, delivery,
+            ));
         }
     }
     commands.sort_by_key(|command| (command.time, command.owner));
     commands
 }
+
 fn commands(input: &Input, order: &[usize; 5], delivery: Option<&Delivery>) -> Vec<Command> {
     let mut commands = Vec::new();
     for (event, &start) in input.skill_times.iter().take(5).enumerate() {
@@ -1052,12 +1089,128 @@ fn firing(input: &Input) -> Vec<usize> {
     out.sort_by_key(|&i| (input.skill_times[i], i));
     out
 }
+/// Integer LIFE changes only at damage and recovery events. Zero-damage notes
+/// share the preceding value; gates additionally see damage through their frame.
+pub(crate) struct LifeProgram {
+    damage: Vec<(usize, f64)>,
+    prefix: Vec<f64>,
+    events: Vec<usize>,
+    boundaries: [usize; 5],
+    delivered: [usize; 5],
+}
+impl LifeProgram {
+    pub(crate) fn new(input: &Input, grades: &[usize]) -> Option<Self> {
+        if !input.life_base.is_finite()
+            || input.life_base < 0.0
+            || input.life_base.fract() != 0.0
+            || input
+                .damage
+                .iter()
+                .any(|value| !value.is_finite() || *value < 0.0 || value.fract() != 0.0)
+            || input
+                .skill_times
+                .iter()
+                .take(5)
+                .any(|&time| input.frame_time(time) >= input.times.last().copied().unwrap_or(0))
+        {
+            return None;
+        }
+        let damage: Vec<_> = grades
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &grade)| {
+                let value = input.damage[grade];
+                (value != 0.0).then_some((index, value))
+            })
+            .collect();
+        let mut prefix = Vec::with_capacity(damage.len() + 1);
+        prefix.push(0.0);
+        for &(_, value) in &damage {
+            prefix.push(prefix.last().unwrap() + value);
+        }
+        if input.life_base * 2.0 + prefix.last().unwrap() >= (1u64 << 52) as f64 {
+            return None;
+        }
+        let boundaries = std::array::from_fn(|event| {
+            input
+                .skill_times
+                .get(event)
+                .map_or(input.times.len(), |&start| {
+                    input.times.partition_point(|&time| time <= start)
+                })
+        });
+        let delivered = std::array::from_fn(|event| {
+            input.skill_times.get(event).map_or(damage.len(), |&start| {
+                damage.partition_point(|&(index, _)| input.times[index] <= input.frame_time(start))
+            })
+        });
+        Some(Self {
+            damage,
+            prefix,
+            events: firing(input),
+            boundaries,
+            delivered,
+        })
+    }
+    pub(crate) fn play(&self, input: &Input, recoveries: [i32; 5]) -> Option<Lives> {
+        if recoveries.iter().any(|&value| value < 0)
+            || input.life_base * 2.0
+                + self.prefix.last().unwrap()
+                + recoveries.iter().map(|&value| value as f64).sum::<f64>()
+                >= (1u64 << 52) as f64
+        {
+            return None;
+        }
+        let mut note = vec![0.0; input.times.len()];
+        let mut gate = HashMap::with_capacity(self.events.len());
+        let (mut cursor, mut damage, mut life) = (0, 0, input.life_base);
+        for event in self
+            .events
+            .iter()
+            .copied()
+            .map(Some)
+            .chain(std::iter::once(None))
+        {
+            let boundary = event.map_or(note.len(), |event| self.boundaries[event]);
+            while damage < self.damage.len() && self.damage[damage].0 < boundary {
+                let (index, amount) = self.damage[damage];
+                note[cursor..index].fill(life);
+                life = (life - amount).max(0.0);
+                note[index] = life;
+                if life == 0.0 {
+                    for &event in &self.events {
+                        gate.entry(event).or_insert(0.0);
+                    }
+                    return Some(Lives { note, gate });
+                }
+                cursor = index + 1;
+                damage += 1;
+            }
+            note[cursor..boundary].fill(life);
+            cursor = boundary;
+            if let Some(event) = event {
+                if life > 0.0 {
+                    life = (input.life_base * 2.0).min(life + recoveries[event] as f64);
+                }
+                gate.insert(
+                    event,
+                    (life - (self.prefix[self.delivered[event]] - self.prefix[damage])).max(0.0),
+                );
+            }
+        }
+        Some(Lives { note, gate })
+    }
+}
 pub(crate) fn lives(
     input: &Input,
     judgements: &[usize],
     order: &[usize; 5],
     slots: &[Slot],
 ) -> Lives {
+    if let Some(lives) = LifeProgram::new(input, judgements).and_then(|program| program.play(input,
+        order.map(|slot| slots.get(slot).map_or(0, |slot| slot.recovery)))) {
+        return lives;
+    }
     let n = input.times.len();
     let mut replay = LifeReplay {
         input,
@@ -1274,11 +1427,12 @@ struct PlayScorer<'a> {
     luck: f64,
     assist: f64,
     converter_ids: [usize; 5],
-    trajectories: Vec<(Vec<usize>, Vec<f64>)>,
+    trajectories: Vec<(Vec<usize>, Vec<f64>, Option<LifeProgram>)>,
     trajectory_ids: HashMap<[usize; 5], usize>,
     grade_buckets: HashMap<u64, Vec<usize>>,
     life_cache: HashMap<([i32; 5], usize), (Lives, usize)>,
     ranges: PlayedRangeCache,
+    cumulative_cache: rustc_hash::FxHashMap<(usize, usize, usize), Vec<Command>>,
     cache_ranges: bool,
     curve_enabled: bool,
     curve_safe: bool,
@@ -1401,6 +1555,7 @@ impl<'a> PlayScorer<'a> {
             grade_buckets: HashMap::new(),
             life_cache: HashMap::new(),
             ranges: rustc_hash::FxHashMap::default(),
+            cumulative_cache: rustc_hash::FxHashMap::default(),
             cache_ranges,
             curve_enabled: false,
             curve_safe,
@@ -1437,7 +1592,8 @@ impl<'a> PlayScorer<'a> {
             pending = if grade <= 2 { 0 } else { pending + 1 };
         }
         let index = self.trajectories.len();
-        self.trajectories.push((converted, combos));
+        let life = LifeProgram::new(self.input, &converted);
+        self.trajectories.push((converted, combos, life));
         self.trajectory_ids.insert(key, index);
         self.grade_buckets.entry(hash).or_default().push(index);
         index
@@ -1449,13 +1605,16 @@ impl<'a> PlayScorer<'a> {
         let (luck, assist) = (self.luck, self.assist);
         let n = input.times.len();
         let recoveries = order.map(|slot| input.slots.get(slot).map(|s| s.recovery).unwrap_or(0));
-        let (converted, combos) = &self.trajectories[trajectory];
+        let (converted, combos, life_program) = &self.trajectories[trajectory];
         let fallback_life_id = n + 1 + self.life_cache.len();
         let (lives, life_id) = self
             .life_cache
             .entry((recoveries, trajectory))
             .or_insert_with(|| {
-                let lives = lives(input, converted, order, &input.slots);
+                let lives = life_program
+                    .as_ref()
+                    .and_then(|program| program.play(input, recoveries))
+                    .unwrap_or_else(|| lives(input, converted, order, &input.slots));
                 let first = lives.note.iter().position(|life| *life <= 0.0).unwrap_or(n);
                 let id = if lives.note[first..].iter().all(|life| *life <= 0.0) {
                     first
@@ -1470,7 +1629,32 @@ impl<'a> PlayScorer<'a> {
             active: Vec::new(),
         };
         let mut cursor = 0;
-        let cumulative = cumulative_commands(input, order, Some(converted), delivery);
+        let cumulative = if delivery.is_none() {
+            let mut commands = Vec::new();
+            for (event, &position) in order.iter().enumerate().take(input.skill_times.len()) {
+                let Some(slot) = input
+                    .slots
+                    .get(position)
+                    .filter(|slot| !slot.cumulative.is_empty())
+                else {
+                    continue;
+                };
+                if self.cumulative_cache.len() >= 512 {
+                    self.cumulative_cache.clear();
+                }
+                commands.extend_from_slice(
+                    self.cumulative_cache
+                        .entry((trajectory, event, position))
+                        .or_insert_with(|| {
+                            slot_cumulative_commands(input, slot, event, Some(converted), None)
+                        }),
+                );
+            }
+            commands.sort_by_key(|command| (command.time, command.owner));
+            commands
+        } else {
+            cumulative_commands(input, order, Some(converted), delivery)
+        };
         let mut pending = cumulative.into_iter().peekable();
         let mut score = 0.0;
         let mut i = 0;

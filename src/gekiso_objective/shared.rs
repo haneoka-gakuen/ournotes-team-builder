@@ -902,7 +902,7 @@ pub(crate) fn search_shared(input: SharedInput<'_>) -> Result<search::Output, St
     }
     let mut hits = Vec::new();
     let mut stats = search::Stats::default();
-    if !seeded && (initial.is_empty() || levels.len() > 1) {
+    if !seeded && (initial.is_empty() || levels.len() > 1 && kernels.iter().any(|kernel| kernel.chart.luck)) {
         let mut objective = PowerSeed {
             bonuses: kernels[0].bonuses.clone(),
         };

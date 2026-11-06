@@ -6,7 +6,7 @@ use crate::{
     power::{matches_targets, Member, Snap},
 };
 mod prepared;
-pub(crate) use prepared::{prepare, Prepared};
+pub(crate) use prepared::{prepare, Played, Prepared};
 
 enum Value {
     Static(bool),

@@ -10,6 +10,7 @@ use crate::{
     skills,
 };
 use serde_json::{json, Value};
+use rustc_hash::FxHashMap;
 use std::{
     collections::{HashMap, VecDeque},
     sync::Arc,
@@ -45,13 +46,87 @@ struct PlayedAssignment {
     members: Vec<usize>,
     base: (f64, f64),
     rows: Vec<Vec<(i32, f64, f64)>>,
+    frontiers: Vec<[Vec<(f64, f64)>; 2]>,
+    power: f64,
 }
 // A fixed conversion and recovery program leaves only additive skill coefficients.
+struct PlayedTrajectory {
+    id: usize,
+    grades: Arc<Vec<usize>>,
+    life: Option<live::LifeProgram>,
+}
+struct PlayedModel {
+    id: usize,
+    grades: Arc<Vec<usize>>,
+    linear: Linear,
+}
 struct PlayedDomain {
-    models: Vec<(Vec<usize>, Linear)>,
-    order_models: Vec<usize>,
+    models: Vec<Arc<PlayedModel>>,
+    frequencies: [Vec<(usize, usize, u32)>; 5],
     base: (f64, f64),
-    weights: HashMap<(usize, usize), (f64, f64)>,
+    weights: FxHashMap<(usize, usize), (f64, f64)>,
+    bytes: usize,
+}
+struct AccuracySeed {
+    weights: Vec<f64>,
+    width: usize,
+    cap: f64,
+    columns: Vec<Vec<f64>>,
+}
+impl Objective for AccuracySeed {
+    fn canonical_leader(&self) -> bool {
+        true
+    }
+    fn conditional_snap_dominance(&self) -> bool {
+        true
+    }
+    fn exchange_snap_equivalent(&mut self, member: usize, a: i32, b: i32) -> bool {
+        self.weights[member * self.width + (a + 1) as usize]
+            == self.weights[member * self.width + (b + 1) as usize]
+    }
+    fn linear_assignment(&self) -> Option<(f64, f64, f64)> {
+        Some((1.0, 1.0, 0.0))
+    }
+    fn skill(&mut self, member: usize, snap: i32) -> (f64, f64) {
+        let value = self.weights[member * self.width + (snap + 1) as usize];
+        (value, value)
+    }
+    fn bound(&mut self, totals: Totals) -> f64 {
+        totals.power + totals.skill.min(self.cap)
+    }
+    fn member_bound(&mut self, members: &[usize], totals: Totals, left: usize) -> Option<f64> {
+        if left != 0 {
+            return None;
+        }
+        let mut values: Vec<_> = self
+            .columns
+            .iter()
+            .map(|column| {
+                members
+                    .iter()
+                    .map(|&member| column[member])
+                    .fold(0.0_f64, f64::max)
+            })
+            .collect();
+        values.sort_by(|a, b| b.total_cmp(a));
+        Some(totals.power + totals.skill.min(values.into_iter().take(5).sum()))
+    }
+    fn interval(&mut self, _team: &Team, totals: Totals) -> (f64, f64) {
+        let value = totals.power + totals.skill;
+        (value, value)
+    }
+    fn exact(&mut self, team: &Team, power: f64, _slots: &[f64]) -> Result<Exact, String> {
+        let weight = team
+            .members
+            .iter()
+            .zip(&team.snaps)
+            .map(|(&member, &snap)| self.weights[member * self.width + (snap + 1) as usize])
+            .sum::<f64>();
+        Ok(Exact {
+            key: power + weight,
+            detail: Value::Null,
+        })
+    }
 }
 pub struct LiveCore {
     pub input: Input,
@@ -65,14 +140,31 @@ pub struct LiveCore {
     pub drains: bool,
     pub(crate) unbounded: bool,
     played_envelope: bool,
+    seed_weights: Option<Vec<f64>>,
+    breaks_combo: bool,
     isolated_events: [bool; 5],
+    isolated_models: FxHashMap<(usize, usize), (Vec<usize>, Linear)>,
     broad_play: bool,
     program_ids: Vec<usize>,
     program_slots: Vec<Slot>,
-    played_domains: HashMap<[usize; 5], PlayedDomain>,
-    played_domain_order: VecDeque<[usize; 5]>,
+    program_converters: Vec<usize>,
+    program_without_recovery: Vec<usize>,
+    recovery_observed: FxHashMap<[usize; 5], bool>,
+    played_trajectories: FxHashMap<[usize; 10], Arc<PlayedTrajectory>>,
+    played_lives: FxHashMap<(usize, [i32; 5], bool), Arc<PlayedModel>>,
+    played_models: FxHashMap<(usize, usize, [usize; 5], bool), Arc<PlayedModel>>,
+    played_weights: FxHashMap<(usize, usize, usize), f64>,
+    next_trajectory: usize,
+    next_model: usize,
+    played_domains: FxHashMap<(bool, [usize; 5]), PlayedDomain>,
+    played_bytes: usize,
+    life_gates: Vec<f64>,
+    played_domain_order: VecDeque<(bool, [usize; 5])>,
     played_assignment: Option<PlayedAssignment>,
-    pub slots: Vec<Slot>,
+    played_matching: crate::assignment::Scratch,
+    played_prices: [Vec<(usize, f64)>; 5],
+    pub slots: Arc<Vec<Slot>>,
+    _play_profile: Arc<skills::Played>,
     ids: Vec<usize>,
     width: usize,
     weights: Vec<Option<Pair>>,
@@ -152,7 +244,6 @@ impl LiveCore {
     ) -> Self {
         let width = snaps.len() + 1;
         let table = slot_table(master, members, snaps);
-        let mut slots = table.slots.clone();
         let judgements = live::judgements_for_types(&chart.judgement_types, play);
         let mut input = chart::prepare(master, chart, 0, Vec::new(), judgements, 1.0, 100.0);
         input.clock = live::FrameClock::for_play(play);
@@ -167,67 +258,14 @@ impl LiveCore {
                 ),
             )
         });
-        if let Some(grades) = &input.judgements {
-            for slot in &mut slots {
-                if slot.convert.as_ref().is_some_and(|convert| {
-                    !grades.iter().any(|grade| {
-                        *grade != convert.judgement && convert.judgements.contains(grade)
-                    })
-                }) {
-                    slot.convert = None;
-                }
-            }
-        }
-        let healthy_play = input.life_base.is_finite()
-            && input.life_base >= 0.0
-            && input.judgements.as_ref().is_some_and(|grades| {
-                grades
-                    .iter()
-                    .all(|&grade| (3..=5).contains(&grade) && input.damage[grade] == 0.0)
-            })
-            && slots.iter().all(|slot| {
-                slot.recovery >= 0
-                    && slot.convert.as_ref().is_none_or(|convert| {
-                        convert.judgement >= 3 && input.damage[convert.judgement] == 0.0
-                    })
-            });
-        if healthy_play {
-            for slot in &mut slots {
-                slot.effects.retain(|effect| {
-                    !(effect.gate.blocks(input.life_base)
-                        && effect.gate.blocks(input.life_base * 2.0))
-                });
-                for effect in &mut slot.effects {
-                    if !effect.gate.blocks(input.life_base)
-                        && !effect.gate.blocks(input.life_base * 2.0)
-                    {
-                        effect.gate = live::Gate {
-                            kind: 0,
-                            value: 0.0,
-                            positive: true,
-                        };
-                    }
-                }
-            }
-            if slots
-                .iter()
-                .all(|slot| slot.effects.iter().all(|effect| effect.gate.kind == 0))
-            {
-                for slot in &mut slots {
-                    slot.recovery = 0;
-                }
-            }
-            for slot in &mut slots {
-                if slot.effects.is_empty() && slot.cumulative.is_empty() && slot.convert.is_none() {
-                    slot.extension_ms = 0.0;
-                }
-            }
-        }
+        let play_profile = table.for_play(&input);
+        let healthy_play = play_profile.healthy;
+        let slots = Arc::clone(&play_profile.slots);
         let mut raise = 0.0_f64;
         let mut perfect_raise = 0.0_f64;
         let mut recovery = 0;
         let mut longest = 0;
-        for slot in &slots {
+        for slot in slots.iter() {
             if input.judgements.is_some() {
                 raise = raise.max(
                     slot.effects
@@ -272,57 +310,7 @@ impl LiveCore {
                     .count(),
             );
         }
-        let isolated =
-            input.skill_times.iter().enumerate().all(|(i, &time)| {
-                input.skill_times.iter().enumerate().all(|(j, &other)| {
-                    i == j || (time as i64 - other as i64).abs() > longest as i64
-                })
-            });
-        let (ids, intern_len) = if input.judgements.is_none() && isolated {
-            let mut intern = HashMap::<Vec<u64>, usize>::new();
-            let mut signature = Vec::new();
-            let mut ids = Vec::with_capacity(slots.len());
-            for slot in &mut slots {
-                slot.recovery = 0;
-                slot.convert = None;
-                slot.effects
-                    .retain(|effect| !effect.gate.blocks(input.life_base));
-                for effect in &mut slot.effects {
-                    effect.gate = crate::live::Gate {
-                        kind: 0,
-                        value: 0.0,
-                        positive: true,
-                    };
-                }
-                if slot.effects.is_empty() && slot.cumulative.is_empty() {
-                    slot.extension_ms = 0.0;
-                }
-                slot.write_signature(&mut signature);
-                let id = if let Some(&id) = intern.get(signature.as_slice()) {
-                    id
-                } else {
-                    let id = intern.len();
-                    intern.insert(std::mem::take(&mut signature), id);
-                    id
-                };
-                ids.push(id);
-            }
-            (ids, intern.len())
-        } else if input.judgements.is_some() {
-            let mut intern = HashMap::<Vec<u64>, usize>::new();
-            let ids = slots
-                .iter()
-                .map(|slot| {
-                    let signature = slot.signature();
-                    let next = intern.len();
-                    *intern.entry(signature).or_insert(next)
-                })
-                .collect();
-            (ids, intern.len())
-        } else {
-            let (ids, intern_len) = table.shapes();
-            (ids.clone(), *intern_len)
-        };
+        let (ids, intern_len) = (play_profile.ids.clone(), play_profile.shapes);
         let unbounded_cumulative = slots
             .iter()
             .flat_map(|slot| &slot.cumulative)
@@ -372,7 +360,7 @@ impl LiveCore {
                         .as_ref()
                         .is_none_or(|convert| (3..=5).contains(&convert.judgement))
             });
-        let (program_ids, program_slots) = if broad_play {
+        let (program_ids, mut program_slots) = if broad_play {
             let mut programs = HashMap::new();
             let mut program_slots = Vec::new();
             let program_ids = slots
@@ -410,6 +398,57 @@ impl LiveCore {
         } else {
             (Vec::new(), Vec::new())
         };
+        let mut converters = FxHashMap::default();
+        let mut program_converters: Vec<usize> = program_slots
+            .iter()
+            .map(|slot| {
+                let Some(convert) = &slot.convert else {
+                    return 0;
+                };
+                let mut signature = vec![
+                    convert.at_start as u64,
+                    convert.judgement as u64,
+                    convert.limit.map_or(u64::MAX, f64::to_bits),
+                    convert.seconds.map_or_else(
+                        || {
+                            window_ms(
+                                slot.effects
+                                    .first()
+                                    .map(|effect| effect.seconds)
+                                    .unwrap_or(5.0),
+                                slot.extension_ms,
+                            )
+                        },
+                        |seconds| window_ms(seconds, 0.0),
+                    ) as u64,
+                ];
+                signature.extend(convert.judgements.iter().map(|&grade| grade as u64));
+                let next = converters.len() + 1;
+                *converters.entry(signature).or_insert(next)
+            })
+            .collect();
+        let mut without_recovery = FxHashMap::default();
+        for (index, slot) in program_slots.iter().enumerate() {
+            if slot.recovery == 0 {
+                without_recovery
+                    .entry(program_converters[index])
+                    .or_insert(index);
+            }
+        }
+        let count = program_slots.len();
+        let mut program_without_recovery = Vec::with_capacity(count);
+        for program in 0..count {
+            let converter = program_converters[program];
+            let canonical = *without_recovery.entry(converter).or_insert_with(|| {
+                let mut slot = program_slots[program].clone();
+                slot.recovery = 0;
+                let index = program_slots.len();
+                program_slots.push(slot);
+                program_converters.push(converter);
+                index
+            });
+            program_without_recovery.push(canonical);
+        }
         let played_envelope = tight_play || broad_play;
         let isolated_events = if tight_play
             && healthy_play
@@ -421,7 +460,7 @@ impl LiveCore {
                         .is_none_or(|convert| !convert.at_start)
             }) {
             let mut footprint = longest;
-            for slot in &slots {
+            for slot in slots.iter() {
                 if let Some(convert) = &slot.convert {
                     footprint = footprint.max(convert.seconds.map_or_else(
                         || {
@@ -467,8 +506,16 @@ impl LiveCore {
         } else {
             high.clone()
         };
+        let tight_ap = input.judgements.is_none()
+            && timing.is_none()
+            && !unbounded_cumulative
+            && slots.iter().any(|slot| !slot.cumulative.is_empty())
+            && slots
+                .iter()
+                .all(|slot| slot.effects.iter().all(|effect| effect.delta >= 0));
+        high.nominal_cumulative = tight_ap;
         let mut perfect_cap = None;
-        if played_envelope {
+        if played_envelope || tight_ap {
             let base: Vec<_> = slots
                 .iter()
                 .step_by(width)
@@ -506,18 +553,20 @@ impl LiveCore {
             } else {
                 f64::INFINITY
             };
-            let grades = input.judgements.as_ref().unwrap();
-            let mut judge = grades
-                .iter()
-                .map(|&grade| input.judge_frac[grade])
-                .fold(0.0, f64::max);
-            for slot in &slots {
-                if let Some(convert) = &slot.convert {
-                    if grades
-                        .iter()
-                        .any(|grade| convert.judgements.contains(grade))
-                    {
-                        judge = judge.max(input.judge_frac[convert.judgement]);
+            let mut judge = input.judge_frac[5];
+            if let Some(grades) = &input.judgements {
+                judge = grades
+                    .iter()
+                    .map(|&grade| input.judge_frac[grade])
+                    .fold(0.0, f64::max);
+                for slot in slots.iter() {
+                    if let Some(convert) = &slot.convert {
+                        if grades
+                            .iter()
+                            .any(|grade| convert.judgements.contains(grade))
+                        {
+                            judge = judge.max(input.judge_frac[convert.judgement]);
+                        }
                     }
                 }
             }
@@ -531,21 +580,28 @@ impl LiveCore {
                 .sum::<f64>();
             if error_base != 0.0 {
                 high.total = (high.total + (error_base * error).next_up()).next_up();
-            }
-            high.ignore_gates = true;
-            high.release_windows = model::prepare_releases(&input, &slots);
-            if tight_play {
-                for life in high.life_at.values_mut() {
-                    *life = input.life_base * 2.0;
+                if tight_ap {
+                    low.total = (low.total - (error_base * error).next_up())
+                        .next_down()
+                        .max(0.0);
                 }
             }
-            factor_cap = (factor_cap + error).next_up();
-            if tight_play {
-                perfect_cap = Some((perfect_raise * overlap as f64 + error).next_up());
+            if played_envelope {
+                high.ignore_gates = true;
+                high.release_windows = model::prepare_releases(&input, &slots);
+                if tight_play {
+                    for life in high.life_at.values_mut() {
+                        *life = input.life_base * 2.0;
+                    }
+                }
+                factor_cap = (factor_cap + error).next_up();
+                if tight_play {
+                    perfect_cap = Some((perfect_raise * overlap as f64 + error).next_up());
+                }
+                low.total = 0.0;
+                low.prefix.fill(0.0);
+                low.perfect_prefix.fill(0.0);
             }
-            low.total = 0.0;
-            low.prefix.fill(0.0);
-            low.perfect_prefix.fill(0.0);
         }
         let unbounded = unbounded_cumulative
             || (input.judgements.is_some()
@@ -559,6 +615,45 @@ impl LiveCore {
         let drains = input.judgements.as_ref().is_some_and(|grades| {
             grades.iter().map(|&grade| input.damage[grade]).sum::<f64>() >= input.life_base
         });
+        let breaks_combo = input
+            .judgements
+            .as_ref()
+            .is_some_and(|grades| grades.iter().any(|&grade| grade <= 2));
+        let seed_weights = if played_envelope && breaks_combo {
+            let grades = input.judgements.as_ref().unwrap();
+            let weights: Vec<_> = slots
+                .iter()
+                .map(|slot| {
+                    slot.convert
+                        .as_ref()
+                        .filter(|convert| convert.at_start && convert.judgement >= 3)
+                        .map_or(0.0, |convert| {
+                            let count = grades
+                                .iter()
+                                .filter(|&&grade| grade <= 2 && convert.judgements.contains(&grade))
+                                .count();
+                            let repairs = convert.limit.map_or(count as f64, |limit| {
+                                limit.ceil().max(1.0).min(count as f64)
+                            });
+                            repairs * 2147483648.0
+                        })
+                })
+                .collect();
+            weights
+                .iter()
+                .any(|&weight| weight > 0.0)
+                .then_some(weights)
+        } else {
+            None
+        };
+        let mut life_gates: Vec<_> = slots
+            .iter()
+            .flat_map(|slot| &slot.effects)
+            .filter(|effect| effect.gate.kind == 1)
+            .map(|effect| effect.gate.value)
+            .collect();
+        life_gates.sort_by(f64::total_cmp);
+        life_gates.dedup();
         Self {
             input,
             timing,
@@ -571,14 +666,31 @@ impl LiveCore {
             drains,
             unbounded,
             played_envelope,
+            seed_weights,
+            breaks_combo,
             isolated_events,
+            isolated_models: FxHashMap::default(),
             broad_play,
             program_ids,
             program_slots,
-            played_domains: HashMap::new(),
+            program_converters,
+            program_without_recovery,
+            recovery_observed: FxHashMap::default(),
+            played_trajectories: FxHashMap::default(),
+            played_lives: FxHashMap::default(),
+            played_models: FxHashMap::default(),
+            played_weights: FxHashMap::default(),
+            next_trajectory: 0,
+            next_model: 0,
+            played_domains: FxHashMap::default(),
+            played_bytes: 0,
+            life_gates,
             played_domain_order: VecDeque::new(),
             played_assignment: None,
+            played_matching: crate::assignment::Scratch::default(),
+            played_prices: std::array::from_fn(|_| Vec::new()),
             slots,
+            _play_profile: play_profile,
             ids,
             width,
             weights: vec![None; intern_len],
@@ -634,14 +746,28 @@ impl LiveCore {
                 }
             }
             if self.isolated_events.iter().any(|&isolated| isolated) {
-                for (event, sharp) in
-                    model::isolated_play_weights(&self.input, skill, &self.isolated_events, &self.high)
-                        .into_iter()
-                        .enumerate()
-                {
-                    if let Some(value) = sharp {
-                        upper.per_event[event] = value;
+                for event in 0..5 {
+                    if !self.isolated_events[event] {
+                        continue;
                     }
+                    let original = self.input.judgements.as_ref().unwrap();
+                    upper.per_event[event] = if skill.convert.is_none() {
+                        model::played_weight(&self.input, &self.high, original, skill, event)
+                    } else {
+                        let program = self._play_profile.converters[index];
+                        let (grades, linear) = self
+                            .isolated_models
+                            .entry((program, event))
+                            .or_insert_with(|| {
+                                let grades =
+                                    live::isolated_judgements(&self.input, skill, event, original);
+                                let linear =
+                                    model::linear_play(&self.input, &grades, true, 0, 1.0, 0);
+                                (grades, linear)
+                            });
+                        linear.total - self.high.prefix[self.input.times.len()]
+                            + model::played_weight(&self.input, linear, grades, skill, event)
+                    };
                 }
                 upper.mean = upper.per_event.iter().sum::<f64>() / 5.0;
                 upper.best = upper
@@ -848,17 +974,20 @@ impl LiveCore {
         (lows, highs)
     }
     pub(crate) fn prepare_dominance(&mut self, power_cap: f64) {
-        if self.unbounded || self.timing.is_some() { return; }
+        if self.unbounded || self.timing.is_some() {
+            return;
+        }
 
         if self.input.judgements.is_none()
             && self
                 .slots
                 .iter()
                 .all(|s| s.effects.iter().all(|e| e.delta >= 0))
-            && self.high.total > 0.0
+            && self.low.total > 0.0
         {
-            let base = self.high.total / self.input.converted_count as f64;
-            self.dominance_margin = ((2.0 * RELATIVE_ERROR * power_cap
+            let base = self.low.total / self.input.converted_count as f64;
+            let rounding_gap = (self.high.total - self.low.total).max(0.0) / self.low.total;
+            self.dominance_margin = (((2.0 * RELATIVE_ERROR + rounding_gap * (1.0 + RELATIVE_ERROR)) * power_cap
                 + self.low.absolute_error / base)
                 / (1.0 - RELATIVE_ERROR))
                 .next_up()
@@ -1071,114 +1200,277 @@ impl LiveCore {
     fn program(&self, member: usize, snap: i32) -> usize {
         self.program_ids[self.at(member, snap)]
     }
-    fn prepare_played_assignment(&mut self, members: &[usize], options: &[Vec<i32>]) {
-        let key = std::array::from_fn(|index| self.program(members[index], options[index][0]));
-        if !self.played_domains.contains_key(&key) {
+    fn recovery_observable(&mut self, members: &[usize], options: &[Vec<i32>]) -> bool {
+        let programs: [usize; 5] =
+            std::array::from_fn(|index| self.program(members[index], options[index][0]));
+        let mut key = [0; 5];
+        let mut registered = 0;
+        for &program in &programs {
+            if self.program_slots[program]
+                .convert
+                .as_ref()
+                .is_some_and(|convert| convert.at_start)
+            {
+                key[registered] = self.program_converters[program];
+                registered += 1;
+            }
+        }
+        *self.recovery_observed.entry(key).or_insert_with(|| {
+            let mut input = self.input.clone();
+            input.slots = programs
+                .iter()
+                .map(|&program| {
+                    let mut slot = self.program_slots[program].clone();
+                    slot.recovery = 0;
+                    if slot
+                        .convert
+                        .as_ref()
+                        .is_some_and(|convert| !convert.at_start)
+                    {
+                        slot.convert = None;
+                    }
+                    slot
+                })
+                .collect();
+            let grades = live::converted_judgements(
+                &input,
+                &[0, 1, 2, 3, 4],
+                input.judgements.as_ref().unwrap(),
+            );
+            if grades.iter().all(|&grade| input.damage[grade] == 0.0)
+                && self.life_gates.iter().all(|&threshold| {
+                    (input.life_base >= threshold) == (input.life_base * 2.0 >= threshold)
+                })
+            {
+                return false;
+            }
+            let Some(life) = live::LifeProgram::new(&input, &grades)
+                .and_then(|program| program.play(&input, [0; 5]))
+            else {
+                return true;
+            };
+            let first = input.skill_times.iter().take(5).copied().min().unwrap_or(0);
+            !life
+                .note
+                .iter()
+                .zip(&input.times)
+                .any(|(&life, &time)| life <= 0.0 && time < first)
+        })
+    }
+    fn prepare_played_assignment(
+        &mut self,
+        members: &[usize],
+        options: &[Vec<i32>],
+        ignore_recovery: bool,
+        relaxed: bool,
+    ) {
+        let physical: [usize; 5] = std::array::from_fn(|index| {
+            let program = if relaxed {
+                options[index]
+                    .iter()
+                    .map(|&snap| self.program(members[index], snap))
+                    .max_by_key(|&program| self.program_slots[program].recovery)
+                    .unwrap()
+            } else {
+                self.program(members[index], options[index][0])
+            };
+            if ignore_recovery {
+                self.program_without_recovery[program]
+            } else {
+                program
+            }
+        });
+        let at_start = |program: usize| {
+            self.program_slots[program]
+                .convert
+                .as_ref()
+                .is_some_and(|convert| convert.at_start)
+        };
+        let mut registration: Vec<_> = physical
+            .iter()
+            .copied()
+            .filter(|&program| at_start(program))
+            .collect();
+        let mut remainder: Vec<_> = physical
+            .iter()
+            .copied()
+            .filter(|&program| !at_start(program))
+            .collect();
+        remainder.sort_unstable();
+        registration.extend(remainder);
+        let key: [usize; 5] = registration.try_into().unwrap();
+        let positions: [usize; 5] = std::array::from_fn(|index| {
+            key.iter()
+                .position(|&program| program == physical[index])
+                .unwrap()
+        });
+        let domain_key = (relaxed, key);
+        let fresh = !self.played_domains.contains_key(&domain_key);
+        if fresh {
             if self.played_domains.len() >= 128 {
                 if let Some(old) = self.played_domain_order.pop_front() {
-                    self.played_domains.remove(&old);
+                    if let Some(domain) = self.played_domains.remove(&old) {
+                        self.played_bytes -= domain.bytes + domain.weights.capacity() * 64;
+                    }
                 }
             }
-            self.played_domain_order.push_back(key);
+            self.played_domain_order.push_back(domain_key);
         }
-        let domain = self.played_domains.entry(key).or_insert_with(|| {
+        if self.played_trajectories.len() >= 256 {
+            self.played_trajectories.clear();
+        }
+        if self.played_lives.len() >= 2048 {
+            self.played_lives.clear();
+        }
+        if self.played_models.len() >= 512 {
+            self.played_models.clear();
+        }
+        if self.played_weights.len() >= 32768 {
+            self.played_weights.clear();
+        }
+        let domain = self.played_domains.entry(domain_key).or_insert_with(|| {
             let mut input = self.input.clone();
             input.slots = key
                 .iter()
                 .map(|&program| self.program_slots[program].clone())
                 .collect();
-            let mut gate_values: Vec<_> = self
-                .slots
-                .iter()
-                .flat_map(|slot| &slot.effects)
-                .filter(|effect| effect.gate.kind == 1)
-                .map(|effect| effect.gate.value)
-                .collect();
-            gate_values.sort_by(f64::total_cmp);
-            gate_values.dedup();
-            let mut contexts = HashMap::new();
-            let mut life_shapes = HashMap::new();
-            let mut converters = HashMap::new();
-            let converter_ids: [usize; 5] = std::array::from_fn(|position| {
-                let slot = &input.slots[position];
-                let Some(convert) = &slot.convert else {
-                    return 0;
-                };
-                if convert.at_start {
-                    return 0;
-                }
-                let mut signature = vec![
-                    convert.judgement as u64,
-                    convert.limit.map_or(u64::MAX, f64::to_bits),
-                    convert.seconds.map_or_else(
-                        || {
-                            window_ms(
-                                slot.effects
-                                    .first()
-                                    .map(|effect| effect.seconds)
-                                    .unwrap_or(5.0),
-                                slot.extension_ms,
-                            )
-                        },
-                        |seconds| window_ms(seconds, 0.0),
-                    ) as u64,
-                ];
-                signature.extend(convert.judgements.iter().map(|&grade| grade as u64));
-                let next = converters.len() + 1;
-                *converters.entry(signature).or_insert(next)
-            });
-            let mut trajectories = HashMap::new();
-            let mut grades = Vec::new();
-            let mut models = Vec::new();
-            let mut order_models = Vec::new();
+            let mut models: Vec<Arc<PlayedModel>> = Vec::new();
+            let mut contexts = FxHashMap::default();
+            let mut order_models = Vec::with_capacity(120);
             let (mut mean, mut maximum) = (0.0, 0.0_f64);
             for order in live::orders() {
-                // At-start actor registration stays in the physical team order.
-                let trajectory_key = order.map(|index| converter_ids[index]);
-                let trajectory = *trajectories.entry(trajectory_key).or_insert_with(|| {
-                    let index = grades.len();
-                    grades.push(live::converted_judgements(
-                        &input,
-                        order,
-                        input.judgements.as_ref().unwrap(),
-                    ));
+                let mut trajectory_key = [0; 10];
+                let mut registered = 0;
+                for (position, &program) in key.iter().enumerate() {
+                    if input.slots[position]
+                        .convert
+                        .as_ref()
+                        .is_some_and(|convert| convert.at_start)
+                    {
+                        trajectory_key[registered] = self.program_converters[program];
+                        registered += 1;
+                    }
+                }
+                for (event, &position) in order.iter().enumerate() {
+                    if input.slots[position]
+                        .convert
+                        .as_ref()
+                        .is_some_and(|convert| !convert.at_start)
+                    {
+                        trajectory_key[5 + event] = self.program_converters[key[position]];
+                    }
+                }
+                // At-start registration remains in physical actor order.
+                let trajectory = self
+                    .played_trajectories
+                    .entry(trajectory_key)
+                    .or_insert_with(|| {
+                        let grades = Arc::new(live::converted_judgements(
+                            &input,
+                            order,
+                            input.judgements.as_ref().unwrap(),
+                        ));
+                        let life = live::LifeProgram::new(&input, &grades);
+                        self.next_trajectory += 1;
+                        Arc::new(PlayedTrajectory {
+                            id: self.next_trajectory,
+                            grades,
+                            life,
+                        })
+                    });
+                let recoveries = order.map(|position| input.slots[position].recovery);
+                let model = self
+                    .played_lives
+                    .entry((trajectory.id, recoveries, relaxed))
+                    .or_insert_with(|| {
+                        let lives = trajectory
+                            .life
+                            .as_ref()
+                            .and_then(|program| program.play(&input, recoveries))
+                            .unwrap_or_else(|| {
+                                live::lives(&input, &trajectory.grades, order, &input.slots)
+                            });
+                        let first_dead = lives
+                            .note
+                            .iter()
+                            .position(|&life| life <= 0.0)
+                            .unwrap_or(input.times.len());
+                        let gates = std::array::from_fn(|event| {
+                            let life = lives.gate.get(&event).copied().unwrap_or(0.0);
+                            self.life_gates
+                                .partition_point(|&threshold| threshold <= life)
+                        });
+                        Arc::clone(
+                            self.played_models
+                                .entry((trajectory.id, first_dead, gates, relaxed))
+                                .or_insert_with(|| {
+                                    self.next_model += 1;
+                                    Arc::new(PlayedModel {
+                                        id: self.next_model,
+                                        grades: Arc::clone(&trajectory.grades),
+                                        linear: {
+                                            let mut linear = model::played_linear(
+                                                &input,
+                                                &trajectory.grades,
+                                                &lives,
+                                            );
+                                            linear.ignore_gates = relaxed;
+                                            linear
+                                        },
+                                    })
+                                }),
+                        )
+                    });
+                let context = *contexts.entry(model.id).or_insert_with(|| {
+                    let index = models.len();
+                    models.push(Arc::clone(model));
                     index
                 });
-                let recoveries = order.map(|index| input.slots[index].recovery);
-                let context = *contexts.entry((trajectory, recoveries)).or_insert_with(|| {
-                    let lives = live::lives(&input, &grades[trajectory], order, &input.slots);
-                    let first_dead = lives
-                        .note
-                        .iter()
-                        .position(|&life| life <= 0.0)
-                        .unwrap_or(input.times.len());
-                    let gates: [usize; 5] = std::array::from_fn(|event| {
-                        let life = lives.gate.get(&event).copied().unwrap_or(0.0);
-                        gate_values.partition_point(|&threshold| threshold <= life)
-                    });
-                    *life_shapes
-                        .entry((trajectory, first_dead, gates))
-                        .or_insert_with(|| {
-                            let model = model::played_linear(&input, &grades[trajectory], &lives);
-                            let index = models.len();
-                            models.push((grades[trajectory].clone(), model));
-                            index
-                        })
-                });
-                let value = models[context].1.total;
+                let value = model.linear.total;
                 mean += value / 120.0;
                 maximum = maximum.max(value);
                 order_models.push(context);
             }
+            let frequencies: [Vec<(usize, usize, u32)>; 5] = std::array::from_fn(|position| {
+                let mut counts = FxHashMap::default();
+                for (order, &context) in live::orders().iter().zip(&order_models) {
+                    let event = order.iter().position(|&index| index == position).unwrap();
+                    if event >= input.skill_times.len() {
+                        continue;
+                    }
+                    *counts.entry((context, event)).or_insert(0u32) += 1;
+                }
+                counts
+                    .into_iter()
+                    .map(|((context, event), count)| (context, event, count))
+                    .collect()
+            });
             let error = (self.high.total - self.high.prefix[self.input.times.len()]).max(0.0);
+            let bytes = models
+                .iter()
+                .map(|model| {
+                    model.grades.capacity() * std::mem::size_of::<usize>()
+                        + (model.linear.prefix.capacity() + model.linear.perfect_prefix.capacity())
+                            * std::mem::size_of::<f64>()
+                })
+                .sum::<usize>()
+                + frequencies
+                    .iter()
+                    .map(|row| row.capacity() * std::mem::size_of::<(usize, usize, u32)>())
+                    .sum::<usize>();
             PlayedDomain {
                 models,
-                order_models,
+                frequencies,
                 base: ((mean + error).next_up(), (maximum + error).next_up()),
-                weights: HashMap::new(),
+                weights: FxHashMap::default(),
+                bytes,
             }
         });
-        let rows = members
+        if fresh {
+            self.played_bytes += domain.bytes;
+        }
+        let capacity = domain.weights.capacity();
+        let rows: Vec<Vec<(i32, f64, f64)>> = members
             .iter()
             .enumerate()
             .zip(options)
@@ -1187,30 +1479,32 @@ impl LiveCore {
                     .iter()
                     .map(|&snap| {
                         let at = member * self.width + (snap + 1) as usize;
+                        let shape = self.ids[at];
                         let weights = domain
                             .weights
-                            .entry((position, self.ids[at]))
+                            .entry((positions[position], shape))
                             .or_insert_with(|| {
                                 let slot = &self.slots[at];
-                                let mut values = HashMap::new();
                                 let (mut mean, mut maximum) = (0.0, 0.0_f64);
-                                for (order, &context) in
-                                    live::orders().iter().zip(&domain.order_models)
+                                for &(context, event, count) in
+                                    &domain.frequencies[positions[position]]
                                 {
-                                    let event =
-                                        order.iter().position(|&index| index == position).unwrap();
-                                    let value =
-                                        *values.entry((context, event)).or_insert_with(|| {
-                                            let (grades, model) = &domain.models[context];
+                                    let model = &domain.models[context];
+                                    let value = *self
+                                        .played_weights
+                                        .entry((model.id, shape, event))
+                                        .or_insert_with(|| {
                                             model::played_weight(
                                                 &self.input,
-                                                model,
-                                                grades,
+                                                &model.linear,
+                                                &model.grades,
                                                 slot,
                                                 event,
                                             )
                                         });
-                                    mean += value / 120.0;
+                                    mean = (mean
+                                        + ((value * count as f64).next_up() / 120.0).next_up())
+                                    .next_up();
                                     maximum = maximum.max(value);
                                 }
                                 (mean.next_up(), maximum.next_up())
@@ -1220,44 +1514,50 @@ impl LiveCore {
                     .collect()
             })
             .collect();
+        self.played_bytes += (domain.weights.capacity() - capacity) * 64;
+        let frontiers = members
+            .iter()
+            .zip(&rows)
+            .map(|(&member, row)| {
+                std::array::from_fn(|criterion| {
+                    let mut points: Vec<_> = row
+                        .iter()
+                        .map(|&(snap, mean, maximum)| {
+                            let column = if snap < 0 {
+                                self.power_width - 1
+                            } else {
+                                snap as usize
+                            };
+                            (
+                                self.snap_power[member * self.power_width + column],
+                                if criterion == 0 { mean } else { maximum },
+                            )
+                        })
+                        .collect();
+                    points.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| b.1.total_cmp(&a.1)));
+                    let mut weight = f64::NEG_INFINITY;
+                    points.retain(|point| {
+                        let keep = point.1 > weight;
+                        weight = weight.max(point.1);
+                        keep
+                    });
+                    points
+                })
+            })
+            .collect();
         self.played_assignment = Some(PlayedAssignment {
             members: members.to_vec(),
             base: domain.base,
             rows,
+            frontiers,
+            power: self.base_power,
         });
-        let mut bytes = self
-            .played_domains
-            .values()
-            .map(|domain| {
-                domain
-                    .models
-                    .iter()
-                    .map(|(grades, model)| {
-                        grades.capacity() * std::mem::size_of::<usize>()
-                            + (model.prefix.capacity() + model.perfect_prefix.capacity())
-                                * std::mem::size_of::<f64>()
-                    })
-                    .sum::<usize>()
-                    + domain.weights.capacity() * 64
-                    + domain.order_models.capacity() * std::mem::size_of::<usize>()
-            })
-            .sum::<usize>();
-        while bytes > 64 * 1024 * 1024 && self.played_domains.len() > 1 {
+        while self.played_bytes > 64 * 1024 * 1024 && self.played_domains.len() > 1 {
             let Some(old) = self.played_domain_order.pop_front() else {
                 break;
             };
             if let Some(domain) = self.played_domains.remove(&old) {
-                bytes -= domain
-                    .models
-                    .iter()
-                    .map(|(grades, model)| {
-                        grades.capacity() * std::mem::size_of::<usize>()
-                            + (model.prefix.capacity() + model.perfect_prefix.capacity())
-                                * std::mem::size_of::<f64>()
-                    })
-                    .sum::<usize>()
-                    + domain.weights.capacity() * 64
-                    + domain.order_models.capacity() * std::mem::size_of::<usize>();
+                self.played_bytes -= domain.bytes + domain.weights.capacity() * 64;
             }
         }
     }
@@ -1342,7 +1642,35 @@ impl LiveObjective {
 }
 impl Objective for LiveObjective {
     fn seed_objective(&self) -> Option<Box<dyn Objective>> {
-        self.core.played_envelope.then(|| Box::new(crate::api::PowerObjective) as Box<dyn Objective>)
+        if !self.core.played_envelope {
+            return None;
+        }
+        Some(if let Some(weights) = &self.core.seed_weights {
+            let mut maxima = Vec::new();
+            let mut columns = Vec::new();
+            for column in 1..self.core.width {
+                let values: Vec<_> = weights
+                    .iter()
+                    .skip(column)
+                    .step_by(self.core.width)
+                    .copied()
+                    .collect();
+                let maximum = values.iter().copied().fold(0.0_f64, f64::max);
+                if maximum > 0.0 {
+                    maxima.push(maximum);
+                    columns.push(values);
+                }
+            }
+            maxima.sort_by(|a, b| b.total_cmp(a));
+            Box::new(AccuracySeed {
+                weights: weights.clone(),
+                width: self.core.width,
+                cap: maxima.into_iter().take(5).sum(),
+                columns,
+            }) as Box<dyn Objective>
+        } else {
+            Box::new(crate::api::PowerObjective)
+        })
     }
     fn seed_ready(&self, detail: &Value) -> bool { detail["scores"].is_object() }
     fn score_ties(&self) -> bool {
@@ -1423,7 +1751,7 @@ impl Objective for LiveObjective {
                 .map(|(&member, choices)| {
                     let mut groups: Vec<(usize, Vec<i32>)> = Vec::new();
                     for &snap in choices {
-                        let key = self.core.program(member, snap);
+                        let key = self.core.program_converters[self.core.program(member, snap)];
                         if let Some((_, group)) =
                             groups.iter_mut().find(|(profile, _)| *profile == key)
                         {
@@ -1447,7 +1775,62 @@ impl Objective for LiveObjective {
                     })
             })
         {
-            self.core.prepare_played_assignment(members, options);
+            self.core.prepare_played_assignment(members, options, false, false);
+        }
+        if self.max_bounds() {
+            self.core.prepare_max(members, options);
+        }
+    }
+    fn refine_assignment_domains(
+        &mut self,
+        members: &[usize],
+        options: &[Vec<i32>],
+    ) -> Option<Vec<Vec<Vec<i32>>>> {
+        if !self.core.broad_play || !self.core.recovery_observable(members, options) {
+            return None;
+        }
+        let mut split = false;
+        let groups = members
+            .iter()
+            .zip(options)
+            .map(|(&member, choices)| {
+                let mut groups: Vec<(usize, Vec<i32>)> = Vec::new();
+                for &snap in choices {
+                    let key = self.core.program(member, snap);
+                    if let Some((_, group)) = groups.iter_mut().find(|(program, _)| *program == key)
+                    {
+                        group.push(snap);
+                    } else {
+                        groups.push((key, vec![snap]));
+                    }
+                }
+                split |= groups.len() > 1;
+                groups.into_iter().map(|(_, group)| group).collect()
+            })
+            .collect();
+        split.then_some(groups)
+    }
+    fn prepare_assignment_domain(
+        &mut self,
+        members: &[usize],
+        options: &[Vec<i32>],
+        complete: bool,
+    ) {
+        if !self.core.broad_play {
+            self.prepare_assignment(members, options);
+            return;
+        }
+        self.core.played_assignment = None;
+        if complete {
+            let ignore_recovery = !self.core.recovery_observable(members, options);
+            let relaxed = !ignore_recovery
+                && members.iter().zip(options).any(|(&member, choices)| {
+                    choices.iter().any(|&snap| {
+                        self.core.program(member, snap) != self.core.program(member, choices[0])
+                    })
+                });
+            self.core
+                .prepare_played_assignment(members, options, ignore_recovery, relaxed);
         }
         if self.max_bounds() {
             self.core.prepare_max(members, options);
@@ -1459,9 +1842,10 @@ impl Objective for LiveObjective {
         totals: Totals,
         assigned: &[i32],
         from: usize,
-        _limit: f64,
+        limit: f64,
     ) -> Option<f64> {
-        if let Some(PlayedAssignment { base, rows, .. }) = &self.core.played_assignment {
+        if let Some(domain) = &self.core.played_assignment {
+            let (base, rows) = (&domain.base, &domain.rows);
             let mut skill = 0.0;
             let maximum = self.target.is_some() || self.criterion == Criterion::Max;
             for (index, row) in rows.iter().enumerate() {
@@ -1472,9 +1856,93 @@ impl Objective for LiveObjective {
                     .fold(f64::NEG_INFINITY, f64::max);
                 skill = (skill + weight).next_up();
             }
-            let high = totals.power * (if maximum { base.1 } else { base.0 } + skill)
-                / self.core.input.converted_count as f64
-                * (1.0 + RELATIVE_ERROR);
+            let scale = (1.0 + RELATIVE_ERROR) / self.core.input.converted_count as f64;
+            let base_skill = if maximum { base.1 } else { base.0 };
+            let mut high = totals.power * (base_skill + skill) * scale;
+            if self.target_max_bound(high) < limit {
+                return Some(self.target_max_bound(high));
+            }
+            let (mut fixed_power, mut fixed_skill) = (domain.power, base_skill);
+            for index in 0..from {
+                let column = if assigned[index] < 0 {
+                    self.core.power_width - 1
+                } else {
+                    assigned[index] as usize
+                };
+                fixed_power = (fixed_power
+                    + self.core.snap_power[members[index] * self.core.power_width + column])
+                    .next_up();
+                let row = rows[index]
+                    .iter()
+                    .find(|entry| entry.0 == assigned[index])?;
+                fixed_skill = (fixed_skill + if maximum { row.2 } else { row.1 }).next_up();
+            }
+            let mut lambda = ((base_skill + skill) / totals.power).sqrt();
+            if fixed_power >= 0.0 && fixed_skill >= 0.0 && lambda.is_finite() && lambda > 0.0 {
+                for _ in 0..3 {
+                    let (mut power, mut weight) = (fixed_power, fixed_skill);
+                    let mut sum = ((lambda * fixed_power).next_up()
+                        + (fixed_skill / lambda).next_up())
+                    .next_up();
+                    let price = |point: &(f64, f64)| {
+                        ((lambda * point.0).next_up() + (point.1 / lambda).next_up()).next_up()
+                    };
+                    for row in domain.frontiers.iter().skip(from) {
+                        let point = row[usize::from(maximum)]
+                            .iter()
+                            .max_by(|a, b| price(a).total_cmp(&price(b)))?;
+                        if point.0 < 0.0 || point.1 < 0.0 {
+                            return Some(self.target_max_bound(high));
+                        }
+                        sum = (sum + price(point)).next_up();
+                        power += point.0;
+                        weight += point.1;
+                    }
+                    high = high.min((((sum * sum).next_up() / 4.0).next_up() * scale).next_up());
+                    if self.target.is_none() && high < limit {
+                        break;
+                    }
+                    let columns = self.core.power_width - 1;
+                    for (slot, row) in rows.iter().enumerate() {
+                        let prices = &mut self.core.played_prices[slot];
+                        prices.clear();
+                        for &(snap, mean, maximum_weight) in row {
+                            if slot < from && snap != assigned[slot]
+                                || slot >= from && snap >= 0 && assigned[..from].contains(&snap)
+                            {
+                                continue;
+                            }
+                            let column = if snap < 0 { columns } else { snap as usize };
+                            let p = self.core.snap_power
+                                [members[slot] * self.core.power_width + column];
+                            let w = if maximum { maximum_weight } else { mean };
+                            prices.push((
+                                if snap < 0 { columns + slot } else { column },
+                                price(&(p, w)),
+                            ));
+                        }
+                    }
+                    let matching = self
+                        .core
+                        .played_matching
+                        .sparse_upper(&self.core.played_prices, columns);
+                    let matched = (((lambda * domain.power).next_up()
+                        + (base_skill / lambda).next_up())
+                    .next_up()
+                        + matching)
+                        .next_up();
+                    high = high
+                        .min((((matched * matched).next_up() / 4.0).next_up() * scale).next_up());
+                    if self.target.is_none() && high < limit {
+                        break;
+                    }
+                    let next = (weight / power).sqrt();
+                    if !next.is_finite() || next <= 0.0 || (next / lambda - 1.0).abs() < 1e-6 {
+                        break;
+                    }
+                    lambda = next;
+                }
+            }
             return Some(self.target_max_bound(high));
         }
         if self.max_bounds() {
@@ -1590,12 +2058,17 @@ impl Objective for LiveObjective {
         }
     }
     fn prefer_snap(&self, member: usize, snap: i32) -> f64 {
-        if self.core.drains {
-            if let Some(convert) = &self.core.slot(member,snap).convert {
-                if convert.at_start && convert.judgement>=3 && convert.judgements.iter().any(|&grade| grade<=2) {
-                    return self.core.max_recovery as f64 + 1.0;
+        if self.core.breaks_combo {
+            if let Some(convert) = &self.core.slot(member, snap).convert {
+                if convert.at_start
+                    && convert.judgement >= 3
+                    && convert.judgements.iter().any(|&grade| grade <= 2)
+                {
+                    return self.core.max_recovery as f64 + 1.0 + convert.limit.unwrap_or(0.0);
                 }
             }
+        }
+        if self.core.drains {
             self.core.slot(member, snap).recovery as f64
         } else {
             0.0
