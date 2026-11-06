@@ -258,7 +258,7 @@ impl FrameClock {
     pub fn advance_ms(self) -> i32 { (1000 + i32::from(self.0) - 1) / i32::from(self.0) }
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct Input {
     #[serde(default, rename = "frameRate", alias = "frame_rate")]
     pub clock: FrameClock,
@@ -407,7 +407,7 @@ struct Command {
     channel: usize,
     delta: i32,
 }
-fn effect_end(input: &Input, slot: &Slot, effect: &Effect, start: i32, judgements: Option<&[usize]>) -> i32 {
+pub(crate) fn effect_end(input: &Input, slot: &Slot, effect: &Effect, start: i32, judgements: Option<&[usize]>) -> i32 {
     let end = start + window_ms(effect.seconds, slot.extension_ms);
     if effect.release_judgements.is_empty()
         || judgements.is_none() && !effect.release_judgements.contains(&5)
@@ -1164,7 +1164,7 @@ fn conversion(input: &Input, slot: &Slot, convert: &Conversion, start: i32) -> C
         judgement: convert.judgement,
     }
 }
-fn converted_judgements(input: &Input, order: &[usize; 5], judgements: &[usize]) -> Vec<usize> {
+pub(crate) fn converted_judgements(input: &Input, order: &[usize; 5], judgements: &[usize]) -> Vec<usize> {
     let mut converted = judgements.to_vec();
     if input.slots.iter().all(|slot| slot.convert.is_none()) {
         return converted;
@@ -1216,6 +1216,33 @@ fn converted_judgements(input: &Input, order: &[usize; 5], judgements: &[usize])
     }
     converted
 }
+pub(crate) fn isolated_judgements(
+    input: &Input,
+    slot: &Slot,
+    event: usize,
+    grades: &[usize],
+) -> Vec<usize> {
+    let mut result = grades.to_vec();
+    let Some(program) = &slot.convert else {
+        return result;
+    };
+    let mut convert = conversion(input, slot, program, input.skill_times[event]);
+    for (index, grade) in result.iter_mut().enumerate() {
+        let time = input.times[index];
+        if time > convert.until {
+            break;
+        }
+        if time > convert.from && *grade != convert.judgement && convert.judgements.contains(grade)
+        {
+            *grade = convert.judgement;
+            convert.left -= 1.0;
+            if convert.left <= 0.0 {
+                break;
+            }
+        }
+    }
+    result
+}
 struct Factors {
     general: f64,
     channel: [f64; 7],
@@ -1237,6 +1264,8 @@ impl Factors {
     }
 }
 /// Custom-judgement scoring of one order; life replays are shared across calls.
+type PlayedRangeCache =
+    rustc_hash::FxHashMap<(usize, usize, [u64; 8], usize, usize), (f64, Option<f64>)>;
 struct PlayScorer<'a> {
     input: &'a Input,
     judgements: &'a [usize],
@@ -1244,134 +1273,403 @@ struct PlayScorer<'a> {
     firing: Vec<usize>,
     luck: f64,
     assist: f64,
-    life_cache: HashMap<([i32; 5], Vec<usize>), Lives>,
+    converter_ids: [usize; 5],
+    trajectories: Vec<(Vec<usize>, Vec<f64>)>,
+    trajectory_ids: HashMap<[usize; 5], usize>,
+    grade_buckets: HashMap<u64, Vec<usize>>,
+    life_cache: HashMap<([i32; 5], usize), (Lives, usize)>,
+    ranges: PlayedRangeCache,
+    cache_ranges: bool,
+    curve_enabled: bool,
+    curve_safe: bool,
+    last_curve: Option<f64>,
 }
 impl<'a> PlayScorer<'a> {
     fn new(input: &'a Input, judgements: &'a [usize]) -> Self {
         let t = f(f(input.adjustment * input.power as f64) * input.difficulty_factor);
+        let mut programs = HashMap::new();
+        let converter_ids = std::array::from_fn(|slot| {
+            let Some(value) = input.slots.get(slot).and_then(|slot| slot.convert.as_ref()) else {
+                return 0;
+            };
+            // Start-of-live programs retain their fixed actor order in this scorer.
+            if value.at_start {
+                return 0;
+            }
+            let skill = &input.slots[slot];
+            let duration = value.seconds.map_or_else(
+                || {
+                    window_ms(
+                        skill
+                            .effects
+                            .first()
+                            .map(|effect| effect.seconds)
+                            .unwrap_or(5.0),
+                        skill.extension_ms,
+                    )
+                },
+                |seconds| window_ms(seconds, 0.0),
+            );
+            let mut key = vec![
+                duration as u64,
+                value.limit.map_or(u64::MAX, f64::to_bits),
+                value.judgement as u64,
+            ];
+            key.extend(value.judgements.iter().map(|&grade| grade as u64));
+            let next = programs.len() + 1;
+            *programs.entry(key).or_insert(next)
+        });
+        let note: Vec<_> = input.note_frac.iter().map(|&v| f(v * t)).collect();
+        let mut actions = 0usize;
+        let mut magnitude = 1.0_f64;
+        for slot in &input.slots {
+            for effect in &slot.effects {
+                let count = if effect.kind == 2000 {
+                    1
+                } else {
+                    effect.judgements.len()
+                };
+                actions = actions.saturating_add(count.saturating_mul(2));
+                magnitude = (magnitude
+                    + f(effect.delta as f64 / 100000.0).abs() * count as f64 * 2.0)
+                    .next_up();
+            }
+            for factor in &slot.cumulative {
+                let count = usize::try_from(factor.cap)
+                    .unwrap_or(usize::MAX)
+                    .saturating_add(1);
+                actions = actions.saturating_add(count.saturating_mul(2));
+                magnitude =
+                    (magnitude + factor.magnitude_cap() / 100000.0 * count as f64 * 3.0).next_up();
+            }
+        }
+        let note_bound = note
+            .iter()
+            .map(|value| {
+                if value.is_finite() {
+                    value.abs()
+                } else {
+                    f64::INFINITY
+                }
+            })
+            .fold(0.0, f64::max);
+        let judge_bound = input
+            .judge_frac
+            .iter()
+            .map(|value| {
+                if value.is_finite() {
+                    value.abs()
+                } else {
+                    f64::INFINITY
+                }
+            })
+            .fold(0.0, f64::max);
+        let raw = f(f(input.luck_percent.min(200.0).abs() / 100.0
+            * f(note_bound * judge_bound * 2.0 * magnitude * 2.0))
+            / input.converted_count as f64)
+        .abs()
+            + 1.0;
+        let life = f(input.life_onus.abs().max(1.0) * raw).abs() + 1.0;
+        let bound = (f(input.assist.abs() * life).abs() + 1.0) * input.times.len() as f64;
+        let cache_ranges = actions as f64 * 2.0_f64.powi(-24) < 0.25
+            && bound.is_finite()
+            && bound < (1u64 << 50) as f64
+            && input
+                .combo_table
+                .iter()
+                .all(|row| row.1.is_finite() && row.1 >= 0.0);
+        let max_scalar = f(f(input.adjustment * i32::MAX as f64) * input.difficulty_factor).abs();
+        let max_fraction = input
+            .note_frac
+            .iter()
+            .copied()
+            .map(f64::abs)
+            .fold(0.0, f64::max);
+        let curve_safe = actions as f64 * 2.0_f64.powi(-24) < 0.25
+            && max_scalar.is_finite()
+            && max_scalar * max_fraction * judge_bound * 4.0 * magnitude < (f32::MAX as f64) / 4.0;
         Self {
             input,
             judgements,
-            note: input.note_frac.iter().map(|&v| f(v * t)).collect(),
+            note,
             firing: firing(input),
             luck: f(input.luck_percent.min(200.0) / 100.0),
             assist: f(input.assist),
+            converter_ids,
+            trajectories: Vec::new(),
+            trajectory_ids: HashMap::new(),
+            grade_buckets: HashMap::new(),
             life_cache: HashMap::new(),
+            ranges: rustc_hash::FxHashMap::default(),
+            cache_ranges,
+            curve_enabled: false,
+            curve_safe,
+            last_curve: None,
         }
     }
+    fn trajectory(&mut self, order: &[usize; 5]) -> usize {
+        let key = order.map(|slot| self.converter_ids[slot]);
+        if let Some(&index) = self.trajectory_ids.get(&key) {
+            return index;
+        }
+        let converted = converted_judgements(self.input, order, self.judgements);
+        use std::hash::{Hash, Hasher};
+        let mut hash = rustc_hash::FxHasher::default();
+        converted.hash(&mut hash);
+        let hash = hash.finish();
+        if let Some(indices) = self.grade_buckets.get(&hash) {
+            if let Some(&index) = indices
+                .iter()
+                .find(|&&index| self.trajectories[index].0 == converted)
+            {
+                self.trajectory_ids.insert(key, index);
+                return index;
+            }
+        }
+        let mut combos = Vec::with_capacity(converted.len());
+        let (mut pending, mut before, mut last) = (0, 0, -1);
+        for (i, &grade) in converted.iter().enumerate() {
+            if self.input.times[i] != last {
+                before = pending;
+                last = self.input.times[i];
+            }
+            combos.push(combo(&self.input.combo_table, before));
+            pending = if grade <= 2 { 0 } else { pending + 1 };
+        }
+        let index = self.trajectories.len();
+        self.trajectories.push((converted, combos));
+        self.trajectory_ids.insert(key, index);
+        self.grade_buckets.entry(hash).or_default().push(index);
+        index
+    }
     fn order(&mut self, order: &[usize; 5], delivery: Option<&Delivery>) -> f64 {
-        let (input, judgements, firing, note) = (self.input, self.judgements, &self.firing, &self.note);
+        let mut curve = self.curve_enabled.then_some(0.0_f64);
+        let trajectory = self.trajectory(order);
+        let (input, firing, note) = (self.input, &self.firing, &self.note);
         let (luck, assist) = (self.luck, self.assist);
         let n = input.times.len();
-    let recoveries = order.map(|slot| input.slots.get(slot).map(|s| s.recovery).unwrap_or(0));
-    let converted = converted_judgements(input, order, judgements);
-    let lives = self.life_cache
-        .entry((recoveries, converted.clone()))
-        .or_insert_with(|| lives(input, &converted, order, &input.slots));
-    let mut combos = Vec::with_capacity(n);
-    let (mut pending_combo, mut before, mut last) = (0, 0, -1);
-    for (i, &judgement) in converted.iter().enumerate() {
-        if input.times[i] != last { before = pending_combo; last = input.times[i]; }
-        combos.push(combo(&input.combo_table, before));
-        pending_combo = if judgement <= 2 { 0 } else { pending_combo + 1 };
-    }
-    let mut factors = Factors {
-        general: f(1.0),
-        channel: [0.0; 7],
-        active: Vec::new(),
-    };
-    let mut cursor = 0;
-    let cumulative = cumulative_commands(input, order, Some(&converted), delivery);
-    let mut pending = cumulative.into_iter().peekable();
-    let mut score = 0.0;
-    for i in 0..=n {
-        let time = if i < n {
-            input.times[i] as i64
-        } else {
-            1 << 53
+        let recoveries = order.map(|slot| input.slots.get(slot).map(|s| s.recovery).unwrap_or(0));
+        let (converted, combos) = &self.trajectories[trajectory];
+        let fallback_life_id = n + 1 + self.life_cache.len();
+        let (lives, life_id) = self
+            .life_cache
+            .entry((recoveries, trajectory))
+            .or_insert_with(|| {
+                let lives = lives(input, converted, order, &input.slots);
+                let first = lives.note.iter().position(|life| *life <= 0.0).unwrap_or(n);
+                let id = if lives.note[first..].iter().all(|life| *life <= 0.0) {
+                    first
+                } else {
+                    fallback_life_id
+                };
+                (lives, id)
+            });
+        let mut factors = Factors {
+            general: f(1.0),
+            channel: [0.0; 7],
+            active: Vec::new(),
         };
-        while cursor < firing.len() && input.skill_times[firing[cursor]] as i64 <= time {
-            let event = firing[cursor];
-            let start = input.skill_times[event];
-            while pending.peek().is_some_and(|command| command.time <= start) {
+        let mut cursor = 0;
+        let cumulative = cumulative_commands(input, order, Some(converted), delivery);
+        let mut pending = cumulative.into_iter().peekable();
+        let mut score = 0.0;
+        let mut i = 0;
+        while i <= n {
+            let time = if i < n {
+                input.times[i] as i64
+            } else {
+                1 << 53
+            };
+            while cursor < firing.len() && input.skill_times[firing[cursor]] as i64 <= time {
+                let event = firing[cursor];
+                let start = input.skill_times[event];
+                while pending.peek().is_some_and(|command| command.time <= start) {
+                    let command = pending.next().unwrap();
+                    factors.general = f(factors.general + f(command.delta as f64 / 100000.0));
+                }
+                factors.expire(start as i64);
+                if let Some(slot) = input.slots.get(order[event]) {
+                    for effect in &slot.effects {
+                        if effect.gate.blocks(lives.gate[&event]) {
+                            continue;
+                        }
+                        let end = effect_end(input, slot, effect, start, Some(converted));
+                        let diff = f(effect.delta as f64 / 100000.0);
+                        let channels = if effect.kind == 2000 {
+                            vec![0]
+                        } else {
+                            effect.judgements.clone()
+                        };
+                        for which in channels {
+                            if which == 0 {
+                                factors.general = f(factors.general + diff);
+                            } else {
+                                factors.channel[which] = f(factors.channel[which] + diff);
+                            }
+                            factors.active.push(Active {
+                                end,
+                                channel: which,
+                                delta: effect.delta,
+                            });
+                        }
+                    }
+                }
+                cursor += 1;
+            }
+            if i == n {
+                break;
+            }
+            factors.expire(time);
+            while pending
+                .peek()
+                .is_some_and(|command| command.time as i64 <= time)
+            {
                 let command = pending.next().unwrap();
                 factors.general = f(factors.general + f(command.delta as f64 / 100000.0));
             }
-            factors.expire(start as i64);
-            if let Some(slot) = input.slots.get(order[event]) {
-                for effect in &slot.effects {
-                    if effect.gate.blocks(lives.gate[&event]) {
-                        continue;
-                    }
-                    let end = effect_end(input, slot, effect, start, Some(&converted));
-                    let diff = f(effect.delta as f64 / 100000.0);
-                    let channels = if effect.kind == 2000 {
-                        vec![0]
-                    } else {
-                        effect.judgements.clone()
-                    };
-                    for which in channels {
-                        if which == 0 {
-                            factors.general = f(factors.general + diff);
-                        } else {
-                            factors.channel[which] = f(factors.channel[which] + diff);
-                        }
-                        factors.active.push(Active {
-                            end,
-                            channel: which,
-                            delta: effect.delta,
-                        });
-                    }
+            let next = if self.cache_ranges {
+                let mut boundary = 1i64 << 53;
+                if let Some(&event) = firing.get(cursor) {
+                    boundary = boundary.min(input.skill_times[event] as i64);
                 }
-            }
-            cursor += 1;
+                if let Some(command) = pending.peek() {
+                    boundary = boundary.min(command.time as i64);
+                }
+                for effect in &factors.active {
+                    boundary = boundary.min(effect.end as i64);
+                }
+                input
+                    .times
+                    .partition_point(|&time| (time as i64) < boundary)
+                    .max(i + 1)
+            } else {
+                i + 1
+            };
+            let collect_curve = self.curve_enabled;
+            let sum = || {
+                (i..next).fold(
+                    (0.0, collect_curve.then_some(0.0_f64)),
+                    |(sum, curve), index| {
+                        let judgement = converted[index];
+                        let up = f(factors.general + factors.channel[judgement]);
+                        let raw = f(f(luck
+                            * f(
+                                f(f(input.judge_frac[judgement] * note[index]) * combos[index])
+                                    * up,
+                            ))
+                            / input.converted_count as f64);
+                        let mut upper = raw;
+                        if lives.note[index] <= 0.0 {
+                            upper = f(input.life_onus * upper);
+                        }
+                        if assist != 1.0 {
+                            upper = f(assist * upper);
+                        }
+                        let mut value = raw.floor();
+                        if lives.note[index] <= 0.0 {
+                            value = f(input.life_onus * value).floor();
+                        }
+                        if assist != 1.0 {
+                            value = f(assist * value).floor();
+                        }
+                        (
+                            sum + value,
+                            curve.and_then(|total| {
+                                (upper.is_finite() && upper >= 0.0)
+                                    .then(|| (total + upper).next_up())
+                            }),
+                        )
+                    },
+                )
+            };
+            let (value, upper) = if self.cache_ranges {
+                if self.ranges.len() >= 4096 {
+                    self.ranges.clear();
+                }
+                let state = std::array::from_fn(|channel| {
+                    if channel == 0 {
+                        factors.general.to_bits()
+                    } else {
+                        factors.channel[channel - 1].to_bits()
+                    }
+                });
+                *self
+                    .ranges
+                    .entry((trajectory, *life_id, state, i, next))
+                    .or_insert_with(sum)
+            } else {
+                sum()
+            };
+            score += value;
+            curve = curve
+                .zip(upper)
+                .map(|(total, value)| (total + value).next_up());
+            i = next;
         }
-        if i == n {
-            break;
-        }
-        factors.expire(time);
-        while pending
-            .peek()
-            .is_some_and(|command| command.time as i64 <= time)
-        {
-            let command = pending.next().unwrap();
-            factors.general = f(factors.general + f(command.delta as f64 / 100000.0));
-        }
-        let judgement = converted[i];
-        let up = f(factors.general + factors.channel[judgement]);
-        let mut x = f(
-            f(luck * f(f(f(input.judge_frac[judgement] * note[i]) * combos[i]) * up))
-                / input.converted_count as f64,
-        )
-        .floor();
-        if lives.note[i] <= 0.0 {
-            x = f(input.life_onus * x).floor();
-        }
-        if assist != 1.0 {
-            x = f(assist * x).floor();
-        }
-        score += x;
-    }
+        self.last_curve = curve;
         score
     }
 }
-fn play(input: &Input, judgements: &[usize]) -> Result<Scores, String> {
+fn play(
+    input: &Input,
+    judgements: &[usize],
+    collect_curve: bool,
+) -> Result<(Scores, Option<[f64; 3]>), String> {
     let generation = crate::cancellation_generation();
     let mut scorer = PlayScorer::new(input, judgements);
+    scorer.curve_enabled = collect_curve
+        && scorer.curve_safe
+        && input.power > 0
+        && input.assist == 1.0
+        && input.luck_percent == 100.0
+        && (1e-6..=1e6).contains(&input.adjustment)
+        && (1e-6..=1e6).contains(&input.difficulty_factor)
+        && (0.0..=1.0).contains(&input.life_onus)
+        && input
+            .note_frac
+            .iter()
+            .all(|&value| value == 0.0 || (1e-6..=1e6).contains(&value))
+        && input
+            .judge_frac
+            .iter()
+            .all(|&value| value == 0.0 || (1e-6..=10.0).contains(&value));
     let mut scores = vec![0.0; 120];
+    let mut curves = vec![None; 120];
     let plan = plan(&input.slots);
     for &index in &plan.representatives {
         if generation != crate::cancellation_generation() {
             return Err("cancelled".into());
         }
         scores[index] = scorer.order(&orders()[index], None);
+        curves[index] = scorer.last_curve;
     }
     for (index, &source) in plan.sources.iter().enumerate() {
         scores[index] = scores[source];
+        curves[index] = curves[source];
     }
-    Ok(summarize(input.power, scores))
+    let curve = curves
+        .iter()
+        .copied()
+        .collect::<Option<Vec<_>>>()
+        .map(|values| {
+            [
+                (values
+                    .iter()
+                    .fold(0.0_f64, |sum, value| (sum + value).next_up())
+                    / 120.0)
+                    .next_up(),
+                values.iter().copied().fold(f64::INFINITY, f64::min),
+                values.iter().copied().fold(0.0, f64::max),
+            ]
+        });
+    Ok((summarize(input.power, scores), curve))
 }
 pub fn score(input: &Input) -> Result<Scores, String> {
+    score_internal(input, false).map(|value| value.0)
+}
+pub(crate) fn score_with_curve(input: &Input) -> Result<(Scores, Option<[f64; 3]>), String> {
+    score_internal(input, true)
+}fn score_internal(input:&Input,collect_curve:bool)->Result<(Scores,Option<[f64;3]>),String> {
     let n = input.times.len();
     if input.note_frac.len() != n
         || input.ap_combo.len() != n
@@ -1398,7 +1696,7 @@ pub fn score(input: &Input) -> Result<Scores, String> {
         if judgements.len() != n || judgements.iter().any(|&j| !(1..=6).contains(&j)) {
             return Err("invalid play judgements".into());
         }
-        play(input, judgements)
+        play(input, judgements,collect_curve)
     } else {
         let native_cumulative = input
             .slots
@@ -1406,9 +1704,9 @@ pub fn score(input: &Input) -> Result<Scores, String> {
             .flat_map(|slot| &slot.cumulative)
             .any(|factor| factor.requires_unbounded_bounds(n));
         if native_cumulative {
-            play(input, &vec![5; n])
+            play(input, &vec![5; n],collect_curve)
         } else {
-            Ok(ap(input))
+            Ok((ap(input),None))
         }
     }
 }

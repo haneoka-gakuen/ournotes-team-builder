@@ -534,7 +534,7 @@ struct ResolvedTeam {
     slots: Vec<live::Slot>,
 }
 
-struct PowerObjective;
+pub(crate) struct PowerObjective;
 impl crate::search::Objective for PowerObjective {
     fn exchange_snap_equivalent(&mut self, _member: usize, _a: i32, _b: i32) -> bool {
         true

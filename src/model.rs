@@ -12,6 +12,149 @@ pub struct Linear {
     pub total: f64,
     pub life_at: HashMap<usize, f64>,
     pub absolute_error: f64,
+    pub ignore_gates: bool,
+    pub conversion_combo: Vec<f64>,
+    pub release_windows: Vec<ReleaseWindow>,
+}
+#[derive(Clone)]
+pub struct ReleaseWindow { event: Option<usize>, from: i32, until: i32, sources: u8, target: usize }
+pub fn prepare_releases(input: &Input, slots: &[Slot]) -> Vec<ReleaseWindow> {
+    let mut seen = std::collections::HashSet::new();
+    let mut windows = Vec::new();
+    for slot in slots {
+        let Some(convert) = &slot.convert else {
+            continue;
+        };
+        let duration = convert.seconds.map_or_else(
+            || {
+                window_ms(
+                    slot.effects.first().map(|e| e.seconds).unwrap_or(5.0),
+                    slot.extension_ms,
+                )
+            },
+            |seconds| window_ms(seconds, 0.0),
+        );
+        let sources = convert
+            .judgements
+            .iter()
+            .fold(0u8, |mask, &grade| mask | (1 << grade));
+        for event in 0..if convert.at_start {
+            1
+        } else {
+            input.skill_times.len().min(5)
+        } {
+            let id = (!convert.at_start).then_some(event);
+            let from = input
+                .clock
+                .frame_time(id.map_or(0, |i| input.skill_times[i]));
+            let until = input.clock.frame_time(from.saturating_add(duration));
+            if seen.insert((id, from, until, sources, convert.judgement)) {
+                windows.push(ReleaseWindow {
+                    event: id,
+                    from,
+                    until,
+                    sources,
+                    target: convert.judgement,
+                });
+            }
+        }
+    }
+    windows
+}
+fn release_end(
+    model: &Linear,
+    input: &Input,
+    slot: &Slot,
+    effect: &live::Effect,
+    event: usize,
+    start: i32,
+    length: i32,
+) -> i32 {
+    let end = start.saturating_add(length);
+    let Some(grades) = input.judgements.as_ref() else {
+        return end;
+    };
+    if effect.release_judgements.is_empty() {
+        return end;
+    }
+    let mask = effect
+        .release_judgements
+        .iter()
+        .fold(0u8, |mask, &grade| mask | (1 << grade));
+    let relaxed = |candidate| {
+        if model.release_windows.iter().any(|window| {
+            window.event != Some(event)
+                && window.until >= start
+                && window.from < candidate
+                && window.sources & mask != 0
+                && mask & (1 << window.target) == 0
+        }) {
+            end
+        } else {
+            candidate
+        }
+    };
+    let convert = slot
+        .convert
+        .as_ref()
+        .filter(|convert| mask & (1 << convert.judgement) == 0);
+    let mut budget = convert.map_or(0.0, |convert| {
+        convert.limit.unwrap_or(f64::INFINITY).ceil().max(1.0)
+    });
+    let from = convert.map_or(0, |convert| {
+        input
+            .clock
+            .frame_time(if convert.at_start { 0 } else { start })
+    });
+    let until = convert.map_or(0, |convert| {
+        let duration = convert.seconds.map_or_else(
+            || {
+                window_ms(
+                    slot.effects.first().map(|e| e.seconds).unwrap_or(5.0),
+                    slot.extension_ms,
+                )
+            },
+            |seconds| window_ms(seconds, 0.0),
+        );
+        input.clock.frame_time(from.saturating_add(duration))
+    });
+    let after_execute = input
+        .clock
+        .frame_time(input.clock.frame_time(start).saturating_add(1));
+    let deadline = input.clock.frame_time(end.saturating_add(1));
+    let mut first = input
+        .times
+        .partition_point(|&time| input.clock.frame_time(time) <= after_execute);
+    while first < input.times.len() {
+        let frame = input.clock.frame_time(input.times[first]);
+        if frame > deadline {
+            break;
+        }
+        let after = first
+            + input.times[first..].partition_point(|&time| input.clock.frame_time(time) <= frame);
+        let mut last = None;
+        let mut unavoidable = false;
+        for (i, &grade) in grades.iter().enumerate().take(after).skip(first) {
+            if mask & (1 << grade) == 0 {
+                continue;
+            }
+            last = Some(i);
+            if budget > 0.0
+                && input.times[i] > from
+                && input.times[i] <= until
+                && convert.is_some_and(|convert| convert.judgements.contains(&grade))
+            {
+                budget -= 1.0;
+            } else {
+                unavoidable = true;
+            }
+        }
+        if unavoidable {
+            return relaxed(end.min(input.times[last.unwrap()]));
+        }
+        first = after;
+    }
+    end
 }
 fn combo(table: &[(usize, f64)], count: usize) -> f64 {
     let mut value = 0.0;
@@ -39,6 +182,9 @@ pub fn linear(input: &Input) -> Linear {
             .map(|e| (e, input.life_base))
             .collect(),
         absolute_error: input.times.len() as f64 + 1.0,
+        ignore_gates: false,
+        conversion_combo: Vec::new(),
+        release_windows: Vec::new(),
     }
 }
 pub fn linear_play(
@@ -101,12 +247,197 @@ pub fn linear_play(
         total: sum,
         life_at,
         absolute_error: n as f64 + 1.0,
+        ignore_gates: false,
+        conversion_combo: Vec::new(),
+        release_windows: Vec::new(),
+    }
+}
+pub fn relaxed_play(input: &Input, grades: &[usize], slots: &[Slot], width: usize) -> Linear {
+    let n = input.times.len();
+    let mut repairs = Vec::new();
+    let mut heals = Vec::new();
+    for column in 1..width {
+        let mut repair = 0usize;
+        let mut heal = 0i32;
+        for slot in slots.iter().skip(column).step_by(width) {
+            heal = heal.max(slot.recovery);
+            if let Some(convert) = &slot.convert {
+                if convert.judgements.iter().any(|&grade| grade <= 2) {
+                    repair = repair.max(convert.limit.map_or(n, |limit| {
+                        if limit.is_finite() {
+                            limit.ceil().max(1.0).min(n as f64) as usize
+                        } else {
+                            n
+                        }
+                    }));
+                }
+            }
+        }
+        repairs.push(repair);
+        heals.push(heal);
+    }
+    relaxed_play_limits(input, grades, repairs, heals)
+}
+pub(crate) fn relaxed_play_limits(
+    input: &Input,
+    grades: &[usize],
+    mut repairs: Vec<usize>,
+    mut heals: Vec<i32>,
+) -> Linear {
+    let n = input.times.len();
+    repairs.sort_unstable_by(|a, b| b.cmp(a));
+    heals.sort_unstable_by(|a, b| b.cmp(a));
+    let budget = repairs.into_iter().take(5).sum::<usize>().min(n);
+    let mut healing = [0.0; 6];
+    for (i, heal) in heals.into_iter().take(5).enumerate() {
+        healing[i + 1] = healing[i] + heal as f64;
+    }
+    for i in 1..=5 {
+        healing[i] = healing[i].max(healing[i - 1]);
+    }
+    let mut damage_order: Vec<_> = (1..=6).collect();
+    damage_order.sort_unstable_by(|&a, &b| input.damage[b].total_cmp(&input.damage[a]));
+    let resets: Vec<_> = grades
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &grade)| (grade <= 2).then_some(i))
+        .collect();
+    let mut counts = [0usize; 7];
+    let mut damage_prefix = vec![0.0; n + 1];
+    let mut total_damage = 0.0;
+    for (i, &grade) in grades.iter().enumerate() {
+        counts[grade] += 1;
+        total_damage += input.damage[grade];
+        let mut remaining = budget;
+        let mut saved = 0.0;
+        for &kind in &damage_order {
+            let used = remaining.min(counts[kind]);
+            saved += used as f64 * input.damage[kind];
+            remaining -= used;
+        }
+        damage_prefix[i + 1] = (total_damage - saved).max(0.0);
+    }
+    let magnitude = input.life_base + total_damage + healing[5];
+    let exact_life = input.life_base.fract() == 0.0
+        && input.damage.iter().all(|damage| damage.fract() == 0.0)
+        && magnitude < 2.0_f64.powi(52);
+    let life_slack = if exact_life {
+        0.0
+    } else {
+        (n as f64 * 16.0 + 64.0) * f64::EPSILON * magnitude
+    };
+    let heal_at = |time: i32| {
+        healing[input
+            .skill_times
+            .iter()
+            .take(5)
+            .filter(|&&start| start <= time)
+            .count()]
+    };
+    let mut prefix = vec![0.0; n + 1];
+    let mut perfect_prefix = vec![0.0; n + 1];
+    let mut conversion_combo = Vec::with_capacity(n);
+    let (mut before, mut last, mut dead) = (0, -1, None);
+    let unit = input.adjustment * input.difficulty_factor;
+    for (i, &grade) in grades.iter().enumerate() {
+        let time = input.times[i];
+        if time != last {
+            before = i;
+            last = time;
+        }
+        let count = resets.partition_point(|&index| index < before);
+        let combo_count = if count > budget {
+            before - resets[count - budget - 1] - 1
+        } else {
+            before
+        };
+        let upper_life = input.life_base + heal_at(time) - damage_prefix[i + 1] + life_slack;
+        if upper_life <= 0.0 && dead.is_none() {
+            dead = Some(i);
+        }
+        let penalty = if dead.is_some() { input.life_onus } else { 1.0 };
+        let multiplier = combo(&input.combo_table, combo_count) * penalty;
+        conversion_combo.push(multiplier);
+        let value = unit * input.note_frac[i] * multiplier;
+        prefix[i + 1] = prefix[i] + value * input.judge_frac[grade];
+        perfect_prefix[i + 1] = perfect_prefix[i]
+            + if grade == 5 {
+                value * input.judge_frac[5]
+            } else {
+                0.0
+            };
+    }
+    let life_at = input
+        .skill_times
+        .iter()
+        .enumerate()
+        .map(|(event, &time)| {
+            let frame = input.clock.frame_time(time);
+            let after = input.times.partition_point(|&note| note <= frame);
+            let life = if dead.is_some_and(|index| index < after) {
+                0.0
+            } else {
+                (input.life_base + heal_at(frame) - damage_prefix[after] + life_slack)
+                    .clamp(0.0, input.life_base * 2.0)
+            };
+            (event, life)
+        })
+        .collect();
+    Linear {
+        total: prefix[n],
+        prefix,
+        perfect_prefix,
+        life_at,
+        absolute_error: n as f64 + 1.0,
+        ignore_gates: true,
+        conversion_combo,
+        release_windows: Vec::new(),
     }
 }
 pub fn window_weight(prefix: &[f64], input: &Input, start: i32, length: i32) -> f64 {
     let a = input.times.partition_point(|&t| t < start);
     let b = input.times.partition_point(|&t| t < start + length);
     prefix[b] - prefix[a]
+}
+fn cumulative_upper(
+    prefix: &[f64],
+    input: &Input,
+    factor: &live::Cumulative,
+    start: i32,
+    grades: Option<&[usize]>,
+) -> f64 {
+    if factor.judgements.is_empty() {
+        return 0.0;
+    }
+    let end = start.saturating_add(factor.bound_duration_ms());
+    let activation = input.clock.frame_time(start);
+    let mut first = input
+        .times
+        .partition_point(|&time| input.clock.frame_time(time) < activation);
+    let mut cursor = input.times.partition_point(|&time| time < start);
+    let finish = input.times.partition_point(|&time| time < end);
+    let (mut count, mut applied, mut total) = (0, 0, 0.0);
+    while first < input.times.len() {
+        let frame = input.clock.frame_time(input.times[first]);
+        if frame > end {
+            break;
+        }
+        let after = first
+            + input.times[first..].partition_point(|&time| input.clock.frame_time(time) <= frame);
+        count += (first..after)
+            .filter(|&index| grades.is_none_or(|grades| factor.judgements.contains(&grades[index])))
+            .count() as i32;
+        let mill = factor.mill(count);
+        if mill != applied {
+            let time = if frame == activation { start } else { frame };
+            let next = input.times.partition_point(|&note| note < time).min(finish);
+            total += f(applied as f64 / 100000.0) * (prefix[next] - prefix[cursor]);
+            cursor = next;
+            applied = mill;
+        }
+        first = after;
+    }
+    total + f(applied as f64 / 100000.0) * (prefix[finish] - prefix[cursor])
 }
 #[derive(Clone)]
 pub struct Weights {
@@ -123,20 +454,24 @@ pub fn skill_weights(
 ) -> Weights {
     let mut per_event = [0.0; 5];
     for effect in &skill.effects {
-        if effect.kind == 2004 && !effect.judgements.contains(&5) {
+        if effect.kind == 2004 && !effect.judgements.contains(&5) && !model.ignore_gates {
             continue;
         }
         let factor = f(effect.delta as f64 / 100000.0);
         let length = window_ms(effect.seconds, skill.extension_ms);
-        let prefix = if effect.kind == 2004 {
+        let prefix = if effect.kind == 2004 && (!model.ignore_gates || effect.judgements.iter()
+            .all(|&grade| grade==5 || grade==6 || input.judge_frac[grade]==0.0)) {
             &model.perfect_prefix
         } else {
             &model.prefix
         };
         for (event, &start) in input.skill_times.iter().enumerate().take(5) {
-            if effect.gate.blocks(model.life_at[&event]) {
+            if !model.ignore_gates && effect.gate.blocks(model.life_at[&event]) {
                 continue;
             }
+            if model.ignore_gates && effect.gate.kind==1 && effect.gate.positive
+                && effect.gate.blocks(model.life_at[&event]) { continue; }
+            let length=if model.ignore_gates {release_end(model,input,skill,effect,event,start,length)-start}else{length};
             per_event[event] += factor * window_weight(prefix, input, start, length);
         }
     }
@@ -145,7 +480,9 @@ pub fn skill_weights(
             let delta = f(factor.at_cap() as f64 / 100000.0);
             let length = factor.bound_duration_ms();
             for (event, &start) in input.skill_times.iter().enumerate().take(5) {
-                per_event[event] += delta * window_weight(&model.prefix, input, start, length);
+                per_event[event] += if model.ignore_gates {
+                    cumulative_upper(&model.prefix, input, factor, start, None)
+                } else { delta * window_weight(&model.prefix, input, start, length) };
             }
         }
     }
@@ -162,6 +499,8 @@ pub fn conversion_weights(
     judgements: &[usize],
     skill: &Slot,
     factor_cap: f64,
+    perfect_cap: Option<f64>,
+    conversion_combo: &[f64],
 ) -> [f64; 5] {
     let mut out = [0.0; 5];
     let Some(convert) = &skill.convert else {
@@ -170,17 +509,23 @@ pub fn conversion_weights(
     let unit = input.adjustment * input.difficulty_factor;
     let perfect = input.judge_frac[5];
     for (event, &time) in input.skill_times.iter().enumerate().take(5) {
-        let start = input.times.partition_point(|&t| t < time);
-        let end = input.times.partition_point(|&t| {
-            t < time
-                + window_ms(
-                    skill.effects.first().map(|e| e.seconds).unwrap_or(5.0),
-                    skill.extension_ms,
-                )
-        });
+        let from = input.clock.frame_time(time);
+        let duration = convert.seconds.map_or_else(
+            || window_ms(skill.effects.first().map(|e| e.seconds).unwrap_or(5.0), skill.extension_ms),
+            |seconds| window_ms(seconds, 0.0),
+        );
+        let start = if convert.at_start { 0 } else { input.times.partition_point(|&t| t <= from) };
+        let until = input.clock.frame_time(from.saturating_add(duration));
+        let end = if convert.at_start { input.times.len() } else { input.times.partition_point(|&t| t <= until) };
         let mut values: Vec<_> = (start..end)
             .filter(|&i| convert.judgements.contains(&judgements[i]))
-            .map(|i| unit * input.note_frac[i] * 2.0 * perfect)
+            .map(|i| match perfect_cap {
+                Some(cap) => unit * input.note_frac[i] * input.ap_combo[i]
+                    * ((perfect - input.judge_frac[judgements[i]]).max(0.0) * factor_cap
+                        + input.judge_frac[judgements[i]] * cap),
+                None => unit * input.note_frac[i] * conversion_combo.get(i).copied().unwrap_or(2.0)
+                    * if conversion_combo.is_empty() {perfect} else {input.judge_frac[convert.judgement]} * factor_cap,
+            })
             .collect();
         values.sort_by(|a, b| b.total_cmp(a));
         let limit = convert.limit.unwrap_or(f64::INFINITY);
@@ -191,7 +536,7 @@ pub fn conversion_weights(
             }
             sum += value;
         }
-        out[event] = sum * factor_cap;
+        out[event] = sum;
     }
     out
 }
@@ -448,4 +793,100 @@ impl PlayBounds {
             power * high / divisor * (1.0 + RELATIVE_ERROR),
         )
     }
+}
+
+/// Disjoint activations cannot exchange conversions or affect each other's counters.
+pub(crate) fn isolated_play_weights(
+    input: &Input,
+    slot: &Slot,
+    events: &[bool; 5],
+    original: &Linear,
+) -> [Option<f64>; 5] {
+    std::array::from_fn(|event| {
+        if !events[event] || event >= input.skill_times.len() {
+            return None;
+        }
+        let original_grades = input.judgements.as_ref().unwrap();
+        if slot.convert.is_none() {
+            return Some(played_weight(input, original, original_grades, slot, event));
+        }
+        let grades = live::isolated_judgements(input, slot, event, original_grades);
+        let model = linear_play(input, &grades, true, 0, 1.0, 0);
+        Some(
+            model.total - original.prefix[input.times.len()]
+                + played_weight(input, &model, &grades, slot, event),
+        )
+    })
+}
+
+pub(crate) fn played_linear(input: &Input, grades: &[usize], lives: &live::Lives) -> Linear {
+    let n = input.times.len();
+    let mut prefix = vec![0.0; n + 1];
+    let mut perfect_prefix = vec![0.0; n + 1];
+    let (mut pending, mut before, mut last) = (0, 0, -1);
+    for (index, &grade) in grades.iter().enumerate() {
+        if input.times[index] != last {
+            before = pending;
+            last = input.times[index];
+        }
+        let penalty = if lives.note[index] > 0.0 {
+            1.0
+        } else {
+            input.life_onus
+        };
+        let value = input.adjustment
+            * input.difficulty_factor
+            * input.note_frac[index]
+            * combo(&input.combo_table, before)
+            * input.judge_frac[grade]
+            * penalty;
+        prefix[index + 1] = prefix[index] + value;
+        perfect_prefix[index + 1] = perfect_prefix[index] + if grade == 5 { value } else { 0.0 };
+        pending = if grade <= 2 { 0 } else { pending + 1 };
+    }
+    Linear {
+        total: prefix[n],
+        prefix,
+        perfect_prefix,
+        life_at: lives.gate.clone(),
+        absolute_error: n as f64 + 1.0,
+        ignore_gates: false,
+        conversion_combo: Vec::new(),
+        release_windows: Vec::new(),
+    }
+}
+pub(crate) fn played_weight(
+    input: &Input,
+    model: &Linear,
+    grades: &[usize],
+    slot: &Slot,
+    event: usize,
+) -> f64 {
+    let start = input.skill_times[event];
+    let mut value = 0.0;
+    for effect in &slot.effects {
+        if !model.ignore_gates && effect.gate.blocks(model.life_at[&event]) {
+            continue;
+        }
+        if model.ignore_gates
+            && effect.gate.kind == 1
+            && effect.gate.positive
+            && effect.gate.blocks(model.life_at[&event])
+        {
+            continue;
+        }
+        let end = live::effect_end(input, slot, effect, start, Some(grades));
+        let first = input.times.partition_point(|&time| time < start);
+        let last = input.times.partition_point(|&time| time < end);
+        for (index, &grade) in grades.iter().enumerate().take(last).skip(first) {
+            if effect.kind == 2000 || effect.judgements.contains(&grade) {
+                value += f(effect.delta as f64 / 100000.0)
+                    * (model.prefix[index + 1] - model.prefix[index]);
+            }
+        }
+    }
+    for factor in &slot.cumulative {
+        value += cumulative_upper(&model.prefix, input, factor, start, Some(grades));
+    }
+    value
 }
