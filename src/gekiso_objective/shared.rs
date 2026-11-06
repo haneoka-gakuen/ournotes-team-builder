@@ -187,6 +187,11 @@ impl<'k, 'a> Combined<'k, 'a> {
                     let n = song.adapter.kernel.chart.full.converted as f64;
                     let (b, scale, residual) = if let Some(bound) = &song.adapter.deterministic {
                         (bound.base, (1.0 / n).next_up(), 0.0)
+                    } else if let Some(coefficient) = song.adapter.coarse_coefficient {
+                        if !coefficient.is_finite() {
+                            return None;
+                        }
+                        (coefficient, 1.0, 0.0)
                     } else if let Some(data) = &song.adapter.data {
                         (
                             data.weights.base,

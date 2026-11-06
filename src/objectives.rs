@@ -42,11 +42,12 @@ pub(crate) struct Pair {
     pub high: Weights,
     pub low: Weights,
 }
+type PlayedFrontiers = [Vec<(f64, f64)>; 2];
 struct PlayedAssignment {
     members: Vec<usize>,
     base: (f64, f64),
-    rows: Vec<Vec<(i32, f64, f64)>>,
-    frontiers: Vec<[Vec<(f64, f64)>; 2]>,
+    rows: Vec<Arc<Vec<(i32, f64, f64)>>>,
+    frontiers: Vec<Arc<PlayedFrontiers>>,
     power: f64,
 }
 // A fixed conversion and recovery program leaves only additive skill coefficients.
@@ -65,6 +66,13 @@ struct PlayedDomain {
     frequencies: [Vec<(usize, usize, u32)>; 5],
     base: (f64, f64),
     weights: FxHashMap<(usize, usize), (f64, f64)>,
+    rows: FxHashMap<(usize, usize), PlayedRow>,
+    bytes: usize,
+}
+struct PlayedRow {
+    available: Vec<bool>,
+    values: Arc<Vec<(i32, f64, f64)>>,
+    frontiers: Arc<PlayedFrontiers>,
     bytes: usize,
 }
 struct AccuracySeed {
@@ -154,6 +162,7 @@ pub struct LiveCore {
     played_lives: FxHashMap<(usize, [i32; 5], bool), Arc<PlayedModel>>,
     played_models: FxHashMap<(usize, usize, [usize; 5], bool), Arc<PlayedModel>>,
     played_weights: FxHashMap<(usize, usize, usize), f64>,
+    cumulative_ids: Vec<Vec<usize>>,
     next_trajectory: usize,
     next_model: usize,
     played_domains: FxHashMap<(bool, [usize; 5]), PlayedDomain>,
@@ -163,6 +172,7 @@ pub struct LiveCore {
     played_assignment: Option<PlayedAssignment>,
     played_matching: crate::assignment::Scratch,
     played_prices: [Vec<(usize, f64)>; 5],
+    played_allowed: [Vec<bool>; 5],
     pub slots: Arc<Vec<Slot>>,
     _play_profile: Arc<skills::Played>,
     ids: Vec<usize>,
@@ -311,6 +321,23 @@ impl LiveCore {
             );
         }
         let (ids, intern_len) = (play_profile.ids.clone(), play_profile.shapes);
+        // Component IDs follow complete slot IDs in the shared coefficient cache.
+        let cumulative_ids = if input.judgements.is_some() {
+            let mut factors = FxHashMap::default();
+            let mut programs = vec![Vec::new(); intern_len];
+            for (slot, &shape) in slots.iter().zip(&ids) {
+                if !programs[shape].is_empty() || slot.cumulative.is_empty() {
+                    continue;
+                }
+                programs[shape] = slot.cumulative.iter().map(|factor| {
+                    let key = (factor.judgements.clone(), factor.unit, factor.value,
+                        factor.maximum, factor.cap, factor.seconds.to_bits());
+                    let next = intern_len + factors.len();
+                    *factors.entry(key).or_insert(next)
+                }).collect();
+            }
+            programs
+        } else { Vec::new() };
         let unbounded_cumulative = slots
             .iter()
             .flat_map(|slot| &slot.cumulative)
@@ -680,6 +707,7 @@ impl LiveCore {
             played_lives: FxHashMap::default(),
             played_models: FxHashMap::default(),
             played_weights: FxHashMap::default(),
+            cumulative_ids,
             next_trajectory: 0,
             next_model: 0,
             played_domains: FxHashMap::default(),
@@ -689,6 +717,7 @@ impl LiveCore {
             played_assignment: None,
             played_matching: crate::assignment::Scratch::default(),
             played_prices: std::array::from_fn(|_| Vec::new()),
+            played_allowed: std::array::from_fn(|_| Vec::new()),
             slots,
             _play_profile: play_profile,
             ids,
@@ -1340,8 +1369,17 @@ impl LiveCore {
             let mut models: Vec<Arc<PlayedModel>> = Vec::new();
             let mut contexts = FxHashMap::default();
             let mut order_models = Vec::with_capacity(120);
+            let mut program_contexts = FxHashMap::<[usize; 5], usize>::default();
             let (mut mean, mut maximum) = (0.0, 0.0_f64);
             for order in live::orders() {
+                let program_order = order.map(|position| key[position]);
+                if let Some(&context) = program_contexts.get(&program_order) {
+                    let value = models[context].linear.total;
+                    mean += value / 120.0;
+                    maximum = maximum.max(value);
+                    order_models.push(context);
+                    continue;
+                }
                 let mut trajectory_key = [0; 10];
                 let mut registered = 0;
                 for (position, &program) in key.iter().enumerate() {
@@ -1432,6 +1470,7 @@ impl LiveCore {
                     index
                 });
                 let value = model.linear.total;
+                program_contexts.insert(program_order, context);
                 mean += value / 120.0;
                 maximum = maximum.max(value);
                 order_models.push(context);
@@ -1473,6 +1512,7 @@ impl LiveCore {
                 frequencies,
                 base: ((mean + error).next_up(), (maximum + error).next_up()),
                 weights: FxHashMap::default(),
+                rows: FxHashMap::default(),
                 bytes,
             }
         });
@@ -1480,71 +1520,68 @@ impl LiveCore {
             self.played_bytes += domain.bytes;
         }
         let capacity = domain.weights.capacity();
-        let rows: Vec<Vec<(i32, f64, f64)>> = members
-            .iter()
-            .enumerate()
-            .zip(options)
-            .map(|((position, &member), choices)| {
-                choices
-                    .iter()
-                    .map(|&snap| {
-                        let at = member * self.width + (snap + 1) as usize;
-                        let shape = self.ids[at];
-                        let weights = domain
-                            .weights
-                            .entry((positions[position], shape))
-                            .or_insert_with(|| {
-                                let slot = &self.slots[at];
-                                let (mut mean, mut maximum) = (0.0, 0.0_f64);
-                                for &(context, event, count) in
-                                    &domain.frequencies[positions[position]]
-                                {
-                                    let model = &domain.models[context];
-                                    let value = *self
-                                        .played_weights
-                                        .entry((model.id, shape, event))
-                                        .or_insert_with(|| {
-                                            model::played_weight(
-                                                &self.input,
-                                                &model.linear,
-                                                &model.grades,
-                                                slot,
-                                                event,
-                                            )
-                                        });
-                                    mean = (mean
-                                        + ((value * count as f64).next_up() / 120.0).next_up())
-                                    .next_up();
-                                    maximum = maximum.max(value);
-                                }
-                                (mean.next_up(), maximum.next_up())
-                            });
-                        (snap, weights.0, weights.1)
-                    })
-                    .collect()
-            })
-            .collect();
-        self.played_bytes += (domain.weights.capacity() - capacity) * 64;
-        let frontiers = members
-            .iter()
-            .zip(&rows)
-            .map(|(&member, row)| {
-                std::array::from_fn(|criterion| {
-                    let mut points: Vec<_> = row
-                        .iter()
-                        .map(|&(snap, mean, maximum)| {
-                            let column = if snap < 0 {
-                                self.power_width - 1
-                            } else {
-                                snap as usize
-                            };
-                            (
-                                self.snap_power[member * self.power_width + column],
-                                if criterion == 0 { mean } else { maximum },
-                            )
-                        })
-                        .collect();
-                    points.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| b.1.total_cmp(&a.1)));
+        let row_capacity = domain.rows.capacity();
+        let bytes = domain.bytes;
+        let mut rows = Vec::with_capacity(5);
+        let mut frontiers = Vec::with_capacity(5);
+        for ((position, &member), choices) in members.iter().enumerate().zip(options) {
+            let allowed = &mut self.played_allowed[position];
+            allowed.resize(self.width, false);
+            allowed.fill(false);
+            for &snap in choices {
+                allowed[(snap + 1) as usize] = true;
+            }
+            let cached = domain.rows.entry((positions[position], member)).or_insert_with(|| PlayedRow {
+                available: vec![false; self.width],
+                values: Arc::new(Vec::new()),
+                frontiers: Arc::new(std::array::from_fn(|_| Vec::new())),
+                bytes: 0,
+            });
+            let mut extended = false;
+            for &snap in choices {
+                let column = (snap + 1) as usize;
+                if cached.available[column] {
+                    continue;
+                }
+                let at = member * self.width + column;
+                let shape = self.ids[at];
+                let weights = *domain.weights.entry((positions[position], shape)).or_insert_with(|| {
+                    let slot = &self.slots[at];
+                    let (mut mean, mut maximum) = (0.0, 0.0_f64);
+                    for &(context, event, count) in &domain.frequencies[positions[position]] {
+                        let model = &domain.models[context];
+                        let weight_key = (model.id, shape, event);
+                        let value = if let Some(&value) = self.played_weights.get(&weight_key) {
+                            value
+                        } else {
+                            let mut value = model::played_effect_weight(
+                                &self.input, &model.linear, &model.grades, slot, event,
+                            );
+                            for (factor, &id) in slot.cumulative.iter().zip(&self.cumulative_ids[shape]) {
+                                value += *self.played_weights.entry((model.id, id, event)).or_insert_with(|| {
+                                    model::cumulative_upper(&model.linear.prefix, &self.input, factor,
+                                        self.input.skill_times[event], Some(&model.grades))
+                                });
+                            }
+                            self.played_weights.insert(weight_key, value);
+                            value
+                        };
+                        mean = (mean + ((value * count as f64).next_up() / 120.0).next_up()).next_up();
+                        maximum = maximum.max(value);
+                    }
+                    (mean.next_up(), maximum.next_up())
+                });
+                Arc::make_mut(&mut cached.values).push((snap, weights.0, weights.1));
+                cached.available[column] = true;
+                extended = true;
+            }
+            if extended {
+                cached.frontiers = Arc::new(std::array::from_fn(|criterion| {
+                    let mut points: Vec<_> = cached.values.iter().map(|&(snap, mean, maximum)| {
+                        let column = if snap < 0 { self.power_width - 1 } else { snap as usize };
+                        (self.snap_power[member * self.power_width + column], if criterion == 0 { mean } else { maximum })
+                    }).collect();
+                    points.sort_by(|a,b| b.0.total_cmp(&a.0).then_with(|| b.1.total_cmp(&a.1)));
                     let mut weight = f64::NEG_INFINITY;
                     points.retain(|point| {
                         let keep = point.1 > weight;
@@ -1552,9 +1589,20 @@ impl LiveCore {
                         keep
                     });
                     points
-                })
-            })
-            .collect();
+                }));
+                let row_bytes = cached.available.capacity()
+                    + cached.values.capacity() * std::mem::size_of::<(i32, f64, f64)>()
+                    + cached.frontiers.iter().map(|row| row.capacity() * std::mem::size_of::<(f64,f64)>()).sum::<usize>();
+                domain.bytes = domain.bytes - cached.bytes + row_bytes;
+                cached.bytes = row_bytes;
+            }
+            // Previously seen choices remain a superset used only for upper bounds.
+            rows.push(Arc::clone(&cached.values));
+            frontiers.push(Arc::clone(&cached.frontiers));
+        }
+        domain.bytes += (domain.rows.capacity() - row_capacity) * 128;
+        self.played_bytes = self.played_bytes - bytes + domain.bytes
+            + (domain.weights.capacity() - capacity) * 64;
         self.played_assignment = Some(PlayedAssignment {
             members: members.to_vec(),
             base: domain.base,
@@ -1740,6 +1788,16 @@ impl Objective for LiveObjective {
         }
     }
     fn prepare_power(&mut self, power: Arc<Vec<f64>>, width: usize) {
+        if self.core.power_width != width || !Arc::ptr_eq(&self.core.snap_power, &power) {
+            self.core.played_assignment = None;
+            for domain in self.core.played_domains.values_mut() {
+                let bytes = domain.rows.values().map(|row| row.bytes).sum::<usize>()
+                    + domain.rows.capacity() * 128;
+                domain.rows = FxHashMap::default();
+                domain.bytes -= bytes;
+                self.core.played_bytes -= bytes;
+            }
+        }
         self.core.snap_power = power;
         self.core.power_width = width;
     }
@@ -1864,7 +1922,8 @@ impl Objective for LiveObjective {
             for (index, row) in rows.iter().enumerate() {
                 let weight = row
                     .iter()
-                    .filter(|entry| index >= from || assigned[index] == entry.0)
+                    .filter(|entry| self.core.played_allowed[index][(entry.0 + 1) as usize]
+                        && (index >= from || assigned[index] == entry.0))
                     .map(|entry| if maximum { entry.2 } else { entry.1 })
                     .fold(f64::NEG_INFINITY, f64::max);
                 skill = (skill + weight).next_up();
@@ -1919,7 +1978,10 @@ impl Objective for LiveObjective {
                     for (slot, row) in rows.iter().enumerate() {
                         let prices = &mut self.core.played_prices[slot];
                         prices.clear();
-                        for &(snap, mean, maximum_weight) in row {
+                        for &(snap, mean, maximum_weight) in row.iter() {
+                            if !self.core.played_allowed[slot][(snap + 1) as usize] {
+                                continue;
+                            }
                             if slot < from && snap != assigned[slot]
                                 || slot >= from && snap >= 0 && assigned[..from].contains(&snap)
                             {
@@ -2149,7 +2211,7 @@ impl Potential {
         let width = snaps.len() + 1;
         let mut areas = Vec::with_capacity(members.len() * width);
         let table = skills::prepare(master, members, snaps);
-        for skill in &table.slots {
+        for skill in table.slots.iter() {
             let mut area = 0.0;
             for effect in &skill.effects {
                 if (effect.kind == 2000 || effect.judgements.contains(&5))

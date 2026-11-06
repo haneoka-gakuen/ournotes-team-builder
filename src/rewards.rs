@@ -519,6 +519,15 @@ pub fn score_coefficient(
             return None;
         }
         let mut coefficient = 0.0;
+        let luck_ranges = (chart.luck && live.gekiso.rush_percent == 100
+            && chart.play.frames.windows(2).all(|frames| {
+                (10..=40).contains(&(frames[1].time_ms - frames[0].time_ms))
+            }) && chart.play.frames.iter().all(|frame| frame.judged.iter().all(|note| {
+                (note.time_ms as i64 - frame.time_ms as i64).abs() <= 40
+            })))
+            .then(|| deterministic_ranges(master, chart))
+            .flatten()
+            .filter(|ranges| ranges.windows(2).all(|pair| pair[0].1 < pair[1].0));
         for (i, note) in chart.notes.iter().enumerate() {
             let frac = chart.note_frac[i];
             let combo = if chart.accuracy.miss_every > 0 {
@@ -559,7 +568,11 @@ pub fn score_coefficient(
             } else {
                 1.0
             };
-            let luck = if chart.luck { 2.0 } else { 1.0 };
+            // Only the core Rush multiplier ends here; support gains retain their tails.
+            let luck = if !chart.luck || live.gekiso.rush_percent == 0
+                || luck_ranges.is_some_and(|ranges| !ranges.iter().enumerate().any(|(range, &(start, end))| {
+                    chart.setup.missions[range] == 2 && start <= note.time_ms && note.time_ms <= end
+                })) { 1.0 } else { 2.0 };
             let mut c = mul(live.adjustment, chart.difficulty_factor);
             for term in [
                 frac,

@@ -881,7 +881,7 @@ pub struct Kernel<'a> {
     performer_key_cache: HashMap<Performer, u32>,
     context_keys: HashMap<Performer, u32>,
     normalized_performers: HashMap<u32, (Performer, u32)>,
-    slots: Vec<Slot>,
+    slots: Arc<Vec<Slot>>,
     shapes: HashMap<(Vec<u64>, Performer), u32>,
     shape_ids: Vec<u32>,
     bound_shape_ids: Vec<u32>,
@@ -897,6 +897,7 @@ pub struct Kernel<'a> {
     luck_members: Vec<Performer>,
     member_gain: Vec<f64>,
     calibrated: bool,
+    coarse_coefficient: Option<f64>,
     luck_supports: Vec<Performer>,
     cache: HashMap<(i32, Vec<u32>), Cached>,
     cache_order: VecDeque<(i32, Vec<u32>)>,
@@ -1554,7 +1555,7 @@ impl<'a> Kernel<'a> {
         } else {
             vec![0]
         };
-        let mut slots = crate::skills::prepare(master, members, snaps).into_slots();
+        let prepared = crate::skills::prepare(master, members, snaps);
         let healthy = chart.accuracy.great == 0.0
             && chart.accuracy.miss_every == 0
             && crate::support_aliases::stable_life_conditions(
@@ -1572,7 +1573,7 @@ impl<'a> Kernel<'a> {
                         r.kind != 3000 && r.kind != 3002 && !(r.kind == 12006 && r.value < 5)
                     })
                 })
-            && slots.iter().all(|s| {
+            && prepared.slots.iter().all(|s| {
                 s.effects.iter().all(|e| {
                     e.gate.blocks(master.live.life_base)
                         == e.gate.blocks(2.0 * master.live.life_base)
@@ -1581,24 +1582,8 @@ impl<'a> Kernel<'a> {
                     .as_ref()
                     .is_none_or(|c| !c.judgements.contains(&6))
             });
-        if healthy {
-            for slot in &mut slots {
-                slot.recovery = 0;
-                slot.convert = None;
-                slot.effects
-                    .retain(|e| !e.gate.blocks(master.live.life_base));
-                for effect in &mut slot.effects {
-                    effect.gate = crate::live::Gate {
-                        kind: 0,
-                        value: 0.0,
-                        positive: true,
-                    };
-                }
-                if slot.effects.is_empty() && slot.cumulative.is_empty() {
-                    slot.extension_ms = 0.0;
-                }
-            }
-        }
+        let slots = if healthy { prepared.for_gekiso(master.live.life_base) }
+            else { Arc::clone(&prepared.slots) };
         let cache = std::mem::take(&mut chart.contexts);
         let cache_order = std::mem::take(&mut chart.context_order);
         let cache_bytes = std::mem::replace(&mut chart.context_bytes, 0);
@@ -1713,6 +1698,7 @@ impl<'a> Kernel<'a> {
             luck_members: Vec::new(),
             member_gain: vec![0.0; members.len()],
             calibrated: false,
+            coarse_coefficient: None,
             luck_supports: Vec::new(),
             cache,
             cache_order,
@@ -6699,6 +6685,7 @@ pub struct Adapter<'k, 'a> {
     nominal_base: Option<f64>,
     member_dominance: HashMap<(usize, usize), bool>,
     deterministic: Option<crate::rewards::DeterministicBound>,
+    coarse_coefficient: Option<f64>,
     roster_price: Option<Arc<crate::rewards::RosterPricing>>,
     window_roster: Option<crate::rewards::WindowRosterBound>,
     roster_prices: VecDeque<RosterPriceEntry>,
@@ -6818,7 +6805,14 @@ impl<'k, 'a> Adapter<'k, 'a> {
             } else {
                 None
             };
-        let data = if deterministic.is_none() {
+        let coarse = deterministic.is_none() && !surrogate && !estimate
+            && (!kernel.chart.luck || !kernel.seeds.is_empty());
+        let coarse_coefficient = coarse.then(|| {
+            *kernel.coarse_coefficient.get_or_insert_with(|| {
+                crate::rewards::score_coefficient(kernel.master, kernel.chart, kernel.members, kernel.snaps, None)
+            })
+        });
+        let data = if deterministic.is_none() && !coarse {
             if !kernel.calibrate(deadline, now) {
                 return None;
             }
@@ -6857,6 +6851,7 @@ impl<'k, 'a> Adapter<'k, 'a> {
             nominal_base: None,
             member_dominance: HashMap::default(),
             deterministic,
+            coarse_coefficient,
             roster_price: None,
             window_roster: None,
             roster_prices: VecDeque::new(),
@@ -8398,6 +8393,13 @@ impl<'k, 'a> Adapter<'k, 'a> {
     fn high(&self, t: Totals) -> f64 {
         if let Some(bound) = &self.deterministic {
             return bound.score(t);
+        }
+        if let Some(coefficient) = self.coarse_coefficient {
+            return if coefficient.is_finite() {
+                (t.power * coefficient).next_up()
+            } else {
+                f64::INFINITY
+            };
         }
         if (!self.kernel.chart.luck || !self.kernel.seeds.is_empty())
             && !self.surrogate

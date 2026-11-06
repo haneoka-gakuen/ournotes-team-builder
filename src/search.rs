@@ -2970,12 +2970,12 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         }
         self.walk_domain(&mut a, totals)
     }
-    fn snap_domains(
+    fn snap_domains<'d>(
         &mut self,
         a: &mut Assignment,
-        domains: &[Vec<Vec<i32>>],
+        domains: &'d [Vec<Vec<i32>>],
         slot: usize,
-        selected: &mut Vec<Vec<i32>>,
+        selected: &mut Vec<&'d Vec<i32>>,
         totals: Totals,
     ) -> Result<(), String> {
         if self.expired() {
@@ -2990,85 +2990,45 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             }
         }
         if slot > 0 && (slot == domains.len() || self.input.objective.partial_assignment_domains()) {
-            let fixed = selected
-                .iter()
-                .filter_map(|domain| (domain.len() == 1 && domain[0] >= 0).then_some(domain[0]))
-                .collect::<Vec<_>>();
-            let mut options = selected.clone();
-            options.extend(
-                domains[slot..]
-                    .iter()
-                    .map(|classes| classes.iter().flatten().copied().collect()),
-            );
-            for choices in &mut options {
+            let mut fixed = [-1; 5];
+            for (index, domain) in selected.iter().enumerate() {
+                if domain.len() == 1 && domain[0] >= 0 {
+                    fixed[index] = domain[0];
+                }
+            }
+            for index in 0..a.options.len() {
+                if index < selected.len() {
+                    a.options[index].clone_from(selected[index]);
+                } else {
+                    a.options[index].clear();
+                    a.options[index].extend(domains[index].iter().flatten().copied());
+                }
+                let choices = &mut a.options[index];
                 if choices.len() > 1 {
-                    choices.retain(|snap| {
-                        *snap < 0 || !a.used[*snap as usize] && !fixed.contains(snap)
-                    });
+                    choices.retain(|&snap| snap < 0 || !a.used[snap as usize] && !fixed.contains(&snap));
                 }
                 if choices.is_empty() {
                     return Ok(());
                 }
             }
-            if a.required_snaps
-                .iter()
-                .any(|&snap| !options.iter().any(|row| row.contains(&(snap as i32))))
-            {
+            if a.required_snaps.iter().any(|&snap| {
+                !a.options.iter().any(|row| row.contains(&(snap as i32)))
+            }) {
                 return Ok(());
             }
-            a.options = options;
-            a.max_power = a
-                .team
-                .iter()
-                .zip(&a.options)
-                .map(|(&member, choices)| {
-                    choices
-                        .iter()
-                        .map(|&snap| {
-                            self.snap_power[member * self.width
-                                + if snap < 0 {
-                                    self.width - 1
-                                } else {
-                                    snap as usize
-                                }]
-                        })
-                        .fold(f64::NEG_INFINITY, f64::max)
-                })
-                .collect();
-            a.max_weight = a
-                .team
-                .iter()
-                .zip(&a.options)
-                .map(|(&member, choices)| {
-                    choices
-                        .iter()
-                        .map(|&snap| {
-                            self.skill[member * self.width
-                                + if snap < 0 {
-                                    self.width - 1
-                                } else {
-                                    snap as usize
-                                }]
-                        })
-                        .fold(f64::NEG_INFINITY, f64::max)
-                })
-                .collect();
-            a.max_bonus = a
-                .options
-                .iter()
-                .map(|choices| {
-                    choices
-                        .iter()
-                        .map(|&snap| {
-                            if snap < 0 {
-                                0.0
-                            } else {
-                                self.snap_bonus[snap as usize]
-                            }
-                        })
-                        .fold(f64::NEG_INFINITY, f64::max)
-                })
-                .collect();
+            for (index, (&member, choices)) in a.team.iter().zip(&a.options).enumerate() {
+                let (mut power, mut weight, mut bonus) =
+                    (f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+                for &snap in choices {
+                    let column = if snap < 0 { self.width - 1 } else { snap as usize };
+                    power = power.max(self.snap_power[member * self.width + column]);
+                    weight = weight.max(self.skill[member * self.width + column]);
+                    bonus = bonus.max(if snap < 0 { 0.0 } else { self.snap_bonus[snap as usize] });
+                }
+                a.max_power[index] = power;
+                a.max_weight[index] = weight;
+                a.max_bonus[index] = bonus;
+            }
             a.assigned.fill(-1);
             self.input.objective.prepare_assignment_domain(
                 &a.team,
@@ -3126,7 +3086,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                 {
                     continue;
                 }
-                selected.push(domain.clone());
+                selected.push(domain);
                 self.snap_domains(a, domains, slot + 1, selected, totals)?;
                 selected.pop();
             }

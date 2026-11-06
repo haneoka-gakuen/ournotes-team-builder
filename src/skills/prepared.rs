@@ -1,5 +1,5 @@
 //! One bounded raw skill table per native library / WASM instance.
-//! Master table identities keep unrelated releases isolated. Weak play views
+//! Master table identities keep unrelated releases isolated. Weak scoring views
 //! share normalized slot programs across charts without retaining old calls.
 use super::resolve;
 use crate::{
@@ -74,6 +74,7 @@ struct Key {
     conditions: Weak<BTreeMap<i32, Condition>>,
     sets: Weak<BTreeMap<i32, Vec<Vec<i32>>>>,
     targets: Weak<BTreeMap<i32, Target>>,
+    cumulative: Weak<BTreeMap<i32, Cumulative>>,
     members: Vec<MemberKey>,
     snaps: Vec<SnapKey>,
 }
@@ -85,6 +86,7 @@ impl Key {
             conditions: Arc::downgrade(&master.conditions),
             sets: Arc::downgrade(&master.condition_sets),
             targets: Arc::downgrade(&master.targets),
+            cumulative: Arc::downgrade(&master.cumulative),
             members: members.iter().map(MemberKey::new).collect(),
             snaps: snaps.iter().map(SnapKey::new).collect(),
         }
@@ -95,6 +97,7 @@ impl Key {
             && self.conditions.as_ptr() == Arc::as_ptr(&master.conditions)
             && self.sets.as_ptr() == Arc::as_ptr(&master.condition_sets)
             && self.targets.as_ptr() == Arc::as_ptr(&master.targets)
+            && self.cumulative.as_ptr() == Arc::as_ptr(&master.cumulative)
             && self.members.len() == members.len()
             && self.snaps.len() == snaps.len()
             && self.members.iter().zip(members).all(|(a, b)| a.matches(b))
@@ -130,9 +133,10 @@ pub(crate) struct Played {
     pub(crate) converters: Vec<usize>,
 }
 pub(crate) struct Prepared {
-    pub(crate) slots: Vec<Slot>,
+    pub(crate) slots: Arc<Vec<Slot>>,
     // Ordinary scoring prepares projections lazily; Gekiso keeps the raw programs.
     played: Mutex<Vec<(PlayKey, Weak<Played>)>>,
+    gekiso: Mutex<Vec<(u64, Weak<Vec<Slot>>)>>,
     converter_limits: OnceLock<([Vec<f64>; 7], Vec<f64>)>,
     bytes: usize,
 }
@@ -155,7 +159,7 @@ impl Prepared {
         let (window_limits, assist_limits) = self.converter_limits.get_or_init(|| {
             let mut limits: [Vec<f64>; 7] = std::array::from_fn(|_| Vec::new());
             let mut assists = Vec::new();
-            for slot in &self.slots {
+            for slot in self.slots.iter() {
                 if let Some(convert) = &slot.convert {
                     let Some(limit) = convert
                         .limit
@@ -240,7 +244,7 @@ impl Prepared {
         {
             return profile;
         }
-        let mut slots = self.slots.clone();
+        let mut slots = self.slots.as_ref().clone();
         for slot in &mut slots {
             if slot.convert.as_ref().is_some_and(|convert| {
                 !convert
@@ -428,16 +432,44 @@ impl Prepared {
         cache.push((key, Arc::downgrade(&profile)));
         profile
     }
-    /// Move an uncached oversized table; shared tables remain immutable.
-    pub(crate) fn into_slots(self: Arc<Self>) -> Vec<Slot> {
+    pub(crate) fn for_gekiso(self: Arc<Self>, life: f64) -> Arc<Vec<Slot>> {
         match Arc::try_unwrap(self) {
-            Ok(table) => table.slots,
-            Err(table) => table.slots.clone(),
+            Ok(table) => {
+                let mut slots = table.slots;
+                normalize_gekiso(Arc::make_mut(&mut slots).as_mut_slice(), life);
+                slots
+            }
+            Err(table) => {
+                let mut cache = table.gekiso.lock().expect("prepared-gekiso-cache-poisoned");
+                cache.retain(|(_, slots)| slots.strong_count() > 0);
+                if let Some(slots) = cache.iter().find_map(|(key, slots)| {
+                    (*key == life.to_bits()).then(|| slots.upgrade()).flatten()
+                }) {
+                    return slots;
+                }
+                let mut slots = table.slots.as_ref().clone();
+                normalize_gekiso(&mut slots, life);
+                let slots = Arc::new(slots);
+                if cache.len() >= 4 { cache.remove(0); }
+                cache.push((life.to_bits(), Arc::downgrade(&slots)));
+                slots
+            }
         }
     }
     /// Upper bound on retained table/key payload, including scoring-view bookkeeping.
     pub(crate) fn retained_bytes(&self) -> usize {
         self.bytes
+    }
+}
+fn normalize_gekiso(slots: &mut [Slot], life: f64) {
+    for slot in slots {
+        slot.recovery = 0;
+        slot.convert = None;
+        slot.effects.retain(|effect| !effect.gate.blocks(life));
+        for effect in &mut slot.effects {
+            effect.gate = crate::live::Gate { kind: 0, value: 0.0, positive: true };
+        }
+        if slot.effects.is_empty() && slot.cumulative.is_empty() { slot.extension_ms = 0.0; }
     }
 }
 
@@ -480,8 +512,9 @@ pub(crate) fn prepare(master: &Master, members: &[Member], snaps: &[Snap]) -> Ar
         }
     }
     let table = Arc::new(Prepared {
-        slots,
+        slots: Arc::new(slots),
         played: Mutex::new(Vec::new()),
+        gekiso: Mutex::new(Vec::new()),
         converter_limits: OnceLock::new(),
         bytes,
     });

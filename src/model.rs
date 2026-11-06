@@ -403,7 +403,7 @@ pub fn window_weight(prefix: &[f64], input: &Input, start: i32, length: i32) -> 
     let b = input.times.partition_point(|&t| t < start + length);
     prefix[b] - prefix[a]
 }
-fn cumulative_upper(
+pub(crate) fn cumulative_upper(
     prefix: &[f64],
     input: &Input,
     factor: &live::Cumulative,
@@ -905,6 +905,19 @@ pub(crate) fn played_weight(
     slot: &Slot,
     event: usize,
 ) -> f64 {
+    let mut value = played_effect_weight(input, model, grades, slot, event);
+    for factor in &slot.cumulative {
+        value += cumulative_upper(&model.prefix, input, factor, input.skill_times[event], Some(grades));
+    }
+    value
+}
+pub(crate) fn played_effect_weight(
+    input: &Input,
+    model: &Linear,
+    grades: &[usize],
+    slot: &Slot,
+    event: usize,
+) -> f64 {
     let start = input.skill_times[event];
     let mut value = 0.0;
     let mut gated = Vec::new();
@@ -973,9 +986,6 @@ pub(crate) fn played_weight(
             })
             .fold(0.0_f64, f64::max);
         value = (value + best).next_up();
-    }
-    for factor in &slot.cumulative {
-        value += cumulative_upper(&model.prefix, input, factor, start, Some(grades));
     }
     value
 }
