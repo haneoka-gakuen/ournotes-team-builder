@@ -12,7 +12,6 @@ pub(super) struct Ranked {
     pub configuration: Configuration,
     variation: i32,
     dimensions: usize,
-    quality: f64,
     pub display: String,
 }
 impl Ranked {
@@ -28,7 +27,15 @@ impl Ranked {
                     .vip_bonus
                     .cmp(&self.configuration.vip_bonus),
             )
-            .then(self.quality.total_cmp(&other.quality))
+            .then_with(|| {
+                self.configuration
+                    .instruments
+                    .iter()
+                    .zip(&other.configuration.instruments)
+                    .map(|(a, b)| b.min_total.cmp(&a.min_total).then(b.total.cmp(&a.total)))
+                    .find(|order| !order.is_eq())
+                    .unwrap_or(Ordering::Equal)
+            })
             .then(self.configuration.id.cmp(&other.configuration.id))
     }
 }
@@ -56,7 +63,7 @@ impl Ord for Node {
         other
             .cost
             .total_cmp(&self.cost)
-            .then(other.order.cmp(&self.order))
+            .then(self.order.cmp(&other.order))
     }
 }
 #[derive(Clone)]
@@ -64,14 +71,12 @@ struct Canonical {
     levels: Vec<i32>,
     total: Total,
     range: Range,
-    quality: f64,
 }
 #[derive(Clone, Copy)]
 struct Bounds {
     total: Total,
     min: i32,
     max: i32,
-    upper_height: f64,
 }
 
 pub(super) struct Tier {
@@ -95,30 +100,20 @@ impl Tier {
         problem: Arc<Problem>,
         vip: i32,
         vip_rank: i32,
-        preference: f64,
+        relaxed: bool,
         radius: (i32, i32),
     ) -> Self {
-        let minimums = problem
-            .caps
-            .iter()
-            .map(|&cap| {
-                if preference < 0.0 {
-                    1
-                } else {
-                    15.max((cap as f64 * preference).ceil() as i32)
-                }
-            })
-            .collect();
+        let minimums = vec![if relaxed { 1 } else { 15 }; problem.caps.len()];
         let kernels = Arc::clone(&problem.kernels[&vip]);
         let mut tier = Self {
             problem,
             vip,
             vip_rank,
             minimums,
-            item_min: if preference < 0.0 { 0 } else { 50 },
+            item_min: if relaxed { 0 } else { 50 },
             rank_span: radius.0,
             item_span: radius.1,
-            relaxed: preference < 0.0,
+            relaxed,
             queue: BinaryHeap::new(),
             kernels,
             seen: HashSet::new(),
@@ -239,54 +234,24 @@ impl Tier {
                 let max = total
                     .max
                     .min(high.iter().sum::<i32>() + self.problem.unseen_cap);
-                let outside = if self.problem.unseen_cap == 0 {
-                    1.0
-                } else {
-                    (max - low_sum) as f64 / self.problem.unseen_cap as f64
-                };
-                let height = high
-                    .iter()
-                    .zip(&self.problem.caps)
-                    .map(|(&rank, &cap)| rank as f64 / cap as f64)
-                    .fold(outside, f64::min);
-                (min <= max).then_some(Bounds {
-                    total,
-                    min,
-                    max,
-                    upper_height: height,
-                })
+                (min <= max).then_some(Bounds { total, min, max })
             })
             .collect()
     }
     fn lower_cost(&self, node: &Node) -> f64 {
-        self.options(node)
-            .into_iter()
-            .map(|option| (1.0 - option.upper_height) * 1000.0)
-            .fold(f64::INFINITY, f64::min)
-    }
-    fn quality(&self, levels: &[i32], range: Range) -> f64 {
-        let sum = levels.iter().sum::<i32>();
-        let normalized: Vec<_> = levels
-            .iter()
-            .zip(&self.problem.caps)
-            .map(|(&rank, &cap)| rank as f64 / cap as f64)
-            .collect();
-        let average = normalized.iter().sum::<f64>() / normalized.len() as f64;
-        let representative = (sum + (self.problem.unseen_cap as f64 * average).round() as i32)
-            .clamp(range.min, range.max);
-        let outside = if self.problem.unseen_cap == 0 {
-            average
-        } else {
-            (representative - sum) as f64 / self.problem.unseen_cap as f64
-        };
-        let height = normalized.iter().copied().fold(outside, f64::min);
-        let spread = (normalized
-            .iter()
-            .map(|value| (value - average).powi(2))
-            .sum::<f64>()
-            + (outside - average).powi(2))
-            / (normalized.len() + 1) as f64;
-        (1.0 - height) * 1000.0 + spread * 10.0
+        if self.options(node).is_empty() {
+            return f64::INFINITY;
+        }
+        let size = self.problem.ids.len();
+        (0..size)
+            .flat_map(|i| (i + 1..size).map(move |j| (i, j)))
+            .map(|(i, j)| {
+                (node.lo[i] - node.hi[j])
+                    .max(node.lo[j] - node.hi[i])
+                    .max(0) as f64
+            })
+            .map(|gap| gap * gap)
+            .sum()
     }
     fn value(
         &mut self,
@@ -386,7 +351,7 @@ impl Tier {
         node.cost.is_finite()
     }
     fn canonical(&self, flat: &[i32]) -> Vec<Canonical> {
-        let mut options: Vec<_> = self
+        let options: Vec<_> = self
             .problem
             .totals
             .iter()
@@ -407,19 +372,13 @@ impl Tier {
                     min: total.min.max(sum + self.problem.unseen_count),
                     max: total.max.min(sum + self.problem.unseen_cap),
                 };
-                (range.min <= range.max).then(|| Canonical {
-                    quality: self.quality(&levels, range),
+                (range.min <= range.max).then_some(Canonical {
                     levels,
                     total,
                     range,
                 })
             })
             .collect();
-        options.sort_by(|a, b| {
-            a.quality
-                .total_cmp(&b.quality)
-                .then(b.range.min.cmp(&a.range.min))
-        });
         options
     }
     pub fn advance(&mut self) -> Option<Ranked> {
@@ -464,26 +423,167 @@ impl Tier {
         }
         let flat = &node.lo[..size];
         let gears = &node.lo[size..];
-        let mut best = f64::INFINITY;
+        let mut best: Option<Ranked> = None;
         for option in self.canonical(flat) {
-            if option.quality >= best {
-                break;
-            }
             if let Some(candidate) = self.configuration(flat, gears, &option) {
-                self.order += 1;
-                let cost = candidate.quality;
-                best = best.min(cost);
-                self.queue.push(Node {
-                    lo: node.lo.clone(),
-                    hi: node.hi.clone(),
-                    cost,
-                    order: self.order,
-                    shift: node.shift,
-                    candidate: Some(candidate),
-                });
+                if best
+                    .as_ref()
+                    .is_none_or(|old| candidate.compare(old).is_lt())
+                {
+                    best = Some(candidate);
+                }
+                if best.as_ref().is_some_and(|row| !row.configuration.changed) {
+                    break;
+                }
             }
         }
+        if let Some(mut candidate) = best {
+            self.add_equivalents(&mut candidate);
+            self.order += 1;
+            self.queue.push(Node {
+                lo: node.lo.clone(),
+                hi: node.hi.clone(),
+                cost: node.cost,
+                order: self.order,
+                shift: node.shift,
+                candidate: Some(candidate),
+            });
+        }
         None
+    }
+    fn add_equivalents(&self, ranked: &mut Ranked) {
+        let ctx = &self.problem;
+        let configuration = &mut ranked.configuration;
+        let mut equivalents = Vec::new();
+        for shift in -ctx.caps.iter().max().unwrap()..=*ctx.caps.iter().max().unwrap() {
+            let mut witnesses = Vec::new();
+            let mut outside = Range {
+                min: ctx.unseen_count,
+                max: ctx.unseen_cap,
+            };
+            for original in &configuration.witnesses {
+                let levels: Vec<_> = original.levels.iter().map(|rank| rank + shift).collect();
+                if levels
+                    .iter()
+                    .enumerate()
+                    .any(|(i, rank)| *rank < self.minimums[i] || *rank > ctx.caps[i])
+                {
+                    break;
+                }
+                let old = ctx
+                    .totals
+                    .iter()
+                    .find(|total| {
+                        total.min <= original.total_value && original.total_value <= total.max
+                    })
+                    .unwrap();
+                let Some(total) = ctx
+                    .totals
+                    .iter()
+                    .find(|total| total.bonus == old.bonus - shift * 5)
+                else {
+                    break;
+                };
+                let sum = levels.iter().sum::<i32>();
+                let range = Range {
+                    min: total.min.max(sum + ctx.unseen_count),
+                    max: total.max.min(sum + ctx.unseen_cap),
+                };
+                if range.min > range.max {
+                    break;
+                }
+                outside.min = outside.min.max(range.min - sum);
+                outside.max = outside
+                    .max
+                    .min(range.max - sum + ctx.unseen_count * super::RADII.last().unwrap().0);
+                witnesses.push(Witness {
+                    levels,
+                    total_rank: range,
+                    ..original.clone()
+                });
+            }
+            if witnesses.len() != configuration.witnesses.len() || outside.min > outside.max {
+                continue;
+            }
+            for witness in &mut witnesses {
+                let sum = witness.levels.iter().sum::<i32>();
+                witness.total_rank.min = witness
+                    .total_rank
+                    .min
+                    .max(sum + outside.min - ctx.unseen_count * super::RADII.last().unwrap().0);
+                witness.total_rank.max = witness.total_rank.max.min(sum + outside.max);
+                witness.total_value = witness.total_rank.min;
+            }
+            let valid = witnesses.iter().all(|witness| {
+                let (_, model) = ctx
+                    .originals
+                    .iter()
+                    .find(|row| row.0 == witness.challenge_id)
+                    .unwrap();
+                let reading = &ctx.readings[*model];
+                let player = ctx.player(
+                    &witness.levels,
+                    &witness.instruments,
+                    witness.total_value,
+                    self.vip_rank,
+                );
+                power::team_power(
+                    &ctx.master,
+                    &player,
+                    &reading.team,
+                    &reading.snaps,
+                    2,
+                    Some(&reading.music),
+                    &ctx.master.events[&ctx.event].effects,
+                )
+                .is_ok_and(|power| power.total == reading.target)
+            });
+            if !valid {
+                continue;
+            }
+            equivalents.push(Equivalent {
+                characters: ctx
+                    .ids
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &id)| Character {
+                        id,
+                        min_level: witnesses.iter().map(|row| row.levels[i]).min().unwrap(),
+                        level: witnesses.iter().map(|row| row.levels[i]).max().unwrap(),
+                        cap: ctx.caps[i],
+                    })
+                    .collect(),
+                instruments: configuration.instruments.clone(),
+                total_rank: witnesses[0].total_rank,
+                witnesses,
+            });
+        }
+        equivalents.sort_by_key(|row| row.total_rank.min);
+        for (i, character) in configuration.characters.iter_mut().enumerate() {
+            character.min_level = equivalents
+                .iter()
+                .map(|row| row.characters[i].min_level)
+                .min()
+                .unwrap();
+            character.level = equivalents
+                .iter()
+                .map(|row| row.characters[i].level)
+                .max()
+                .unwrap();
+        }
+        configuration.total_rank = Range {
+            min: equivalents
+                .iter()
+                .map(|row| row.total_rank.min)
+                .min()
+                .unwrap(),
+            max: equivalents
+                .iter()
+                .map(|row| row.total_rank.max)
+                .max()
+                .unwrap(),
+        };
+        configuration.equivalents = equivalents;
     }
     fn configuration(&mut self, flat: &[i32], gears: &[i32], option: &Canonical) -> Option<Ranked> {
         let original = (self.rank_span, self.item_span);
@@ -524,7 +624,8 @@ impl Tier {
                 .unseen_cap
                 .min(option.range.max - own + self.problem.unseen_count * self.rank_span),
         };
-        let accepted = self.join(
+        let mut best = None;
+        self.join(
             1,
             option,
             gears,
@@ -535,7 +636,9 @@ impl Tier {
             gears,
             gears,
             outside,
-        )?;
+            &mut best,
+        );
+        let accepted = best?.0;
         let size = self.problem.ids.len();
         let minimum: Vec<_> = (0..size)
             .map(|i| accepted.iter().map(|row| row.levels[i]).min().unwrap())
@@ -652,6 +755,9 @@ impl Tier {
             matched_challenges: ctx.originals.iter().map(|row| row.0).collect(),
             relaxed: self.relaxed,
             changed: variation != 0,
+            change_cost: variation,
+            changed_dimensions: dimensions,
+            equivalents: Vec::new(),
             witnesses: ctx
                 .originals
                 .iter()
@@ -681,7 +787,6 @@ impl Tier {
         ])
         .to_string();
         Some(Ranked {
-            quality: self.quality(&option.levels, accepted[0].total_rank),
             configuration,
             variation,
             dimensions,
@@ -702,11 +807,51 @@ impl Tier {
         min_items: &[i32],
         max_items: &[i32],
         outside: Range,
-    ) -> Option<Vec<Witness>> {
+        best: &mut Option<(Vec<Witness>, (i32, usize))>,
+    ) {
+        let globals: Vec<_> = witnesses
+            .iter()
+            .map(|row| {
+                self.problem
+                    .totals
+                    .iter()
+                    .find(|total| total.min <= row.total_value && row.total_value <= total.max)
+                    .unwrap()
+                    .bonus
+            })
+            .collect();
+        let global_span = globals.iter().max().unwrap() - globals.iter().min().unwrap();
+        let cost = (
+            min_levels
+                .iter()
+                .zip(max_levels)
+                .map(|(lo, hi)| (hi - lo) * 5)
+                .sum::<i32>()
+                + min_items
+                    .iter()
+                    .zip(max_items)
+                    .map(|(lo, hi)| hi - lo)
+                    .sum::<i32>()
+                + global_span,
+            min_levels
+                .iter()
+                .zip(max_levels)
+                .filter(|(lo, hi)| lo != hi)
+                .count()
+                + min_items
+                    .iter()
+                    .zip(max_items)
+                    .filter(|(lo, hi)| lo != hi)
+                    .count()
+                + usize::from(global_span != 0),
+        );
+        if best.as_ref().is_some_and(|old| cost >= old.1) {
+            return;
+        }
         if index == self.problem.readings.len() {
             let own = option.levels.iter().sum::<i32>();
             let upper = (option.range.max - own).clamp(outside.min, outside.max);
-            return Some(
+            *best = Some((
                 witnesses
                     .iter()
                     .map(|witness| {
@@ -726,7 +871,9 @@ impl Tier {
                         }
                     })
                     .collect(),
-            );
+                cost,
+            ));
+            return;
         }
         if local[index].is_none() {
             local[index] = Some(self.local_witnesses(index, option, gears));
@@ -771,7 +918,7 @@ impl Tier {
                 .map(|(a, b)| (*a).max(*b))
                 .collect();
             witnesses.push(witness);
-            let accepted = self.join(
+            self.join(
                 index + 1,
                 option,
                 gears,
@@ -782,13 +929,10 @@ impl Tier {
                 &items_lo,
                 &items_hi,
                 range,
+                best,
             );
             witnesses.pop();
-            if accepted.is_some() {
-                return accepted;
-            }
         }
-        None
     }
     fn local_witnesses(
         &mut self,

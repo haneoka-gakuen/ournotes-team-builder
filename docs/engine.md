@@ -12,7 +12,9 @@ Member, snapshot, leader and binding constraints apply to every candidate. An un
 
 `eventGrowthStart` binds recorded song decks and release-pinned growth catalogues to an existing engine context. `eventGrowthStep` advances the retained search with a small computation budget. It uses the normal card resolver, slot-power arithmetic and shared parameter curves; no chart is required.
 
-Up to ten feasible configurations are retained globally. Stable exact witnesses rank first, followed by smaller character, instrument and account-bonus changes. T.G.W is a prior after those changes, with no reserved count per tier. Wider historical domains are explored progressively while exact searches retain their frontiers; a candidate is checked against the narrowest domain that explains it.
+Up to ten feasible configurations are retained globally. Stable exact witnesses rank first, followed by smaller character, instrument and account-bonus changes. T.G.W follows those changes, with no reserved count per tier. Equal-evidence ties use descending instrument totals; character rank height has no ranking weight. Wider historical domains are explored progressively while exact searches retain their frontiers; a candidate is checked against the narrowest domain that explains it.
+
+Equivalent decompositions of character-rank and account-total bonuses are grouped in `equivalents`. The outer character and account-total ranges are marginal envelopes; each equivalent contains correlated levels and its own song witnesses. Their cartesian product is not a valid configuration. Only currently obtainable mission caps constrain maximum ranks; there is no percentile-of-cap admission stage. Historical joins minimize the actual change cost rather than accepting the first feasible join.
 
 Each song has an integer witness that exactly reproduces its recorded power. Across witnesses, character ranks differ by at most two and each band's instrument total by at most ten. Account totals must be realizable within the same unseen-character envelope. Rank caps come from currently obtainable mission EXP; normal instrument totals start at fifty.
 

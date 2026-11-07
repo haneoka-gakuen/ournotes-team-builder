@@ -86,6 +86,14 @@ pub struct Witness {
 }
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct Equivalent {
+    characters: Vec<Character>,
+    instruments: Vec<Instrument>,
+    total_rank: Range,
+    witnesses: Vec<Witness>,
+}
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Configuration {
     id: String,
     characters: Vec<Character>,
@@ -95,7 +103,10 @@ pub struct Configuration {
     matched_challenges: Vec<i32>,
     relaxed: bool,
     changed: bool,
+    change_cost: i32,
+    changed_dimensions: usize,
     witnesses: Vec<Witness>,
+    equivalents: Vec<Equivalent>,
 }
 #[derive(Clone)]
 struct Reading {
@@ -520,12 +531,12 @@ struct Phase {
     done: bool,
 }
 impl Phase {
-    fn new(problem: Arc<Problem>, preference: f64, radius: (i32, i32)) -> Self {
+    fn new(problem: Arc<Problem>, relaxed: bool, radius: (i32, i32)) -> Self {
         let tiers = problem
             .vips
             .iter()
             .map(|&(bonus, rank)| {
-                search::Tier::new(Arc::clone(&problem), bonus, rank, preference, radius)
+                search::Tier::new(Arc::clone(&problem), bonus, rank, relaxed, radius)
             })
             .collect();
         Self {
@@ -586,7 +597,7 @@ pub struct Search {
     status: &'static str,
     generation: u64,
 }
-const PREFERENCES: [f64; 3] = [0.7, 0.0, -1.0];
+const PREFERENCES: [bool; 2] = [false, true];
 const RADII: [(i32, i32); 5] = [(0, 0), (1, 1), (1, 3), (2, 5), (2, 10)];
 impl Search {
     pub fn new(master: &Master, data: &Value, input: &Value) -> Result<Self, String> {
