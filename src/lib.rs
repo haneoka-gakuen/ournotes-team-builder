@@ -5,6 +5,7 @@ pub mod assignment;
 pub mod chart;
 pub mod clock;
 pub mod event;
+pub mod event_growth;
 pub mod full;
 pub mod gekiso;
 pub mod gekiso_objective;

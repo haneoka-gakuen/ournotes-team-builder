@@ -74,6 +74,8 @@ impl SharedFloors {
     }
 }
 pub struct Engine {
+    pub(crate) growth_source: Option<Arc<Value>>,
+    pub(crate) event_growth: Option<crate::event_growth::Search>,
     pub master: Master,
     pub charts: BTreeMap<(i32, i32), Chart>,
     pub sources: BTreeMap<(i32, i32), Source>,
@@ -144,6 +146,8 @@ impl Engine {
     }
     pub fn from_master(master: Master) -> Self {
         Self {
+            growth_source: None,
+            event_growth: None,
             master,
             charts: BTreeMap::new(),
             sources: BTreeMap::new(),

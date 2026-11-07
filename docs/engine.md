@@ -8,6 +8,16 @@ A completed search has checked every legal team and proves its result. A search 
 
 Member, snapshot, leader and binding constraints apply to every candidate. An unknown required card or binding leaves no legal team, and manual evaluation rejects unknown snapshots.
 
+## Activity growth inference
+
+`eventGrowthStart` binds recorded song decks and release-pinned growth catalogues to an existing engine context. `eventGrowthStep` advances the retained search with a small computation budget. It uses the normal card resolver, slot-power arithmetic and shared parameter curves; no chart is required.
+
+Up to ten feasible configurations are retained globally. Stable exact witnesses rank first, followed by smaller character, instrument and account-bonus changes. T.G.W is a prior after those changes, with no reserved count per tier. Wider historical domains are explored progressively while exact searches retain their frontiers; a candidate is checked against the narrowest domain that explains it.
+
+Each song has an integer witness that exactly reproduces its recorded power. Across witnesses, character ranks differ by at most two and each band's instrument total by at most ten. Account totals must be realizable within the same unseen-character envelope. Rank caps come from currently obtainable mission EXP; normal instrument totals start at fifty.
+
+Here `complete` marks the end of bounded candidate collection, separate from the exhaustive proof contract of ordinary team search. Closing or cancelling the owning context releases its inference state.
+
 ## Event rewards
 
 A `rewardPlan` maximises a nonnegative integer-weighted sum of PT, CP and badges, followed by up to two ordered tie levels.

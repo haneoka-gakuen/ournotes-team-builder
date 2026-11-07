@@ -15,7 +15,7 @@ struct Session {
 static NEXT: AtomicU64 = AtomicU64::new(1);
 static SESSIONS: OnceLock<Mutex<HashMap<u64, Arc<Session>>>> = OnceLock::new();
 struct MasterEntry {
-    data: Value,
+    data: Arc<Value>,
     master: master::Master,
     scores: crate::api::SharedScores,
     #[cfg(not(target_arch = "wasm32"))]
@@ -47,10 +47,10 @@ pub fn execute(input: &Value) -> Result<Value, String> {
                 .map_err(|_| "master-cache-poisoned")?;
             if cache
                 .as_ref()
-                .is_none_or(|entry| entry.data != input["data"])
+                .is_none_or(|entry| entry.data.as_ref() != &input["data"])
             {
                 *cache = Some(MasterEntry {
-                    data: input["data"].clone(),
+                    data: Arc::new(input["data"].clone()),
                     master: master::compile(&input["data"])?,
                     scores: crate::api::SharedScores::default(),
                     #[cfg(not(target_arch = "wasm32"))]
@@ -59,6 +59,7 @@ pub fn execute(input: &Value) -> Result<Value, String> {
             }
             let entry = cache.as_ref().unwrap();
             let mut engine = Engine::from_master(entry.master.clone());
+            engine.growth_source = Some(Arc::clone(&entry.data));
             engine.scored_seeds = entry.scores.clone();
             #[cfg(not(target_arch = "wasm32"))]
             {
@@ -119,6 +120,18 @@ pub fn execute(input: &Value) -> Result<Value, String> {
         #[cfg(not(target_arch = "wasm32"))]
         let _budget = crate::parallel::enter_budget(engine.worker_budget);
         match op {
+            "eventGrowthStart" => {
+                let source = engine.growth_source.as_ref().ok_or("missing-growth-source")?;
+                let search = crate::event_growth::Search::new(&engine.master, source, &input["request"])?;
+                let result = search.response();
+                engine.event_growth = Some(search);
+                Ok(result)
+            }
+            "eventGrowthStep" => {
+                let search = engine.event_growth.as_mut().ok_or("event-growth-not-started")?;
+                search.step(master::number(&input["budgetMs"], 8.0).clamp(1.0, 16.0));
+                Ok(search.response())
+            }
             "qualify" => {
                 Ok(json!({"issues":crate::pt::validate(&engine.master,&input["request"])?}))
             }
