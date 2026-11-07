@@ -127,6 +127,11 @@ pub fn execute(input: &Value) -> Result<Value, String> {
                 engine.event_growth = Some(search);
                 Ok(result)
             }
+            "eventGrowthPage" => {
+                let search = engine.event_growth.as_mut().ok_or("event-growth-not-started")?;
+                search.set_page(master::int(&input["page"]).max(0) as usize);
+                Ok(search.response())
+            }
             "eventGrowthStep" => {
                 let search = engine.event_growth.as_mut().ok_or("event-growth-not-started")?;
                 search.step(master::number(&input["budgetMs"], 8.0).clamp(1.0, 16.0));

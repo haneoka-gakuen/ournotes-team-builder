@@ -1,6 +1,7 @@
 //! Joint inverse power search over saved activity decks. Uses the same compiled
 //! Master, growth resolution and integer power arithmetic as normal team building.
 mod limits;
+mod profiles;
 mod search;
 
 use crate::{
@@ -15,28 +16,32 @@ use std::{
     sync::Arc,
 };
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Request {
     event_id: i32,
     as_of: f64,
     observations: Vec<ReadingInput>,
+    #[serde(default)]
+    total: Option<RowInput>,
     sources: Value,
 }
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ReadingInput {
     challenge_id: i32,
+    #[serde(skip)]
+    context_challenge_id: Option<i32>,
     row: RowInput,
 }
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RowInput {
     profile_id: Option<String>,
     total_power: Option<i64>,
     cards: Vec<CardInput>,
 }
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CardInput {
     slot: usize,
@@ -79,6 +84,7 @@ pub struct Instrument {
 #[serde(rename_all = "camelCase")]
 pub struct Witness {
     challenge_id: i32,
+    context_challenge_id: i32,
     levels: Vec<i32>,
     instruments: Vec<i32>,
     total_rank: Range,
@@ -101,6 +107,7 @@ pub struct Configuration {
     total_rank: Range,
     vip_bonus: i32,
     matched_challenges: Vec<i32>,
+    matched_total: bool,
     relaxed: bool,
     changed: bool,
     change_cost: i32,
@@ -111,6 +118,7 @@ pub struct Configuration {
 #[derive(Clone)]
 struct Reading {
     challenge: i32,
+    context_challenge: i32,
     target: i64,
     team: Vec<Member>,
     snaps: Vec<Option<Snap>>,
@@ -126,7 +134,7 @@ struct Band {
     cap: i32,
 }
 struct Problem {
-    master: Master,
+    master: Arc<Master>,
     event: i32,
     readings: Vec<Reading>,
     originals: Vec<(i32, usize)>,
@@ -135,13 +143,15 @@ struct Problem {
     all_caps: BTreeMap<i32, i32>,
     unseen_cap: i32,
     unseen_count: i32,
+    unseen_span: i32,
     bands: Vec<Band>,
     totals: Vec<Total>,
     vips: Vec<(i32, i32)>,
-    flat_sources: Vec<(i32, i32)>,
     max_flat: i32,
     conflict: bool,
     kernels: BTreeMap<i32, search::KernelBank>,
+    deltas: search::DeltaBank,
+    marginals: BTreeMap<i32, search::MarginalBank>,
 }
 fn empty_player() -> Player {
     Player {
@@ -237,7 +247,10 @@ fn prepare(
     let challenge = master
         .challenge_music
         .iter()
-        .find(|song| song.id == input.challenge_id && song.event_id == event)
+        .find(|song| {
+            song.id == input.context_challenge_id.unwrap_or(input.challenge_id)
+                && song.event_id == event
+        })
         .ok_or("missingRules")?;
     let song = master
         .songs
@@ -259,6 +272,22 @@ fn prepare(
         2,
         Some(&music),
     );
+    let effects = &master.events.get(&event).ok_or("missingRules")?.effects;
+    if percents.iter().flatten().any(|&value| value < 0)
+        || team.iter().any(|member| {
+            member.own.iter().any(|&value| value < 0)
+                || master.params.music_type_base + member.music_type_rate < 0
+                || master.params.music_tag_base + member.music_tag_rate < 0
+                || power::member_event_percent(effects, member, 2) < 0
+        })
+        || snaps.iter().flatten().any(|snap| {
+            master.params.type_link_base + snap.type_link_rate < 0
+                || snap.percent.iter().any(|&value| value < 0)
+                || power::snap_event_percent(effects, snap, 2) < 0
+        })
+    {
+        return Err("missingRules".into());
+    }
     let mut signature: Vec<_> = team
         .iter()
         .enumerate()
@@ -290,6 +319,7 @@ fn prepare(
     signature.sort_by_key(|row| row.0);
     Ok(Reading {
         challenge: input.challenge_id,
+        context_challenge: challenge.id,
         target: input
             .row
             .total_power
@@ -305,7 +335,7 @@ fn prepare(
     })
 }
 impl Problem {
-    fn new(master: &Master, data: &Value, request: Request) -> Result<Self, String> {
+    fn new(master: &Arc<Master>, data: &Value, request: Request) -> Result<Self, String> {
         if !master.events.contains_key(&request.event_id) {
             return Err("missingRules".into());
         }
@@ -323,7 +353,15 @@ impl Problem {
             .iter()
             .enumerate()
             .any(|(i, &(rank, bonus))| rank != i as i32 + 1 || bonus != i as i32 * 5)
-            || master.total_rank_bonus.iter().any(|row| row.1 % 5 != 0)
+            || master
+                .total_rank_bonus
+                .iter()
+                .any(|row| row.1 % 5 != 0 || row.1 < 0)
+            || master.vip_bonus.values().any(|&bonus| bonus < 0)
+            || master
+                .total_rank_bonus
+                .windows(2)
+                .any(|pair| pair[0].1 > pair[1].1)
         {
             return Err("missingRules".into());
         }
@@ -426,19 +464,13 @@ impl Problem {
                         .unwrap()
                 })
                 .collect();
-            let model = readings
-                .iter()
-                .position(|other| other.signature == row.signature && other.target == row.target)
-                .unwrap_or(readings.len());
-            mapping.push((row.challenge, model));
-            if model == readings.len() {
-                readings.push(row);
-            }
+            mapping.push((row.challenge, readings.len()));
+            readings.push(row);
         }
         let conflict = readings.iter().enumerate().any(|(i, row)| {
             readings[..i]
                 .iter()
-                .any(|other| row.signature == other.signature)
+                .any(|other| row.signature == other.signature && row.target != other.target)
         });
         let total_cap = all_caps.values().sum::<i32>();
         let mut totals: Vec<_> = master
@@ -454,6 +486,18 @@ impl Problem {
         for i in 0..totals.len().saturating_sub(1) {
             totals[i].max = totals[i + 1].min - 1;
         }
+        let mut merged: Vec<Total> = Vec::new();
+        for total in totals {
+            if let Some(previous) = merged
+                .last_mut()
+                .filter(|previous| previous.bonus == total.bonus)
+            {
+                previous.max = total.max;
+            } else {
+                merged.push(total);
+            }
+        }
+        let totals = merged;
         let max_flat = master
             .character_rank_bonus
             .last()
@@ -461,12 +505,6 @@ impl Problem {
             .unwrap_or(0)
             / 5
             + totals.last().map(|row| row.bonus).unwrap_or(0) / 5;
-        let mut flat_sources = vec![(1, 25); max_flat as usize + 1];
-        for total in &totals {
-            for &(rank, bonus) in master.character_rank_bonus.iter() {
-                flat_sources[((bonus + total.bonus) / 5) as usize] = (rank, total.min);
-            }
-        }
         let mut vips = BTreeMap::from([(0, 1)]);
         for (&rank, &bonus) in master.vip_bonus.iter() {
             vips.entry(bonus).or_insert(rank);
@@ -483,10 +521,15 @@ impl Problem {
             })
             .collect();
         Ok(Self {
-            master: master.clone(),
+            master: Arc::clone(master),
             event: request.event_id,
             unseen_cap: total_cap - caps.iter().sum::<i32>(),
             unseen_count: master.characters.len() as i32 - ids.len() as i32,
+            unseen_span: all_caps
+                .iter()
+                .filter(|(id, _)| !ids.contains(id))
+                .map(|(_, cap)| (cap - 1).clamp(0, RANK_SPAN))
+                .sum(),
             readings,
             originals: mapping,
             ids,
@@ -494,10 +537,14 @@ impl Problem {
             bands,
             all_caps,
             totals,
+            marginals: vips
+                .iter()
+                .map(|&(bonus, _)| (bonus, Arc::new(std::sync::Mutex::new(BTreeMap::new()))))
+                .collect(),
             vips,
-            flat_sources,
             max_flat,
             conflict,
+            deltas: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             kernels,
         })
     }
@@ -523,104 +570,101 @@ impl Problem {
     }
 }
 
-struct Phase {
-    tiers: Vec<search::Tier>,
-    cursor: usize,
-    probe: bool,
-    candidates: usize,
-    done: bool,
-}
-impl Phase {
-    fn new(problem: Arc<Problem>, relaxed: bool, radius: (i32, i32)) -> Self {
-        let tiers = problem
-            .vips
-            .iter()
-            .map(|&(bonus, rank)| {
-                search::Tier::new(Arc::clone(&problem), bonus, rank, relaxed, radius)
-            })
-            .collect();
-        Self {
-            tiers,
-            cursor: 0,
-            probe: true,
-            candidates: 0,
-            done: false,
-        }
-    }
-    fn advance(&mut self) -> Option<search::Ranked> {
-        if self.cursor >= self.tiers.len() {
-            self.probe = false;
-            self.cursor = self
-                .tiers
-                .iter()
-                .position(|tier| !tier.finished())
-                .unwrap_or(self.tiers.len());
-            if self.cursor == self.tiers.len() || self.candidates >= 256 {
-                self.done = true;
-                return None;
-            }
-        }
-        let tier = &mut self.tiers[self.cursor];
-        if tier.finished() {
-            self.cursor += 1;
-            return None;
-        }
-        let candidate = tier.advance();
-        if tier.finished() || self.probe && (candidate.is_some() || tier.visited >= 4096) {
-            self.cursor += 1;
-        }
-        if candidate.is_some() {
-            self.candidates += 1;
-        }
-        candidate
-    }
-    fn stable_ready(&self, rows: &[search::Ranked]) -> bool {
-        if self.probe || rows.len() < 10 || rows.iter().any(|row| row.configuration.changed) {
-            return false;
-        }
-        let worst = rows.last().unwrap().configuration.vip_bonus;
-        self.tiers.iter().all(|tier| {
-            tier.finished() || tier.vip < worst || tier.vip == worst && tier.produced >= 10
-        })
-    }
-}
 pub struct Search {
-    problem: Option<Arc<Problem>>,
-    phases: Vec<Phase>,
-    rows: Vec<search::Ranked>,
-    preference: usize,
-    active: usize,
-    slice_ms: f64,
-    sweep: bool,
-    elapsed_ms: f64,
+    problems: Vec<Arc<Problem>>,
+    tiers: Vec<search::Tier>,
+    scouts: Vec<search::Tier>,
+    scout_cursor: usize,
+    scout_ms: f64,
+    scout_slice: f64,
+    scout_tick: usize,
+    rows: Vec<Arc<search::Ranked>>,
+    previews: BTreeMap<String, Arc<search::Ranked>>,
+    seen: BTreeSet<String>,
+    relaxed: bool,
+    incumbent: Option<i32>,
+    minimum: Option<i32>,
+    budget: i32,
+    page: usize,
+    examined: usize,
+    pruned: usize,
     complete: bool,
     status: &'static str,
     generation: u64,
 }
-const PREFERENCES: [bool; 2] = [false, true];
-const RADII: [(i32, i32); 5] = [(0, 0), (1, 1), (1, 3), (2, 5), (2, 10)];
+const PAGE_SIZE: usize = 10;
+const RANK_SPAN: i32 = 2;
+const ITEM_SPAN: i32 = 10;
 impl Search {
     pub fn new(master: &Master, data: &Value, input: &Value) -> Result<Self, String> {
-        let request: Request =
+        let mut request: Request =
             serde_json::from_value(input.clone()).map_err(|error| error.to_string())?;
-        let prepared = Problem::new(master, data, request);
+        let prepared = (|| {
+            let compiled = Arc::new((*master).clone());
+            let mut problems = Vec::new();
+            let mut contexts = BTreeSet::new();
+            if let Some(total) = request.total.take().filter(|total| {
+                request
+                    .observations
+                    .first()
+                    .is_none_or(|song| song.row.profile_id == total.profile_id)
+            }) {
+                for challenge in master
+                    .challenge_music
+                    .iter()
+                    .filter(|song| song.event_id == request.event_id)
+                {
+                    let reading = ReadingInput {
+                        challenge_id: 0,
+                        context_challenge_id: Some(challenge.id),
+                        row: total.clone(),
+                    };
+                    if let Ok(prepared) = prepare(master, data, request.event_id, reading.clone()) {
+                        if !contexts.insert(prepared.signature) {
+                            continue;
+                        }
+                        let mut branch = request.clone();
+                        branch.observations.push(reading);
+                        problems.push(Arc::new(Problem::new(&compiled, data, branch)?));
+                    }
+                }
+            }
+            if problems.is_empty() {
+                problems.push(Arc::new(Problem::new(&compiled, data, request)?));
+            }
+            let deltas = Arc::clone(&problems[0].deltas);
+            for problem in problems.iter_mut().skip(1) {
+                Arc::get_mut(problem).unwrap().deltas = Arc::clone(&deltas);
+            }
+            Ok::<_, String>(problems)
+        })();
         let mut search = Self {
-            problem: None,
-            phases: Vec::new(),
+            problems: Vec::new(),
+            tiers: Vec::new(),
+            scouts: Vec::new(),
+            scout_cursor: 0,
+            scout_ms: 0.0,
+            scout_slice: 0.0,
+            scout_tick: 0,
             rows: Vec::new(),
-            preference: 0,
-            active: 0,
-            slice_ms: 0.0,
-            sweep: false,
-            elapsed_ms: 0.0,
+            previews: BTreeMap::new(),
+            seen: BTreeSet::new(),
+            relaxed: false,
+            incumbent: None,
+            minimum: None,
+            budget: 0,
+            page: 0,
+            examined: 0,
+            pruned: 0,
             complete: false,
             status: "ready",
             generation: crate::cancellation_generation(),
         };
         match prepared {
-            Ok(problem) => {
-                search.problem = Some(Arc::new(problem));
-                search.add_phase();
+            Ok(problems) => {
+                search.problems = problems;
+                search.add_tiers();
+                search.add_scouts();
             }
             Err(error) => {
                 search.complete = true;
@@ -633,100 +677,212 @@ impl Search {
         }
         Ok(search)
     }
-    fn add_phase(&mut self) {
-        self.active = self.phases.len();
-        self.phases.push(Phase::new(
-            Arc::clone(self.problem.as_ref().unwrap()),
-            PREFERENCES[self.preference],
-            RADII[self.active],
-        ));
-        self.slice_ms = 0.0;
+    fn add_tiers(&mut self) {
+        self.examined += self.tiers.iter().map(|tier| tier.visited).sum::<usize>();
+        self.pruned += self.tiers.iter().map(|tier| tier.pruned).sum::<usize>();
+        self.tiers = self
+            .problems
+            .iter()
+            .flat_map(|problem| {
+                problem.vips.iter().map(|&(bonus, rank)| {
+                    search::Tier::new(
+                        Arc::clone(problem),
+                        bonus,
+                        rank,
+                        self.relaxed,
+                        self.budget,
+                        false,
+                    )
+                })
+            })
+            .collect();
     }
-    fn schedule(&mut self) {
-        if self.phases.iter().all(|phase| phase.done) {
-            if self.phases.len() < RADII.len() {
-                self.add_phase();
-                return;
-            }
-            if !self.rows.is_empty() {
-                self.complete = true;
-                return;
-            }
-            self.preference += 1;
-            if self.preference == PREFERENCES.len() {
-                self.complete = true;
-                self.status = if self.problem.as_ref().unwrap().conflict {
-                    "conflictingRecords"
-                } else {
-                    "noMatch"
-                };
-                return;
-            }
-            self.phases.clear();
-            self.sweep = false;
-            self.add_phase();
-            return;
+    fn offer(&mut self, row: Arc<search::Ranked>) {
+        let cost = row.configuration.change_cost;
+        if self.incumbent.is_none_or(|old| cost < old) {
+            self.incumbent = Some(cost);
         }
-        if !self.sweep && self.phases.len() < RADII.len() {
-            self.add_phase();
-            return;
+        if cost == 0 || cost == self.budget {
+            self.minimum = Some(self.minimum.map(|old| old.min(cost)).unwrap_or(cost));
         }
-        self.sweep = true;
-        self.active = (1..=self.phases.len())
-            .map(|offset| (self.active + offset) % self.phases.len())
-            .find(|&index| !self.phases[index].done)
+        let limit = self.incumbent.unwrap() + 1;
+        self.previews
+            .retain(|_, row| row.configuration.change_cost <= limit);
+        let key = &row.configuration.id;
+        if cost <= limit
+            && !self.seen.contains(key)
+            && self
+                .previews
+                .get(key)
+                .is_none_or(|old| row.compare(old).is_lt())
+        {
+            self.previews.insert(key.clone(), row);
+        }
+    }
+    fn clear_scouts(&mut self) {
+        self.examined += self.scouts.iter().map(|tier| tier.visited).sum::<usize>();
+        self.pruned += self.scouts.iter().map(|tier| tier.pruned).sum::<usize>();
+        self.scouts.clear();
+        self.scout_cursor = 0;
+        self.scout_slice = 0.0;
+    }
+    fn add_scouts(&mut self) {
+        self.scouts = self
+            .problems
+            .iter()
+            .flat_map(|problem| {
+                problem.vips.iter().map(|&(bonus, rank)| {
+                    let maximum = problem.ids.len() as i32 * RANK_SPAN * 5
+                        + problem.bands.len() as i32 * ITEM_SPAN
+                        + problem.totals.last().unwrap().bonus
+                        - problem.totals[0].bonus;
+                    search::Tier::new(
+                        Arc::clone(problem),
+                        bonus,
+                        rank,
+                        self.relaxed,
+                        maximum,
+                        true,
+                    )
+                })
+            })
+            .collect();
+        self.scouts.sort_by_key(|tier| std::cmp::Reverse(tier.vip));
+    }
+    fn next_budget(&mut self) {
+        let mut maximum = self
+            .problems
+            .iter()
+            .map(|problem| {
+                problem.ids.len() as i32 * RANK_SPAN * 5
+                    + problem.bands.len() as i32 * ITEM_SPAN
+                    + problem.totals.last().unwrap().bonus
+                    - problem.totals[0].bonus
+            })
+            .max()
             .unwrap();
-        self.slice_ms = 0.0;
+        if let Some(incumbent) = self.incumbent {
+            maximum = maximum.min(incumbent + 1);
+        }
+        if self.budget < maximum {
+            self.budget += 1;
+            if self.incumbent == Some(self.budget) {
+                self.minimum = self.incumbent;
+            }
+            self.add_tiers();
+            return;
+        }
+        if self.rows.is_empty() && !self.relaxed {
+            self.relaxed = true;
+            self.budget = 0;
+            self.add_tiers();
+            return;
+        }
+        self.complete = true;
+        self.page = self.page.min(self.rows.len().saturating_sub(1) / PAGE_SIZE);
+        if self.rows.is_empty() {
+            self.status = if self.problems.iter().any(|problem| problem.conflict) {
+                "conflictingRecords"
+            } else {
+                "noMatch"
+            };
+        }
     }
     pub fn step(&mut self, budget_ms: f64) {
-        let begin = clock::milliseconds();
-        let stop = begin + budget_ms;
-        while !self.complete && clock::milliseconds() < stop {
+        let stop = clock::milliseconds() + budget_ms;
+        while !self.complete
+            && self.rows.len() < (self.page + 1) * PAGE_SIZE
+            && clock::milliseconds() < stop
+        {
             if crate::cancellation_generation() != self.generation {
                 self.complete = true;
                 break;
             }
-            // A larger history domain can supply an early witness while exact searches keep their frontiers.
-            let allowance = if self.sweep {
-                [64.0, 48.0, 32.0, 24.0, 16.0][self.active]
-            } else if self.active == 0 {
-                160.0
-            } else {
-                60.0
-            };
-            if self.phases[self.active].done || self.slice_ms >= allowance {
-                self.schedule();
+            self.scout_tick += 1;
+            if self.scout_cursor < self.scouts.len()
+                && (self.scout_ms < 200.0 || self.scout_tick.is_multiple_of(4))
+            {
+                let before = clock::milliseconds();
+                let scout = &mut self.scouts[self.scout_cursor];
+                scout.advance();
+                let elapsed = clock::milliseconds() - before;
+                self.scout_ms += elapsed;
+                self.scout_slice += elapsed;
+                let previews = std::mem::take(&mut scout.latest);
+                let finished = scout.finished();
+                if !previews.is_empty() {
+                    for preview in previews {
+                        self.offer(preview);
+                    }
+                    self.clear_scouts();
+                } else if finished || self.scout_slice >= 16.0 {
+                    self.scout_slice = 0.0;
+                    self.scout_cursor = (1..=self.scouts.len())
+                        .map(|offset| (self.scout_cursor + offset) % self.scouts.len())
+                        .find(|&i| !self.scouts[i].finished())
+                        .unwrap_or(self.scouts.len());
+                }
                 continue;
             }
-            let before = clock::milliseconds();
-            let candidate = self.phases[self.active].advance();
-            self.slice_ms += clock::milliseconds() - before;
-            if let Some(mut candidate) = candidate {
-                if let Some(index) = self.rows.iter().position(|row| {
-                    row.configuration.id == candidate.configuration.id
-                        || row.display == candidate.display
-                }) {
-                    if candidate.compare(&self.rows[index]).is_lt() {
-                        candidate.configuration.id = self.rows[index].configuration.id.clone();
-                        self.rows[index] = candidate;
-                    }
-                } else {
+            let next = self
+                .tiers
+                .iter()
+                .enumerate()
+                .filter(|(_, tier)| !tier.finished())
+                .min_by(|(i, a), (j, b)| {
+                    a.bound()
+                        .unwrap()
+                        .cmp(b.bound().unwrap())
+                        .then(b.ready_rank().cmp(&a.ready_rank()))
+                        .then(a.visited.cmp(&b.visited))
+                        .then(i.cmp(j))
+                })
+                .map(|(i, _)| i);
+            let Some(index) = next else {
+                self.next_budget();
+                continue;
+            };
+            let candidate = self.tiers[index].advance();
+            let discovered = std::mem::take(&mut self.tiers[index].latest);
+            if !discovered.is_empty() {
+                self.clear_scouts();
+            }
+            for preview in discovered {
+                self.offer(preview);
+            }
+            if let Some(candidate) = candidate {
+                if self.seen.insert(candidate.configuration.id.clone()) {
+                    debug_assert!(self
+                        .rows
+                        .last()
+                        .is_none_or(|old| !candidate.compare(old).is_lt()));
+                    self.previews.remove(&candidate.configuration.id);
                     self.rows.push(candidate);
                 }
-                self.rows.sort_by(search::Ranked::compare);
-                self.rows.truncate(10);
-            }
-            if self.phases[0].stable_ready(&self.rows)
-                || !self.rows.is_empty()
-                    && self.elapsed_ms + clock::milliseconds() - begin >= 2000.0
-            {
-                self.complete = true;
             }
         }
-        self.elapsed_ms += clock::milliseconds() - begin;
+    }
+    pub fn set_page(&mut self, page: usize) {
+        self.page = page.min(self.rows.len() / PAGE_SIZE);
     }
     pub fn response(&self) -> Value {
-        json!({"rows":self.rows.iter().map(|row|&row.configuration).collect::<Vec<_>>(),"count":self.rows.len(),
-            "complete":self.complete,"status":self.status,"rankCaps":self.problem.as_ref().map(|problem|&problem.all_caps)})
+        let end = (self.page + 1) * PAGE_SIZE;
+        let mut rows: Vec<_> = self
+            .rows
+            .iter()
+            .skip(self.page * PAGE_SIZE)
+            .take(PAGE_SIZE)
+            .collect();
+        let mut pending: Vec<_> = self.previews.values().collect();
+        pending.sort_by(|a, b| a.compare(b));
+        rows.extend(pending.into_iter().take(PAGE_SIZE - rows.len()));
+        json!({"rows":rows.into_iter().map(|row|&row.configuration).collect::<Vec<_>>(),
+            "count":self.rows.len() + self.previews.len(), "certified":self.rows.len(), "costBound":self.budget,
+            "minimumCost":self.minimum, "costLimit":self.incumbent.map(|cost|cost+1),
+            "examinedBoxes":self.examined + self.tiers.iter().map(|tier| tier.visited).sum::<usize>() + self.scouts.iter().map(|tier|tier.visited).sum::<usize>(),
+            "prunedBoxes":self.pruned + self.tiers.iter().map(|tier| tier.pruned).sum::<usize>() + self.scouts.iter().map(|tier|tier.pruned).sum::<usize>(),
+            "page":self.page,"pageSize":PAGE_SIZE,"awaitingPage":!self.complete && self.rows.len() >= end,
+            "hasMore":!self.complete || self.rows.len() > end,"complete":self.complete,"status":self.status,
+            "rankCaps":self.problems.first().map(|problem|&problem.all_caps)})
     }
 }
