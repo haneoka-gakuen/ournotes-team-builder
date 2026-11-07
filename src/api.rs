@@ -574,6 +574,7 @@ impl crate::search::Objective for PowerObjective {
     }
 }
 fn constraints(
+    master: &Master,
     input: &Value,
     members: &[power::Member],
     snaps: &[power::Snap],
@@ -651,6 +652,21 @@ fn constraints(
             .map(|v| crate::num::round(v * 100.0)),
         max_bonus: None,
         member_floor: None,
+        member_floors: master::rows(&input["minMissionMembers"]).iter().enumerate()
+            .filter_map(|(index, minimum)| {
+                let minimum = minimum.as_f64()?;
+                if minimum <= 0.0 { return None; }
+                let mission = index as i32 + 1;
+                Some(crate::search::MemberFloor {
+                    values: members.iter().map(|member| {
+                        let kind = master.gekiso_skills.get(&member.card.gekiso_skill_id)
+                            .map_or(0, |skill| skill.mission_type);
+                        f64::from(kind == mission || kind == 4)
+                    }).collect(),
+                    minimum,
+                    maximum: 1.0,
+                })
+            }).collect(),
     }
 }
 fn search_box(master: &Master, request: &Value) -> Result<power::BoxCards, String> {
@@ -687,7 +703,7 @@ fn search_box(master: &Master, request: &Value) -> Result<power::BoxCards, Strin
     });
     let excluded = keys(&c["excludedSnaps"]);
     let required = if master::rows(&c["bindings"]).len() >= 5 {
-        let resolved = constraints(c, &cards.members, &cards.snaps);
+        let resolved = constraints(master, c, &cards.members, &cards.snaps);
         (resolved.bindings.len() >= 5).then(|| {
             resolved
                 .required_snaps
@@ -749,7 +765,7 @@ impl Engine {
             .unwrap_or_default();
         let member_pct = |member: &power::Member| power::member_event_percent(effects, member, 2);
         let snap_pct = |snap: &power::Snap| power::snap_event_percent(effects, snap, 2);
-        let constraints = constraints(&request["constraints"], &cards.members, &cards.snaps);
+        let constraints = constraints(&self.master, &request["constraints"], &cards.members, &cards.snaps);
         let k = master::number(&request["k"], 1.0).max(1.0) as usize;
         let deadline = request["deadline"].as_f64().unwrap_or_else(|| {
             request["timeLimitMs"]
@@ -822,7 +838,7 @@ impl Engine {
         let cards = search_box(&self.master, request)?;
         crate::progress::keys(&cards.members, &cards.snaps);
         let player = power::player_state(&self.master, &request["player"]);
-        let constraints = constraints(&request["constraints"], &cards.members, &cards.snaps);
+        let constraints = constraints(&self.master, &request["constraints"], &cards.members, &cards.snaps);
         let k = master::number(&request["k"], 1.0).max(1.0) as usize;
         let deadline = request["deadline"].as_f64().unwrap_or_else(|| {
             request["timeLimitMs"]
@@ -1634,7 +1650,7 @@ impl Engine {
         let seed_count = master::int(&goal["seeds"]).max(0);
         let seeds: Vec<i32> = (0..seed_count).collect();
         let criterion = Criterion::from_value(&goal["criterion"]);
-        let constraints = constraints(&request["constraints"], &cards.members, &cards.snaps);
+        let constraints = constraints(&self.master, &request["constraints"], &cards.members, &cards.snaps);
         let k = master::number(&request["k"], 1.0).max(1.0) as usize;
         let deadline = request["deadline"].as_f64().unwrap_or_else(|| {
             request["timeLimitMs"]
@@ -1839,7 +1855,7 @@ impl Engine {
         if exchange.is_some_and(|(_, d)| d <= 0.0) {
             return Err("invalid-cp-exchange".into());
         }
-        let constraints = constraints(&request["constraints"], &cards.members, &cards.snaps);
+        let constraints = constraints(&self.master, &request["constraints"], &cards.members, &cards.snaps);
         let generation = crate::cancellation_generation();
         let mut results = Vec::new();
         let mut overall = Vec::new();
@@ -2545,6 +2561,15 @@ impl Engine {
     ) -> Result<Value, String> {
         let request = &input["request"];
         let goal = &request["goal"];
+        let counts = &request["constraints"]["minMissionMembers"];
+        if !counts.is_null() && !counts.as_array().is_some_and(|counts| counts.len() == 3
+            && counts.iter().all(|value| value.as_f64().is_some_and(|count| count.is_finite()
+                && count.fract() == 0.0 && (0.0..=5.0).contains(&count)))) {
+            return Err("gekiso-members-input".into());
+        }
+        if master::rows(counts).iter().map(|value| value.as_f64().unwrap()).sum::<f64>() > 5.0 {
+            return Err("gekiso-members-total".into());
+        }
         validate_gekiso_counts(if goal["kind"] == "gekiso" { goal } else { &goal["gekiso"] })?;
         if matches!(goal["kind"].as_str(), Some("score" | "event" | "gekiso"))
             && (request["aggregation"] == "mean" || goal["arena"]["mode"] == "shared")
@@ -2778,7 +2803,7 @@ impl Engine {
         }
         let cards = search_box(&self.master, request)?;
         let player = power::player_state(&self.master, &request["player"]);
-        let mut constraints = constraints(&request["constraints"], &cards.members, &cards.snaps);
+        let mut constraints = constraints(&self.master, &request["constraints"], &cards.members, &cards.snaps);
         crate::progress::keys(&cards.members, &cards.snaps);
         let song = master::rows(&goal["songs"])
             .first()
@@ -3686,7 +3711,7 @@ impl Engine {
         let cp_cost = master::int(&goal["challengePointsPerLive"]) as i64;
         let cards = search_box(&self.master, request)?;
         let player = power::player_state(&self.master, &request["player"]);
-        let constraints = constraints(&request["constraints"], &cards.members, &cards.snaps);
+        let constraints = constraints(&self.master, &request["constraints"], &cards.members, &cards.snaps);
         let route = Route::for_goal(
             &self.master,
             goal,

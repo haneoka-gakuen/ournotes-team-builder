@@ -1364,7 +1364,7 @@ impl Engine {
             snaps: &cards.snaps,
             music: Some(&music),
             objective: &mut combined,
-            constraints: constraints(&request["constraints"], &cards.members, &cards.snaps),
+            constraints: constraints(&self.master, &request["constraints"], &cards.members, &cards.snaps),
             k,
             deadline,
             now,

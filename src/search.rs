@@ -319,6 +319,7 @@ pub struct Constraints {
     pub min_bonus: Option<f64>,
     pub max_bonus: Option<f64>,
     pub member_floor: Option<MemberFloor>,
+    pub member_floors: Vec<MemberFloor>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -643,7 +644,7 @@ pub(crate) fn valid_seed(members: &[Member], snaps: &[Snap], c: &Constraints, se
             .iter()
             .chain(c.bindings.keys())
             .any(|member| !seed.members.contains(member))
-        || c.member_floor.as_ref().is_some_and(|floor| {
+        || c.member_floor.iter().chain(&c.member_floors).any(|floor| {
             seed.members
                 .iter()
                 .map(|&member| floor.values[member])
@@ -1743,11 +1744,10 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         Ok(())
     }
     fn member_floor_possible(&self, chosen: &[usize], left: usize) -> bool {
-        let Some(floor) = &self.input.constraints.member_floor else {
-            return true;
-        };
-        let current: f64 = chosen.iter().map(|&i| floor.values[i]).sum();
-        current + floor.maximum * left as f64 >= floor.minimum
+        self.input.constraints.member_floor.iter().chain(&self.input.constraints.member_floors).all(|floor| {
+            let current: f64 = chosen.iter().map(|&i| floor.values[i]).sum();
+            current + floor.maximum * left as f64 >= floor.minimum
+        })
     }
     fn member_price(
         &self,
@@ -2114,8 +2114,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         } else {
             (None, None)
         };
-        if self.input.constraints.member_floor.is_some()
-            && !self.member_floor_possible(chosen, left)
+        if !self.member_floor_possible(chosen, left)
         {
             return Ok(());
         }
@@ -3665,8 +3664,8 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                                     .input
                                     .constraints
                                     .member_floor
-                                    .as_ref()
-                                    .is_some_and(|f| f.values[better] < f.values[worse])
+                                    .iter().chain(&self.input.constraints.member_floors)
+                                    .any(|f| f.values[better] < f.values[worse])
                             {
                                 continue;
                             }

@@ -269,7 +269,7 @@ impl Engine {
                 members: &cards.members,
                 snaps: &cards.snaps,
                 music: Some(&music[0]),
-                constraints: constraints(&request["constraints"], &cards.members, &cards.snaps),
+                constraints: constraints(&self.master, &request["constraints"], &cards.members, &cards.snaps),
                 now,
                 generation: crate::cancellation_generation(),
                 min_just_window_ms: minimum_just_window,
