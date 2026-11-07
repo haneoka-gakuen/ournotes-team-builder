@@ -1,9 +1,11 @@
-//! Native input kinds and shared spatial candidates for cumulative delivery.
+//! Native input feasibility, frame candidates and cached flick-reservation components.
 mod frame;
+mod optimize;
 mod search;
+pub(crate) use optimize::FrameObjective;
 use crate::{chart::Chart, live, master::Master, num::f};
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::{Arc, Mutex},
 };
 
@@ -25,6 +27,7 @@ struct Note {
     body_right: f64,
     before: [i32; 6],
     after: [i32; 6],
+    input_first: i64,
     first: i32,
     last: i32,
     last_phase: i32,
@@ -32,23 +35,29 @@ struct Note {
     forced_frame: i32,
 }
 impl Note {
+    #[inline]
     fn trace(&self) -> bool {
         matches!(self.op, 21 | 60..=63 | 104 | 105 | 120)
     }
+    #[inline]
     fn tail(&self) -> bool {
         self.op == 22
     }
+    #[inline]
     fn flick(&self) -> bool {
         matches!(self.op, 40..=42 | 102)
     }
+    #[inline]
     fn asynchronous(&self) -> bool {
         self.trace() || self.tail()
     }
+    #[inline]
     fn body_distance(&self, point: f64) -> f64 {
         f(self.body_left - point)
             .max(f(point - self.body_right))
             .max(0.0)
     }
+    #[inline]
     fn grade_at(&self, time: i32) -> usize {
         let diff = time - self.time;
         (1..=5)
@@ -105,6 +114,22 @@ pub struct InputTiming {
     notes: Vec<Note>,
     checked: Arc<Mutex<InputChecks>>,
     local_checked: Arc<Mutex<LocalChecks>>,
+    atoms: Arc<Mutex<search::AtomCache>>,
+    witnesses: Arc<Mutex<Vec<Vec<i32>>>>,
+    orderings: Vec<(usize, usize)>,
+    contexts: Arc<HashMap<i32, Arc<Vec<usize>>>>,
+    components: Arc<Vec<FlickComponent>>,
+    component_checked: Arc<Mutex<ComponentChecks>>,
+}
+struct FlickComponent {
+    start: i32,
+    end: i32,
+    notes: Vec<usize>,
+}
+#[derive(Default)]
+struct ComponentChecks {
+    values: HashMap<(usize, Vec<i32>), Option<Conflict>>,
+    bytes: usize,
 }
 type InputChecks = HashMap<Vec<i32>, Result<Option<Conflict>, String>>;
 type LocalChecks = HashMap<(i32, i32, Vec<i32>), bool>;
@@ -209,6 +234,7 @@ impl InputTiming {
                 body_right: f(end + 0.5),
                 before,
                 after,
+                input_first: i64::from(source.time_ms) - i64::from(max_before),
                 first: clock.frame_time(source.time_ms.saturating_sub(max_before)),
                 last: source.time_ms.saturating_add(max_after),
                 last_phase,
@@ -273,20 +299,67 @@ impl InputTiming {
             }
             frames[i] = allowed.into_iter().collect();
         }
+        let mut traces = HashMap::<(u64, u64, [i32; 6], [i32; 6]), Vec<usize>>::new();
+        for (i, note) in notes.iter().enumerate().filter(|(_, note)| note.trace() && note.grade == 5) {
+            traces.entry((note.left.to_bits(), note.right.to_bits(), note.before, note.after)).or_default().push(i);
+        }
+        let mut orderings = Vec::new();
+        for group in traces.values_mut() {
+            group.sort_by_key(|&i| notes[i].time);
+            for pair in group.windows(2) {
+                orderings.push((pair[0], pair[1]));
+                if notes[pair[0]].time == notes[pair[1]].time { orderings.push((pair[1], pair[0])); }
+            }
+        }
+        let mut contexts = HashMap::<i32, Vec<usize>>::new();
+        for (i, note) in notes.iter().enumerate() {
+            let last = *frames[i].last().unwrap();
+            let mut at = note.first;
+            while at <= last {
+                contexts.entry(at).or_default().push(i);
+                if at == last { break; }
+                at = clock.frame_time(at.saturating_add(1));
+            }
+        }
+        // Only flick reservations cross frames. Disjoint potential intervals
+        // can be certified independently; other notes only share one update.
+        let mut flicks: Vec<_> = notes.iter().enumerate().filter(|(_, note)| note.flick()).map(|(i, _)| i).collect();
+        flicks.sort_by_key(|&i| notes[i].first);
+        let mut components = Vec::<FlickComponent>::new();
+        for i in flicks {
+            let start = notes[i].first;
+            let end = *frames[i].last().unwrap();
+            if let Some(previous) = components.last_mut().filter(|previous| previous.end >= start) { previous.end = previous.end.max(end); }
+            else { components.push(FlickComponent { start, end, notes: Vec::new() }); }
+        }
+        for component in &mut components {
+            component.notes = notes.iter().enumerate().filter(|(i, note)| note.first <= component.end && *frames[*i].last().unwrap() >= component.start).map(|(i, _)| i).collect();
+        }
         Ok(Self {
             frames,
             clock,
             notes,
             checked: Arc::new(Mutex::new(HashMap::new())),
             local_checked: Arc::new(Mutex::new(HashMap::new())),
+            atoms: Arc::new(Mutex::new(search::AtomCache::default())),
+            witnesses: Arc::new(Mutex::new(Vec::new())),
+            orderings,
+            contexts: Arc::new(contexts.into_iter().map(|(at, indices)| (at, Arc::new(indices))).collect()),
+            components: Arc::new(components),
+            component_checked: Arc::new(Mutex::new(ComponentChecks::default())),
         })
     }
 
     pub fn conflict(&self, selected: &[i32]) -> Result<Option<Conflict>, String> {
-        if let Some(result) = self.checked.lock().unwrap().get(selected) {
-            return result.clone();
+        let cached = self.checked.lock().unwrap().get(selected).cloned();
+        let was_cached = cached.is_some();
+        let result = cached.unwrap_or_else(|| self.check_inputs(selected));
+        if matches!(&result, Ok(None)) {
+            self.remember_verified(selected)?;
+            return result;
         }
-        let result = self.check_inputs(selected);
+        if was_cached { return result; }
+        result.as_ref()?;
         let mut checked = self.checked.lock().unwrap();
         let capacity = (1_048_576 / selected.len().max(1).saturating_mul(16)).clamp(1, 256);
         if checked.len() >= capacity {
@@ -296,9 +369,35 @@ impl InputTiming {
         result
     }
 
+    fn remember_verified(&self, selected: &[i32]) -> Result<(), String> {
+        let mut checked = self.checked.lock().unwrap();
+        if matches!(checked.get(selected), Some(Ok(Some(_)))) { return Err("native input proof contradiction".into()); }
+        if !checked.contains_key(selected) {
+            let capacity = (1_048_576 / selected.len().max(1).saturating_mul(16)).clamp(1, 256);
+            if checked.len() >= capacity { checked.clear(); }
+            checked.insert(selected.to_vec(), Ok(None));
+        }
+        drop(checked);
+        let mut witnesses = self.witnesses.lock().unwrap();
+        if !witnesses.iter().any(|known| known == selected) {
+            if witnesses.len() == 8 { witnesses.remove(0); }
+            witnesses.push(selected.to_vec());
+        }
+        Ok(())
+    }
+
+    pub fn witnesses(&self) -> Vec<Vec<i32>> {
+        self.witnesses.lock().unwrap().clone()
+    }
+
+    pub(crate) fn ordering_pairs(&self) -> &[(usize, usize)] { &self.orderings }
+
     fn check_inputs(&self, selected: &[i32]) -> Result<Option<Conflict>, String> {
-        use frame::State;
-        let clock = self.clock;
+        for &(first, second) in &self.orderings {
+            if selected[first] > selected[second] {
+                return Ok(Some(Conflict { notes: vec![first, second], interval: None }));
+            }
+        }
         for (i, &at) in selected.iter().enumerate() {
             if !self.frames[i].contains(&at) {
                 return Ok(Some(Conflict {
@@ -307,6 +406,86 @@ impl InputTiming {
                 }));
             }
         }
+        for i in 0..self.components.len() {
+            if let Some(conflict) = self.component_conflict(i, selected)? { return Ok(Some(conflict)); }
+        }
+        let mut frames = BTreeSet::new();
+        for (i, &at) in selected.iter().enumerate() {
+            if self.notes[i].flick() { continue; }
+            let component = self.components.partition_point(|component| component.end < at);
+            if self.components.get(component).is_none_or(|component| component.start > at) { frames.insert(at); }
+        }
+        for at in frames {
+            if let Some(conflict) = self.local_conflict(selected, at, at)? {
+                return Ok(Some(conflict));
+            }
+        }
+        Ok(None)
+    }
+
+    fn component_conflict(&self, index: usize, selected: &[i32]) -> Result<Option<Conflict>, String> {
+        let component = &self.components[index];
+        let key: Vec<_> = component.notes.iter().map(|&i| if selected[i] < component.start { -1 } else if selected[i] > component.end { -2 } else { selected[i] }).collect();
+        if let Some(value) = self.component_checked.lock().unwrap().values.get(&(index, key.clone())).cloned() { return Ok(value); }
+        // A late Perfect that needs a saved flick must also survive the
+        // preceding update. Check that short necessary condition first.
+        for &i in &component.notes {
+            let note = &self.notes[i];
+            let at = selected[i];
+            if !note.flick() || note.grade != 5 || at < component.start || at > component.end
+                || *input_times(self.clock,at).start() <= note.time.saturating_add(note.after[5]) { continue; }
+            let start = self.clock.frame_time(at.saturating_sub(self.clock.advance_ms()));
+            match self.local_conflict(selected,start,at) {
+                Ok(Some(conflict)) => return Ok(Some(conflict)),
+                Err(error) if error == "cancelled" => return Err(error),
+                _ => {}
+            }
+        }
+        let notes: Vec<_> = component.notes.iter().map(|&i| self.notes[i].clone()).collect();
+        let targets: Vec<_> = component.notes.iter().map(|&i| selected[i]).collect();
+        let initial = frame::State { done: targets.iter().map(|&at| at < component.start).collect(), flicks: vec![None; notes.len()] };
+        let mut frames: BTreeSet<_> = targets.iter().copied().filter(|&at| component.start <= at && at <= component.end).collect();
+        for (i, note) in notes.iter().enumerate() {
+            for at in [note.auto_frame, note.forced_frame] {
+                if component.start <= at && at <= component.end && at <= targets[i] { frames.insert(at); }
+            }
+            if note.flick() {
+                let mut at = note.first;
+                while at <= targets[i] {
+                    frames.insert(at);
+                    if at == targets[i] { break; }
+                    at = self.clock.frame_time(at.saturating_add(1));
+                }
+            }
+        }
+        let checked = replay(self.clock, &notes, &frames.into_iter().collect::<Vec<_>>(), &targets, &initial, &self.atoms, None);
+        let mut tightened = None;
+        if !matches!(checked, Ok(None)) {
+            if matches!(&checked, Err(error) if error == "cancelled") { return Err("cancelled".into()); }
+            let mut ends: Vec<_> = targets.iter().copied().filter(|&at| component.start <= at && at <= component.end).collect();
+            ends.sort_unstable(); ends.dedup();
+            for at in ends.into_iter().rev() {
+                let start = self.clock.frame_time(at.saturating_sub(self.clock.advance_ms()));
+                match self.local_conflict(selected,start,at) {
+                    Ok(Some(conflict)) => { tightened = Some(conflict); break; },
+                    Err(error) if error == "cancelled" => return Err(error),
+                    _ => {}
+                }
+            }
+        }
+        let value = if tightened.is_some() { tightened } else { checked?.map(|(start, end)| Conflict {
+            notes: component.notes.iter().copied().filter(|&i| self.notes[i].first <= end && *self.frames[i].last().unwrap() >= start).collect(),
+            interval: Some((start, end)),
+        }) };
+        let bytes = key.len() * 4 + value.as_ref().map_or(0, |conflict| conflict.notes.len() * std::mem::size_of::<usize>()) + 64;
+        let mut checked = self.component_checked.lock().unwrap();
+        if checked.bytes + bytes > 4 * 1_048_576 { checked.values.clear(); checked.bytes = 0; }
+        checked.values.insert((index, key), value.clone());
+        checked.bytes += bytes;
+        Ok(value)
+    }
+
+    fn replay_frames(&self, selected: &[i32]) -> BTreeSet<i32> {
         let mut frames: BTreeSet<_> = selected.iter().copied().collect();
         for (i, note) in self.notes.iter().enumerate() {
             for at in [note.auto_frame, note.forced_frame] {
@@ -318,37 +497,22 @@ impl InputTiming {
                 let mut at = note.first;
                 while at <= selected[i] {
                     frames.insert(at);
-                    at = clock.frame_time(at.saturating_add(1));
+                    at = self.clock.frame_time(at.saturating_add(1));
                 }
             }
         }
-        let frames: Vec<_> = frames.into_iter().collect();
-        for &at in &frames {
-            if let Some(conflict) = self.local_conflict(selected, at, at)? {
-                return Ok(Some(conflict));
-            }
-        }
-        let initial = State {
-            done: vec![false; self.notes.len()],
-            flicks: vec![None; self.notes.len()],
-        };
-        for (i, note) in self.notes.iter().enumerate() {
-            if note.flick() && selected[i] > note.time {
-                let at = selected[i];
-                let before = *input_times(clock, at).start() - 1;
-                if let Some(conflict) = self.local_conflict(selected, before, at)? {
-                    return Ok(Some(conflict));
-                }
-            }
-        }
-        if replay(clock, &self.notes, &frames, selected, &initial)? {
-            Ok(None)
-        } else {
-            Ok(Some(Conflict {
-                notes: (0..selected.len()).collect(),
-                interval: None,
-            }))
-        }
+        frames
+    }
+
+    fn verify_program(&self, selected: &[i32], inputs: &BTreeMap<i32, Vec<frame::Touch>>) -> Result<bool, String> {
+        if selected.iter().enumerate().any(|(i, at)| !self.frames[i].contains(at)) { return Ok(false); }
+        let mut frames = self.replay_frames(selected);
+        frames.extend(inputs.keys().copied());
+        let initial = frame::State { done: vec![false; self.notes.len()], flicks: vec![None; self.notes.len()] };
+        if replay(self.clock, &self.notes, &frames.into_iter().collect::<Vec<_>>(), selected, &initial, &self.atoms, Some(inputs))?.is_none() {
+            self.remember_verified(selected)?;
+            Ok(true)
+        } else { Ok(false) }
     }
 
     fn local_conflict(
@@ -358,15 +522,8 @@ impl InputTiming {
         end: i32,
     ) -> Result<Option<Conflict>, String> {
         use frame::{ReservedFlick, State};
-        let context: Vec<_> = self
-            .notes
-            .iter()
-            .enumerate()
-            .filter(|(i, note)| {
-                note.first <= end && self.frames[*i].last().is_some_and(|&last| start <= last)
-            })
-            .map(|(i, _)| i)
-            .collect();
+        let context = if start == end { self.contexts.get(&start).cloned().unwrap_or_else(|| Arc::new(Vec::new())) }
+            else { Arc::new(self.notes.iter().enumerate().filter(|(i, note)| note.first <= end && self.frames[*i].last().is_some_and(|&last| start <= last)).map(|(i, _)| i).collect()) };
         let key: Vec<_> = context
             .iter()
             .map(|&i| {
@@ -380,7 +537,7 @@ impl InputTiming {
             })
             .collect();
         let conflict = || Conflict {
-            notes: context.clone(),
+            notes: context.as_ref().clone(),
             interval: Some((start, end)),
         };
         if let Some(&possible) = self
@@ -436,6 +593,8 @@ impl InputTiming {
                 if !frame::in_area(note, saved.begin) { return 1; }
                 if selected[i] == start && note.grade_at(saved.time) == note.grade { 0 } else { 2 }
             }));
+            let mut classes = HashSet::new();
+            options.retain(|&saved| classes.insert(search::reserved_class(note, saved)));
             choices.push((i, options));
         }
         fn possible(
@@ -444,18 +603,19 @@ impl InputTiming {
             frames: &[i32],
             selected: &[i32],
             choices: &[(usize, Vec<Option<ReservedFlick>>)],
-            step: usize,
             state: &mut State,
+            atoms: &Arc<Mutex<search::AtomCache>>,
         ) -> Result<bool, String> {
-            let Some((index, options)) = choices.get(step) else {
-                return replay(clock, notes, frames, selected, state);
+            let Some(((index, options), rest)) = choices.split_first() else {
+                return replay(clock, notes, frames, selected, state, atoms, None).map(|conflict| conflict.is_none());
             };
             let mut unresolved = None;
             for &option in options {
                 state.flicks[*index] = option;
-                match possible(clock, notes, frames, selected, choices, step + 1, state) {
+                match possible(clock, notes, frames, selected, rest, state, atoms) {
                     Ok(true) => return Ok(true),
                     Ok(false) => {}
+                    Err(error) if error == "cancelled" => return Err(error),
                     Err(error) => unresolved = Some(error),
                 }
             }
@@ -475,8 +635,8 @@ impl InputTiming {
             &frames,
             &selected,
             &choices,
-            0,
             &mut initial.clone(),
+            &self.atoms,
         )?;
         let mut cache = self.local_checked.lock().unwrap();
         if cache.len() >= 8192 {
@@ -493,7 +653,9 @@ fn replay(
     frames: &[i32],
     selected: &[i32],
     initial: &frame::State,
-) -> Result<bool, String> {
+    atoms: &Arc<Mutex<search::AtomCache>>,
+    inputs: Option<&BTreeMap<i32, Vec<frame::Touch>>>,
+) -> Result<Option<(i32, i32)>, String> {
     use frame::ReservedFlick;
     type Saved = Vec<(usize, ReservedFlick)>;
     struct Step {
@@ -501,8 +663,17 @@ fn replay(
         notes: Vec<usize>,
         incoming: Saved,
         key: Vec<u8>,
-        search: search::Search,
+        search: Choices,
         complete: bool,
+    }
+    struct Choices {
+        search: Option<search::Search>,
+        forced: Option<search::Outcome>,
+    }
+    impl Choices {
+        fn next(&mut self) -> Result<Option<search::Outcome>, String> {
+            if let Some(search) = &mut self.search { search.next() } else { Ok(self.forced.take()) }
+        }
     }
     let mut saved: Saved = initial
         .flicks
@@ -516,6 +687,8 @@ fn replay(
     let mut witness = Vec::<(i32, Vec<frame::Touch>)>::new();
     let generation = crate::cancellation_generation();
     let mut iterations = 0usize;
+    let mut block_start = frames.first().copied().unwrap_or(0);
+    let mut block_end = block_start;
     loop {
         iterations += 1;
         if iterations.is_multiple_of(128) {
@@ -526,33 +699,31 @@ fn replay(
         }
         if let Some(index) = step.take() {
             if index == frames.len() {
-                return Ok(true);
+                return Ok(None);
             }
             let at = frames[index];
+            block_end = block_end.max(at);
             let indices: Vec<_> = notes
                 .iter()
                 .enumerate()
                 .filter(|(i, note)| !initial.done[*i] && selected[*i] >= at && note.first <= at)
                 .map(|(i, _)| i)
                 .collect();
+            if indices.iter().any(|&i| notes[i].flick() && selected[i] > at) {
+                block_end = block_end.max(frames.get(index + 1).copied().unwrap_or(at));
+            }
             let key: Vec<_> = indices
                 .iter()
                 .map(|&i| {
                     saved
                         .iter()
                         .find(|&&(j, _)| j == i)
-                        .map_or(0, |&(_, value)| {
-                            if frame::in_area(&notes[i], value.begin) {
-                                2 + notes[i].grade_at(value.time) as u8
-                            } else {
-                                1
-                            }
-                        })
+                        .map_or(0, |&(_, value)| search::reserved_class(&notes[i], Some(value)))
                 })
                 .collect();
             if !failed.contains(&(index, key.clone())) {
                 let local_notes: Vec<_> = indices.iter().map(|&i| notes[i].clone()).collect();
-                let due: Vec<_> = indices.iter().map(|&i| selected[i] == at).collect();
+                let targets: Vec<_> = indices.iter().map(|&i| selected[i]).collect();
                 let local = frame::State {
                     done: vec![false; indices.len()],
                     flicks: indices
@@ -568,18 +739,27 @@ fn replay(
                 let complete = indices
                     .iter()
                     .all(|&i| !notes[i].flick() || selected[i] == at);
+                let choices = if let Some(inputs) = inputs.and_then(|inputs| inputs.get(&at)) {
+                    let mut state = local.clone();
+                    let judged = frame::run(&local_notes, at, inputs, &mut state);
+                    let valid = judged.len() == targets.iter().filter(|&&target| target == at).count()
+                        && judged.iter().all(|j| targets[j.note] == at && j.grade == local_notes[j.note].grade);
+                    Choices { search: None, forced: valid.then(|| search::Outcome { state, inputs: inputs.clone() }) }
+                } else {
+                    Choices { search: Some(search::Search::new(local_notes, at, targets, local, clock, Arc::clone(atoms), frames.get(index + 1).copied())), forced: None }
+                };
                 stack.push(Step {
                     index,
                     notes: indices,
                     incoming: saved.clone(),
                     key,
-                    search: search::Search::new(local_notes, at, due, local, clock),
+                    search: choices,
                     complete,
                 });
             }
         }
         let Some(current) = stack.last_mut() else {
-            return Ok(false);
+            return Ok(Some((block_start, block_end)));
         };
         if let Some(outcome) = current.search.next()? {
             let index = current.index;
@@ -598,6 +778,8 @@ fn replay(
                 stack.clear();
                 failed.clear();
                 witness.clear();
+                block_start = frames.get(index + 1).copied().unwrap_or(frames[index]);
+                block_end = block_start;
             }
             step = Some(index + 1);
         } else {

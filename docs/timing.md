@@ -28,6 +28,12 @@ For ordinary expiry, `SkillEffectUpdater.UpdateExecuting` (`0x55eb68c`) detects 
 
 Direct execution of the original function with `ExecuteTimeMs = 1001` and a five-second duration leaves state 3 at time 6001. An update at 6016 changes it to state 4 with `FinishTimeMs = 6001`.
 
+## Reachable schedules in the engine
+
+Flick reservations are the input state carried between updates. The engine caches independent flick intervals and checks other judgement frames separately. Spatial candidates include exterior cells beyond widened hit areas. Input words share their observable selection state and complete finite input languages. Frames without flick judgements factor flick reservations from Enter inputs. Every retained outcome is checked by the whole-frame selector.
+
+Timing search shares immutable frame domains and propagates watched conflicts. Late Perfect flicks that require a saved input first check the preceding update. Failed flick components also check two-update windows for smaller certified conflicts. A single-counter AP fallback advances legal frame states together with the original binary32 factor ledger. A relaxed-window optimum requires a full input certificate; a complete frame search retains its actual touches for replay. `guideAvailable: false` identifies an unavailable fixed early-input plan while preserving the numeric `best` field and the separate `worst` and `optimal` results.
+
 ## Artifact identity
 
 These addresses refer to original `libil2cpp.so` SHA-256 `119a19de9dfae037e75b4443769247ac38df4f1e60e61031363aa1227be48d4e`. The native execution checks restore the original client's readonly constants as well as its executable instructions.

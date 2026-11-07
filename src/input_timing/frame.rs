@@ -9,7 +9,7 @@ pub(super) enum TouchState {
     Exit,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub(super) struct Touch {
     pub state: TouchState,
     pub lane: f64,
@@ -62,10 +62,12 @@ pub(super) struct Scratch {
     claimed: Vec<Option<usize>>,
 }
 
+#[inline]
 pub(super) fn in_area(note: &Note, lane: f64) -> bool {
     note.left <= lane && lane <= note.right
 }
 
+#[inline]
 pub(super) fn in_body(note: &Note, lane: f64) -> bool {
     note.body_left <= lane && lane <= note.body_right
 }
@@ -74,30 +76,21 @@ pub(super) fn in_body(note: &Note, lane: f64) -> bool {
 pub(super) fn input_for(note: &Note, inputs: &[Touch]) -> Option<usize> {
     let mut selected: Option<usize> = None;
     for (index, input) in inputs.iter().enumerate() {
-        if !in_area(note, input.lane)
-            && !(note.flick() && input.flick_begin.is_some_and(|lane| in_area(note, lane)))
-        {
-            continue;
-        }
-        let Some(previous) = selected else {
-            selected = Some(index);
-            continue;
-        };
-        let old = inputs[previous];
-        let choose_new = if note.flick() {
-            old.flick_begin.is_none() && input.flick_begin.is_some()
-        } else if note.asynchronous() {
-            input.state == TouchState::Hold
-        } else if input.state == TouchState::Enter {
-            old.state != TouchState::Enter || !in_body(note, old.lane) || in_body(note, input.lane)
-        } else {
-            false
-        };
-        if choose_new {
+        if prefers_input(note, selected.map(|previous| inputs[previous]), *input) {
             selected = Some(index);
         }
     }
     selected
+}
+
+#[inline]
+pub(super) fn prefers_input(note: &Note, previous: Option<Touch>, input: Touch) -> bool {
+    if !in_area(note, input.lane) && !(note.flick() && input.flick_begin.is_some_and(|lane| in_area(note, lane))) { return false; }
+    let Some(old) = previous else { return true; };
+    if note.flick() { old.flick_begin.is_none() && input.flick_begin.is_some() }
+    else if note.asynchronous() { input.state == TouchState::Hold }
+    else if input.state == TouchState::Enter { old.state != TouchState::Enter || !in_body(note, old.lane) || in_body(note, input.lane) }
+    else { false }
 }
 
 /// ShouldPreferCandidateNote uses frame offsets when no press position exists.
@@ -122,11 +115,9 @@ fn prefer(notes: &[Note], old: usize, new: usize, frame: i32, lane: Option<f64>)
     }
 }
 
+#[inline]
 pub(super) fn permitted_time(note: &Note, time: i32) -> bool {
-    let difference = i64::from(time) - i64::from(note.time);
-    let before = note.before.iter().copied().max().unwrap_or(0).max(0);
-    let after = note.after.iter().copied().max().unwrap_or(0).max(0);
-    difference >= -i64::from(before) && difference <= i64::from(after)
+    i64::from(time) >= note.input_first && time <= note.last
 }
 
 fn judge_input(
@@ -197,6 +188,14 @@ pub(super) fn run(
 pub(super) fn run_cached<'a>(
     notes: &[Note], frame: i32, inputs: &[Touch], state: &mut State, scratch: &'a mut Scratch,
 ) -> &'a [Judgement] {
+    run_selection(notes, frame, inputs, None, state, scratch)
+}
+
+pub(super) fn run_selected<'a>(notes: &[Note], frame: i32, inputs: &[Touch], selected: &[Option<usize>], state: &mut State, scratch: &'a mut Scratch) -> &'a [Judgement] {
+    run_selection(notes, frame, inputs, Some(selected), state, scratch)
+}
+
+fn run_selection<'a>(notes: &[Note], frame: i32, inputs: &[Touch], selected: Option<&[Option<usize>]>, state: &mut State, scratch: &'a mut Scratch) -> &'a [Judgement] {
     let Scratch { results, synchronous, asynchronous, claims, claimed } = scratch;
     results.clear();
     if synchronous.len() < inputs.len() { synchronous.resize_with(inputs.len(), Vec::new); }
@@ -241,7 +240,7 @@ pub(super) fn run_cached<'a>(
             continue;
         }
         let claim_before = matches!(note.op, 40 | 41 | 102) && state.flicks[index].is_none();
-        let selected = input_for(note, inputs);
+        let selected = selected.map_or_else(|| input_for(note, inputs), |selected| selected[index]);
         let mut judged = None;
         if let Some(unit) = selected {
             let input = inputs[unit];

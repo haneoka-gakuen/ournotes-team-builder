@@ -1,9 +1,12 @@
 //! Ordinary live scoring over the canonical 120 skill orders. The score path
 //! follows every binary32 operation and time boundary of the website engine.
 use crate::num::{f, window_ms};
+mod frame_optimization;
+mod timing_constraints;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BinaryHeap, HashMap},
+    rc::Rc,
     sync::{Arc, Mutex, OnceLock},
 };
 
@@ -269,11 +272,11 @@ impl FrameClock {
         Self::from(play["frameRate"].as_u64().filter(|hz| matches!(hz, 30 | 60 | 90 | 120)).unwrap_or(60) as u16)
     }
 
+    #[inline]
     pub fn frame_time(self, time: i32) -> i32 {
         let hz = i64::from(self.0);
         let time = i64::from(time.max(0));
-        let mut frame = ((time * hz + 999) / 1000 - 1).max(0);
-        while frame * 1000 / hz < time { frame += 1; }
+        let frame = (time * hz + 999) / 1000;
         (frame * 1000 / hz).min(i64::from(i32::MAX)) as i32
     }
 
@@ -493,18 +496,21 @@ fn timed_scores(input: &Input, frames: &[Vec<i32>], best: bool, timing: Option<&
             }
         })
     }
-    fn deliveries(input: &Input, frames: &[Vec<i32>], windows: &[Window], grades: &[usize], best: bool) -> Vec<Delivery> {
+    fn deliveries<D: AsRef<[i32]>>(input: &Input, frames: &[D], windows: &[Window], grades: &[usize], best: bool) -> Vec<Delivery> {
         let mut selected = Vec::with_capacity(frames.len());
         let mut choices = Vec::new();
         for (i, allowed) in frames.iter().enumerate() {
-            let applicable: Vec<_> = windows.iter().copied().filter(|w| w.2 & (1 << grades[i]) != 0).collect();
-            if applicable.is_empty() {
-                selected.push(*allowed.iter().min_by_key(|&&frame| (frame as i64 - input.frame_time(input.times[i]) as i64).abs()).unwrap());
+            let allowed = allowed.as_ref();
+            let nominal = input.frame_time(input.times[i]);
+            if !windows.iter().any(|window| window.2 & (1 << grades[i]) != 0 && allowed.iter().any(|&at| window.0 <= at && at <= window.1)) {
+                selected.push(*allowed.iter().min_by_key(|&&frame| (i64::from(frame) - i64::from(nominal)).abs()).unwrap());
                 continue;
             }
+            let applicable: Vec<_> = windows.iter().copied().filter(|window| window.2 & (1 << grades[i]) != 0
+                && allowed.iter().any(|&at| window.0 <= at && at <= window.1)).collect();
             // Earlier/later delivery dominates only when every affected counter
             // agrees. Keep all remaining choices, including overlapping windows.
-            let equivalent_key = |frame: i32| ((i64::from(frame) - i64::from(input.frame_time(input.times[i]))).abs(), frame);
+            let equivalent_key = |frame: i32| ((i64::from(frame) - i64::from(nominal)).abs(), frame);
             let options: Vec<_> = allowed.iter().copied().filter(|&frame| {
                 !allowed.iter().any(|&other| other != frame && dominates(other, frame, &applicable, best)
                     && (!dominates(frame, other, &applicable, best) || equivalent_key(other) < equivalent_key(frame)))
@@ -572,7 +578,7 @@ fn timed_scores(input: &Input, frames: &[Vec<i32>], best: bool, timing: Option<&
             }
         }
         scores[index] = if let Some(timing) = timing {
-            reachable_extreme(input, timing, frames, best, (extreme, chosen),
+            reachable_extreme(input, timing, frames, best, (extreme, chosen, index),
                 |domains, evaluate| {
                     let mut value = if best { f64::NEG_INFINITY } else { f64::INFINITY };
                     let mut selected = None;
@@ -590,12 +596,25 @@ fn timed_scores(input: &Input, frames: &[Vec<i32>], best: bool, timing: Option<&
     for (index, &source) in plan.sources.iter().enumerate() { scores[index] = scores[source]; }
     Ok(scores)
 }
+type FrameDomain = Rc<[i32]>;
+fn restrict_domain(domain: &mut FrameDomain, keep: impl Fn(i32) -> bool) {
+    if domain.iter().all(|&at| keep(at)) { return; }
+    *domain = domain.iter().copied().filter(|&at| keep(at)).collect::<Vec<_>>().into();
+}
 struct TimingNode {
     priority: f64,
     serial: usize,
     bound: f64,
-    domains: Vec<Vec<i32>>,
-    delivery: Delivery,
+    domains: Vec<(usize, FrameDomain)>,
+    delivery: Vec<(usize, i32)>,
+}
+impl TimingNode {
+    fn bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.domains.capacity() * std::mem::size_of::<(usize, FrameDomain)>()
+            + self.domains.iter().map(|(_, domain)| domain.len() * std::mem::size_of::<i32>()).sum::<usize>()
+            + self.delivery.capacity() * std::mem::size_of::<(usize, i32)>()
+    }
 }
 impl PartialEq for TimingNode {
     fn eq(&self, other: &Self) -> bool { self.serial == other.serial && self.priority.to_bits() == other.priority.to_bits() }
@@ -606,7 +625,7 @@ impl PartialOrd for TimingNode {
 }
 impl Ord for TimingNode {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.priority.total_cmp(&other.priority).then_with(|| other.serial.cmp(&self.serial))
+        self.priority.total_cmp(&other.priority).then_with(|| self.serial.cmp(&other.serial))
     }
 }
 fn reachable_extreme<E: FnMut(&Delivery) -> f64>(
@@ -614,57 +633,154 @@ fn reachable_extreme<E: FnMut(&Delivery) -> f64>(
     timing: &crate::input_timing::InputTiming,
     frames: &[Vec<i32>],
     best: bool,
-    initial: (f64, Delivery),
-    mut relax: impl FnMut(&[Vec<i32>], &mut E) -> (f64, Delivery),
+    initial: (f64, Delivery, usize),
+    mut relax: impl FnMut(&[FrameDomain], &mut E) -> (f64, Delivery),
     evaluate: &mut E,
 ) -> Result<f64, String> {
-    let (bound, delivery) = initial;
-    let generation = crate::cancellation_generation();
-    if timing.conflict(&delivery.selected())?.is_none() { return Ok(bound); }
-    let mut incumbent = if best { f64::NEG_INFINITY } else { f64::INFINITY };
+    fn prefer_nominal<E: FnMut(&Delivery) -> f64, D: AsRef<[i32]>>(preferred: &[i32], windows: &[(i32, i32)], domains: &[D], score: f64, mut delivery: Delivery, evaluate: &mut E) -> Delivery {
+        // Saturated counters leave timing ties. Keep the exact bound while
+        // avoiding unnecessary input conflicts on those notes.
+        let mut positions = vec![0; delivery.notes.len()];
+        for (position, &note) in delivery.notes.iter().enumerate() { positions[note] = position; }
+        for (i, domain) in domains.iter().enumerate() {
+            let domain = domain.as_ref();
+            let nominal = preferred[i];
+            let nearest = *domain.iter().min_by_key(|&&at| ((i64::from(at) - i64::from(nominal)).abs(), at)).unwrap();
+            let previous = delivery.frames[positions[i]];
+            if previous == nearest { continue; }
+            delivery.move_note(i, nearest, &mut positions);
+            let observed = windows.iter().any(|&(start, end)| (start <= previous && previous <= end) || (start <= nearest && nearest <= end));
+            if observed && evaluate(&delivery) != score { delivery.move_note(i, previous, &mut positions); }
+        }
+        delivery
+    }
+    let (bound, delivery, order_index) = initial;
+    let windows: Vec<_> = input.skill_times.iter().take(5).enumerate().flat_map(|(event, &start)| {
+        input.slots[orders()[order_index][event]].cumulative.iter().filter(|factor| !factor.judgements.is_empty() && factor.value != 0)
+            .map(move |factor| (input.frame_time(start), start + factor.duration_ms()))
+    }).collect();
     let nominal: Vec<_> = input.times.iter().map(|&time| input.frame_time(time)).collect();
-    if timing.conflict(&nominal)?.is_none() {
+    let mut preferred = nominal.clone();
+    let mut incumbent = if best { f64::NEG_INFINITY } else { f64::INFINITY };
+    for witness in timing.witnesses() {
+        let score = evaluate(&Delivery::from_frames(&witness));
+        if if best { score > incumbent } else { score < incumbent } { incumbent = score; preferred = witness; }
+    }
+    let delivery = prefer_nominal(&preferred, &windows, frames, bound, delivery, evaluate);
+    let generation = crate::cancellation_generation();
+    match timing.conflict(&delivery.selected()) {
+        Ok(None) => return Ok(bound),
+        Ok(Some(_)) => {}
+        Err(error) => {
+            if error != "cancelled" {
+                if let Some(value) = frame_optimization::score(input, timing, order_index, best)? { return Ok(value); }
+            }
+            return Err(error);
+        }
+    }
+    if matches!(timing.conflict(&nominal), Ok(None)) {
         let value = evaluate(&Delivery::from_frames(&nominal));
         incumbent = if best { incumbent.max(value) } else { incumbent.min(value) };
     }
     let priority = |score: f64| if best { score } else { -score };
-    let storage = |domains: &[Vec<i32>]| domains.len() * (std::mem::size_of::<Vec<i32>>() + 12)
-        + domains.iter().map(|domain| domain.len() * 4).sum::<usize>();
+    let delivery_changes = |delivery: Delivery| delivery.selected().into_iter().enumerate()
+        .filter(|&(i, at)| at != nominal[i]).collect::<Vec<_>>();
     let mut queue = BinaryHeap::new();
-    let domains = frames.to_vec();
-    let mut queue_bytes = storage(&domains);
-    queue.push(TimingNode { priority: priority(bound), serial: 0, bound, domains, delivery });
+    let base_domains: Vec<FrameDomain> = frames.iter().map(|domain| Rc::from(domain.as_slice())).collect();
+    let root = TimingNode { priority: priority(bound), serial: 0, bound, domains: Vec::new(), delivery: delivery_changes(delivery) };
+    let mut queue_bytes = root.bytes();
+    queue.push(root);
     let mut serial = 0;
+    let mut constraints = timing_constraints::Constraints::new(&base_domains, timing.ordering_pairs());
+    let mut visited = 0usize;
     while let Some(node) = queue.pop() {
-        queue_bytes -= storage(&node.domains);
+        visited += 1;
+        if visited == 64 {
+            if let Some(value) = frame_optimization::score(input, timing, order_index, best)? { return Ok(value); }
+        }
+        queue_bytes -= node.bytes();
         crate::clock::milliseconds();
         if generation != crate::cancellation_generation() { return Err("cancelled".into()); }
         if if best { node.bound <= incumbent } else { node.bound >= incumbent } { continue; }
-        let selected = node.delivery.selected();
-        let Some(conflict) = timing.conflict(&selected)? else {
-            incumbent = node.bound;
+        let mut prefix = base_domains.clone();
+        for (note, domain) in node.domains { prefix[note] = domain; }
+        if !constraints.propagate(&mut prefix) { continue; }
+        let mut selected = nominal.clone();
+        for &(note, at) in &node.delivery { selected[note] = at; }
+        let mut bound = node.bound;
+        if selected.iter().enumerate().any(|(note, at)| !prefix[note].contains(at)) {
+            let (value, delivery) = relax(&prefix, evaluate);
+            bound = value;
+            if if best { bound <= incumbent } else { bound >= incumbent } { continue; }
+            selected = prefer_nominal(&preferred, &windows, &prefix, bound, delivery, evaluate).selected();
+        }
+        let checked = timing.conflict(&selected);
+        if let Err(error) = checked {
+            if error != "cancelled" {
+                if let Some(value) = frame_optimization::score(input, timing, order_index, best)? { return Ok(value); }
+            }
+            return Err(error);
+        }
+        let Some(conflict) = checked.unwrap() else {
+            incumbent = bound;
+            preferred = selected;
             continue;
         };
-        let mut prefix = node.domains.clone();
+        {
+            let nogood: Vec<_> = conflict.notes.iter().map(|&note| {
+                let forbidden = frames[note].iter().copied().filter(|&frame| conflict.interval.map_or(frame == selected[note], |(start, end)| {
+                    frame < start && selected[note] < start || frame > end && selected[note] > end || frame == selected[note]
+                })).collect();
+                (note, forbidden)
+            }).collect();
+            if incumbent.is_finite() && nogood.iter().all(|(note, forbidden): &(usize, Vec<i32>)| forbidden.contains(&preferred[*note])) {
+                return Err("native input conflict proof contradiction".into());
+            }
+            constraints.add(nogood);
+        }
         for note in conflict.notes {
             let same = |frame: i32| conflict.interval.map_or(frame == selected[note], |(start, end)| {
                 frame < start && selected[note] < start || frame > end && selected[note] > end || frame == selected[note]
             });
             let mut domains = prefix.clone();
-            domains[note].retain(|&frame| !same(frame));
-            prefix[note].retain(|&frame| same(frame));
+            restrict_domain(&mut domains[note], |frame| !same(frame));
+            restrict_domain(&mut prefix[note], same);
             if domains[note].is_empty() { continue; }
+            if !constraints.propagate(&mut domains) { continue; }
             let (bound, delivery) = relax(&domains, evaluate);
             if if best { bound <= incumbent } else { bound >= incumbent } { continue; }
-            queue_bytes += storage(&domains);
-            if queue_bytes > 16 * 1_048_576 { return Err("native timing search budget exceeded".into()); }
+            let delivery = prefer_nominal(&preferred, &windows, &domains, bound, delivery, evaluate);
             serial += 1;
-            queue.push(TimingNode { priority: priority(bound), serial, bound, domains, delivery });
+            let node = TimingNode { priority: priority(bound), serial, bound,
+                domains: domains.into_iter().enumerate().filter(|(i, domain)| !Rc::ptr_eq(domain, &base_domains[*i])).collect(),
+                delivery: delivery_changes(delivery),
+            };
+            queue_bytes += node.bytes();
+            if queue_bytes > 16 * 1_048_576 { return Err("native timing search budget exceeded".into()); }
+            queue.push(node);
         }
     }
     if incumbent.is_finite() { Ok(incumbent) } else { Err("unreachable native input sequence".into()) }
 }
 impl Delivery {
+    fn move_note(&mut self, note: usize, time: i32, positions: &mut [usize]) {
+        let mut position = positions[note];
+        self.frames[position] = time;
+        while position > 0 && (self.frames[position], self.notes[position]) < (self.frames[position - 1], self.notes[position - 1]) {
+            self.frames.swap(position, position - 1);
+            self.notes.swap(position, position - 1);
+            positions[self.notes[position]] = position;
+            positions[self.notes[position - 1]] = position - 1;
+            position -= 1;
+        }
+        while position + 1 < self.frames.len() && (self.frames[position], self.notes[position]) > (self.frames[position + 1], self.notes[position + 1]) {
+            self.frames.swap(position, position + 1);
+            self.notes.swap(position, position + 1);
+            positions[self.notes[position]] = position;
+            positions[self.notes[position + 1]] = position + 1;
+            position += 1;
+        }
+    }
     fn from_frames(frames: &[i32]) -> Self {
         let mut rows: Vec<_> = frames.iter().copied().enumerate().map(|(i, frame)| (frame, i)).collect();
         rows.sort_unstable();
@@ -854,6 +970,7 @@ struct ApScorer<'a> {
     luck: f64,
     assist: f64,
     prefixes: HashMap<u64, Vec<f64>>,
+    prefix_work: rustc_hash::FxHashMap<u64, usize>,
     commands: Option<Vec<Vec<Vec<Command>>>>,
     ranges: rustc_hash::FxHashMap<(u64, usize, usize), f64>,
     magnitude: f64,
@@ -877,6 +994,7 @@ impl<'a> ApScorer<'a> {
             luck: f(input.luck_percent.min(200.0) / 100.0),
             assist: f(input.assist),
             prefixes: HashMap::new(),
+            prefix_work: rustc_hash::FxHashMap::default(),
             commands: None,
             ranges: rustc_hash::FxHashMap::default(),
             magnitude,
@@ -893,17 +1011,34 @@ impl<'a> ApScorer<'a> {
         // Below the integer precision limit, summing a range is identical to
         // subtracting full-chart prefixes. Large inputs retain prefix order.
         if self.integer_bound(factor) < (1u64 << 52) as f64 {
+            if let Some(sums) = self.prefixes.get(&factor.to_bits()) { return sums[end] - sums[start]; }
             if self.ranges.len() >= 4096 { self.ranges.clear(); }
-            *self.ranges.entry((factor.to_bits(), start, end)).or_insert_with(|| {
-                self.base[start..end].iter().map(|&note| {
+            let key = (factor.to_bits(), start, end);
+            if let Some(&value) = self.ranges.get(&key) { return value; }
+            let work = self.prefix_work.entry(factor.to_bits()).or_default();
+            *work = work.saturating_add(end - start);
+            if *work >= self.base.len().max(32) {
+                let sums = self.factor_prefix(factor);
+                return sums[end] - sums[start];
+            }
+            let value = self.base[start..end].iter().map(|&note| {
                     let score = f(f(self.luck * f(note * factor)) / self.input.converted_count as f64).floor();
                     if self.assist == 1.0 { score } else { f(self.assist * score).floor() }
-                }).sum()
-            })
+                }).sum();
+            self.ranges.insert(key, value);
+            value
         } else {
-            let sums = prefix(&mut self.prefixes, &self.base, factor, self.luck, self.assist, self.input.converted_count);
+            let sums = self.factor_prefix(factor);
             sums[end] - sums[start]
         }
+    }
+    fn factor_prefix(&mut self, factor: f64) -> &[f64] {
+        let limit = (8 * 1_048_576 / ((self.base.len() + 1) * std::mem::size_of::<f64>())).max(1);
+        if self.prefixes.len() >= limit && !self.prefixes.contains_key(&factor.to_bits()) {
+            self.prefixes.clear();
+            self.prefix_work.clear();
+        }
+        prefix(&mut self.prefixes, &self.base, factor, self.luck, self.assist, self.input.converted_count)
     }
     fn prepare_blocks(&mut self) {
         self.blocks_checked = true;
@@ -2028,6 +2163,7 @@ pub struct TimingWindow {
 pub struct Timing {
     pub score: f64,
     pub best: f64,
+    pub guide_available: bool,
     pub advance_ms: i32,
     pub windows: Vec<TimingWindow>,
 }
@@ -2098,9 +2234,9 @@ pub fn timing_with_inputs(input: &Input, order_index: usize, before_ms: &[i32], 
         Some(grades) => Scorer::Play(PlayScorer::new(input, grades)),
         None => Scorer::Ap(ApScorer::new(input)),
     };
-    let mut evaluate = |offsets: &[i32]| {
+    let mut evaluate = |offsets: &[i32], check_inputs: bool| {
         let delivery = Delivery::new(input, offsets);
-        if let Some(inputs) = inputs {
+        if let Some(inputs) = inputs.filter(|_| check_inputs) {
             if !matches!(inputs.conflict(&delivery.selected()), Ok(None)) { return None; }
         }
         Some(match &mut scorer {
@@ -2109,14 +2245,18 @@ pub fn timing_with_inputs(input: &Input, order_index: usize, before_ms: &[i32], 
         })
     };
     let mut offsets = vec![0; n];
-    let score = evaluate(&offsets)?;
+    let score = evaluate(&offsets, false)?;
+    if evaluate(&offsets, true).is_none() {
+        for window in &mut windows { window.steps.clear(); }
+        return Some(Timing { score, best: score, guide_available: false, advance_ms, windows });
+    }
     let mut best = score;
     for (window, step, chord) in groups {
         let previous: Vec<_> = chord.iter().map(|&i| offsets[i]).collect();
         for &i in &chord {
             offsets[i] = -advance_ms;
         }
-        let Some(value) = evaluate(&offsets) else {
+        let Some(value) = evaluate(&offsets, true) else {
             for (&i, offset) in chord.iter().zip(previous) { offsets[i] = offset; }
             continue;
         };
@@ -2132,7 +2272,8 @@ pub fn timing_with_inputs(input: &Input, order_index: usize, before_ms: &[i32], 
     for window in &mut windows {
         window.steps.retain(|step| step.gain > 0.0);
     }
-    Some(Timing { score, best, advance_ms, windows })
+    if let Some(inputs) = inputs { let _ = inputs.conflict(&Delivery::new(input, &offsets).selected()); }
+    Some(Timing { score, best, guide_available: true, advance_ms, windows })
 }
 #[cfg(test)]
 mod delivery_extremes_tests {
