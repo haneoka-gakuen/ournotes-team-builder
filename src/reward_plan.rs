@@ -134,14 +134,13 @@ impl Plan {
             })
             .collect()
     }
-    pub(crate) fn upper(&self, rewards: [f64; 3]) -> Vec<f64> {
-        self.levels
-            .iter()
-            .map(|level| {
+    pub(crate) fn upper(&self, rewards: [f64; 3]) -> [f64; 3] {
+        std::array::from_fn(|index| {
+            self.levels.get(index).map_or(0.0, |level| {
                 level.iter().fold(0.0, |sum, term| {
                     let raw = rewards[term.metric.index()];
                     let product = raw * term.weight as f64;
-                    let product = if raw.fract() == 0.0 && product.abs() <= (1u64 << 53) as f64 {
+                    let product = if raw.fract() == 0.0 && product.abs() < (1u64 << 53) as f64 {
                         product
                     } else {
                         product.next_up()
@@ -149,7 +148,7 @@ impl Plan {
                     let total = sum + product;
                     if sum.fract() == 0.0
                         && product.fract() == 0.0
-                        && total.abs() <= (1u64 << 53) as f64
+                        && total.abs() < (1u64 << 53) as f64
                     {
                         total
                     } else {
@@ -157,7 +156,7 @@ impl Plan {
                     }
                 })
             })
-            .collect()
+        })
     }
 }
 
@@ -199,6 +198,12 @@ impl Fraction {
         } else {
             value
         }
+    }
+    pub(crate) fn next_grid_lower(&self, denominator: usize) -> Option<f64> {
+        let denominator = BigInt::from(denominator);
+        (&self.0 * &denominator).is_integer().then(|| {
+            Self(&self.0 + BigRational::new(BigInt::from(1), denominator)).lower()
+        })
     }
     pub(crate) fn divided(&self, value: u32) -> Self {
         Self(&self.0 / BigInt::from(value))
@@ -816,6 +821,18 @@ impl<'a> Ranked<'a> {
         } else { f64::INFINITY };
         self.raw_upper_at(totals, bonuses, anchor_upper, score)
     }
+    fn cheap_assignment_rewards(
+        &mut self,
+        members: &[usize],
+        totals: Totals,
+        assigned: &[i32],
+        from: usize,
+    ) -> [f64; 3] {
+        let raw = self.source.objective().cheap_assignment_bound(members, totals, assigned, from);
+        let mut rewards = self.assignment_upper(members, totals, assigned, from, raw);
+        self.cp_assignment(&mut rewards, members, assigned, from, totals.power);
+        rewards
+    }
     fn team_upper(&mut self, team: &Team, totals: Totals, anchor_upper: f64) -> [f64; 3] {
         let mut result = self.assignment_upper(&team.members, totals, &team.snaps, 5, anchor_upper);
         self.cp_assignment(&mut result, &team.members, &team.snaps, 5, totals.power);
@@ -1021,13 +1038,18 @@ impl Objective for Ranked<'_> {
         assigned: &[i32],
         from: usize,
     ) -> f64 {
-        let raw = self
-            .source
-            .objective()
-            .cheap_assignment_bound(members, totals, assigned, from);
-        let mut rewards = self.assignment_upper(members, totals, assigned, from, raw);
-        self.cp_assignment(&mut rewards, members, assigned, from, totals.power);
+        let rewards = self.cheap_assignment_rewards(members, totals, assigned, from);
         self.upper(rewards)
+    }
+    fn ranked_assignment_upper(
+        &mut self,
+        members: &[usize],
+        totals: Totals,
+        assigned: &[i32],
+        from: usize,
+    ) -> Option<[f64; 3]> {
+        let rewards = self.cheap_assignment_rewards(members, totals, assigned, from);
+        Some(self.context.plan.upper(rewards))
     }
     fn prepare_power(&mut self, power: Arc<Vec<f64>>, width: usize) {
         self.source.objective().prepare_power(power, width);
