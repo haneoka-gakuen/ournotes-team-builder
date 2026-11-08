@@ -97,7 +97,12 @@ struct Combined<'a> {
     k: usize,
 }
 
-fn below_reward_cutoff(sums: [f64; 3], songs: usize, cutoff: &[(f64, f64)]) -> bool {
+fn cannot_improve_reward(
+    sums: [f64; 3],
+    songs: usize,
+    cutoff: &[(f64, f64)],
+    retain_equal: bool,
+) -> bool {
     for (sum, &(current, next)) in sums.into_iter().zip(cutoff) {
         let upper = (sum / songs as f64).next_up();
         if upper < current {
@@ -108,7 +113,8 @@ fn below_reward_cutoff(sums: [f64; 3], songs: usize, cutoff: &[(f64, f64)]) -> b
             return false;
         }
     }
-    false
+    // An equal reward rank cannot replace the retained winner in a top-one search.
+    !retain_equal
 }
 
 impl Combined<'_> {
@@ -304,7 +310,7 @@ impl Combined<'_> {
         let bound = joint.min((sum / self.songs.len() as f64).next_up());
         if let (Some(mut sums), Some(cutoff)) = (rank_sums, &self.reward_cutoff) {
             sums[0] = sum;
-            if below_reward_cutoff(sums, self.songs.len(), cutoff) {
+            if cannot_improve_reward(sums, self.songs.len(), cutoff, self.k > 1) {
                 return bound.min(self.floor.next_down());
             }
         }
