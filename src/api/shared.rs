@@ -92,8 +92,31 @@ struct Combined<'a> {
     joint_zero: bool,
     priority: Vec<f64>,
     floor: f64,
+    reward_grid: Option<usize>,
+    reward_cutoff: Option<Vec<(f64, f64)>>,
     k: usize,
 }
+
+fn cannot_improve_reward(
+    sums: [f64; 3],
+    songs: usize,
+    cutoff: &[(f64, f64)],
+    retain_equal: bool,
+) -> bool {
+    for (sum, &(current, next)) in sums.into_iter().zip(cutoff) {
+        let upper = (sum / songs as f64).next_up();
+        if upper < current {
+            return true;
+        }
+        // A bound below the next attainable value can at most tie this level.
+        if upper.partial_cmp(&next) != Some(std::cmp::Ordering::Less) {
+            return false;
+        }
+    }
+    // An equal reward rank cannot replace the retained winner in a top-one search.
+    !retain_equal
+}
+
 impl Combined<'_> {
     fn joint_linear(&self) -> bool {
         !self.event
@@ -235,57 +258,63 @@ impl Combined<'_> {
         }
         let width = self.snaps.len() + 1;
         let mut sum = 0.0_f64;
+        let mut rank_sums = self.reward_cutoff.as_ref().map(|_| [0.0_f64; 3]);
         for song in &mut self.songs {
             let mut t = Totals::default();
             for (slot, &m) in members.iter().enumerate() {
-                let choices: Vec<_> = if slot < from {
-                    vec![assigned[slot]]
+                let choices = if slot < from {
+                    std::slice::from_ref(&assigned[slot])
                 } else {
-                    self.options[slot]
-                        .iter()
-                        .copied()
-                        .filter(|&s| s < 0 || !assigned[..from].contains(&s))
-                        .collect()
+                    &self.options[slot]
                 };
-                let col = |s: i32| if s < 0 { width - 1 } else { s as usize };
-                t.power = (t.power
-                    + choices
-                        .iter()
-                        .map(|&s| song.slots[slot][col(s)])
-                        .fold(f64::NEG_INFINITY, f64::max))
-                .next_up();
-                t.skill = (t.skill
-                    + choices
-                        .iter()
-                        .map(|&s| song.skills[m * width + col(s)].1)
-                        .fold(f64::NEG_INFINITY, f64::max))
-                .next_up();
-                t.skill_low += choices
-                    .iter()
-                    .map(|&s| song.skills[m * width + col(s)].0)
-                    .fold(f64::INFINITY, f64::min);
-                t.bonus += song.objective.member_bonus(m)
-                    + choices
-                        .iter()
-                        .map(|&s| {
-                            if s < 0 {
-                                0.0
-                            } else {
-                                song.objective.snap_bonus(s as usize)
-                            }
-                        })
-                        .fold(0.0, f64::max);
+                let (mut power, mut skill, mut skill_low, mut bonus) =
+                    (f64::NEG_INFINITY, f64::NEG_INFINITY, f64::INFINITY, 0.0_f64);
+                for &snap in choices {
+                    if slot >= from && snap >= 0 && assigned[..from].contains(&snap) {
+                        continue;
+                    }
+                    let col = if snap < 0 { width - 1 } else { snap as usize };
+                    let weights = song.skills[m * width + col];
+                    power = power.max(song.slots[slot][col]);
+                    skill = skill.max(weights.1);
+                    skill_low = skill_low.min(weights.0);
+                    if snap >= 0 {
+                        bonus = bonus.max(song.objective.snap_bonus(snap as usize));
+                    }
+                }
+                t.power = (t.power + power).next_up();
+                t.skill = (t.skill + skill).next_up();
+                t.skill_low += skill_low;
+                t.bonus += song.objective.member_bonus(m) + bonus;
             }
-            let mut bound = song.objective.bound(t).min(
-                song.objective
-                    .cheap_assignment_bound(members, t, assigned, from),
-            );
+            let bound = song.objective.bound(t);
+            let ranked = rank_sums.as_ref().and_then(|_| {
+                song.objective.ranked_assignment_upper(members, t, assigned, from)
+            });
+            let mut bound = bound.min(ranked.map_or_else(
+                || song.objective.cheap_assignment_bound(members, t, assigned, from),
+                |levels| levels[0],
+            ));
             if let Some(value) = song.objective.assignment_bound(members, t, assigned, from) {
                 bound = bound.min(value);
             }
             sum = (sum + bound).next_up();
+            if let (Some(sums), Some(levels)) = (&mut rank_sums, ranked) {
+                for (sum, &upper) in sums[1..].iter_mut().zip(&levels[1..]) {
+                    *sum = (*sum + upper).next_up();
+                }
+            } else {
+                rank_sums = None;
+            }
         }
-        joint.min((sum / self.songs.len() as f64).next_up())
+        let bound = joint.min((sum / self.songs.len() as f64).next_up());
+        if let (Some(mut sums), Some(cutoff)) = (rank_sums, &self.reward_cutoff) {
+            sums[0] = sum;
+            if cannot_improve_reward(sums, self.songs.len(), cutoff, self.k > 1) {
+                return bound.min(self.floor.next_down());
+            }
+        }
+        bound
     }
 }
 impl Objective for Combined<'_> {
@@ -364,9 +393,14 @@ impl Objective for Combined<'_> {
             .unwrap_or(0.0)
     }
     fn observe_hits(&mut self, hits: &[search::Hit]) {
-        self.floor = hits
-            .get(self.k - 1)
-            .map_or(f64::NEG_INFINITY, |hit| hit.key);
+        let hit = hits.get(self.k - 1);
+        self.floor = hit.map_or(f64::NEG_INFINITY, |hit| hit.key);
+        self.reward_cutoff = self.reward_grid.and_then(|grid| {
+            crate::reward_plan::ranking(&hit?.detail["rewardRanking"])?
+                .into_iter()
+                .map(|level| Some((level.lower(), level.next_grid_lower(grid)?)))
+                .collect()
+        });
     }
     fn seed_objective(&self) -> Option<Box<dyn Objective>> {
         Some(Box::new(super::PowerObjective))
@@ -785,6 +819,15 @@ impl Objective for Combined<'_> {
         from: usize,
     ) -> f64 {
         self.upper(members, assigned, from)
+    }
+    fn assignment_bound(
+        &mut self,
+        members: &[usize],
+        _totals: Totals,
+        assigned: &[i32],
+        from: usize,
+    ) -> Option<f64> {
+        (from == 5 && self.reward_cutoff.is_some()).then(|| self.upper(members, assigned, from))
     }
     fn interval(&mut self, team: &Team, _t: Totals) -> (f64, f64) {
         let fallback = (
@@ -1318,6 +1361,15 @@ impl Engine {
         for group in &linear_groups {
             for &song in &group.songs { power_groups[song] = group.song; }
         }
+        // Ordinary event settlement averages integer reward units (1/10,000)
+        // over the same complete set of skill orders on every chart.
+        let reward_grid = if !battle && plan.as_ref().is_some_and(|plan| {
+            plan.criterion == crate::reward_plan::Aggregation::Mean && plan.levels.len() > 1
+        }) {
+            (crate::live::orders().len() * 10_000).checked_mul(songs.len())
+        } else {
+            None
+        };
         let mut combined = Combined {
             master: &self.master,
             player: &player,
@@ -1345,6 +1397,8 @@ impl Engine {
             joint_zero: false,
             priority,
             floor: f64::NEG_INFINITY,
+            reward_grid,
+            reward_cutoff: None,
             k,
         };
         let deadline = request["deadline"].as_f64().unwrap_or_else(|| {

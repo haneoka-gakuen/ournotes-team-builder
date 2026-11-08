@@ -165,6 +165,15 @@ pub trait Objective {
     ) -> f64 {
         self.bound(totals)
     }
+    fn ranked_assignment_upper(
+        &mut self,
+        _members: &[usize],
+        _totals: Totals,
+        _assigned: &[i32],
+        _from: usize,
+    ) -> Option<[f64; 3]> {
+        None
+    }
     fn member_bound(&mut self, _members: &[usize], _totals: Totals, _left: usize) -> Option<f64> {
         None
     }
