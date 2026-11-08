@@ -55,34 +55,10 @@ cargo run --release --example bench -- input.json
 | `qualify` | Check a request before running it |
 | `growth` | Rank card upgrades by how much each one gains |
 | `rates` | Report each song's scoring weights, rank thresholds and skill windows |
+| `evaluateAll` | Score one fixed team on each of several songs |
+| `eventGrowthStart`, `eventGrowthStep`, `eventGrowthPage` | Infer character and band growth from recorded event decks |
 
 `cancel()` stops running searches. For other languages, the same engine is exposed as C functions that take and return JSON strings, such as `haneoka_context_json`.
-
-## Event reward settlement
-
-Normal lives and normal skips earn CP from the rank's CP value and the Live Boost event-point multiplier. Challenge lives and challenge skips consume CP and earn none. Boost multipliers come from the selected release's matching consumption row; an unboosted normal live uses 1×.
-
-PT follows `CalculateEventPoint`: add 10000 to the bonus basis points, multiply the base rank points and event-point multiplier with signed Int32 wrapping, then divide by 10000 toward zero. Item rewards follow `ApplyEventBonus`: multiply the signed Int32 inputs in signed Int64, divide toward zero and cap each reward row at Int32 maximum. Each item's selection probability is applied after that row settles. Search bounds enumerate reachable bonus totals when native wrapping breaks monotonicity.
-
-An event goal can set `rewardPlan: {unit: 1, criterion: "mean", levels: [[{metric: "points", weight: 1}]]}`. Each outcome settles before averaging; fractions and ordered tie levels are compared exactly. `criterion: "max"` selects the lexicographically greatest reward tuple among the observed outcomes, including all 120 skill orders. It uses score ceilings and reachable grade payouts for pruning; mean-reward bounds never exclude a maximum-reward candidate. Unlisted rewards do not participate in comparison.
-
-Gekiso event goals accept `rewardRoom: {mode: "battle", players: 5, otherAverageScore: 10000000}` or `{mode: "solo"}`. Battle room thresholds use `trunc(sqrt(5 / players) * battleRequiredScore * players)`. An explicit other-player average is subtracted for the other `players - 1` players; otherwise everyone is assumed to score equally. Solo Mission uses the personal score thresholds. Thresholds are projected once per request and shared by settlement and search bounds; the default five-player equal-score room retains the existing chart without copying it. Fixed-team evaluation accepts the same option under `request.event.rewardRoom`.
-
-LUCK uses the requested seeds 0 through `luckSamples - 1`. A completed search proves the optimum for those samples and orders. The response retains its sample count and `sampled` flag; it does not turn the finite sample into a full-distribution expectation.
-
-## Cumulative judgement timing
-
-Ordinary score requests can set `goal.play.cumulativeTiming` to `"best"` or `"worst"` with `criterion: "max"`. Evaluation uses the same field on `request.play`. Each of the 120 skill orders receives its own timing maximum or minimum, then the best order determines the team's score. Omitting the field preserves nominal scoring.
-
-`play.frameRate` selects 30, 60, 90 or 120 updates per second, with 60 as the default. These modes optimize cumulative-counter delivery with the existing base-judgement pattern, chart-time score ledger, ordinary combo, conversion windows and member-skill schedule. Updates are evenly spaced from music time 0. Canonical charts retain native input geometry and line ownership. The release document supplies `liveTools.judgementAreaOffsets` from the same release's options resource.
-
-The activation frame counts its complete judgement batch and records its initial factor at the skill event's chart time. Later steps use their delivery frame's time. Expiry removes the factor at the event's chart time plus its duration, even when the next update detects expiry later. [Native timing](docs/timing.md) records the original client paths behind these boundaries.
-
-Whole-frame input-unit replay applies native touch selection, synchronous priority, asynchronous delivery and press-enter claims. Taps require a press enter. Early Trace and normal slide-tail delivery require a release; held late delivery writes the nominal judgement time. Flicks retain the actual flick event's time and begin position, including reserved delivery on a later frame. Line completion can force an unjudged head to Miss. Combo and connection notes follow the Trace path. Unscored guide and hidden nodes produce Pass, rather than independent cumulative inputs. Critical and Trace judgement types accept only their native grade sets.
-
-Monotone delivery dominance must hold for every affected counter. Equivalent choices prefer nominal timing; conflicting windows remain enumerated. A selected optimum must pass input replay. Necessary local input conflicts partition the remaining domains; bounded caches and search queues return an error when their budget is exhausted. Numeric card dominance based on the nominal model is disabled in these modes.
-
-An ordinary `timeline` request with a `timing` context returns `worst` and `optimal` alongside nominal `score` and the input-checked guide's `best`. The guide advances one frame rounded up to whole milliseconds: 34, 17, 12 or 9 ms for the selected frame rate. Timeline bounds evaluate only the selected order's equivalence class; full-team evaluation still returns all 120 orders. Each guide step's `noteIndices` addresses the canonical judged-note stream; unchanged co-timed notes remain outside that guide step.
 
 ## Build
 
@@ -100,7 +76,8 @@ cargo build --release --target wasm32-unknown-unknown
 
 ## Learn more
 
-[Engine notes](docs/engine-notes.md) cover how the search works and what each request option guarantees.
+- [Engine guarantees](docs/engine.md): what each request option guarantees, including event reward settlement and growth inference.
+- [Timing](docs/timing.md): cumulative judgement timing options and the original client paths behind them.
 
 ## License
 

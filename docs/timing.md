@@ -1,4 +1,14 @@
-# Original-client timing paths
+# Cumulative judgement timing
+
+## Request options
+
+Score requests can set `goal.play.cumulativeTiming` to `"best"` or `"worst"` with `criterion: "max"`; evaluation reads `request.play.cumulativeTiming`. Each of the 120 skill orders gets its own timing optimum and the best order sets the team's score. Without the option, scoring is nominal.
+
+`play.frameRate` is 30, 60, 90 or 120 (default 60). The release document supplies `liveTools.judgementAreaOffsets`. Numeric card dominance is off in these modes, and a selected optimum must pass whole-frame input replay.
+
+A `timeline` request with a `timing` context returns `worst` and `optimal` next to the nominal `score` and the input-checked guide's `best`. Guide steps advance one frame rounded up to whole milliseconds (34, 17, 12 or 9 ms) and address notes by `noteIndices` in the judged-note stream. Timeline bounds cover only the selected skill order; full evaluation returns all 120.
+
+## Original-client paths
 
 The ordinary cumulative scorer separates judgement delivery from the score ledger. `play.frameRate` selects 30, 60, 90 or 120 evenly spaced updates per second, with 60 as the default. The first update has music time 0.
 

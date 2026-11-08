@@ -33,6 +33,18 @@ A `rewardPlan` maximises a nonnegative integer-weighted sum of PT, CP and badges
 | Score target | The mean-score top K is proven first. If every team reaches the target in all 120 skill orders, it is also the target optimum |
 | Finite Live Boost | Maximises total event points over the budget, including the CP distribution across skill orders and the expected challenge count |
 
+Rewards settle with the client's integer rules before outcomes are compared:
+
+- Normal lives and skips earn CP from the rank's CP value and the Live Boost multiplier. Challenge lives and skips consume CP and earn none. Boost multipliers come from the release's consumption row; an unboosted normal live uses 1×.
+- PT follows `CalculateEventPoint`: signed Int32 arithmetic on `10000 + bonus`, rank points and the event-point multiplier, divided by 10000 toward zero.
+- Item rewards follow `ApplyEventBonus`: Int64 products of Int32 inputs, divided toward zero and capped at Int32 maximum per row, before the row's selection probability applies.
+
+`rewardPlan.criterion` is `mean` (settle each outcome, then average) or `max` (the greatest reward tuple over all observed outcomes and 120 skill orders). Rewards not listed in the plan do not take part in comparison.
+
+`rewardRoom` sets the Gekiso event room: `{mode: "battle", players, otherAverageScore}` uses `trunc(sqrt(5 / players) * battleRequiredScore * players)` minus the other players' scores, and `{mode: "solo"}` uses the personal thresholds. Fixed-team evaluation reads it from `request.event.rewardRoom`.
+
+LUCK uses seeds 0 to `luckSamples - 1`. A completed search is optimal for those samples; the response keeps its sample count and `sampled` flag.
+
 Gekiso's minimum COMBO BONUS is the sustained base multiplier after the first COMBO activation, at initial LIFE. Later thresholds affect scoring but do not satisfy the minimum.
 
 ## Gekiso
