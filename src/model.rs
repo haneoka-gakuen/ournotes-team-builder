@@ -257,27 +257,56 @@ pub fn linear_play(
 }
 pub fn relaxed_play(input: &Input, grades: &[usize], slots: &[Slot], width: usize) -> Linear {
     let n = input.times.len();
+    let mut breaks = vec![[0usize; 2]; n + 1];
+    for (index, &grade) in grades.iter().enumerate() {
+        breaks[index + 1] = breaks[index];
+        if grade <= 2 { breaks[index + 1][grade - 1] += 1; }
+    }
+    let mut budgets = rustc_hash::FxHashMap::default();
     let mut repairs = Vec::new();
     let mut heals = Vec::new();
-    for column in 1..width {
+    for column in 0..width {
         let mut repair = 0usize;
         let mut heal = 0i32;
         for slot in slots.iter().skip(column).step_by(width) {
             heal = heal.max(slot.recovery);
             if let Some(convert) = &slot.convert {
                 if convert.judgements.iter().any(|&grade| grade <= 2) {
-                    repair = repair.max(convert.limit.map_or(n, |limit| {
+                    let limit = convert.limit.map_or(n, |limit| {
                         if limit.is_finite() {
                             limit.ceil().max(1.0).min(n as f64) as usize
                         } else {
                             n
                         }
-                    }));
+                    });
+                    let duration = convert.seconds.map_or_else(
+                        || window_ms(slot.effects.first().map(|effect| effect.seconds).unwrap_or(5.0), slot.extension_ms),
+                        |seconds| window_ms(seconds, 0.0),
+                    );
+                    let mask = u8::from(convert.judgements.contains(&1)) | u8::from(convert.judgements.contains(&2)) << 1;
+                    let budget = *budgets.entry((mask, duration, convert.at_start, limit)).or_insert_with(|| {
+                        let count = |start| {
+                            let from = input.clock.frame_time(start);
+                            let Some(end) = from.checked_add(duration) else { return limit; };
+                            let until = input.clock.frame_time(end);
+                            if until <= from { return 0; }
+                            let first = input.times.partition_point(|&time| time <= from);
+                            let after = input.times.partition_point(|&time| time <= until);
+                            (0..2).filter(|&grade| mask & (1 << grade) != 0)
+                                .map(|grade| breaks[after][grade] - breaks[first][grade]).sum::<usize>().min(limit)
+                        };
+                        if convert.at_start { count(0) }
+                        else { input.skill_times.iter().take(5).map(|&start| count(start)).max().unwrap_or(0) }
+                    });
+                    repair = repair.max(budget);
                 }
             }
         }
-        repairs.push(repair);
-        heals.push(heal);
+        // Empty Snapshot slots do not consume a shared card and may occur five times.
+        for _ in 0..if column == 0 { 5 } else { 1 } {
+            repairs.push(repair);
+            heals.push(heal);
+        }
     }
     relaxed_play_limits(input, grades, repairs, heals)
 }

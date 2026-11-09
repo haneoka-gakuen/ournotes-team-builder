@@ -973,6 +973,7 @@ pub struct Kernel<'a> {
     chain_choices: HashMap<(i32, [u32; 5], u8), Arc<ChainChoice>>,
     chain_choice_order: VecDeque<(i32, [u32; 5], u8)>,
     healthy: bool,
+    steady_life: bool,
     owner_local: bool,
     regional_gains: HashMap<(i32, Vec<u32>, u32), f64>,
     regional_gain_order: VecDeque<(i32, Vec<u32>, u32)>,
@@ -1556,8 +1557,8 @@ impl<'a> Kernel<'a> {
             vec![0]
         };
         let prepared = crate::skills::prepare(master, members, snaps);
-        let healthy = chart.accuracy.great == 0.0
-            && chart.accuracy.miss_every == 0
+        let steady_life = chart.accuracy.miss_every == 0
+            && chart.judgements.iter().all(|&grade| master.live.damage[grade] == 0.0)
             && crate::support_aliases::stable_life_conditions(
                 master,
                 members,
@@ -1574,15 +1575,16 @@ impl<'a> Kernel<'a> {
                     })
                 })
             && prepared.slots.iter().all(|s| {
-                s.effects.iter().all(|e| {
+                s.recovery >= 0 && s.effects.iter().all(|e| {
                     e.gate.blocks(master.live.life_base)
                         == e.gate.blocks(2.0 * master.live.life_base)
                 }) && s
                     .convert
                     .as_ref()
-                    .is_none_or(|c| !c.judgements.contains(&6))
+                    .is_none_or(|c| !c.judgements.contains(&6) && master.live.damage[c.judgement] == 0.0)
             });
-        let slots = if healthy { prepared.for_gekiso(master.live.life_base) }
+        let healthy = chart.accuracy.great == 0.0 && steady_life;
+        let slots = if steady_life { prepared.for_gekiso(master.live.life_base, !healthy) }
             else { Arc::clone(&prepared.slots) };
         let cache = std::mem::take(&mut chart.contexts);
         let cache_order = std::mem::take(&mut chart.context_order);
@@ -1774,6 +1776,7 @@ impl<'a> Kernel<'a> {
             chain_choices: HashMap::default(),
             chain_choice_order: VecDeque::new(),
             healthy,
+            steady_life,
             owner_local: member_fields.owner_local(),
             regional_gains: HashMap::default(),
             regional_gain_order: VecDeque::new(),
@@ -4765,7 +4768,13 @@ impl Kernel<'_> {
         coefficient
     }
     fn deterministic_order_bound(&mut self, team: &Team, power: f64, limit: f64) -> Option<f64> {
-        if self.chart.luck || !self.healthy {
+        if self.chart.luck || !self.steady_life {
+            return None;
+        }
+        if !self.healthy && (!self.owner_local
+            || !self.chart.setup.missions.iter().all(|&mission| mission == 1)
+            || team.members.iter().zip(&team.snaps).any(|(&member, &snap)| self.slot(member, snap).convert.is_some()))
+        {
             return None;
         }
         let key = std::array::from_fn(|slot| self.shape_id(team.members[slot], team.snaps[slot]));
@@ -6895,7 +6904,7 @@ impl<'k, 'a> Adapter<'k, 'a> {
     ) -> Option<f64> {
         if !self.combo_attempted {
             self.combo_attempted = true;
-            if !self.kernel.healthy {
+            if !self.kernel.healthy && self.deterministic.is_none() {
                 return None;
             }
             let script = self.kernel.combo_script(members)?;
@@ -9365,7 +9374,7 @@ impl Objective for Adapter<'_, '_> {
             }
             self.fixed_local_power = Arc::new(powers);
         }
-        if self.kernel.healthy
+        if (self.kernel.healthy || self.deterministic.is_some())
             && (self.kernel.chart.luck && !self.kernel.seeds.is_empty()
                 || self
                     .kernel
@@ -10842,6 +10851,9 @@ struct ReplayObjective<'a> {
     just_window: Option<crate::just_window::Prepared>,
 }
 impl Objective for ReplayObjective<'_> {
+    fn prepare_power(&mut self, power: Arc<Vec<f64>>, _width: usize) {
+        if let Some(bound) = &mut self.bound { bound.snapshot_power(power); }
+    }
     fn filter_member_dominates(&self, better: usize, worse: usize) -> bool { self.just_window.as_ref().is_none_or(|window| window.member_dominates(better, worse)) }
     fn filter_permutation_invariant(&self) -> bool { self.just_window.as_ref().is_none_or(crate::just_window::Prepared::permutation_invariant) }
 

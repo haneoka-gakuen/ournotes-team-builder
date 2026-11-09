@@ -14,6 +14,7 @@ use std::{
 };
 
 const CACHE_BYTES: usize = 16 * 1024 * 1024;
+type GekisoView = ((u64, bool), Weak<Vec<Slot>>);
 
 struct MemberKey {
     skill: (i32, i32),
@@ -136,7 +137,7 @@ pub(crate) struct Prepared {
     pub(crate) slots: Arc<Vec<Slot>>,
     // Ordinary scoring prepares projections lazily; Gekiso keeps the raw programs.
     played: Mutex<Vec<(PlayKey, Weak<Played>)>>,
-    gekiso: Mutex<Vec<(u64, Weak<Vec<Slot>>)>>,
+    gekiso: Mutex<Vec<GekisoView>>,
     converter_limits: OnceLock<([Vec<f64>; 7], Vec<f64>)>,
     bytes: usize,
 }
@@ -432,26 +433,26 @@ impl Prepared {
         cache.push((key, Arc::downgrade(&profile)));
         profile
     }
-    pub(crate) fn for_gekiso(self: Arc<Self>, life: f64) -> Arc<Vec<Slot>> {
+    pub(crate) fn for_gekiso(self: Arc<Self>, life: f64, keep_converters: bool) -> Arc<Vec<Slot>> {
         match Arc::try_unwrap(self) {
             Ok(table) => {
                 let mut slots = table.slots;
-                normalize_gekiso(Arc::make_mut(&mut slots).as_mut_slice(), life);
+                normalize_gekiso(Arc::make_mut(&mut slots).as_mut_slice(), life, keep_converters);
                 slots
             }
             Err(table) => {
                 let mut cache = table.gekiso.lock().expect("prepared-gekiso-cache-poisoned");
                 cache.retain(|(_, slots)| slots.strong_count() > 0);
                 if let Some(slots) = cache.iter().find_map(|(key, slots)| {
-                    (*key == life.to_bits()).then(|| slots.upgrade()).flatten()
+                    (*key == (life.to_bits(), keep_converters)).then(|| slots.upgrade()).flatten()
                 }) {
                     return slots;
                 }
                 let mut slots = table.slots.as_ref().clone();
-                normalize_gekiso(&mut slots, life);
+                normalize_gekiso(&mut slots, life, keep_converters);
                 let slots = Arc::new(slots);
                 if cache.len() >= 4 { cache.remove(0); }
-                cache.push((life.to_bits(), Arc::downgrade(&slots)));
+                cache.push(((life.to_bits(), keep_converters), Arc::downgrade(&slots)));
                 slots
             }
         }
@@ -461,15 +462,15 @@ impl Prepared {
         self.bytes
     }
 }
-fn normalize_gekiso(slots: &mut [Slot], life: f64) {
+fn normalize_gekiso(slots: &mut [Slot], life: f64, keep_converters: bool) {
     for slot in slots {
         slot.recovery = 0;
-        slot.convert = None;
+        if !keep_converters { slot.convert = None; }
         slot.effects.retain(|effect| !effect.gate.blocks(life));
         for effect in &mut slot.effects {
             effect.gate = crate::live::Gate { kind: 0, value: 0.0, positive: true };
         }
-        if slot.effects.is_empty() && slot.cumulative.is_empty() { slot.extension_ms = 0.0; }
+        if slot.effects.is_empty() && slot.cumulative.is_empty() && slot.convert.is_none() { slot.extension_ms = 0.0; }
     }
 }
 

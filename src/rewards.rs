@@ -1562,7 +1562,14 @@ struct PreparedSlot {
     score_rows: Vec<[i32; 5]>,
     normal: (usize, f64),
     shape: Vec<(i32, f64)>,
-    windows: Vec<(f64, Vec<(usize, usize)>)>,
+    windows: Vec<PreparedWindow>,
+    conversion_key: Vec<u64>,
+}
+struct PreparedWindow {
+    delta: f64,
+    mask: u8,
+    duration: i32,
+    intervals: Vec<(usize, usize)>,
 }
 impl PreparedSlot {
     fn template_key(&self) -> Vec<u64> {
@@ -1586,12 +1593,14 @@ impl PreparedSlot {
             key.extend([duration as u64, delta.to_bits()]);
         }
         key.push(self.windows.len() as u64);
-        for (delta, intervals) in &self.windows {
-            key.extend([delta.to_bits(), intervals.len() as u64]);
-            for &(start, end) in intervals {
+        for window in &self.windows {
+            key.extend([window.delta.to_bits(), u64::from(window.mask), window.duration as u64, window.intervals.len() as u64]);
+            for &(start, end) in &window.intervals {
                 key.extend([start as u64, end as u64]);
             }
         }
+        key.push(self.conversion_key.len() as u64);
+        key.extend_from_slice(&self.conversion_key);
         key
     }
 }
@@ -1861,7 +1870,8 @@ impl BoundPreparation {
                             (start, end)
                         })
                         .collect();
-                    normal_windows.push((delta, intervals));
+                    let mask = if effect.kind == 2000 {0} else {effect.judgements.iter().fold(0u8,|mask,&grade|mask | (1 << grade))};
+                    normal_windows.push(PreparedWindow { delta, mask, duration: window_ms(effect.seconds, slot.extension_ms), intervals });
                 }
                 for factor in &slot.cumulative {
                     let delta = f(factor.at_cap() as f64 / 100000.0);
@@ -1879,9 +1889,10 @@ impl BoundPreparation {
                             (start, end)
                         })
                         .collect();
-                    normal_windows.push((delta, intervals));
+                    normal_windows.push(PreparedWindow { delta, mask: 0, duration, intervals });
                 }
                 score_rows.sort_unstable();
+                let conversion_key = if chart.accuracy.great == 0.0 { Vec::new() } else { slot.conversion_signature().unwrap_or_default() };
                 let slot = PreparedSlot {
                     positive,
                     converts,
@@ -1890,6 +1901,7 @@ impl BoundPreparation {
                     normal: (actions, absolute),
                     shape,
                     windows: normal_windows,
+                    conversion_key,
                 };
                 let key = slot.template_key();
                 let next = slots.len() as u32;
@@ -3963,8 +3975,29 @@ impl DeterministicBound {
             }
         }
 
-        if chart.accuracy.great != 0.0
-            || chart.accuracy.miss_every != 0
+        let great = chart.accuracy.great != 0.0;
+        let ordinary = great.then(|| crate::skills::prepare(master, members, snaps));
+        let great_script = match &script {
+            ComboSource::None => true,
+            ComboSource::Actors(actors) => actors.iter().all(|actor| actor.gekisou_skill.is_none_or(|(id, level)| {
+                master.gekiso_skills[&id].effects.iter().filter(|row| row.level == level)
+                    .all(|row| row.cumulative_id == 0 || master.cumulative.get(&row.cumulative_id)
+                        .is_some_and(|counter| [7000, 7001].contains(&counter.kind)))
+            })),
+            _ => false,
+        };
+        if great && (!great_script
+            || master.live.life_base <= 0.0
+            || chart.setup.missions.iter().any(|&mission| mission != 1)
+            || chart.judgements.iter().any(|&grade| master.live.damage[grade] != 0.0)
+            || !crate::support_aliases::stable_life_conditions(master, members, snaps, &chart.setup.missions)
+            || master.gekiso_skills.values().chain(master.gekiso_support_skills.values())
+                .flat_map(|skill| &skill.effects).any(|row| row.kind == 3004 && row.value < 0)
+            || ordinary.as_ref().unwrap().slots.iter().any(|slot| slot.recovery < 0 || slot.convert.as_ref()
+                .is_some_and(|convert| !(3..=5).contains(&convert.judgement) || master.live.damage[convert.judgement] != 0.0
+                    || convert.judgements.contains(&4) && convert.judgement != 5)))
+        { return None; }
+        if chart.accuracy.miss_every != 0
             || chart
                 .setup
                 .missions
@@ -4132,6 +4165,13 @@ impl DeterministicBound {
             beta_weights.push(beta);
         }
         let all = *prefix.last()?;
+        let judgement_prefixes: Option<[Vec<f64>; 7]> = great.then(|| std::array::from_fn(|grade| {
+            let mut prefix=vec![0.0];
+            for (index,&judgement) in chart.judgements.iter().enumerate() {
+                prefix.push(add(*prefix.last().unwrap(),if judgement==grade {beta_weights[index]}else{0.0}));
+            }
+            prefix
+        }));
         let mut windows = CumulativeWindows::new(
             master,
             chart,
@@ -4179,9 +4219,14 @@ impl DeterministicBound {
             template_commands.push(windows.commands(&slot.score_rows));
             support_gains.push(windows.gain(chart, &slot.score_rows));
             let mut row = [0.0; 5];
-            for &(delta, ref intervals) in &slot.windows {
-                for (event, &(start, end)) in intervals.iter().enumerate() {
-                    let weight = (prefix[end] - prefix[start]).max(0.0) + 32.0 * f64::EPSILON * all;
+            for window in &slot.windows {
+                let (delta, mask) = (window.delta, window.mask);
+                for (event, &(start, end)) in window.intervals.iter().enumerate() {
+                    let sum = if mask != 0 {
+                        judgement_prefixes.as_ref().map(|prefixes| (0..7).filter(|&grade|mask & (1 << grade)!=0)
+                            .map(|grade|(prefixes[grade][end]-prefixes[grade][start]).max(0.0)).fold(0.0,add))
+                    }else{None};
+                    let weight = sum.unwrap_or_else(||(prefix[end]-prefix[start]).max(0.0)) + (if great {4 * chart.notes.len() + 64} else {32}) as f64 * f64::EPSILON * all;
                     row[event] = add(row[event], mul(delta, up(weight)));
                 }
             }
@@ -4214,6 +4259,73 @@ impl DeterministicBound {
         }
         positives.sort_by(|a, b| b.total_cmp(a));
         let positive = positives.into_iter().take(5).fold(0.0, add);
+        if let Some(ordinary) = &ordinary {
+            // Each supported pulse converts at most its quota inside one skill
+            // window. Credit its largest note gains, independently of all other
+            // pulses; duplicate credits only raise the score ceiling.
+            let support_tail = (master.live.after_ms.max(0.0).ceil() as i32).saturating_add(1000);
+            let factors: Vec<_> = chart.times.iter().map(|&time| {
+                let mut factor = if ranges.iter().any(|&(start,end)| start <= time && time <= end.saturating_add(support_tail)) {
+                    add(1.0,positive)
+                } else {1.0};
+                let mut perfect=0.0;
+                for &(_,start) in chart.full.events.iter().take(5) {
+                    let elapsed = i64::from(time)-i64::from(start);
+                    if elapsed < -40 {continue;}
+                    let envelope = ordinary_shapes.iter().map(|shape| shape.iter()
+                        .filter(|&&(duration,_)| elapsed < i64::from(duration)+40)
+                        .map(|&(_,delta)|delta).fold(0.0,add)).fold(0.0,f64::max);
+                    factor=add(factor,envelope);
+                    let channel=prepared.slots.iter().map(|slot| slot.windows.iter()
+                        .filter(|window| window.mask & (1 << 5)!=0 && window.mask & (1 << 4)==0 && elapsed < i64::from(window.duration)+40)
+                        .map(|window|window.delta).fold(0.0,add)).fold(0.0,f64::max);
+                    perfect=add(perfect,channel);
+                }
+                (factor,perfect)
+            }).collect();
+            let mut gains = vec![[0.0_f64; 5]; profiles.len()];
+            for (index, slot) in ordinary.slots.iter().enumerate() {
+                let Some(convert) = &slot.convert else { continue; };
+                if !convert.judgements.contains(&4) { continue; }
+                let column = index % (snaps.len() + 1);
+                if column == 0 { return None; }
+                let snapshot = &snaps[column - 1];
+                let actor = Performer::from_member(master, &members[index / (snaps.len() + 1)], Some(snapshot));
+                let rows: Vec<_> = snapshot.card.support_skills.iter().zip(snapshot.skill_levels)
+                    .flat_map(|(id, level)| master.support_skills.get(id).into_iter().flatten()
+                        .filter(move |row| row.level == level && row.kind == 12006))
+                    .filter(|row| static_gk_group(master,row.condition_group,&actor) != Some(false)).collect();
+                if rows.len() != 1 { return None; }
+                let row = rows[0];
+                let pulse = master.condition_sets.get(&row.trigger_group).is_some_and(|sets| sets.len() == 1
+                    && sets[0].len() == 1 && master.conditions.get(&sets[0][0])
+                        .is_some_and(|condition| condition.positive && [4010, 5020].contains(&condition.kind)));
+                if !pulse || row.trigger_type != 1 || row.cumulative_id != 0 || row.reset_group != 0 { return None; }
+                let duration = convert.seconds.map_or_else(
+                    || window_ms(slot.effects.first().map(|effect| effect.seconds).unwrap_or(5.0), slot.extension_ms),
+                    |seconds| window_ms(seconds, 0.0));
+                let quota = convert.limit.map_or(chart.notes.len(), |limit| limit.ceil().max(1.0).min(chart.notes.len() as f64) as usize);
+                let target = prepared.row_ids[index] as usize;
+                for (event, &(_, start)) in chart.full.events.iter().take(5).enumerate() {
+                    let from = start.saturating_sub(40);
+                    let end = start.saturating_add(duration).saturating_add(slot.extension_ms.abs().ceil() as i32).saturating_add(40);
+                    let first = chart.times.partition_point(|&time| time < from);
+                    let after = chart.times.partition_point(|&time| time <= end);
+                    let mut values: Vec<_> = (first..after).filter_map(|note| {
+                        let grade = chart.judgements[note];
+                        let delta = chart.judge_frac[convert.judgement] - chart.judge_frac[grade];
+                        (delta > 0.0 && convert.judgements.contains(&grade))
+                            .then(|| mul(raw_weights[note],add(mul(up(delta),factors[note].0),mul(chart.judge_frac[grade],factors[note].1))))
+                    }).collect();
+                    values.sort_unstable_by(|a,b| b.total_cmp(a));
+                    let gain = values.into_iter().take(quota).fold(0.0, add);
+                    gains[target][event] = gains[target][event].max(gain);
+                }
+            }
+            for (profile,gains) in profiles.iter_mut().zip(gains) {
+                for (value,gain) in profile.iter_mut().zip(gains) { *value=add(*value,gain); }
+            }
+        }
         let u = 2.0_f64.powi(-24);
         let mut errors = [0.0; 6];
         for c in 0..=5 {
@@ -4255,7 +4367,7 @@ impl DeterministicBound {
                 (rounding - 1.0).next_up(),
             ),
         ) / chart.full.converted as f64);
-        let minimum_judge = chart.judge_frac[5].min(chart.judge_frac[6]);
+        let minimum_judge = if great { chart.judge_frac[3..=6].iter().copied().fold(f64::INFINITY, f64::min) } else { chart.judge_frac[5].min(chart.judge_frac[6]) };
         let minimum_coefficient = (chart.note_frac.iter().fold(0.0_f64, |sum, &frac| {
             let term = (((master.live.adjustment * chart.difficulty_factor).next_down() * frac)
                 .next_down()
@@ -4276,6 +4388,7 @@ impl DeterministicBound {
         );
         let width = snaps.len() + 1;
         let capacity = prepared.capacity;
+        if great && capacity > 0 { return None; }
         let (prefix_gain, regional_prefix) = if capacity == 0 {
             (vec![0.0], vec![vec![0.0]; ranges.len()])
         } else {
