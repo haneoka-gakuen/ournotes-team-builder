@@ -149,6 +149,9 @@ pub trait Objective {
     fn snap_bonus(&self, _snap: usize) -> f64 {
         0.0
     }
+    /// Equal identities share every slot program tested by snap_dominance.
+    /// Equal vectors must also imply equal skill values within each objective.
+    fn snap_program_identity(&self) -> Option<usize> { None }
     fn snap_dominance(&mut self, _member: usize, _snap: i32) -> Vec<f64> {
         Vec::new()
     }
@@ -585,6 +588,7 @@ struct Runner<'a, O: Objective + ?Sized> {
     started: f64,
     last_notify: f64,
     generation: u64,
+    visit_polls: u8,
     width: usize,
     bases: Vec<SlotBase>,
     snap_power: Arc<Vec<f64>>,
@@ -955,6 +959,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             started,
             last_notify: started,
             generation,
+            visit_polls: 0,
             width,
             bases,
             snap_power,
@@ -1002,6 +1007,10 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
     fn expired(&self) -> bool {
         self.generation != crate::cancellation_generation()
             || self.input.deadline != f64::INFINITY && (self.input.now)() > self.input.deadline
+    }
+    fn visit_expired(&mut self) -> bool {
+        self.visit_polls = self.visit_polls.wrapping_add(1);
+        self.timed_out || self.visit_polls & 63 == 0 && self.expired()
     }
     fn report_pending(&mut self) {
         if self.input.on_candidate.is_none() || self.hits.is_empty() {
@@ -2233,7 +2242,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         {
             return Ok(());
         }
-        if self.expired() {
+        if self.visit_expired() {
             self.timed_out = true;
             self.unexplored = self.unexplored.max(bound);
             return Ok(());
@@ -2988,10 +2997,14 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         totals: Totals,
         refined: bool,
     ) -> Result<(), String> {
-        if self.expired() {
+        if self.visit_expired() {
             self.timed_out = true;
             self.unexplored = f64::INFINITY;
             return Ok(());
+        }
+        if slot == 0 && domains.iter().all(|row| row.len() == 1) {
+            let mut selected = domains.iter().map(|row| &row[0]).collect();
+            return self.snap_domains(a, domains, domains.len(), &mut selected, totals, refined);
         }
         if slot > 0 {
             self.stats.snap_nodes += 1;

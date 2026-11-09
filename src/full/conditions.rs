@@ -217,6 +217,14 @@ impl Checker {
                 | Test::JudgementCount { .. }
         )
     }
+    pub(crate) fn range_stable(&self) -> bool {
+        match &self.test {
+            Test::Fixed(_) | Test::SameMember(_) | Test::RangePlaying { .. } | Test::RangeStart { .. } | Test::RangeComplete | Test::Rush(_) => true,
+            Test::And(items) | Test::Or(items) => items.iter().all(Self::range_stable),
+            Test::Not(inner) => inner.range_stable(),
+            _ => false,
+        }
+    }
     pub(crate) fn idle_input(&self) -> Option<IdleInput> {
         self.idle
     }

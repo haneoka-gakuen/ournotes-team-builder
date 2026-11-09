@@ -174,7 +174,7 @@ pub fn emit(hits: &[Hit]) {
             return;
         };
         let now = crate::clock::milliseconds();
-        if hits.is_empty() || now - state.last < 250.0 {
+        if hits.is_empty() || hits.len() > 1 && !state.last_hits.is_empty() && now - state.last < 250.0 {
             return;
         }
         let identity: Vec<_> = hits

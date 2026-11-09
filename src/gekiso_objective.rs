@@ -7246,6 +7246,17 @@ impl<'k, 'a> Adapter<'k, 'a> {
         self.fixed_leaf_order.push_back(key);
         Some(Arc::clone(self.fixed_leaf_models.get(&key)?))
     }
+    fn selected_luck_score_ceiling(&mut self, team: &Team, power: f64) -> Option<f64> {
+        if !self.kernel.chart.luck || self.kernel.seeds.is_empty()
+            || self.kernel.chart.setup.missions.iter().any(|&mission| mission != 2)
+            || !self.kernel.healthy || !self.kernel.owner_local
+            || gekiso::uses_full_replay(self.kernel.master, self.kernel.chart, &self.kernel.seeds)
+            || self.kernel.has_converter(team) { return None; }
+        let deck = self.kernel.original_deck(team);
+        let slots = team.members.iter().zip(&team.snaps)
+            .map(|(&member, &snap)| Arc::new(self.kernel.slot(member, snap).clone())).collect::<Vec<_>>();
+        self.kernel.seeded_rush_bound(&deck, &slots, power as i32).ok().flatten()
+    }
     fn fixed_converted_score_ceiling(&mut self, team: &Team, power: f64) -> Option<f64> {
         let (_, _, supports) = self.fixed_conversion_trace(team)?;
         if let Some(model) = self.fixed_region_model(team, supports) {
@@ -9203,7 +9214,8 @@ impl Objective for Adapter<'_, '_> {
             let tight = self
                 .fixed_luck_score_ceiling(&team.members, &team.snaps, 5, t.power)
                 .map_or(upper, |value| upper.min(value));
-            let converted = self.fixed_converted_score_ceiling(team, t.power);
+            let converted = self.selected_luck_score_ceiling(team, t.power)
+                .or_else(|| self.fixed_converted_score_ceiling(team, t.power));
             let no_rng = if converted.is_none() {
                 self.fixed_no_rng_score_ceiling(team, t.power)
             } else {
@@ -11489,7 +11501,7 @@ fn search_levels(
     kernel.seed_preview = seed_only;
     kernel.live_floor = cooperative_floor
         && k == 1
-        && criterion == Criterion::Max
+        && matches!(criterion, Criterion::Mean | Criterion::Max)
         && kernel.chart.luck
         && kernel.seeds.len() >= 16;
     if kernel.chart.luck && !kernel.seeds.is_empty() {

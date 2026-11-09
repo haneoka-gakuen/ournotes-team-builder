@@ -8,7 +8,7 @@ A completed search has checked every legal team and proves its result. A search 
 
 Member, snapshot, leader and binding constraints apply to every candidate. An unknown required card or binding leaves no legal team, and manual evaluation rejects unknown snapshots.
 
-Ordinary MISS searches prepare converter domains before recovery amounts. When even maximal recovery leaves every order dead before the second or third activation, recovery-specific marginal ceilings enter the corresponding slot rows. Their averaged base-score ceilings remain conservative; surviving domains retain the exact recovery partition and final scoring.
+Ordinary MISS searches prepare converter domains before recovery amounts. When even maximal recovery leaves every order dead before the second or third activation, recovery-specific marginal ceilings enter the corresponding slot rows. Their averaged base-score ceilings remain conservative; surviving domains retain the exact recovery partition and final scoring. Recovery bounds price only the current legal Snapshot choices. A card can dominate another with the same conversion/recovery program and matching score-effect windows only after a conservative power margin covers per-note rounding; cumulative programs remain equal.
 
 ## Activity growth inference
 
@@ -51,7 +51,7 @@ Gekiso's minimum COMBO BONUS is the sustained base multiplier after the first CO
 
 ## Gekiso
 
-Deterministic results and manual evaluations replay all 120 skill orders. Mean searches subtract completed orders from their individual score ceilings and stop rejected candidates once the remaining ceiling cannot reach the incumbent. Accepted teams keep the complete distribution. A LUCK sample count of 0 gives nominal expectations, and a positive count averages fixed seeds 0 to n-1.
+Deterministic results and manual evaluations replay all 120 skill orders. Mean searches subtract completed orders from their individual score ceilings and stop rejected candidates once the remaining ceiling cannot reach the incumbent. Accepted teams keep the complete distribution. Single-team improvements stream immediately. Sampled mean and maximum searches can share fully scored candidate floors while independent workers continue their proofs. Fixed-seed pure-LUCK leaves use their selected performers for the Rush ceiling before preparing a broader support-family bound. Lottery preparation reuses condition scheduling and skips inactive frames only with no damage, pending draws, timed effects or unsupported condition dependencies; note, skill, standby and range boundaries remain explicit. A LUCK sample count of 0 gives nominal expectations, and a positive count averages fixed seeds 0 to n-1.
 
 For no-damage COMBO charts, GREAT retains judgement-specific score bounds and conditional COMBO traces. Ordinary GREAT-to-PERFECT pulses are bounded by their activation windows and conversion quotas. Stable LIFE projections retain these converters; unsupported programs use the full replay path. Final scores still replay all orders. COMBO levels and conditional branches within one search share the same immutable card preparation; conversion pulses and their per-note ordinary factor envelopes are prepared once per complete skill template. Shared charts combine fixed-formation coefficients before matching physical Snapshots and cache complete-formation mean ceilings.
 
@@ -63,7 +63,7 @@ For no-damage COMBO charts, GREAT retains judgement-specific score bounds and co
 
 ## Multiple songs
 
-`request.aggregation: "mean"` searches one formation over all `goal.songs`. Score objectives use mean scores, and event objectives average their selected rewards. Ordinary accuracy searches intersect each song's converter and recovery domains and prune partial domains with the individual song ceilings.
+`request.aggregation: "mean"` searches one formation over all `goal.songs`. Score objectives use mean scores, and event objectives average their selected rewards. Equal prepared power tables and skill-program identities share setup and dominance dimensions; every chart keeps its own score coefficients and complete result. Ordinary accuracy searches intersect each song's converter and recovery domains and prune partial domains with the individual song ceilings.
 
 In Arena, `mode: "shared"` searches one leader, member set and snapshot assignment for the equal-weight average over every chart. Only this joint search proves the result; per-song optima are seeds.
 

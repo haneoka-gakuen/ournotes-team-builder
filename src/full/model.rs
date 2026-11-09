@@ -99,6 +99,7 @@ struct LivePool {
 struct CondSkill {
     member: usize,
     skill_type: i32,
+    steady_rows: bool,
     updater: ConditionUpdater,
 }
 #[derive(Clone)]
@@ -889,9 +890,11 @@ impl<'a> Model<'a> {
                 release: factory.group(row.release_group, member)?,
             });
         }
+        let steady_rows = effects.iter().all(|effect| !self.rows[effect.row].while_executing);
         self.condition.push(CondSkill {
             member,
             skill_type,
+            steady_rows,
             updater: ConditionUpdater::new(effects, gate)?,
         });
         Ok(())
@@ -900,6 +903,22 @@ impl<'a> Model<'a> {
         for (target, source) in self.events.iter_mut().zip(events) {
             target.0 = source.0;
         }
+    }
+    fn condition_indices(&mut self) -> ConditionIndices {
+        let mut selected = self.condition_schedule.as_ref().map(|schedule| schedule.select(
+            &self.frame_events, !self.judged.is_empty(), self.frame_rank, self.gk.as_ref(),
+        ));
+        if self.record.is_none() {
+            if let (Some(selected), Some(g)) = (&mut selected, &self.gk) {
+                let changed = !self.frame_events.is_empty() || !self.judged.is_empty() || self.frame_rank.is_some()
+                    || !g.controller.updates.is_empty() || !g.previous_lots.is_empty();
+                for i in (ConditionIndices { selected: Some(*selected), all: 0..self.condition.len() }) {
+                    let condition = &mut self.condition[i];
+                    if condition.steady_rows && condition.updater.idle_lottery_frame(changed) { *selected &= !(1 << i); }
+                }
+            }
+        }
+        ConditionIndices { selected, all: 0..self.condition.len() }
     }
     pub fn frame(&mut self, time: i32, judged: &[JudgedNote], dt: f64) -> Result<(), String> {
         self.frame_time = time;
@@ -1028,18 +1047,7 @@ impl<'a> Model<'a> {
             self.enabled
                 .sort_by_key(|&i| self.live[i].key as i64 * 10 + self.live[i].index as i64);
         }
-        let selected_conditions = self.condition_schedule.as_ref().map(|schedule| {
-            schedule.select(
-                &self.frame_events,
-                !self.judged.is_empty(),
-                self.frame_rank,
-                self.gk.as_ref(),
-            )
-        });
-        let condition_indices = ConditionIndices {
-            selected: selected_conditions,
-            all: 0..self.condition.len(),
-        };
+        let condition_indices = self.condition_indices();
         for observer in &mut self.rush_observers {
             observer.begin_frame();
         }

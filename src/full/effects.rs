@@ -315,6 +315,23 @@ pub struct ConditionUpdater {
     second_phase: bool,
     first_phase: bool,
     quiet: bool,
+    range_stable: bool,
+    lottery_pause: bool,
+    lottery_seen: bool,
+}
+fn effects_range_stable(effects: &[Effect]) -> bool {
+    !effects.is_empty() && effects.iter().all(|effect| effect.trigger_type == SUSTAINED && !timed(effect.act)
+        && effect.cumulative.is_none()
+        && [&effect.trigger, &effect.condition, &effect.release, &effect.reset].into_iter().flatten().all(Checker::range_stable))
+}
+fn effects_lottery_pause(effects: &[Effect]) -> bool {
+    effects.iter().all(|effect| !timed(effect.act) && effect.cumulative.is_none()
+        && [&effect.release, &effect.reset].into_iter().flatten().all(Checker::range_stable)
+        && if effect.trigger_type == SUSTAINED {
+            [&effect.trigger, &effect.condition].into_iter().flatten().all(Checker::range_stable)
+        } else {
+            effect.trigger_type == ONE_SHOT && effect.trigger.as_ref().and_then(Checker::idle_input).is_some()
+        })
 }
 impl ConditionUpdater {
     pub(crate) fn fixed_life(&mut self, life: i32) {
@@ -336,6 +353,8 @@ impl ConditionUpdater {
                 checker.fixed_life(life);
             }
         }
+        self.range_stable = effects_range_stable(&self.effects);
+        self.lottery_pause = effects_lottery_pause(&self.effects);
     }
     pub fn new(effects: Vec<Effect>, gate: Option<i32>) -> Result<Self, String> {
         let mut ids: Vec<_> = effects.iter().map(|e| e.id).collect();
@@ -404,6 +423,8 @@ impl ConditionUpdater {
             }
             idle.as_mut().unwrap().insert(input.unwrap());
         }
+        let range_stable = effects_range_stable(&effects);
+        let lottery_pause = effects_lottery_pause(&effects);
         let count = effects.len();
         let second_phase = effects.iter().any(|effect| effect.phase == 2);
         let first_phase = effects.iter().any(|effect| effect.phase == 1);
@@ -423,6 +444,9 @@ impl ConditionUpdater {
             second_phase,
             first_phase,
             quiet: false,
+            range_stable,
+            lottery_pause,
+            lottery_seen: false,
         })
     }
     pub(super) fn idle_inputs(&self) -> Option<&IdleInputs> {
@@ -430,6 +454,17 @@ impl ConditionUpdater {
     }
     pub(super) fn executing(&self) -> bool {
         !self.executing.is_empty()
+    }
+    pub(crate) fn can_pause_lottery(&self) -> bool {
+        self.lottery_pause && self.updaters.iter().all(|updater| matches!(updater.state.state, STAY | EXECUTING))
+    }
+    pub(crate) fn idle_lottery_frame(&mut self, changed: bool) -> bool {
+        let seen = self.lottery_seen;
+        // An edge trigger also changes when the first empty frame clears it.
+        self.lottery_seen = !changed;
+        !changed && seen && self.range_stable && self.executing.is_empty()
+            && self.sustained.iter().flatten().all(|state| state.executing.is_empty()
+                && state.current.is_none_or(|index| self.updaters[index].state.state == EXECUTING))
     }
     pub fn begin_frame(&mut self) {
         self.trigger_checked = false;
