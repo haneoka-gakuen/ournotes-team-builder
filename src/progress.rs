@@ -168,6 +168,14 @@ fn hit_json(state: &State, hit: &Hit) -> Value {
     value
 }
 pub fn emit(hits: &[Hit]) {
+    emit_hits(hits, true);
+}
+
+pub(crate) fn emit_provisional(hits: &[Hit]) {
+    emit_hits(hits, false);
+}
+
+fn emit_hits(hits: &[Hit], advance_throttle: bool) {
     STATE.with(|state| {
         let mut state = state.borrow_mut();
         let Some(callback) = state.callback else {
@@ -191,7 +199,9 @@ pub fn emit(hits: &[Hit]) {
         if identity == state.last_hits {
             return;
         }
-        state.last = now;
+        if advance_throttle {
+            state.last = now;
+        }
         state.last_hits = identity;
         if hits.iter().any(|h| {
             h.team.members.iter().any(|&i| i >= state.members.len())
