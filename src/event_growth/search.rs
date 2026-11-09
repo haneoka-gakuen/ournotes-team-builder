@@ -124,7 +124,6 @@ pub(super) struct Tier {
     item_min: i32,
     rank_span: i32,
     item_span: i32,
-    relaxed: bool,
     queue: BinaryHeap<Node>,
     kernels: KernelBank,
     deltas: DeltaBank,
@@ -144,15 +143,9 @@ pub(super) struct Tier {
     pub latest: Vec<Arc<Ranked>>,
 }
 impl Tier {
-    pub fn new(
-        problem: Arc<Problem>,
-        vip: i32,
-        vip_rank: i32,
-        relaxed: bool,
-        budget: i32,
-        scout: bool,
-    ) -> Self {
-        let minimums = vec![if relaxed { 1 } else { 15 }; problem.caps.len()];
+    pub fn new(problem: Arc<Problem>, vip: i32, vip_rank: i32, budget: i32, scout: bool) -> Self {
+        // Scouts try common high-growth values first. Certified tiers cover the legal domain.
+        let minimums = vec![if scout { 15 } else { 1 }; problem.caps.len()];
         let kernels = Arc::clone(&problem.kernels[&vip]);
         let mut tier = Self {
             deltas: Arc::clone(&problem.deltas),
@@ -167,7 +160,7 @@ impl Tier {
             vip,
             vip_rank,
             minimums,
-            item_min: if relaxed { 0 } else { 50 },
+            item_min: if scout { 50 } else { 0 },
             rank_span: if scout {
                 1
             } else {
@@ -178,7 +171,6 @@ impl Tier {
             } else {
                 budget.min(super::ITEM_SPAN)
             },
-            relaxed,
             queue: BinaryHeap::new(),
             kernels,
             seen: HashSet::new(),
@@ -200,6 +192,7 @@ impl Tier {
                 .bands
                 .iter()
                 .any(|band| band.cap < tier.item_min)
+            || tier.problem.primary_totals.is_empty()
             || budget == 0 && tier.problem.conflict
         {
             return tier;
@@ -522,13 +515,17 @@ impl Tier {
             .map(|j| ctx.caps[j] - offsets.ranks.iter().map(|r| r[j]).max().unwrap())
             .collect();
         let mut gauges = Vec::new();
-        for &total in &ctx.totals {
+        for &total in &ctx.primary_totals {
             let mut a = i32::MIN;
             let mut b = i32::MAX;
             let mut valid = true;
             for r in 0..ctx.readings.len() {
-                let Some(actual) = ctx
-                    .totals
+                let totals = if r == 0 {
+                    &ctx.primary_totals
+                } else {
+                    &ctx.totals
+                };
+                let Some(actual) = totals
                     .iter()
                     .find(|t| t.bonus == total.bonus + offsets.bonus[r])
                 else {
@@ -654,7 +651,7 @@ impl Tier {
     }
     fn options(&self, node: &Node) -> Vec<Bounds> {
         self.problem
-            .totals
+            .primary_totals
             .iter()
             .filter_map(|&total| {
                 if node
@@ -997,7 +994,7 @@ impl Tier {
         let size = ctx.ids.len();
         let mut lower = vec![i32::MAX; size];
         let mut upper = vec![i32::MIN; size];
-        for total in &ctx.totals {
+        for total in &ctx.primary_totals {
             if node
                 .total
                 .is_some_and(|selected| selected.bonus != total.bonus)
@@ -1156,7 +1153,7 @@ impl Tier {
     fn canonical(&self, flat: &[i32]) -> Vec<Canonical> {
         let options: Vec<_> = self
             .problem
-            .totals
+            .primary_totals
             .iter()
             .filter_map(|&total| {
                 if self
@@ -1375,7 +1372,9 @@ impl Tier {
                 if !self.scout && candidate.variation != self.budget {
                     continue;
                 }
-                self.add_equivalents(&mut candidate);
+                if !self.add_equivalents(&mut candidate) {
+                    continue;
+                }
                 let candidate = Arc::new(candidate);
                 self.latest.push(Arc::clone(&candidate));
                 if self.scout {
@@ -1399,7 +1398,7 @@ impl Tier {
             }
         }
     }
-    fn add_equivalents(&self, ranked: &mut Ranked) {
+    fn add_equivalents(&self, ranked: &mut Ranked) -> bool {
         let ctx = &self.problem;
         let configuration = &mut ranked.configuration;
         let mut equivalents = Vec::new();
@@ -1409,7 +1408,7 @@ impl Tier {
                 min: ctx.unseen_count,
                 max: ctx.unseen_cap,
             };
-            for original in &configuration.witnesses {
+            for (index, original) in configuration.witnesses.iter().enumerate() {
                 let levels: Vec<_> = original.levels.iter().map(|rank| rank + shift).collect();
                 if levels
                     .iter()
@@ -1425,8 +1424,12 @@ impl Tier {
                         total.min <= original.total_value && original.total_value <= total.max
                     })
                     .unwrap();
-                let Some(total) = ctx
-                    .totals
+                let totals = if index == 0 {
+                    &ctx.primary_totals
+                } else {
+                    &ctx.totals
+                };
+                let Some(total) = totals
                     .iter()
                     .find(|total| total.bonus == old.bonus - shift * 5)
                 else {
@@ -1451,7 +1454,7 @@ impl Tier {
             if witnesses.len() != configuration.witnesses.len() || outside.min > outside.max {
                 continue;
             }
-            for witness in &mut witnesses {
+            for (index, witness) in witnesses.iter_mut().enumerate() {
                 let sum = witness.levels.iter().sum::<i32>();
                 witness.total_rank.min = witness
                     .total_rank
@@ -1459,6 +1462,15 @@ impl Tier {
                     .max(sum + outside.min - ctx.unseen_span);
                 witness.total_rank.max = witness.total_rank.max.min(sum + outside.max);
                 witness.total_value = witness.total_rank.min;
+                let team_sum: i32 = ctx.readings[index]
+                    .characters
+                    .iter()
+                    .map(|&character| witness.levels[character])
+                    .sum();
+                witness.outside_rank = Some(Range {
+                    min: witness.total_rank.min - team_sum,
+                    max: witness.total_rank.max - team_sum,
+                });
             }
             let valid = witnesses.iter().all(|witness| {
                 let (_, model) = ctx
@@ -1504,6 +1516,9 @@ impl Tier {
                 witnesses,
             });
         }
+        if equivalents.is_empty() {
+            return false;
+        }
         equivalents.sort_by_key(|row| row.total_rank.min);
         for (i, character) in configuration.characters.iter_mut().enumerate() {
             character.min_level = equivalents
@@ -1530,6 +1545,7 @@ impl Tier {
                 .unwrap(),
         };
         configuration.equivalents = equivalents;
+        true
     }
     fn configurations(&mut self, gears: &[i32], option: &Canonical) -> Vec<Ranked> {
         let anchor = Witness {
@@ -1539,6 +1555,7 @@ impl Tier {
             instruments: gears.to_vec(),
             total_rank: option.range,
             total_value: option.range.min,
+            outside_rank: None,
         };
         let own = option.levels.iter().sum::<i32>();
         let mut local: Vec<Option<Vec<Witness>>> = vec![None; self.problem.readings.len()];
@@ -1711,7 +1728,6 @@ impl Tier {
                 .filter_map(|row| (row.0 != 0).then_some(row.0))
                 .collect(),
             matched_total: ctx.originals.iter().any(|row| row.0 == 0),
-            relaxed: self.relaxed,
             changed: variation != 0,
             change_cost: variation,
             changed_dimensions: dimensions,
@@ -1934,6 +1950,7 @@ impl Tier {
                 instruments,
                 total_rank: range,
                 total_value: range.min,
+                outside_rank: None,
             }];
         }
 
@@ -2099,6 +2116,7 @@ impl Tier {
                             instruments: instruments.to_vec(),
                             total_rank: range,
                             total_value: range.min,
+                            outside_rank: None,
                         });
                     },
                 );
