@@ -4130,6 +4130,9 @@ impl Engine {
             }
             density[bin as usize] += 1;
         }
+        let variable_life = ["great", "good", "bad", "miss", "missEvery"]
+            .iter()
+            .any(|key| master::number(&request["play"][key], 0.0) != 0.0);
         let mut windows = Vec::new();
         for (event, slot) in master::integers(&request["order"]).into_iter().enumerate() {
             if event >= chart.skill_times.len() {
@@ -4138,24 +4141,42 @@ impl Engine {
             let member = members.get(slot as usize).ok_or("invalid-skill-order")?;
             let snap = snaps.get(slot as usize).ok_or("invalid-snap-slot")?;
             let skill = skills::resolve(&self.master, member, *snap, &mut Vec::new());
-            let (mut percent, mut perfect, mut length) = (0.0, 0.0, 0i32);
-            for effect in &skill.effects {
-                if effect.gate.blocks(self.master.live.life_base)
-                    && ["great", "good", "bad", "miss"]
-                        .iter()
-                        .all(|key| master::number(&request["play"][key], 0.0) == 0.0)
-                {
-                    continue;
+            let bonuses = |life| {
+                let (mut percent, mut perfect, mut length) = (0.0, 0.0, 0);
+                for effect in skill.effects.iter().filter(|effect| !effect.gate.blocks(life)) {
+                    if effect.kind == 2000 {
+                        percent += effect.delta as f64 / 1000.0;
+                    } else {
+                        perfect += effect.delta as f64 / 1000.0;
+                    }
+                    length = length.max(crate::num::window_ms(effect.seconds, skill.extension_ms));
                 }
-                if effect.kind == 2000 {
-                    percent += effect.delta as f64 / 1000.0;
-                } else {
-                    perfect += effect.delta as f64 / 1000.0;
+                (percent, perfect, length)
+            };
+            let (percent, perfect, mut length) = bonuses(self.master.live.life_base);
+            let mut thresholds: Vec<_> = skill.effects.iter()
+                .filter(|effect| variable_life && effect.gate.kind == 1)
+                .map(|effect| effect.gate.value)
+                .collect();
+            thresholds.sort_by(f64::total_cmp);
+            thresholds.dedup();
+            let mut branches = Vec::new();
+            if !thresholds.is_empty() {
+                for (index, minimum) in std::iter::once(None).chain(thresholds.iter().copied().map(Some)).enumerate() {
+                    let (percent, perfect, duration) = bonuses(minimum.unwrap_or(f64::NEG_INFINITY));
+                    length = length.max(duration);
+                    branches.push(json!({
+                        "minLife": minimum, "maxLifeExclusive": thresholds.get(index),
+                        "percent": percent, "perfectPercent": perfect,
+                    }));
                 }
-                length = length.max(crate::num::window_ms(effect.seconds, skill.extension_ms));
             }
             let start = chart.skill_times[event];
-            windows.push(json!({"member":member.key,"event":event,"startMs":start,"endMs":start as i64+length as i64,"percent":percent,"perfectPercent":perfect,"extensionMs":skill.extension_ms}));
+            let mut window = json!({"member":member.key,"event":event,"startMs":start,"endMs":start as i64+length as i64,"percent":percent,"perfectPercent":perfect,"extensionMs":skill.extension_ms});
+            if !branches.is_empty() {
+                window["lifeBranches"] = json!(branches);
+            }
+            windows.push(window);
         }
         let mut out = json!({"durationMs":duration,"density":density,"fever":chart.fevers,"windows":windows,"cachedCharts":self.cached_chart_keys()});
         if request["timing"].is_object() {
