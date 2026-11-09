@@ -221,6 +221,7 @@ impl Engine {
         {
             let mut trial = scoped_input.clone();
             trial["request"]["goal"]["songs"] = json!([songs[0]]);
+            trial["charts"] = json!([{ "song": songs[0], "source": sources[0] }]);
             trial["request"]["aggregation"] = Value::Null;
             trial["request"]["seedOnly"] = json!(true);
             trial["request"]["noFloor"] = json!(true);
