@@ -951,7 +951,7 @@ pub struct Kernel<'a> {
     combo_scripts: Option<crate::reward_trace::Scripts>,
     last_combo_key: Option<(Vec<Performer>, String)>,
     fixed_preparations: HashMap<Option<usize>, Arc<crate::rewards::BoundPreparation>>,
-    global_fixed_preparation: Option<Arc<crate::rewards::BoundPreparation>>,
+    bound_preparation: Option<Arc<crate::rewards::BoundPreparation>>,
     fixed_combo_trace_order: VecDeque<String>,
     fixed_luck_counts: HashMap<(String, usize), Option<Arc<crate::rewards::LuckEnvelope>>>,
     fixed_luck_count_order: VecDeque<(String, usize)>,
@@ -1754,7 +1754,7 @@ impl<'a> Kernel<'a> {
             combo_scripts: None,
             last_combo_key: None,
             fixed_preparations: HashMap::default(),
-            global_fixed_preparation: None,
+            bound_preparation: None,
             fixed_combo_trace_order: VecDeque::new(),
             fixed_luck_counts: HashMap::default(),
             fixed_luck_count_order: VecDeque::new(),
@@ -6791,17 +6791,17 @@ impl<'k, 'a> Adapter<'k, 'a> {
                     kernel.snaps,
                     1.0 + level as f64,
                     (None, global_luck.as_deref()),
-                    &mut kernel.global_fixed_preparation,
+                    &mut kernel.bound_preparation,
                 )
             } else if !surrogate && !estimate && !kernel.chart.luck {
                 if kernel.maximum_level > 0 {
-                    crate::rewards::DeterministicBound::with_combo(
+                    crate::rewards::DeterministicBound::with_combo_preparation(
                         kernel.master,
                         kernel.chart,
                         kernel.members,
                         kernel.snaps,
                         1.0 + level as f64,
-                        None,
+                        (None, &mut kernel.bound_preparation),
                     )
                 } else {
                     crate::rewards::DeterministicBound::new(
@@ -6976,13 +6976,13 @@ impl<'k, 'a> Adapter<'k, 'a> {
                     return None;
                 }
                 if !self.kernel.combo_bounds.contains_key(&script) {
-                    let mut model = crate::rewards::DeterministicBound::with_combo(
+                    let mut model = crate::rewards::DeterministicBound::with_combo_preparation(
                         self.kernel.master,
                         self.kernel.chart,
                         self.kernel.members,
                         self.kernel.snaps,
                         1.0 + self.level as f64,
-                        Some(&script),
+                        (Some(&script), &mut self.kernel.bound_preparation),
                     )?;
                     model.coefficient_limit = 256;
                     model.snapshot_power(Arc::clone(&self.snapshot_power));
@@ -11457,7 +11457,7 @@ fn search_levels(
     let mut kernel = Kernel::new(env.master, env.members, env.snaps, chart, seeds, criterion);
     kernel.just_window = just_window;
     if let Some(bounds) = shared_bounds {
-        kernel.global_fixed_preparation = bounds.preparation.clone();
+        kernel.bound_preparation = bounds.preparation.clone();
         kernel.global_fixed_luck = bounds.luck.clone();
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -12012,7 +12012,7 @@ fn search_levels(
                     hits: hits.clone(),
                     queue,
                     bounds: SharedLevelBounds {
-                        preparation: kernel.global_fixed_preparation.clone(),
+                        preparation: kernel.bound_preparation.clone(),
                         luck: kernel.global_fixed_luck.clone(),
                         luck_cache: Arc::clone(kernel.shared_fixed_luck.get_or_insert_with(|| {
                             Arc::new(SharedLuckCache::new(kernel.chart.notes.len()))

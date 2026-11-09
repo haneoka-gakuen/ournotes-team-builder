@@ -1564,6 +1564,13 @@ struct PreparedSlot {
     shape: Vec<(i32, f64)>,
     windows: Vec<PreparedWindow>,
     conversion_key: Vec<u64>,
+    pulse: Option<PreparedPulse>,
+}
+struct PreparedPulse {
+    duration: i32,
+    quota: usize,
+    mask: u8,
+    judgement: usize,
 }
 struct PreparedWindow {
     delta: f64,
@@ -1601,6 +1608,9 @@ impl PreparedSlot {
         }
         key.push(self.conversion_key.len() as u64);
         key.extend_from_slice(&self.conversion_key);
+        if let Some(pulse) = &self.pulse {
+            key.extend([1, pulse.duration as u64, pulse.quota as u64, u64::from(pulse.mask), pulse.judgement as u64]);
+        } else { key.push(0); }
         key
     }
 }
@@ -1893,6 +1903,26 @@ impl BoundPreparation {
                 }
                 score_rows.sort_unstable();
                 let conversion_key = if chart.accuracy.great == 0.0 { Vec::new() } else { slot.conversion_signature().unwrap_or_default() };
+                let pulse = if chart.accuracy.great != 0.0 && slot.convert.as_ref().is_some_and(|convert| convert.judgements.contains(&4)) {
+                    let convert = slot.convert.as_ref().unwrap();
+                    let snapshot = snap?;
+                    let rows: Vec<_> = snapshot.card.support_skills.iter().zip(snapshot.skill_levels)
+                        .flat_map(|(id, level)| master.support_skills.get(id).into_iter().flatten()
+                            .filter(move |row| row.level == level && row.kind == 12006))
+                        .filter(|row| static_gk_group(master, row.condition_group, &p) != Some(false)).collect();
+                    if rows.len() != 1 { return None; }
+                    let row = rows[0];
+                    let pulse = master.condition_sets.get(&row.trigger_group).is_some_and(|sets| sets.len() == 1
+                        && sets[0].len() == 1 && master.conditions.get(&sets[0][0])
+                            .is_some_and(|condition| condition.positive && [4010, 5020].contains(&condition.kind)));
+                    if !pulse || row.trigger_type != 1 || row.cumulative_id != 0 || row.reset_group != 0 { return None; }
+                    let duration = convert.seconds.map_or_else(
+                        || window_ms(slot.effects.first().map(|effect| effect.seconds).unwrap_or(5.0), slot.extension_ms),
+                        |seconds| window_ms(seconds, 0.0)).saturating_add(slot.extension_ms.abs().ceil() as i32);
+                    Some(PreparedPulse { duration,
+                        quota: convert.limit.map_or(chart.notes.len(), |limit| limit.ceil().max(1.0).min(chart.notes.len() as f64) as usize),
+                        mask: convert.judgements.iter().fold(0, |mask, &grade| mask | (1 << grade)), judgement: convert.judgement })
+                } else { None };
                 let slot = PreparedSlot {
                     positive,
                     converts,
@@ -1902,6 +1932,7 @@ impl BoundPreparation {
                     shape,
                     windows: normal_windows,
                     conversion_key,
+                    pulse,
                 };
                 let key = slot.template_key();
                 let next = slots.len() as u32;
@@ -1943,6 +1974,7 @@ impl BoundPreparation {
 enum ComboSource<'a> {
     None,
     Actors(&'a [Performer]),
+    PreparedActors(&'a [Performer], Arc<BoundPreparation>),
     Trace(Arc<crate::reward_trace::ComboTrace>),
     Prepared(
         Option<Arc<crate::reward_trace::ComboTrace>>,
@@ -3737,30 +3769,24 @@ impl DeterministicBound {
             None,
         )
     }
-    pub(crate) fn with_combo(
+    pub(crate) fn with_combo_preparation(
         master: &Master,
         chart: &gekiso::Chart,
         members: &[Member],
         snaps: &[Snap],
         combo_multiplier: f64,
-        script: Option<&[Performer]>,
+        source: (Option<&[Performer]>, &mut Option<Arc<BoundPreparation>>),
     ) -> Option<Self> {
-        if chart.luck {
-            return None;
-        }
-        Self::with_envelope(
-            master,
-            chart,
-            members,
-            snaps,
-            combo_multiplier,
-            script.map_or(ComboSource::None, ComboSource::Actors),
-            None,
-        )
-        .map(|mut bound| {
-            bound.preparation = None;
-            bound
-        })
+        if chart.luck { return None; }
+        let script = match (source.0, source.1.as_ref()) {
+            (Some(actors), Some(prepared)) => ComboSource::PreparedActors(actors, Arc::clone(prepared)),
+            (None, Some(prepared)) => ComboSource::Prepared(None, Arc::clone(prepared)),
+            (Some(actors), None) => ComboSource::Actors(actors),
+            (None, None) => ComboSource::None,
+        };
+        let mut bound = Self::with_envelope(master, chart, members, snaps, combo_multiplier, script, None)?;
+        *source.1 = bound.preparation.take();
+        Some(bound)
     }
     pub(crate) fn with_combo_trace(
         master: &Master,
@@ -3979,7 +4005,8 @@ impl DeterministicBound {
         let ordinary = great.then(|| crate::skills::prepare(master, members, snaps));
         let great_script = match &script {
             ComboSource::None => true,
-            ComboSource::Actors(actors) => actors.iter().all(|actor| actor.gekisou_skill.is_none_or(|(id, level)| {
+            ComboSource::Prepared(None, _) => true,
+            ComboSource::Actors(actors) | ComboSource::PreparedActors(actors, _) => actors.iter().all(|actor| actor.gekisou_skill.is_none_or(|(id, level)| {
                 master.gekiso_skills[&id].effects.iter().filter(|row| row.level == level)
                     .all(|row| row.cumulative_id == 0 || master.cumulative.get(&row.cumulative_id)
                         .is_some_and(|counter| [7000, 7001].contains(&counter.kind)))
@@ -4060,6 +4087,7 @@ impl DeterministicBound {
                 )?)),
                 None,
             ),
+            ComboSource::PreparedActors(actors, prepared) => (Some(Arc::new(crate::reward_trace::ComboTrace::new(master, chart, actors)?)), Some(prepared)),
             ComboSource::Trace(trace) => (Some(trace), None),
             ComboSource::Prepared(trace, prepared) => (trace, Some(prepared)),
         };
@@ -4259,7 +4287,7 @@ impl DeterministicBound {
         }
         positives.sort_by(|a, b| b.total_cmp(a));
         let positive = positives.into_iter().take(5).fold(0.0, add);
-        if let Some(ordinary) = &ordinary {
+        if great {
             // Each supported pulse converts at most its quota inside one skill
             // window. Credit its largest note gains, independently of all other
             // pulses; duplicate credits only raise the score ceiling.
@@ -4284,41 +4312,21 @@ impl DeterministicBound {
                 (factor,perfect)
             }).collect();
             let mut gains = vec![[0.0_f64; 5]; profiles.len()];
-            for (index, slot) in ordinary.slots.iter().enumerate() {
-                let Some(convert) = &slot.convert else { continue; };
-                if !convert.judgements.contains(&4) { continue; }
-                let column = index % (snaps.len() + 1);
-                if column == 0 { return None; }
-                let snapshot = &snaps[column - 1];
-                let actor = Performer::from_member(master, &members[index / (snaps.len() + 1)], Some(snapshot));
-                let rows: Vec<_> = snapshot.card.support_skills.iter().zip(snapshot.skill_levels)
-                    .flat_map(|(id, level)| master.support_skills.get(id).into_iter().flatten()
-                        .filter(move |row| row.level == level && row.kind == 12006))
-                    .filter(|row| static_gk_group(master,row.condition_group,&actor) != Some(false)).collect();
-                if rows.len() != 1 { return None; }
-                let row = rows[0];
-                let pulse = master.condition_sets.get(&row.trigger_group).is_some_and(|sets| sets.len() == 1
-                    && sets[0].len() == 1 && master.conditions.get(&sets[0][0])
-                        .is_some_and(|condition| condition.positive && [4010, 5020].contains(&condition.kind)));
-                if !pulse || row.trigger_type != 1 || row.cumulative_id != 0 || row.reset_group != 0 { return None; }
-                let duration = convert.seconds.map_or_else(
-                    || window_ms(slot.effects.first().map(|effect| effect.seconds).unwrap_or(5.0), slot.extension_ms),
-                    |seconds| window_ms(seconds, 0.0));
-                let quota = convert.limit.map_or(chart.notes.len(), |limit| limit.ceil().max(1.0).min(chart.notes.len() as f64) as usize);
-                let target = prepared.row_ids[index] as usize;
+            for (target, slot) in prepared.slots.iter().enumerate() {
+                let Some(pulse) = &slot.pulse else { continue; };
                 for (event, &(_, start)) in chart.full.events.iter().take(5).enumerate() {
                     let from = start.saturating_sub(40);
-                    let end = start.saturating_add(duration).saturating_add(slot.extension_ms.abs().ceil() as i32).saturating_add(40);
+                    let end = start.saturating_add(pulse.duration).saturating_add(40);
                     let first = chart.times.partition_point(|&time| time < from);
                     let after = chart.times.partition_point(|&time| time <= end);
                     let mut values: Vec<_> = (first..after).filter_map(|note| {
                         let grade = chart.judgements[note];
-                        let delta = chart.judge_frac[convert.judgement] - chart.judge_frac[grade];
-                        (delta > 0.0 && convert.judgements.contains(&grade))
+                        let delta = chart.judge_frac[pulse.judgement] - chart.judge_frac[grade];
+                        (delta > 0.0 && pulse.mask & (1 << grade) != 0)
                             .then(|| mul(raw_weights[note],add(mul(up(delta),factors[note].0),mul(chart.judge_frac[grade],factors[note].1))))
                     }).collect();
                     values.sort_unstable_by(|a,b| b.total_cmp(a));
-                    let gain = values.into_iter().take(quota).fold(0.0, add);
+                    let gain = values.into_iter().take(pulse.quota).fold(0.0, add);
                     gains[target][event] = gains[target][event].max(gain);
                 }
             }

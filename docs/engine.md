@@ -51,7 +51,7 @@ Gekiso's minimum COMBO BONUS is the sustained base multiplier after the first CO
 
 Deterministic results and manual evaluations replay all 120 skill orders. A LUCK sample count of 0 gives nominal expectations, and a positive count averages fixed seeds 0 to n-1.
 
-For no-damage COMBO charts, GREAT retains judgement-specific score bounds and conditional COMBO traces. Ordinary GREAT-to-PERFECT pulses are bounded by their activation windows and conversion quotas. Stable LIFE projections retain these converters; unsupported programs use the full replay path. Final scores still replay all orders.
+For no-damage COMBO charts, GREAT retains judgement-specific score bounds and conditional COMBO traces. Ordinary GREAT-to-PERFECT pulses are bounded by their activation windows and conversion quotas. Stable LIFE projections retain these converters; unsupported programs use the full replay path. Final scores still replay all orders. COMBO levels and conditional branches within one search share the same immutable card preparation; conversion pulses are prepared once per complete skill template.
 
 `goal.arena` sets the league band, music type and three mission overrides for one call. Zero keeps the song's own value.
 
