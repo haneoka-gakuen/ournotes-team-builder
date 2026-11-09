@@ -72,6 +72,8 @@ struct Combined<'k, 'a> {
     floor: f64,
     k: usize,
     last_bounds: Vec<f64>,
+    joint: Option<crate::rewards::FixedRegionBound>,
+    joint_options: Vec<Vec<i32>>,
 }
 
 impl<'k, 'a> Combined<'k, 'a> {
@@ -227,6 +229,8 @@ impl<'k, 'a> Combined<'k, 'a> {
             floor: f64::NEG_INFINITY,
             k: 1,
             last_bounds: Vec::new(),
+            joint: None,
+            joint_options: Vec::new(),
         }
     }
 
@@ -381,6 +385,33 @@ impl<'k, 'a> Combined<'k, 'a> {
             total.bonus += song.adapter.kernel.bonuses[member] as f64;
         }
         total
+    }
+
+    fn joint_bound(&mut self, assigned: &[i32], from: usize, totals: Totals, cutoff: f64) -> Option<f64> {
+        if !self.same_power || self.songs.len() < 2 { return None; }
+        if self.joint.is_none() {
+            let width = self.songs[0].adapter.kernel.snaps.len() + 1;
+            let count = self.songs.len() as f64;
+            let mut base = 0.0_f64;
+            let mut rows = vec![[0.0_f64; 5]; width * 5];
+            for song in &self.songs {
+                let shared = song.adapter.combo_bound.as_ref()?;
+                let (constant, profiles) = shared.lock().unwrap_or_else(|error| error.into_inner()).assignment_mean_rows(&self.roster)?;
+                base = (base + (constant / count).next_up()).next_up();
+                for (row, profile) in rows.iter_mut().zip(profiles) {
+                    let value = (row[0] + (profile / count).next_up()).next_up();
+                    row.fill(value);
+                }
+            }
+            let component = Arc::new(crate::rewards::FixedComponent { base, converted: 1.0, width, rows });
+            let rows = Arc::new(crate::rewards::FixedRegionRows::new(&[component], Arc::new(AtomicUsize::new(0)), 0)?);
+            let song = &self.songs[0];
+            let powers = Arc::new(self.roster.iter().flat_map(|&member| song.snap_power[member * width..(member + 1) * width].iter().copied()).collect());
+            self.joint = crate::rewards::FixedRegionBound::new(rows, &[0, 1, 2, 3, 4], powers);
+        }
+        let joint = self.joint.as_mut()?;
+        joint.prepare_prefix(&self.joint_options, assigned, from);
+        Some(joint.physical_score_ceiling(self.songs[0].base, totals, Criterion::Mean, None, cutoff))
     }
 
     fn upper(
@@ -642,6 +673,8 @@ impl Objective for Combined<'_, '_> {
         Some((upper / self.songs.len() as f64).next_up())
     }
     fn prepare_assignment(&mut self, members: &[usize], options: &[Vec<i32>]) {
+        self.joint = None;
+        self.joint_options = options.to_vec();
         self.roster = members.to_vec();
         let master = self.songs[0].adapter.kernel.master;
         let roster: Vec<_> = members.iter().map(|&m| self.songs[0].adapter.kernel.members[m].clone()).collect();
@@ -720,11 +753,9 @@ impl Objective for Combined<'_, '_> {
         limit: f64,
     ) -> Option<f64> {
         let coarse = self.bound(t);
-        Some(if coarse < limit {
-            coarse
-        } else {
-            coarse.min(self.upper(members, assigned, from, true, limit))
-        })
+        if coarse < limit { return Some(coarse); }
+        let upper = coarse.min(self.upper(members, assigned, from, true, limit));
+        Some(if upper < limit { upper } else { self.joint_bound(assigned, from, t, limit).map_or(upper, |joint| upper.min(joint)) })
     }
     fn interval(&mut self, team: &Team, _t: Totals) -> (f64, f64) {
         if self
@@ -1058,8 +1089,13 @@ impl Kernel<'_> {
         power: f64,
         counters: &crate::support_aliases::JustCounters,
     ) -> Option<f64> {
-        if !self.healthy || !self.owner_local || self.chart.luck || !self.seeds.is_empty() {
-            return None;
+        if !self.steady_life || !self.owner_local || self.chart.luck || !self.seeds.is_empty() { return None; }
+        if !self.healthy && (!self.chart.setup.missions.iter().all(|&mission| mission == 1)
+            || team.members.iter().zip(&team.snaps).any(|(&member, &snap)| self.slot(member, snap).convert.is_some())
+            || self.has_converter(team)) { return None; }
+        let key = std::array::from_fn(|slot| self.shape_id(team.members[slot], team.snaps[slot]));
+        if let Some(&coefficient) = self.shared_mean_coefficients.get(&key) {
+            return Some(((power * coefficient).next_up() * (1.0 + 3e-12) + (self.chart.notes.len() + 4) as f64).next_up());
         }
         let mut deck = self.deck_of(team);
         for actor in &mut deck {
@@ -1079,6 +1115,8 @@ impl Kernel<'_> {
             .fold(0.0_f64, |sum, value| (sum + value).next_up())
             / 120.0)
             .next_up();
+        if self.shared_mean_coefficients.len() >= 4096 { self.shared_mean_coefficients.clear(); }
+        self.shared_mean_coefficients.insert(key, mean);
         Some(
             ((power * mean).next_up() * (1.0 + 3e-12) + (self.chart.notes.len() + 4) as f64)
                 .next_up(),

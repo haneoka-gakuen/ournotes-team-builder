@@ -980,6 +980,7 @@ pub struct Kernel<'a> {
     gain_probe: Option<Performer>,
     luck_envelopes: HashMap<Vec<u32>, Arc<Weights>>,
     order_bounds: HashMap<[u32; 5], f64>,
+    shared_mean_coefficients: HashMap<[u32; 5], f64>,
     order_estimates: HashMap<([u32; 5], [u32; 5]), f64>,
     choice_domains: HashMap<Vec<i32>, u32>,
     next_choice_base: u64,
@@ -1783,6 +1784,7 @@ impl<'a> Kernel<'a> {
             gain_probe,
             luck_envelopes: HashMap::default(),
             order_bounds: HashMap::default(),
+            shared_mean_coefficients: HashMap::default(),
             order_estimates: HashMap::default(),
             choice_domains: HashMap::default(),
             next_choice_base: 0,
@@ -4710,6 +4712,18 @@ impl Kernel<'_> {
             key,
             detail: json!({"pendingScores":true}),
         })
+    }
+    fn bounded_mean_evaluate(&mut self, team: &Team, power: i32, cutoff: search::Cutoff) -> Result<Option<search::Evaluation>, String> {
+        if self.chart.luck || !self.seeds.is_empty() || self.criterion != Criterion::Mean { return Ok(None); }
+        let Some(ceilings) = self.max_order_bounds(team, power) else { return Ok(None); };
+        self.exact_calls += 1;
+        let deck = self.original_deck(team);
+        let Some(scores) = gekiso::replay_bounded_mean(self.master, self.chart, &deck, power, &ceilings, cutoff)? else {
+            return Ok(Some(search::Evaluation::Pruned(if cutoff.prune_equal { cutoff.key } else { cutoff.key.next_down() })));
+        };
+        let mut detail = json!({"scores":scores,"seeds":1,"comboBonus":if self.chart.setup.missions.iter().any(|m| *m==1 || *m==4) {Some(1+team.members.iter().map(|&i|self.opening_bonuses[i]).sum::<i32>())} else {None}});
+        self.decorate_window(team, power, &mut detail)?;
+        Ok(Some(search::Evaluation::Exact(Exact { key: scores.scores.mean, detail })))
     }
     fn deterministic_coefficient(&mut self, team: &Team) -> Option<f64> {
         if self.chart.luck || !self.healthy || !self.owner_local || self.just_context.is_none() {
@@ -10119,6 +10133,9 @@ impl Objective for Adapter<'_, '_> {
                     return Ok(search::Evaluation::Pruned(upper));
                 }
             }
+        }
+        if !self.estimate && !self.surrogate && cutoff.key.is_finite() {
+            if let Some(evaluation) = self.kernel.bounded_mean_evaluate(team, power as i32, cutoff)? { return Ok(evaluation); }
         }
         self.exact(team, power, slots)
             .map(search::Evaluation::Exact)

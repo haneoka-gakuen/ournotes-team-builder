@@ -2048,12 +2048,14 @@ pub(crate) fn replay_order(
     Ok((model.score.score.score as f64, ranges))
 }
 type ReplayValue = (f64, [f64; 3]);
+type ReplayObserver<'a> = dyn Fn(f64, usize, f64) -> bool + Sync + 'a;
 struct ReplayTree<'a> {
     chart: &'a Chart,
     events: &'a [Vec<(usize, i32)>],
     chronological: Vec<usize>,
     generation: u64,
-    observe: Option<&'a (dyn Fn(f64, usize) -> bool + Sync)>,
+    observe: Option<&'a ReplayObserver<'a>>,
+    upper: &'a [f64],
     multiplicities: &'a [usize],
     stopped: AtomicBool,
 }
@@ -2106,6 +2108,7 @@ impl ReplayTree<'_> {
                 !observe(
                     score,
                     orders.iter().map(|&order| self.multiplicities[order]).sum(),
+                    orders.iter().fold(0.0_f64, |sum, &order| (sum + self.upper[order]).next_down()),
                 )
             }) {
                 self.stopped.store(true, Ordering::Relaxed);
@@ -2231,7 +2234,9 @@ fn replay_orders_observed(
         seeds.to_vec()
     };
     let orders: Vec<_> = (0..live::orders().len()).collect();
-    let Some(values) = replay_selected_orders(master, chart, deck, &runs, power, &orders, observe)?
+    let notify = |score, count, _| observe.is_none_or(|observe| observe(score, count));
+    let observation = observe.map(|_| (&[][..], &notify as &ReplayObserver<'_>));
+    let Some(values) = replay_selected_orders(master, chart, deck, &runs, power, &orders, observation)?
     else {
         return Ok(None);
     };
@@ -2240,6 +2245,32 @@ fn replay_orders_observed(
         range_scores: std::array::from_fn(|range| {
             values.iter().map(|value| value.1[range]).sum::<f64>() / values.len() as f64
         }),
+    }))
+}
+
+/// Subtract completed orders from their individual conservative score ceilings.
+pub(crate) fn replay_bounded_mean(
+    master: &Master,
+    chart: &Chart,
+    deck: &[Performer],
+    power: i32,
+    ceilings: &[f64],
+    cutoff: crate::search::Cutoff,
+) -> Result<Option<ReplayedScores>, String> {
+    let remaining = ceilings.iter().fold(0.0_f64, |sum, &value| (sum + value).next_up());
+    let state = std::sync::Mutex::new((remaining, 0.0_f64));
+    let observe = |score: f64, count: usize, upper: f64| {
+        let mut state = state.lock().unwrap();
+        state.0 = (state.0 - upper).next_up().max(0.0);
+        state.1 = (state.1 + (score * count as f64).next_up()).next_up();
+        let upper = ((state.0 + state.1).next_up() / 120.0).next_up();
+        !(upper < cutoff.key || cutoff.prune_equal && upper == cutoff.key)
+    };
+    let orders: Vec<_> = (0..120).collect();
+    let Some(values) = replay_selected_orders(master, chart, deck, &[0], power, &orders, Some((ceilings, &observe)))? else { return Ok(None); };
+    Ok(Some(ReplayedScores {
+        scores: live::summarize(power, values.iter().map(|value| value.0).collect()),
+        range_scores: std::array::from_fn(|range| values.iter().map(|value| value.1[range]).sum::<f64>() / 120.0),
     }))
 }
 
@@ -2268,7 +2299,7 @@ fn replay_selected_orders(
     runs: &[i32],
     power: i32,
     orders: &[usize],
-    observe: Option<&(dyn Fn(f64, usize) -> bool + Sync)>,
+    observation: Option<(&[f64], &ReplayObserver<'_>)>,
 ) -> Result<Option<Vec<ReplayValue>>, String> {
     if orders.is_empty() {
         return Ok(Some(Vec::new()));
@@ -2308,6 +2339,10 @@ fn replay_selected_orders(
         for (maximum, count) in live_capacity.iter_mut().zip(counts) { *maximum = (*maximum).max(count); }
     }
     chronological.sort_by_key(|&event| (chart.full.events[event].1, event));
+    let mut upper = vec![0.0_f64; event_orders.len()];
+    if let Some((ceilings, _)) = observation {
+        for (&index, &value) in indices.iter().zip(ceilings) { upper[index] = (upper[index] + value).next_down(); }
+    }
     let mut multiplicities = vec![0; event_orders.len()];
     for &index in &indices {
         multiplicities[index] += 1;
@@ -2317,7 +2352,8 @@ fn replay_selected_orders(
         events: &event_orders,
         chronological,
         generation,
-        observe,
+        observe: observation.map(|(_, observer)| observer),
+        upper: &upper,
         multiplicities: &multiplicities,
         stopped: AtomicBool::new(false),
     };

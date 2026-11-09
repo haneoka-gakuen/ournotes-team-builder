@@ -240,6 +240,24 @@ impl Combined<'_> {
                 .min((fixed + self.joint_matching.maximum_upper(&weights, columns)).next_up()),
         )
     }
+    fn program_domains(&mut self, members: &[usize], options: &[Vec<i32>], refined: bool) -> Option<Vec<Vec<Vec<i32>>>> {
+        if self.event { return None; }
+        let mut combined: Option<Vec<Vec<Vec<i32>>>> = None;
+        for song in &mut self.songs {
+            let next = if refined { song.objective.refine_assignment_domains(members, options) }
+                else { song.objective.assignment_domains(members, options) };
+            let Some(next) = next else { continue; };
+            if let Some(groups) = &mut combined {
+                for (row, next) in groups.iter_mut().zip(next) {
+                    *row = row.iter().flat_map(|group| next.iter().filter_map(|other| {
+                        let shared: Vec<_> = group.iter().copied().filter(|snap| other.contains(snap)).collect();
+                        (!shared.is_empty()).then_some(shared)
+                    })).collect();
+                }
+            } else { combined = Some(next); }
+        }
+        combined.filter(|rows| !refined || rows.iter().any(|row| row.len() > 1))
+    }
     fn eligible(&self, team: &Team) -> bool {
         self.songs.iter().all(|song| {
             song.opening.is_empty()
@@ -810,6 +828,51 @@ impl Objective for Combined<'_> {
                 })
                 .collect();
         }
+    }
+    fn assignment_domains(&mut self, members: &[usize], options: &[Vec<i32>]) -> Option<Vec<Vec<Vec<i32>>>> {
+        self.program_domains(members, options, false)
+    }
+    fn refine_assignment_domains(&mut self, members: &[usize], options: &[Vec<i32>]) -> Option<Vec<Vec<Vec<i32>>>> {
+        self.program_domains(members, options, true)
+    }
+    fn partial_assignment_domains(&self) -> bool { self.songs.iter().all(|song| song.objective.partial_assignment_domains()) }
+    fn partial_refined_assignment_domains(&self) -> bool { self.songs.iter().all(|song| song.objective.partial_refined_assignment_domains()) }
+    fn prepare_assignment_domain(&mut self, members: &[usize], options: &[Vec<i32>], complete: bool) {
+        self.options = options.to_vec();
+        for song in &mut self.songs { song.objective.prepare_assignment_domain(members, options, complete); }
+    }
+    fn assignment_order_bound(&mut self, members: &[usize], _t: Totals, assigned: &[i32], from: usize, limit: f64) -> Option<f64> {
+        if self.event { return None; }
+        let coarse = self.upper(members, assigned, from);
+        if coarse < limit { return Some(coarse); }
+        let width = self.snaps.len() + 1;
+        let totals: Vec<_> = self.songs.iter().map(|song| {
+            let mut t = Totals::default();
+            for (slot, &member) in members.iter().enumerate() {
+                let choices = if slot < from { std::slice::from_ref(&assigned[slot]) } else { self.options[slot].as_slice() };
+                let (mut power, mut skill) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+                for &snap in choices {
+                    if slot >= from && snap >= 0 && assigned[..from].contains(&snap) { continue; }
+                    let col = if snap < 0 { width - 1 } else { snap as usize };
+                    power = power.max(song.slots[slot][col]);
+                    skill = skill.max(song.skills[member * width + col].1);
+                }
+                t.power = (t.power + power).next_up(); t.skill = (t.skill + skill).next_up();
+            }
+            t
+        }).collect();
+        let mut bounds: Vec<_> = self.songs.iter_mut().zip(&totals).map(|(song, &t)| song.objective.bound(t)
+            .min(song.objective.cheap_assignment_bound(members, t, assigned, from))).collect();
+        let count = bounds.len() as f64;
+        for (index, song) in self.songs.iter_mut().enumerate() {
+            let others = bounds.iter().enumerate().filter(|&(other, _)| other != index)
+                .fold(0.0_f64, |sum, (_, &value)| (sum + value).next_up());
+            let target = if limit.is_finite() { (limit * count - others).max(0.0) } else { 0.0 };
+            if let Some(value) = song.objective.assignment_order_bound(members, totals[index], assigned, from, target) { bounds[index] = bounds[index].min(value); }
+            let upper = (bounds.iter().fold(0.0_f64, |sum, &value| (sum + value).next_up()) / count).next_up();
+            if upper < limit { return Some(coarse.min(upper)); }
+        }
+        Some(coarse.min((bounds.iter().fold(0.0_f64, |sum, &value| (sum + value).next_up()) / count).next_up()))
     }
     fn cheap_assignment_bound(
         &mut self,

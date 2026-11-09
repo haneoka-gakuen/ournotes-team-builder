@@ -58,10 +58,12 @@ struct PlayedTrajectory {
 }
 struct PlayedModel {
     id: usize,
+    trajectory: usize,
     grades: Arc<Vec<usize>>,
     linear: Linear,
 }
 struct PlayedDomain {
+    early_recovery: Option<Vec<usize>>,
     models: Vec<Arc<PlayedModel>>,
     frequencies: [Vec<(usize, usize, u32)>; 5],
     base: (f64, f64),
@@ -74,6 +76,18 @@ struct PlayedRow {
     values: Arc<Vec<(i32, f64, f64)>>,
     frontiers: Arc<PlayedFrontiers>,
     bytes: usize,
+}
+fn recovery_life(input: &Input, grades: &[usize], recoveries: [i32; 5], program: Option<&live::LifeProgram>) -> live::LifeSummary {
+    program.and_then(|program| program.summary(input, recoveries)).unwrap_or_else(|| {
+        let slots: Vec<_> = recoveries.iter().map(|&recovery| Slot {
+            effects: Vec::new(), cumulative: Vec::new(), extension_ms: 0.0, recovery, convert: None,
+        }).collect();
+        let lives = live::lives(input, grades, &[0, 1, 2, 3, 4], &slots);
+        live::LifeSummary {
+            first_dead: lives.note.iter().position(|&life| life <= 0.0).unwrap_or(input.times.len()),
+            gates: std::array::from_fn(|event| lives.gate.get(&event).copied().unwrap_or(0.0)),
+        }
+    })
 }
 struct AccuracySeed {
     weights: Vec<f64>,
@@ -165,6 +179,8 @@ pub struct LiveCore {
     cumulative_ids: Vec<Vec<usize>>,
     next_trajectory: usize,
     next_model: usize,
+    early_models: FxHashMap<(usize, usize, i32), Arc<PlayedModel>>,
+    maximum_deaths: FxHashMap<usize, usize>,
     played_domains: FxHashMap<(bool, [usize; 5]), PlayedDomain>,
     played_bytes: usize,
     life_gates: Vec<f64>,
@@ -710,6 +726,8 @@ impl LiveCore {
             cumulative_ids,
             next_trajectory: 0,
             next_model: 0,
+            early_models: FxHashMap::default(),
+            maximum_deaths: FxHashMap::default(),
             played_domains: FxHashMap::default(),
             played_bytes: 0,
             life_gates,
@@ -1267,6 +1285,7 @@ impl LiveCore {
                 input.judgements.as_ref().unwrap(),
             );
             if grades.iter().all(|&grade| input.damage[grade] == 0.0)
+                && self.program_slots.iter().all(|slot| slot.convert.as_ref().is_none_or(|convert| input.damage[convert.judgement] == 0.0))
                 && self.life_gates.iter().all(|&threshold| {
                     (input.life_base >= threshold) == (input.life_base * 2.0 >= threshold)
                 })
@@ -1357,6 +1376,8 @@ impl LiveCore {
         if self.played_models.len() >= 512 {
             self.played_models.clear();
         }
+        if self.early_models.len() >= 256 { self.early_models.clear(); }
+        if self.maximum_deaths.len() >= 2048 { self.maximum_deaths.clear(); }
         if self.played_weights.len() >= 32768 {
             self.played_weights.clear();
         }
@@ -1450,6 +1471,7 @@ impl LiveCore {
                                     self.next_model += 1;
                                     Arc::new(PlayedModel {
                                         id: self.next_model,
+                                        trajectory: trajectory.id,
                                         grades: Arc::clone(&trajectory.grades),
                                         linear: {
                                             let mut linear = model::played_linear(
@@ -1475,6 +1497,26 @@ impl LiveCore {
                 maximum = maximum.max(value);
                 order_models.push(context);
             }
+            let mut events: Vec<_> = (0..input.skill_times.len().min(5)).collect();
+            events.sort_by_key(|&event| (input.skill_times[event], event));
+            let early_recovery = if relaxed && events.len() >= 2 {
+                let mut latest = None;
+                let mut survives = false;
+                for model in &models {
+                    let dead = *self.maximum_deaths.entry(model.trajectory).or_insert_with(|| {
+                        let program = self.played_trajectories.values().find(|trajectory| trajectory.id == model.trajectory)
+                            .and_then(|trajectory| trajectory.life.as_ref());
+                        recovery_life(&input, &model.grades, [self.max_recovery; 5], program).first_dead
+                    });
+                    if let Some(&time) = input.times.get(dead) { latest = Some(latest.map_or(time, |prior: i32| prior.max(time))); }
+                    else { survives = true; break; }
+                }
+                if survives { None } else {
+                    latest.and_then(|dead| (1..events.len().min(3)).find(|&index|
+                        input.clock.frame_time(dead) < input.clock.frame_time(input.skill_times[events[index]])))
+                        .map(|index| events[..index].to_vec())
+                }
+            } else { None };
             let frequencies: [Vec<(usize, usize, u32)>; 5] = std::array::from_fn(|position| {
                 let mut counts = vec![[0u32; 5]; models.len()];
                 for (order, &context) in live::orders().iter().zip(&order_models) {
@@ -1508,9 +1550,10 @@ impl LiveCore {
                     .map(|row| row.capacity() * std::mem::size_of::<(usize, usize, u32)>())
                     .sum::<usize>();
             PlayedDomain {
+                base: (((if early_recovery.is_some() { 0.0 } else { mean }) + error).next_up(), (maximum + error).next_up()),
+                early_recovery,
                 models,
                 frequencies,
-                base: ((mean + error).next_up(), (maximum + error).next_up()),
                 weights: FxHashMap::default(),
                 rows: FxHashMap::default(),
                 bytes,
@@ -1566,7 +1609,28 @@ impl LiveCore {
                             self.played_weights.insert(weight_key, value);
                             value
                         };
-                        mean = (mean + ((value * count as f64).next_up() / 120.0).next_up()).next_up();
+                        let mean_value = if domain.early_recovery.as_ref().is_some_and(|events| events.contains(&event)) {
+                            let recovery = slot.recovery;
+                            let alternate = self.early_models.entry((model.trajectory, event, recovery)).or_insert_with(|| {
+                                let mut recoveries = [self.max_recovery; 5]; recoveries[event] = recovery;
+                                let program = self.played_trajectories.values().find(|trajectory| trajectory.id == model.trajectory)
+                                    .and_then(|trajectory| trajectory.life.as_ref());
+                                let life = recovery_life(&self.input, &model.grades, recoveries, program);
+                                self.next_model += 1;
+                                Arc::new(PlayedModel { id: self.next_model, trajectory: model.trajectory,
+                                    grades: Arc::clone(&model.grades), linear: {
+                                        let mut linear = model::played_linear(&self.input, &model.grades, &life);
+                                        let first = domain.early_recovery.as_ref().unwrap()[0];
+                                        linear.ignore_gates = event != first || self.input.skill_times.iter().take(5).enumerate().any(|(other, &time)|
+                                            other != first && self.input.clock.frame_time(time) == self.input.clock.frame_time(self.input.skill_times[first]));
+                                        linear
+                                    } })
+                            });
+                            let weight = *self.played_weights.entry((alternate.id, shape, event)).or_insert_with(||
+                                model::played_weight(&self.input, &alternate.linear, &alternate.grades, slot, event));
+                            (weight + (alternate.linear.total / domain.early_recovery.as_ref().unwrap().len() as f64).next_up()).next_up()
+                        } else { value };
+                        mean = (mean + ((mean_value * count as f64).next_up() / 120.0).next_up()).next_up();
                         maximum = maximum.max(value);
                     }
                     (mean.next_up(), maximum.next_up())
@@ -1889,7 +1953,11 @@ impl Objective for LiveObjective {
             return;
         }
         self.core.played_assignment = None;
-        if complete {
+        let converters_fixed = members.iter().zip(options).all(|(&member, row)| {
+            let first = self.core.program_converters[self.core.program(member, row[0])];
+            row.iter().all(|&snap| self.core.program_converters[self.core.program(member, snap)] == first)
+        });
+        if complete || converters_fixed {
             let ignore_recovery = !self.core.recovery_observable(members, options);
             let relaxed = !ignore_recovery
                 && members.iter().zip(options).any(|(&member, choices)| {
@@ -1907,6 +1975,7 @@ impl Objective for LiveObjective {
     fn partial_assignment_domains(&self) -> bool {
         !self.core.broad_play || self.max_bounds()
     }
+    fn partial_refined_assignment_domains(&self) -> bool { true }
     fn assignment_order_bound(
         &mut self,
         members: &[usize],

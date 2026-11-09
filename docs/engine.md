@@ -8,6 +8,8 @@ A completed search has checked every legal team and proves its result. A search 
 
 Member, snapshot, leader and binding constraints apply to every candidate. An unknown required card or binding leaves no legal team, and manual evaluation rejects unknown snapshots.
 
+Ordinary MISS searches prepare converter domains before recovery amounts. When even maximal recovery leaves every order dead before the second or third activation, recovery-specific marginal ceilings enter the corresponding slot rows. Their averaged base-score ceilings remain conservative; surviving domains retain the exact recovery partition and final scoring.
+
 ## Activity growth inference
 
 `eventGrowthStart` binds recorded song decks and release-pinned growth catalogues to an existing context. `eventGrowthStep` advances complete branch-and-bound search; `eventGrowthPage` resumes its retained frontier for another ten-row page. There is no total result cap or fixed-time completion shortcut. The displayed domain is the globally minimal change cost and cost + 1. Any feasible incumbent supplies a safe upper bound; once the minimum is proved the cost window is exact.
@@ -49,9 +51,9 @@ Gekiso's minimum COMBO BONUS is the sustained base multiplier after the first CO
 
 ## Gekiso
 
-Deterministic results and manual evaluations replay all 120 skill orders. A LUCK sample count of 0 gives nominal expectations, and a positive count averages fixed seeds 0 to n-1.
+Deterministic results and manual evaluations replay all 120 skill orders. Mean searches subtract completed orders from their individual score ceilings and stop rejected candidates once the remaining ceiling cannot reach the incumbent. Accepted teams keep the complete distribution. A LUCK sample count of 0 gives nominal expectations, and a positive count averages fixed seeds 0 to n-1.
 
-For no-damage COMBO charts, GREAT retains judgement-specific score bounds and conditional COMBO traces. Ordinary GREAT-to-PERFECT pulses are bounded by their activation windows and conversion quotas. Stable LIFE projections retain these converters; unsupported programs use the full replay path. Final scores still replay all orders. COMBO levels and conditional branches within one search share the same immutable card preparation; conversion pulses are prepared once per complete skill template.
+For no-damage COMBO charts, GREAT retains judgement-specific score bounds and conditional COMBO traces. Ordinary GREAT-to-PERFECT pulses are bounded by their activation windows and conversion quotas. Stable LIFE projections retain these converters; unsupported programs use the full replay path. Final scores still replay all orders. COMBO levels and conditional branches within one search share the same immutable card preparation; conversion pulses and their per-note ordinary factor envelopes are prepared once per complete skill template. Shared charts combine fixed-formation coefficients before matching physical Snapshots and cache complete-formation mean ceilings.
 
 `goal.arena` sets the league band, music type and three mission overrides for one call. Zero keeps the song's own value.
 
@@ -61,9 +63,11 @@ For no-damage COMBO charts, GREAT retains judgement-specific score bounds and co
 
 ## Multiple songs
 
-`request.aggregation: "mean"` searches one formation over all `goal.songs`. Score objectives use mean scores, and event objectives average their selected rewards.
+`request.aggregation: "mean"` searches one formation over all `goal.songs`. Score objectives use mean scores, and event objectives average their selected rewards. Ordinary accuracy searches intersect each song's converter and recovery domains and prune partial domains with the individual song ceilings.
 
 In Arena, `mode: "shared"` searches one leader, member set and snapshot assignment for the equal-weight average over every chart. Only this joint search proves the result; per-song optima are seeds.
+
+Mean-score envelopes maximize each Snapshot's complete mean contribution before combining slots. Cached means preserve directed rounding and physical Snapshot matching.
 
 ## Caches
 

@@ -227,6 +227,7 @@ pub trait Objective {
     fn partial_assignment_domains(&self) -> bool {
         true
     }
+    fn partial_refined_assignment_domains(&self) -> bool { self.partial_assignment_domains() }
     fn roster_bound(&mut self, _members: &[usize], _totals: Totals, _limit: f64) -> Option<f64> {
         None
     }
@@ -2974,7 +2975,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             ..Totals::default()
         };
         if let Some(domains) = self.input.objective.assignment_domains(&a.team, &a.options) {
-            return self.snap_domains(&mut a, &domains, 0, &mut Vec::new(), totals);
+            return self.snap_domains(&mut a, &domains, 0, &mut Vec::new(), totals, false);
         }
         self.walk_domain(&mut a, totals)
     }
@@ -2985,6 +2986,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         slot: usize,
         selected: &mut Vec<&'d Vec<i32>>,
         totals: Totals,
+        refined: bool,
     ) -> Result<(), String> {
         if self.expired() {
             self.timed_out = true;
@@ -2997,7 +2999,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                 self.report_pending();
             }
         }
-        if slot > 0 && (slot == domains.len() || self.input.objective.partial_assignment_domains()) {
+        if slot > 0 && (slot == domains.len() || if refined { self.input.objective.partial_refined_assignment_domains() } else { self.input.objective.partial_assignment_domains() }) {
             let mut fixed = [-1; 5];
             for (index, domain) in selected.iter().enumerate() {
                 if domain.len() == 1 && domain[0] >= 0 {
@@ -3074,7 +3076,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             }
             if slot == domains.len() {
                 if let Some(refined) = self.input.objective.refine_assignment_domains(&a.team, &a.options) {
-                    return self.snap_domains(a, &refined, 0, &mut Vec::new(), totals);
+                    return self.snap_domains(a, &refined, 0, &mut Vec::new(), totals, true);
                 }
                 let upper = self.remaining_bound(a, 0, totals);
                 if upper < self.assignment_limit(a) || self.cannot_improve_set(a, upper) {
@@ -3095,7 +3097,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                     continue;
                 }
                 selected.push(domain);
-                self.snap_domains(a, domains, slot + 1, selected, totals)?;
+                self.snap_domains(a, domains, slot + 1, selected, totals, refined)?;
                 selected.pop();
             }
         }
