@@ -1,5 +1,6 @@
 //! Equal-weight objectives retain one formation across every selected chart.
 use super::*;
+use std::cmp::Ordering;
 use crate::{
     event::{EventObjective, Route, RouteKind},
     objectives::{Criterion, LiveCore, LiveObjective},
@@ -21,6 +22,7 @@ struct SongObjective<'a> {
     opening: Vec<i32>,
     member_base: Vec<f64>,
     domain_power: Vec<f64>,
+    ranking_totals: Totals,
 }
 struct LinearGroup {
     song: usize,
@@ -94,28 +96,41 @@ struct Combined<'a> {
     priority: Vec<f64>,
     floor: f64,
     reward_grid: Option<usize>,
-    reward_cutoff: Option<Vec<(f64, f64)>>,
+    reward_cutoff: Option<Vec<RankCutoff>>,
     k: usize,
 }
 
-fn cannot_improve_reward(
-    sums: [f64; 3],
+struct RankCutoff {
+    value: Fraction,
+    lower: f64,
+    upper: f64,
+    next: Option<f64>,
+}
+
+fn rank_bound_order(
+    sums: impl IntoIterator<Item = f64>,
     songs: usize,
-    cutoff: &[(f64, f64)],
-    retain_equal: bool,
-) -> bool {
-    for (sum, &(current, next)) in sums.into_iter().zip(cutoff) {
+    cutoff: &[RankCutoff],
+) -> Ordering {
+    for (sum, level) in sums.into_iter().zip(cutoff) {
         let upper = (sum / songs as f64).next_up();
-        if upper < current {
-            return true;
+        if upper < level.lower {
+            return Ordering::Less;
         }
         // A bound below the next attainable value can at most tie this level.
-        if upper.partial_cmp(&next) != Some(std::cmp::Ordering::Less) {
-            return false;
+        if let Some(next) = level.next {
+            if upper < next { continue; }
+            return Ordering::Greater;
+        }
+        if upper > level.upper { return Ordering::Greater; }
+        let Some(value) = Fraction::from_value(sum) else { return Ordering::Greater; };
+        match value.divided(songs as u32).cmp(&level.value) {
+            Ordering::Less => return Ordering::Less,
+            Ordering::Greater => return Ordering::Greater,
+            Ordering::Equal => {}
         }
     }
-    // An equal reward rank cannot replace the retained winner in a top-one search.
-    !retain_equal
+    Ordering::Equal
 }
 
 impl Combined<'_> {
@@ -277,6 +292,8 @@ impl Combined<'_> {
         }
         let width = self.snaps.len() + 1;
         let mut sum = 0.0_f64;
+        let mut power_sum = 0.0_f64;
+        let score_tie = self.plan.as_ref().is_some_and(Plan::score_tie);
         let mut rank_sums = self.reward_cutoff.as_ref().map(|_| [0.0_f64; 3]);
         for song in &mut self.songs {
             let mut t = Totals::default();
@@ -306,6 +323,8 @@ impl Combined<'_> {
                 t.skill_low += skill_low;
                 t.bonus += song.objective.member_bonus(m) + bonus;
             }
+            power_sum = (power_sum + t.power).next_up();
+            if score_tie { song.ranking_totals = t; }
             let bound = song.objective.bound(t);
             let ranked = rank_sums.as_ref().and_then(|_| {
                 song.objective.ranked_assignment_upper(members, t, assigned, from)
@@ -329,7 +348,22 @@ impl Combined<'_> {
         let bound = joint.min((sum / self.songs.len() as f64).next_up());
         if let (Some(mut sums), Some(cutoff)) = (rank_sums, &self.reward_cutoff) {
             sums[0] = sum;
-            if cannot_improve_reward(sums, self.songs.len(), cutoff, self.k > 1) {
+            let rewards = self.plan.as_ref().unwrap().levels.len();
+            match rank_bound_order(sums.into_iter().take(rewards), self.songs.len(), &cutoff[..rewards]) {
+                Ordering::Less => return bound.min(self.floor.next_down()),
+                Ordering::Greater => return bound,
+                Ordering::Equal => {}
+            }
+            let score_sum = if score_tie {
+                self.songs.iter_mut().fold(0.0_f64, |sum, song| {
+                    let score = song.objective.ranking_score_upper(members, song.ranking_totals, assigned, from).unwrap_or(f64::INFINITY);
+                    (sum + score).next_up()
+                })
+            } else { 0.0 };
+            let tail = [score_sum, power_sum];
+            let from = if score_tie { 0 } else if self.plan.as_ref().is_some_and(Plan::power_tie) { 1 } else { 2 };
+            let order = rank_bound_order(tail[from..].iter().copied(), self.songs.len(), &cutoff[rewards..]);
+            if order.is_lt() || order.is_eq() && self.k == 1 {
                 return bound.min(self.floor.next_down());
             }
         }
@@ -415,10 +449,19 @@ impl Objective for Combined<'_> {
         let hit = hits.get(self.k - 1);
         self.floor = hit.map_or(f64::NEG_INFINITY, |hit| hit.key);
         self.reward_cutoff = self.reward_grid.and_then(|grid| {
-            crate::reward_plan::ranking(&hit?.detail["rewardRanking"])?
+            let ranks = crate::reward_plan::ranking(&hit?.detail["rewardRanking"])?;
+            let rewards = self.plan.as_ref().unwrap().levels.len();
+            let power = self.plan.as_ref().is_some_and(Plan::power_tie);
+            let count = ranks.len();
+            Some(ranks
                 .into_iter()
-                .map(|level| Some((level.lower(), level.next_grid_lower(grid)?)))
-                .collect()
+                .enumerate()
+                .map(|(index, value)| RankCutoff {
+                    lower: value.lower(), upper: value.upper(),
+                    next: if index < rewards { value.next_grid_lower(grid) }
+                        else if power && index + 1 == count { value.next_grid_lower(self.songs.len()) } else { None },
+                    value,
+                }).collect())
         });
     }
     fn seed_objective(&self) -> Option<Box<dyn Objective>> {
@@ -1001,7 +1044,7 @@ impl Objective for Combined<'_> {
         if let Some(window) = crate::just_window::aggregate(parts.iter().map(|part| &part["detail"]["justWindow"])) { detail["justWindow"] = window; }
         let mut key = mean(&["key"]);
         if let Some(plan) = &self.plan {
-            let ranks: Vec<_> = (0..plan.levels.len())
+            let ranks: Vec<_> = (0..plan.levels.len() + plan.tail_len())
                 .map(|i| {
                     Fraction::mean(
                         &parts
@@ -1345,6 +1388,7 @@ impl Engine {
                 opening,
                 member_base: Vec::new(),
                 domain_power: Vec::new(),
+                ranking_totals: Totals::default(),
             });
         }
         let affine = (effects.is_empty()
@@ -1403,8 +1447,8 @@ impl Engine {
             .map_or(index, |identity| *seen_programs.entry(identity).or_insert(index))).collect();
         // Ordinary event settlement averages integer reward units (1/10,000)
         // over the same complete set of skill orders on every chart.
-        let reward_grid = if !battle && plan.as_ref().is_some_and(|plan| {
-            plan.criterion == crate::reward_plan::Aggregation::Mean && plan.levels.len() > 1
+        let reward_grid = if plan.as_ref().is_some_and(|plan| {
+            plan.power_tie() || !battle && plan.criterion == crate::reward_plan::Aggregation::Mean && plan.levels.len() > 1
         }) {
             (crate::live::orders().len() * 10_000).checked_mul(songs.len())
         } else {

@@ -43,6 +43,8 @@ Rewards settle with the client's integer rules before outcomes are compared:
 
 `rewardPlan.criterion` is `mean` (settle each outcome, then average) or `max` (the greatest reward tuple over all observed outcomes and 120 skill orders). Rewards not listed in the plan do not take part in comparison.
 
+`rewardPlan.tieBreak: "score"` compares average score and then total power after every configured reward level; `"power"` compares only power. These additional `rewardRanking` entries are exact fractions. Shared-song searches use their equal-weight means across charts. Omitting `tieBreak` retains reward-only ranking.
+
 `rewardRoom` sets the Gekiso event room: `{mode: "battle", players, otherAverageScore}` uses `trunc(sqrt(5 / players) * battleRequiredScore * players)` minus the other players' scores, and `{mode: "solo"}` uses the personal thresholds. Fixed-team evaluation reads it from `request.event.rewardRoom`.
 
 LUCK uses seeds 0 to `luckSamples - 1`. A completed search is optimal for those samples; the response keeps its sample count and `sampled` flag.

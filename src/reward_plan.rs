@@ -1,4 +1,4 @@
-//! Explicit reward sums and ordered reward-only tie levels.
+//! Explicit reward sums, ordered reward levels and optional score/power ties.
 use crate::{
     chart::Chart,
     event::{BonusEnvelope, EventObjective, Route, RouteKind},
@@ -51,6 +51,10 @@ pub(crate) struct AutoCp {
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum Aggregation { #[default] Mean, Max, Min }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum TieBreak { Power, Score }
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Plan {
@@ -61,9 +65,14 @@ pub(crate) struct Plan {
     pub minimum_rank: Option<i32>,
     pub levels: Vec<Vec<Term>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tie_break: Option<TieBreak>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_cp: Option<AutoCp>,
 }
 impl Plan {
+    pub(crate) fn power_tie(&self) -> bool { self.tie_break.is_some() }
+    pub(crate) fn score_tie(&self) -> bool { self.tie_break == Some(TieBreak::Score) }
+    pub(crate) fn tail_len(&self) -> usize { usize::from(self.power_tie()) + usize::from(self.score_tie()) }
     pub(crate) fn parse(value: &Value) -> Result<Self, String> {
         let plan: Self = serde_json::from_value(value.clone()).map_err(|_| "reward-plan-format")?;
         if plan.minimum_rank.is_some_and(|rank| !(2..=7).contains(&rank)) { return Err("reward-plan-rank".into()); }
@@ -261,6 +270,14 @@ impl<'a> Source<'a> {
             Self::Gekiso(value) => value.score_upper(totals),
         }
     }
+    fn mean_assignment_score(&mut self, members: &[usize], assigned: &[i32], from: usize, totals: Totals) -> f64 {
+        let upper = match self {
+            Self::Ordinary(value) => value.score_upper_orders(members, assigned, from, totals.power)
+                .map(|scores| (scores.into_iter().fold(0.0, |sum, score| (sum + score).next_up()) / 120.0).next_up()),
+            Self::Gekiso(value) => value.mean_assignment_score(members, assigned, from, totals.power),
+        };
+        upper.unwrap_or_else(|| self.score_upper(totals))
+    }
 }
 
 pub(crate) struct Context<'a> {
@@ -445,7 +462,7 @@ impl<'a> Ranked<'a> {
                 inner.reward_ties(
                     None,
                     context.plan.levels.len() > 1,
-                    context.plan.levels.len() <= 2,
+                    context.plan.levels.len() <= 2 && !context.plan.power_tie(),
                 );
             }
         }
@@ -594,18 +611,37 @@ impl<'a> Ranked<'a> {
         result[at] = result[at].min(source);
         result
     }
-    fn upper(&self, rewards: [f64; 3]) -> f64 {
+    fn needs_score_upper(&self, rewards: [f64; 3]) -> bool {
+        self.context.plan.score_tie() && self.incumbent.as_ref().is_some_and(|incumbent| {
+            self.context.plan.upper(rewards).iter().take(self.context.plan.levels.len())
+                .zip(incumbent).all(|(&upper, known)| upper == known.lower())
+        })
+    }
+    fn upper(&self, rewards: [f64; 3], power: f64, score: f64) -> f64 {
         let values = self.context.plan.upper(rewards);
         if let Some(incumbent) = &self.incumbent {
-            if *incumbent == self.cap_levels {
+            if !self.context.plan.power_tie() && *incumbent == self.cap_levels {
                 return incumbent[0].lower().next_down();
             }
-            for (&upper, known) in values.iter().zip(incumbent) {
+            for (&upper, known) in values.iter().take(self.context.plan.levels.len()).zip(incumbent) {
                 match upper.total_cmp(&known.lower()) {
                     Ordering::Greater => return values[0],
                     Ordering::Less => return values[0].min(incumbent[0].lower().next_down()),
                     Ordering::Equal => {}
                 }
+            }
+            if self.context.plan.score_tie() {
+                let known = incumbent[self.context.plan.levels.len()].lower();
+                match score.partial_cmp(&known) {
+                    Some(Ordering::Less) => return values[0].min(incumbent[0].lower().next_down()),
+                    Some(Ordering::Equal) => {}
+                    _ => return values[0],
+                }
+            }
+            if self.context.plan.power_tie()
+                && power.partial_cmp(&incumbent.last().unwrap().next_grid_lower(1).unwrap()) != Some(Ordering::Less)
+            {
+                return values[0];
             }
             return values[0].min(incumbent[0].lower().next_down());
         }
@@ -670,7 +706,7 @@ impl<'a> Ranked<'a> {
             }
         }
     }
-    fn finish(&mut self, team: &Team, mut exact: Exact) -> Result<Exact, String> {
+    fn finish(&mut self, team: &Team, power: f64, mut exact: Exact) -> Result<Exact, String> {
         let bonuses: [f64; 2] = std::array::from_fn(|kind| {
             team.members
                 .iter()
@@ -773,7 +809,14 @@ impl<'a> Ranked<'a> {
                 .collect::<Result<Vec<_>, _>>()?;
             rows.try_into().unwrap()
         };
-        let ranked = self.context.plan.rank(&rewards);
+        let mut ranked = self.context.plan.rank(&rewards);
+        if self.context.plan.score_tie() {
+            ranked.push(Fraction::from_value(exact.detail["scores"]["mean"].as_f64().unwrap_or(0.0))
+                .ok_or("reward-plan-score")?);
+        }
+        if self.context.plan.power_tie() {
+            ranked.push(Fraction::from_value(power).ok_or("reward-plan-power")?);
+        }
         exact.key = ranked[0].value();
         exact.detail["rewardRanking"] =
             json!(ranked.iter().map(Fraction::json).collect::<Vec<_>>());
@@ -890,7 +933,16 @@ impl Objective for Ranked<'_> {
         true
     }
     fn seed_objective(&self) -> Option<Box<dyn Objective>> {
-        self.source.view().seed_objective()
+        self.source.view().seed_objective().or_else(|| {
+            (self.context.plan.power_tie()
+                && matches!(self.source, Source::Gekiso(_))
+                && self.context.plan.levels[0].iter().any(|term| term.metric == self.anchor_metric))
+                .then(|| Box::new(crate::event::BonusSurrogate {
+                    members: self.member_bonus[self.anchor].clone(),
+                    snaps: self.snap_bonus[self.anchor].clone(),
+                    weight: 16_777_216.0,
+                }) as Box<dyn Objective>)
+        })
     }
     fn compare_rank(&self, a: &Hit, b: &Hit) -> Option<Ordering> {
         compare(&a.detail["rewardRanking"], &b.detail["rewardRanking"])
@@ -916,7 +968,7 @@ impl Objective for Ranked<'_> {
                 source.reward_ties(
                     incumbent,
                     self.context.plan.levels.len() > 1,
-                    self.context.plan.levels.len() <= 2,
+                    self.context.plan.levels.len() <= 2 && !self.context.plan.power_tie(),
                 );
             }
         }
@@ -1038,7 +1090,7 @@ impl Objective for Ranked<'_> {
         let mut bonuses = self.bonus_max;
         bonuses[self.anchor] = bonuses[self.anchor].min(totals.bonus);
         let rewards = self.raw_upper(totals, bonuses, raw);
-        self.upper(rewards)
+        self.upper(rewards, totals.power, self.source.score_upper(totals))
     }
     fn cheap_assignment_bound(
         &mut self,
@@ -1048,7 +1100,16 @@ impl Objective for Ranked<'_> {
         from: usize,
     ) -> f64 {
         let rewards = self.cheap_assignment_rewards(members, totals, assigned, from);
-        self.upper(rewards)
+        let score = if self.needs_score_upper(rewards) {
+            self.ranking_score_upper(members, totals, assigned, from).unwrap_or(f64::INFINITY)
+        } else { f64::INFINITY };
+        self.upper(rewards, totals.power, score)
+    }
+    fn ranking_score_upper(&mut self, members: &[usize], totals: Totals, assigned: &[i32], from: usize) -> Option<f64> {
+        self.context.plan.score_tie().then(|| {
+            if self.context.route.kind == RouteKind::Skip { 0.0 }
+            else { self.source.mean_assignment_score(members, assigned, from, totals) }
+        })
     }
     fn ranked_assignment_upper(
         &mut self,
@@ -1117,7 +1178,7 @@ impl Objective for Ranked<'_> {
         } else { f64::INFINITY };
         let mut rewards = self.raw_upper_at(totals, bonuses, raw, score);
         self.cp_members(&mut rewards, members, from, totals.power);
-        Some(self.upper(rewards))
+        Some(self.upper(rewards, totals.power, self.source.score_upper(totals)))
     }
     fn early_member_bound(&mut self, members: &[usize], from: usize, _limit: f64) -> Option<f64> {
         let floor = self.raw_floor;
@@ -1139,7 +1200,7 @@ impl Objective for Ranked<'_> {
             ..Totals::default()
         };
         let rewards = self.raw_upper(totals, bonuses, raw);
-        Some(self.upper(rewards))
+        Some(self.upper(rewards, totals.power, self.source.score_upper(totals)))
     }
     fn roster_bound(&mut self, members: &[usize], totals: Totals, _limit: f64) -> Option<f64> {
         let floor = self.raw_floor;
@@ -1157,7 +1218,7 @@ impl Objective for Ranked<'_> {
         });
         let mut rewards = self.raw_upper(totals, bonuses, raw);
         self.cp_members(&mut rewards, members, 0, totals.power);
-        Some(self.upper(rewards))
+        Some(self.upper(rewards, totals.power, self.source.score_upper(totals)))
     }
     fn prepare_assignment(&mut self, members: &[usize], options: &[Vec<i32>]) {
         self.source.objective().prepare_assignment(members, options);
@@ -1208,7 +1269,7 @@ impl Objective for Ranked<'_> {
             ..Totals::default()
         };
         let rewards = self.raw_upper(totals, bonuses, raw);
-        Some(self.upper(rewards))
+        Some(self.upper(rewards, power, self.source.score_upper(totals)))
     }
     fn prepare_assignment_domain(
         &mut self,
@@ -1237,7 +1298,10 @@ impl Objective for Ranked<'_> {
             .unwrap_or_else(|| self.source.objective().bound(totals));
         let mut rewards = self.assignment_upper(members, totals, assigned, from, raw);
         self.cp_assignment(&mut rewards, members, assigned, from, totals.power);
-        Some(self.upper(rewards))
+        let score = if self.needs_score_upper(rewards) {
+            self.ranking_score_upper(members, totals, assigned, from).unwrap_or(f64::INFINITY)
+        } else { f64::INFINITY };
+        Some(self.upper(rewards, totals.power, score))
     }
     fn generic_assignment_product(&self) -> bool {
         self.source.view().generic_assignment_product()
@@ -1267,17 +1331,23 @@ impl Objective for Ranked<'_> {
             .leaf_bound(team, totals)
             .unwrap_or_else(|| self.source.objective().bound(totals));
         let rewards = self.team_upper(team, totals, raw);
-        Some(self.upper(rewards))
+        let score = if self.needs_score_upper(rewards) {
+            self.ranking_score_upper(&team.members, totals, &team.snaps, 5).unwrap_or(f64::INFINITY)
+        } else { f64::INFINITY };
+        Some(self.upper(rewards, totals.power, score))
     }
     fn interval(&mut self, team: &Team, totals: Totals) -> (f64, f64) {
         let (_, raw) = self.source.objective().interval(team, totals);
         let rewards = self.team_upper(team, totals, raw);
-        let upper = self.upper(rewards);
+        let score = if self.needs_score_upper(rewards) {
+            self.ranking_score_upper(&team.members, totals, &team.snaps, 5).unwrap_or(f64::INFINITY)
+        } else { f64::INFINITY };
+        let upper = self.upper(rewards, totals.power, score);
         (if self.envelopes.iter().any(Option::is_some) { f64::NEG_INFINITY } else { upper.min(0.0) }, upper)
     }
     fn exact(&mut self, team: &Team, power: f64, slots: &[f64]) -> Result<Exact, String> {
         let result = self.source.objective().exact(team, power, slots)?;
-        self.finish(team, result)
+        self.finish(team, power, result)
     }
     fn evaluate(
         &mut self,
@@ -1316,7 +1386,11 @@ impl Objective for Ranked<'_> {
             let raw = self.source.objective().bound(totals);
             self.team_upper(team, totals, raw)
         };
-        let upper = self.upper(rewards);
+        let score_totals = Totals { power, skill: f64::INFINITY, ..Totals::default() };
+        let score = if self.needs_score_upper(rewards) {
+            self.ranking_score_upper(&team.members, score_totals, &team.snaps, 5).unwrap_or(f64::INFINITY)
+        } else { f64::INFINITY };
+        let upper = self.upper(rewards, power, score);
         if upper < cutoff.key {
             return Ok(Evaluation::Pruned(upper));
         }
@@ -1333,7 +1407,7 @@ impl Objective for Ranked<'_> {
                 prune_equal: false,
             },
         )? {
-            Evaluation::Exact(result) => self.finish(team, result).map(Evaluation::Exact),
+            Evaluation::Exact(result) => self.finish(team, power, result).map(Evaluation::Exact),
             Evaluation::Pruned(raw) => {
                 let bonuses = self.bonuses(&team.members, &team.snaps, 5);
                 let totals = Totals {
@@ -1343,7 +1417,7 @@ impl Objective for Ranked<'_> {
                     ..Totals::default()
                 };
                 let rewards = self.raw_upper(totals, bonuses, raw);
-                let upper = self.upper(rewards);
+                let upper = self.upper(rewards, power, score);
                 if upper < cutoff.key {
                     Ok(Evaluation::Pruned(upper))
                 } else {

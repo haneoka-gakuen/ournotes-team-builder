@@ -6475,6 +6475,9 @@ impl<'a> RewardObjective<'a> {
     pub(crate) fn maximum_assignment_score(&mut self, members: &[usize], assigned: &[i32], from: usize, power: f64) -> Option<f64> {
         Some(self.assignment_model()?.score_ceiling(members, assigned, from, power, crate::objectives::Criterion::Max))
     }
+    pub(crate) fn mean_assignment_score(&mut self, members: &[usize], assigned: &[i32], from: usize, power: f64) -> Option<f64> {
+        Some(self.assignment_model()?.score_ceiling(members, assigned, from, power, crate::objectives::Criterion::Mean))
+    }
     pub(crate) fn maximum_member_score(&mut self, members: &[usize], from: usize, power: f64) -> Option<f64> {
         Some(self.deterministic.as_mut()?.member_score_ceiling(members, from, power, crate::objectives::Criterion::Max))
     }
@@ -7269,7 +7272,9 @@ impl<'a> RewardObjective<'a> {
     fn lex_bound(&self, primary: f64, other: f64, mean: f64) -> f64 {
         if let Some(best) = self.lex_cutoff() {
             let tied_out = if self.reward_only_ties {
-                !self.tie_other_reward || other < best[1] || self.reward_ties_complete && other == best[1]
+                if self.tie_other_reward {
+                    other < best[1] || self.reward_ties_complete && other == best[1]
+                } else { self.reward_ties_complete }
             } else { other < best[1] || other == best[1] && mean <= best[2] };
             if primary == best[0] && tied_out {
                 return primary.next_down();
