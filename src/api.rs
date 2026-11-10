@@ -656,6 +656,7 @@ fn constraints(
             .map(|v| crate::num::round(v * 100.0)),
         max_bonus: None,
         member_floor: None,
+        skill_roles: crate::skill_roles::Limits::prepare(master, &input["skillRoles"], members, snaps, &input["skillRoleMissions"]),
         member_floors: master::rows(&input["minMissionMembers"]).iter().enumerate()
             .filter_map(|(index, minimum)| {
                 let minimum = minimum.as_f64()?;
@@ -4313,5 +4314,54 @@ pub(crate) fn normalize_hit(hit: &mut Value) {
         for key in ["score", "skipScore", "event", "potential"] {
             object.entry(key).or_insert(Value::Null);
         }
+    }
+}
+
+impl Engine {
+    pub fn sample(&mut self, input: &Value) -> Result<Value, String> {
+        if input["request"]["songRules"].is_object() {
+            let (mut scoped, input) = self.song_rule_view(input)?; return scoped.sample(&input);
+        }
+        if input["request"]["gekiso"]["arena"].is_object() {
+            let (mut scoped, input, _, _) = self.arena_view(input)?; return scoped.sample(&input);
+        }
+        let request = &input["request"]; let song = &request["songs"][0];
+        self.load_source(input, song)?;
+        let id = master::int(&song["songId"]); let difficulty = master::int(&song["difficulty"]);
+        let ResolvedTeam { members, snaps, music, power, slots, .. } = self.resolve_team(request, &request["team"], id)?;
+        let compiled = self.charts.get(&(id, difficulty)).ok_or("missing-chart")?;
+        let index = request["order"].as_u64().filter(|&index| index < 120).ok_or("invalid-skill-order")? as usize;
+        let mistakes = &request["play"]["mistakes"];
+        let selected: Vec<usize> = master::rows(&mistakes["indices"]).iter().map(|value| value.as_u64().map(|value| value as usize).ok_or("invalid-mistake-index")).collect::<Result<_,_>>()?;
+        let grade = mistakes["judgement"].as_u64().unwrap_or(1) as usize;
+        if ![1,4].contains(&grade) { return Err("invalid-mistake-judgement".into()); }
+        let (score, life, notes, grades) = if request["gekiso"].is_object() {
+            use crate::full::{conditions::Performer, model::Model};
+            let source = self.sources.get(&(id,difficulty)).ok_or("missing-chart")?;
+            let accuracy = serde_json::from_value(request["gekiso"]["accuracy"].clone()).map_err(|error| error.to_string())?;
+            let mut chart = crate::gekiso::Chart::new(&self.master, source, compiled.difficulty.play_level, compiled.song.missions.clone(), accuracy, gekiso_ranks(&request["gekiso"]))?;
+            chart.music_type = music.music_type;
+            if selected.iter().any(|&index| index >= chart.notes.len()) { return Err("invalid-mistake-index".into()); }
+            let changed: BTreeMap<_,_> = selected.iter().map(|&index| (chart.notes[index].id, live::native_judgement(chart.notes[index].judgement_type, grade))).collect();
+            for frame in &mut chart.play.frames { for note in &mut frame.judged { if let Some(&grade) = changed.get(&note.note_id) { note.judgement = grade as i32; } } }
+            let order = &live::orders()[index];
+            let deck: Vec<_> = members.iter().zip(&snaps).map(|(member,snap)| Performer::from_member(&self.master, member, snap.as_ref())).collect();
+            let events: Vec<_> = chart.full.events.iter().map(|&(event,time)| (order[event], time)).collect();
+            let mut params = chart.params(); params.power = power.total as i32; params.music_type = music.music_type;
+            let mut model = Model::new(&self.master, &deck, &chart.full.notes, &events, params, Some(&chart.setup), (0,false))?;
+            let mut life = model.life.current;
+            for (index,frame) in chart.play.frames.iter().enumerate() { model.frame(frame.time_ms, &frame.judged, chart.play.dt[index])?; life = life.min(model.life.current); }
+            let notes: Vec<_> = chart.notes.iter().enumerate().map(|(index,note)| json!({"index":index,"timeMs":note.time_ms,"op":note.op,"judgementType":note.judgement_type})).collect();
+            (model.score.score.score as f64, life as f64, notes, Vec::<usize>::new())
+        } else {
+            if selected.iter().any(|&index| index >= compiled.times.len()) { return Err("invalid-mistake-index".into()); }
+            let grades = live::judgements_for_types(&compiled.judgement_types, &request["play"]);
+            let mut prepared = chart::prepare(&self.master, compiled, power.total as i32, slots, grades, 1.0, 100.0);
+            prepared.clock = live::FrameClock::for_play(&request["play"]);
+            let (score,life,grades) = live::sample(&prepared,index)?;
+            let notes: Vec<_> = compiled.times.iter().enumerate().map(|(index,&time)| json!({"index":index,"timeMs":time,"op":compiled.note_types[index],"judgementType":compiled.judgement_types[index]})).collect();
+            (score, life, notes, grades)
+        };
+        Ok(json!({"score":score,"lowestLife":life,"notes":if request["includeNotes"] == true { notes } else { Vec::new() },"judgements":grades,"cachedCharts":self.cached_chart_keys()}))
     }
 }

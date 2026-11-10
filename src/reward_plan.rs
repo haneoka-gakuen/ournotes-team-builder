@@ -49,7 +49,7 @@ pub(crate) struct AutoCp {
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub(crate) enum Aggregation { #[default] Mean, Max }
+pub(crate) enum Aggregation { #[default] Mean, Max, Min }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -57,6 +57,8 @@ pub(crate) struct Plan {
     pub unit: u32,
     #[serde(default)]
     pub criterion: Aggregation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minimum_rank: Option<i32>,
     pub levels: Vec<Vec<Term>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_cp: Option<AutoCp>,
@@ -64,6 +66,7 @@ pub(crate) struct Plan {
 impl Plan {
     pub(crate) fn parse(value: &Value) -> Result<Self, String> {
         let plan: Self = serde_json::from_value(value.clone()).map_err(|_| "reward-plan-format")?;
+        if plan.minimum_rank.is_some_and(|rank| !(2..=7).contains(&rank)) { return Err("reward-plan-rank".into()); }
         if plan.unit == 0
             || plan.unit > 1_000_000_000
             || plan.levels.is_empty()
@@ -567,7 +570,7 @@ impl<'a> Ranked<'a> {
         result[1] = (2..=rank)
             .map(|grade| self.context.route.cp(grade))
             .fold(0.0, f64::max);
-        if self.context.plan.criterion == Aggregation::Max { return result; }
+        if self.context.plan.criterion != Aggregation::Mean { return result; }
         let at = if self.anchor == 0 { 0 } else { 2 };
         let source = if self.integer_rewards && anchor_upper.fract() == 0.0 {
             anchor_upper
@@ -609,7 +612,7 @@ impl<'a> Ranked<'a> {
         values[0]
     }
     fn primary_floor(&self, value: f64) -> f64 {
-        if self.context.plan.criterion == Aggregation::Max || !value.is_finite() {
+        if self.context.plan.criterion != Aggregation::Mean || !value.is_finite() {
             return f64::NEG_INFINITY;
         }
         let Some(value) = Fraction::from_value(value.next_down()) else {
@@ -639,7 +642,7 @@ impl<'a> Ranked<'a> {
         Fraction((value.0 - others) / BigInt::from(own.weight)).lower() - self.rounding
     }
     fn update_floor(&mut self) {
-        if self.context.plan.criterion == Aggregation::Max { return; }
+        if self.context.plan.criterion != Aggregation::Mean { return; }
         self.raw_floor = self.primary_floor(self.context.floor);
         let Some(incumbent) = &self.incumbent else {
             return;
@@ -702,10 +705,10 @@ impl<'a> Ranked<'a> {
                     .context
                     .route
                     .reward_units(bonuses[0], bonuses[1], rank);
-                if count > 0 && self.context.plan.criterion == Aggregation::Max {
+                if count > 0 && self.context.plan.criterion != Aggregation::Mean {
                     let rank_values = units.map(|value| Fraction::new(value, 10_000));
                     let key = self.context.plan.rank(&rank_values);
-                    if maximum.as_ref().is_none_or(|old| key > old.0) { maximum = Some((key, units, rank)); }
+                    if maximum.as_ref().is_none_or(|old| if self.context.plan.criterion == Aggregation::Min { key < old.0 } else { key > old.0 }) { maximum = Some((key, units, rank)); }
                 }
                 for (total, value) in totals.iter_mut().zip(units) {
                     *total += value * count as i128;
@@ -717,7 +720,7 @@ impl<'a> Ranked<'a> {
                 values.map(|value| Fraction::new(value, 10_000))
             } else { totals.map(|total| Fraction::new(total, observations * 10_000)) }
         } else {
-            if self.context.plan.criterion == Aggregation::Max { return Err("reward-plan-ranks".into()); }
+            if self.context.plan.criterion != Aggregation::Mean { return Err("reward-plan-ranks".into()); }
             let (direct, other, cp) = if gekiso {
                 let count = settlement["observations"]
                     .as_f64()
@@ -816,7 +819,7 @@ impl<'a> Ranked<'a> {
     }
     fn assignment_upper(&mut self, members: &[usize], totals: Totals, assigned: &[i32], from: usize, anchor_upper: f64) -> [f64; 3] {
         let bonuses = self.bonuses(members, assigned, from);
-        let score = if self.context.plan.criterion == Aggregation::Max {
+        let score = if self.context.plan.criterion != Aggregation::Mean {
             self.source.maximum_assignment_score(members, assigned, from, totals.power)
         } else { f64::INFINITY };
         self.raw_upper_at(totals, bonuses, anchor_upper, score)
@@ -862,13 +865,17 @@ impl Objective for Ranked<'_> {
         self.source.view().filter_snap_dominates(member, better, worse)
     }
     fn has_team_filter(&self) -> bool {
-        self.source.view().has_team_filter()
+        self.context.plan.minimum_rank.is_some() || self.source.view().has_team_filter()
     }
     fn team_filter_impossible(&self) -> bool {
         self.source.view().team_filter_impossible()
     }
     fn feasible_team(&mut self, team: &Team, power: f64) -> Result<bool, String> {
-        self.source.objective().feasible_team(team, power)
+        if !self.source.objective().feasible_team(team, power)? { return Ok(false); }
+        let Some(minimum) = self.context.plan.minimum_rank else { return Ok(true); };
+        let exact = self.source.objective().exact(team, power, &[])?;
+        let settlement = if matches!(self.source, Source::Gekiso(_)) { &exact.detail["settlement"] } else { &exact.detail };
+        Ok(settlement["ranks"].as_object().is_some_and(|rows| !rows.is_empty() && rows.iter().all(|(rank,count)| count.as_u64().unwrap_or(0) == 0 || rank.parse::<i32>().is_ok_and(|rank| rank >= minimum))))
     }
     fn feasible_assignment(
         &self,
@@ -972,6 +979,7 @@ impl Objective for Ranked<'_> {
                 .exchange_snap_equivalent(member, a, b)
     }
     fn numeric_member_dominance(&mut self, better: usize, worse: usize, delta: f64) -> bool {
+        if self.context.plan.criterion == Aggregation::Min || self.context.plan.minimum_rank.is_some() { return false; }
         [Metric::Points, Metric::Items]
             .iter()
             .enumerate()
@@ -991,6 +999,7 @@ impl Objective for Ranked<'_> {
         worse: i32,
         delta: f64,
     ) -> bool {
+        if self.context.plan.criterion == Aggregation::Min || self.context.plan.minimum_rank.is_some() { return false; }
         [Metric::Points, Metric::Items]
             .iter()
             .enumerate()
@@ -1100,7 +1109,7 @@ impl Objective for Ranked<'_> {
                 + self.member_suffix[kind][from][left]
                 + self.snap_top[kind]
         });
-        let score = if self.context.plan.criterion == Aggregation::Max {
+        let score = if self.context.plan.criterion != Aggregation::Mean {
             match &mut self.source {
                 Source::Gekiso(source) => source.maximum_member_score(members, from, totals.power).unwrap_or(f64::INFINITY),
                 Source::Ordinary(_) => f64::INFINITY,
@@ -1311,7 +1320,7 @@ impl Objective for Ranked<'_> {
         if upper < cutoff.key {
             return Ok(Evaluation::Pruned(upper));
         }
-        if self.context.plan.criterion == Aggregation::Max {
+        if self.context.plan.criterion != Aggregation::Mean {
             return self.exact(team, power, slots).map(Evaluation::Exact);
         }
         let floor = self.raw_floor.max(self.primary_floor(cutoff.key));

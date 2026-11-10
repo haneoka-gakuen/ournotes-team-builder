@@ -1,5 +1,6 @@
 //! Portable team-building core. Native and WASM share algorithms and numeric
 //! semantics; process management, network access and Flutter stay outside.
+mod skill_roles;
 pub mod api;
 pub mod assignment;
 pub mod chart;

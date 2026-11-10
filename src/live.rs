@@ -2031,6 +2031,17 @@ fn play(
         });
     Ok((summarize(input.power, scores), curve))
 }
+pub(crate) fn sample(input: &Input, index: usize) -> Result<(f64, f64, Vec<usize>), String> {
+    let order = orders().get(index).ok_or("invalid-skill-order")?;
+    let grades = input.judgements.clone().unwrap_or_else(|| vec![5; input.times.len()]);
+    let mut scorer = PlayScorer::new(input, &grades);
+    let score = scorer.order(order, None);
+    let trajectory = scorer.trajectory(order);
+    let converted = scorer.trajectories[trajectory].0.clone();
+    let recoveries = order.map(|slot| input.slots.get(slot).map_or(0, |slot| slot.recovery));
+    let health = scorer.life_cache[&(recoveries, trajectory)].0.note.iter().copied().fold(input.life_base, f64::min);
+    Ok((score, health, converted))
+}
 pub fn score(input: &Input) -> Result<Scores, String> {
     score_internal(input, false).map(|value| value.0)
 }
@@ -2090,6 +2101,14 @@ pub fn judgements_for_types(kinds: &[i32], play: &serde_json::Value) -> Option<V
     judgement_pattern(kinds.len(), play, Some(kinds))
 }
 fn judgement_pattern(count: usize, play: &serde_json::Value, kinds: Option<&[i32]>) -> Option<Vec<usize>> {
+    if let Some(indices) = play["mistakes"]["indices"].as_array() {
+        let grade = play["mistakes"]["judgement"].as_u64().unwrap_or(1) as usize;
+        let mut out = vec![5; count];
+        for index in indices.iter().filter_map(|index| index.as_u64()).map(|index| index as usize).filter(|&index| index < count) {
+            out[index] = kinds.map_or(grade, |types| native_judgement(types[index], grade));
+        }
+        return Some(out);
+    }
     let number = |key: &str| crate::master::number(&play[key], 0.0);
     let (great, good, bad, miss, every) = (
         number("great"),
