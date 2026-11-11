@@ -4181,13 +4181,39 @@ impl Engine {
         }
         let mut out = json!({"durationMs":duration,"density":density,"fever":chart.fevers,"windows":windows,"cachedCharts":self.cached_chart_keys()});
         if request["timing"].is_object() {
-            out["timing"] = self.order_timing(request, &song["songId"], &song["difficulty"])?;
+            if request["timing"]["gekiso"].is_object() {
+                out["guide"] = self.gekiso_timing_guide(request, &song["songId"], &song["difficulty"])?;
+            } else {
+                out["timing"] = self.order_timing(request, &song["songId"], &song["difficulty"])?;
+            }
         }
         Ok(out)
     }
 }
 
 impl Engine {
+    fn gekiso_timing_guide(&self, request: &Value, song_id: &Value, difficulty: &Value) -> Result<Value, String> {
+        use crate::full::conditions::Performer;
+        let (song_id, difficulty) = (master::int(song_id), master::int(difficulty));
+        let mut evaluation = request["timing"].clone();
+        for key in ["members", "snaps", "unknownPolicy"] { evaluation[key] = request[key].clone(); }
+        let team = json!({"members": request["memberKeys"], "snaps": request["snapKeys"], "leader": request["memberKeys"][0]});
+        let resolved = self.resolve_team(&evaluation, &team, song_id)?;
+        let order: Vec<usize> = master::integers(&request["order"]).into_iter().map(|slot| slot as usize).collect();
+        let Some(index) = live::orders().iter().position(|row| row[..] == order[..]) else { return Ok(Value::Null) };
+        let compiled = self.charts.get(&(song_id, difficulty)).ok_or("missing-chart")?;
+        let source = self.sources.get(&(song_id, difficulty)).ok_or("missing-chart")?;
+        let setup = &evaluation["gekiso"];
+        let accuracy = serde_json::from_value(setup["accuracy"].clone()).map_err(|error| error.to_string())?;
+        let mut chart = crate::gekiso::Chart::new(&self.master, source, compiled.difficulty.play_level, compiled.song.missions.clone(), accuracy, gekiso_ranks(setup))?;
+        chart.music_type = resolved.music.music_type;
+        let deck = resolved.members.iter().zip(&resolved.snaps).map(|(member, snap)| Performer::from_member(&self.master, member, snap.as_ref())).collect();
+        let input = chart::prepare(&self.master, compiled, resolved.power.total as i32, resolved.slots, Some(chart.judgements.clone()), 1.0, 100.0);
+        Ok(json!(crate::gekiso_guide::build(crate::gekiso_guide::Context {
+            master: &self.master, compiled, chart, deck, input, power: resolved.power.total as i32,
+            order: index, seeds: (0..master::int(&setup["seeds"]).max(0)).collect(),
+        })?))
+    }
     /// Best judgement timing of one normal-live order (`live::timing`), from the
     /// evaluation context in `request.timing`.
     fn order_timing(&self, request: &Value, song_id: &Value, difficulty: &Value) -> Result<Value, String> {

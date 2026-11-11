@@ -8,6 +8,14 @@ Score requests can set `goal.play.cumulativeTiming` to `"best"` or `"worst"` wit
 
 A `timeline` request with a `timing` context returns `worst` and `optimal` next to the nominal `score` and the input-checked guide's `best`. Guide steps advance one frame rounded up to whole milliseconds (34, 17, 12 or 9 ms) and address notes by `noteIndices` in the judged-note stream. Timeline bounds cover only the selected skill order; full evaluation returns all 120.
 
+## COMBO and cumulative input guide
+
+A timeline request whose `timing` evaluation context contains `gekiso` returns `guide`: `frameRate`, optional `score`/`best`, and chronological `actions`. Actions contain their kind (`combo-opening`, `combo-chord`, `combo-ending`, `skill`), event or range, canonical judged-note indices, nominal note times, and delivery times. `included` marks opening splits already used by normal Gekiso scoring. Their COMBO difference is measured against simultaneous delivery and is not added again to the plan score.
+
+The Gekiso replay clock is 60 Hz. Opening splits, positive COMBO-bonus activation frames, range-ending independent inputs and cumulative early-input candidates share one selected delivery schedule. The whole-frame input selector checks every accepted change. Complete replay compares both total score and each range's mission count (maximum COMBO, JUST count or LUCK bonus); an added step cannot reduce either. Each step's score and COMBO gains are marginal to the preceding accepted changes. Explicit LUCK samples replay the complete requested seed sequence. Automatic LUCK omits score deltas, retains existing opening splits and limits new inputs to cumulative early steps at or after activation.
+
+For song 100001 EXPERT, member 74's LIFE-gated COMBO skill makes a 7.578-second opening chord split gain 3 Gekiso COMBO. With snapshot 76 on that member, the 8.842-second and 9.473-second cumulative inputs can coexist with the split. A maximum-growth five-member replay gains a further 13,384 total score from those two early inputs. A lineup with member 53's 25-COMBO trigger can instead gain 5 COMBO and 33,401 score by splitting the 9.789-second chord. Other lineups on the same chart can have no opening or ending benefit; the guide follows the selected lineup and order.
+
 ## Original-client paths
 
 The ordinary cumulative scorer separates judgement delivery from the score ledger. `play.frameRate` selects 30, 60, 90 or 120 evenly spaced updates per second, with 60 as the default. The first update has music time 0.

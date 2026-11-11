@@ -2164,6 +2164,8 @@ pub struct TimingStep {
     pub time_ms: i32,
     pub notes: usize,
     pub note_indices: Vec<usize>,
+    pub note_times_ms: Vec<i32>,
+    pub input_times_ms: Vec<i32>,
     pub gain: f64,
 }
 /// A cumulative snapshot's counting window: its counted notes and steps.
@@ -2234,7 +2236,10 @@ pub fn timing_with_inputs(input: &Input, order_index: usize, before_ms: &[i32], 
                 if mill != applied && !chord.is_empty() {
                     let last = input.times[*chord.last().unwrap()];
                     groups.push((windows.len(), window.steps.len(), chord.clone()));
-                    window.steps.push(TimingStep { step: (count / factor.unit).min(factor.cap), time_ms: last, notes: chord.len(), note_indices: chord, gain: 0.0 });
+                    window.steps.push(TimingStep { step: (count / factor.unit).min(factor.cap), time_ms: last, notes: chord.len(),
+                        note_times_ms: chord.iter().map(|&i| input.times[i]).collect(),
+                        input_times_ms: chord.iter().map(|&i| input.frame_time(input.times[i] - advance_ms)).collect(),
+                        note_indices: chord, gain: 0.0 });
                 }
                 applied = mill;
                 first = after;

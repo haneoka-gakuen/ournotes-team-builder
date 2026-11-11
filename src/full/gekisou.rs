@@ -634,6 +634,10 @@ impl Controller {
         self.flag();
         id
     }
+    pub(crate) fn combo_bonus_count(&self) -> usize { self.combo_stack.len() }
+    pub(crate) fn combo_bonus_times(&self, after: usize) -> impl Iterator<Item = i32> + '_ {
+        self.combo_stack[after..].iter().filter_map(|&(time, delta, _)| (delta > 0.0).then_some(time))
+    }
     pub fn subtract_combo_bonus(&mut self, time: i32, id: i32) -> Result<(), String> {
         let bonus = self
             .combo_bonus_ids

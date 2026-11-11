@@ -9,6 +9,7 @@ pub mod event;
 pub mod event_growth;
 pub mod full;
 pub mod gekiso;
+mod gekiso_guide;
 pub mod gekiso_objective;
 mod just_bound;
 pub(crate) mod just_window;

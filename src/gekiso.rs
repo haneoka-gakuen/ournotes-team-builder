@@ -2006,6 +2006,24 @@ pub(crate) fn replay_order(
     power: i32,
     order_index: usize,
 ) -> Result<(f64, [f64; 3]), String> {
+    replay_order_mode(master, chart, deck, power, order_index, (0, false)).map(|value| (value.score, value.ranges))
+}
+pub(crate) struct ReplayedOrder {
+    pub score: f64,
+    pub ranges: [f64; 3],
+    pub combos: [i32; 3],
+    pub missions: [i32; 3],
+    pub combo_frames: Vec<i32>,
+}
+pub(crate) fn replay_order_mode(
+    master: &Master,
+    chart: &Chart,
+    deck: &[Performer],
+    power: i32,
+    order_index: usize,
+    mode: (i32, bool),
+) -> Result<ReplayedOrder, String> {
+    let (seed, trace_combo) = mode;
     let order = &live::orders()[order_index];
     let events = chart
         .full
@@ -2029,23 +2047,34 @@ pub(crate) fn replay_order(
         &events,
         params,
         Some(&chart.setup),
-        (0, false),
+        (seed, false),
     )?;
     chart.fixed_life(&mut model);
     let generation = crate::cancellation_generation();
+    let mut combo_frames = Vec::new();
     for (k, frame) in chart.play.frames.iter().enumerate() {
         if generation != crate::cancellation_generation() {
             return Err("cancelled".into());
         }
+        let count = if trace_combo { model.gk.as_ref().map_or(0, |g| g.controller.combo_bonus_count()) } else { 0 };
         model.frame(frame.time_ms, &frame.judged, chart.play.dt[k])?;
+        if let Some(g) = model.gk.as_ref().filter(|_| trace_combo) {
+            combo_frames.extend(g.controller.combo_bonus_times(count).map(|time| live::FrameClock::default().frame_time(time)));
+        }
     }
     let mut ranges = [0.0; 3];
+    let mut combos = [0; 3];
+    let mut missions = [0; 3];
     if let Some(g) = &model.gk {
         for (score, state) in ranges.iter_mut().zip(&g.controller.states) {
             *score = state.score() as f64;
         }
+        for (combo, state) in combos.iter_mut().zip(&g.controller.states) { *combo = state.max_combo; }
+        for ((value, state), &mission) in missions.iter_mut().zip(&g.controller.states).zip(&chart.setup.missions) {
+            *value = match mission { 1 => state.max_combo, 2 => state.luck.total_bonus, 3 => state.just, _ => 0 };
+        }
     }
-    Ok((model.score.score.score as f64, ranges))
+    Ok(ReplayedOrder { score: model.score.score.score as f64, ranges, combos, missions, combo_frames })
 }
 type ReplayValue = (f64, [f64; 3]);
 type ReplayObserver<'a> = dyn Fn(f64, usize, f64) -> bool + Sync + 'a;
