@@ -21,6 +21,7 @@ pub struct Team {
     pub members: Vec<usize>,
     pub snaps: Vec<i32>,
 }
+#[derive(Clone)]
 pub struct Exact {
     pub key: f64,
     pub detail: Value,
@@ -306,6 +307,13 @@ pub trait Objective {
     fn leaf_bound(&mut self, _team: &Team, _totals: Totals) -> Option<f64> {
         None
     }
+    /// Conservative primary and tie ceilings for a complete physical assignment.
+    fn leaf_rank_upper(&mut self, _team: &Team, _totals: Totals) -> Option<[f64; 3]> { None }
+    fn rank_floor(&self) -> Option<[f64; 3]> { None }
+    fn ranked_bounds(&self)->bool {false}
+    fn leaf_rank_ties(&self) -> bool { false }
+    fn roster_rank_upper(&mut self, _members:&[usize]) -> Option<[f64;3]> {None}
+    fn domain_rank_upper(&mut self) -> Option<[f64;3]> {None}
     fn interval(&mut self, team: &Team, totals: Totals) -> (f64, f64);
     fn exact(&mut self, team: &Team, power: f64, slot_powers: &[f64]) -> Result<Exact, String>;
     fn exact_value(&mut self, team: &Team, power: f64, slot_powers: &[f64]) -> Result<f64, String> {
@@ -353,8 +361,8 @@ pub struct Hit {
     #[serde(skip)]
     pub totals: Totals,
 }
-#[derive(Default, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase",default)]
 pub struct Stats {
     pub leaders: usize,
     pub member_nodes: usize,
@@ -2285,6 +2293,17 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                 && (a.exact_low > upper
                     || !self.input.objective.score_ties() && a.exact_low == upper)
     }
+    fn rank_limit(&self) -> Option<[f64;3]> {
+        let known=if self.hits.len()>=self.input.k {let last=&self.hits[self.input.k-1];let tie=self.input.objective.tie_rank(last);Some([last.key,tie[0],tie[1]])}else{None};
+        match (known,self.input.objective.rank_floor()) {
+            (Some(a),Some(b))=>Some(if a[0].total_cmp(&b[0]).then_with(||a[1].total_cmp(&b[1])).then_with(||a[2].total_cmp(&b[2])).is_lt(){b}else{a}),
+            (a,b)=>a.or(b),
+        }
+    }
+    fn rank_pruned(&self, upper:[f64;3], floor:[f64;3])->bool {
+        let order=upper[0].total_cmp(&floor[0]).then_with(||upper[1].total_cmp(&floor[1])).then_with(||upper[2].total_cmp(&floor[2]));
+        order.is_lt() || order.is_eq() && self.input.objective.leaf_rank_ties()
+    }
     fn assignment_bound(&mut self, a: &Assignment, totals: Totals, from: usize) -> f64 {
         self.input
             .objective
@@ -2556,6 +2575,13 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             members: a.team.clone(),
             snaps: picks,
         };
+        if let Some(floor)=self.input.objective.ranked_bounds().then(||self.rank_limit()).flatten() {
+            if let Some(upper) = self.input.objective.leaf_rank_upper(&team, totals) {
+                if self.rank_pruned(upper,floor) {
+                    return Ok(());
+                }
+            }
+        }
         if self
             .input
             .objective
@@ -2612,6 +2638,11 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         Ok(())
     }
     fn assign(&mut self, team: Vec<usize>) -> Result<(), String> {
+        if let Some(floor)=self.input.objective.ranked_bounds().then(||self.rank_limit()).flatten() {
+            if let Some(upper)=self.input.objective.roster_rank_upper(&team) {
+                if self.rank_pruned(upper,floor) {return Ok(());}
+            }
+        }
         let set_key = self.set_key(&team);
         let exact_low = self
             .retained
@@ -3072,6 +3103,11 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                 &a.options,
                 slot == domains.len(),
             );
+            if let Some(floor)=self.input.objective.ranked_bounds().then(||self.rank_limit()).flatten() {
+                if let Some(upper)=self.input.objective.domain_rank_upper() {
+                    if self.rank_pruned(upper,floor) {return Ok(());}
+                }
+            }
             let order_limit = self.assignment_necessary_limit(a);
             let bound = self.input.objective.assignment_order_bound(
                 &a.team,

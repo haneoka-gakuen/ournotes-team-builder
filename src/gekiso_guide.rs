@@ -29,6 +29,11 @@ pub(crate) struct Guide {
 }
 #[derive(Clone)]
 struct Outcome {
+    valid: bool,
+    base: f64,
+    protect_base: bool,
+    wins: [f64; 3],
+    all_win: f64,
     score: f64,
     combos: [f64; 3],
     missions: [f64; 3],
@@ -36,7 +41,12 @@ struct Outcome {
 }
 impl Outcome {
     fn improves(&self, previous: &Self) -> bool {
-        self.score >= previous.score
+        self.valid
+            && previous.valid
+            && (!self.protect_base || self.base >= previous.base)
+            && self.all_win >= previous.all_win
+            && self.wins.iter().zip(previous.wins).all(|(&a, b)| a >= b)
+            && self.score >= previous.score
             && self
                 .missions
                 .iter()
@@ -63,6 +73,10 @@ pub(crate) struct Context<'a> {
     pub power: i32,
     pub order: usize,
     pub seeds: Vec<i32>,
+    pub opponents: Option<gekiso::sections::OpponentSamples>,
+    pub window: Option<crate::just_window::Trace>,
+    pub minimum: Option<f64>,
+    pub preserve_base: bool,
 }
 impl Context<'_> {
     fn score(&mut self, selected: &[i32], trace_combo: bool) -> Result<Outcome, String> {
@@ -94,18 +108,60 @@ impl Context<'_> {
                 .sort_by_key(|note| (note.time_ms, note.note_id));
         }
         let mut total = 0.0;
+        let mut base = 0.0;
+        let mut wins = [0.0; 3];
+        let mut all_win = 0.0;
         let mut combos = [0.0; 3];
         let mut missions = [0.0; 3];
         let mut combo_frames = Vec::new();
+        let deliveries = self
+            .chart
+            .notes
+            .iter()
+            .enumerate()
+            .map(|(index, note)| (note.id, selected[index]))
+            .collect();
         for &seed in &self.seeds {
-            let value = gekiso::replay_order_mode(
+            let scene = gekiso::sections::ReplayScene {
+                opponents: self
+                    .opponents
+                    .as_ref()
+                    .map(|samples| &samples[seed as usize % samples.len()]),
+                deliveries: Some(&deliveries),
+                window: self.window.as_ref(),
+                minimum: self.minimum,
+            };
+            let value = gekiso::replay_order_scene(
                 self.master,
                 &self.chart,
                 &self.deck,
                 self.power,
                 self.order,
                 (seed, trace_combo),
+                Some(&scene),
             )?;
+            if !value.valid {
+                return Ok(Outcome {
+                    valid: false,
+                    base: 0.0,
+                    protect_base: self.preserve_base,
+                    wins: [0.0; 3],
+                    all_win: 0.0,
+                    score: 0.0,
+                    combos: [0.0; 3],
+                    missions: [0.0; 3],
+                    combo_frames: Vec::new(),
+                });
+            }
+            base += value.base_score;
+            for (win, rank) in wins.iter_mut().zip(value.ranks) {
+                if rank == 1 {
+                    *win += 1.0;
+                }
+            }
+            if value.ranks.iter().all(|&rank| rank == 1) {
+                all_win += 1.0;
+            }
             total += value.score;
             for (target, value) in missions.iter_mut().zip(value.missions) {
                 *target += value as f64;
@@ -124,6 +180,11 @@ impl Context<'_> {
         combo_frames.sort_unstable();
         combo_frames.dedup();
         Ok(Outcome {
+            valid: true,
+            base: base / self.seeds.len() as f64,
+            protect_base: self.preserve_base,
+            wins: wins.map(|win| win / self.seeds.len() as f64),
+            all_win: all_win / self.seeds.len() as f64,
             score: total / self.seeds.len() as f64,
             combos,
             missions,
@@ -143,7 +204,9 @@ pub(crate) fn build(mut context: Context<'_>) -> Result<Option<Guide>, String> {
     {
         return Ok(None);
     }
-    if !context.chart.luck {
+    if !gekiso::replay_random(context.master, &context.chart, &context.deck)
+        && context.opponents.is_none()
+    {
         context.seeds.clear();
     }
     let report_scores = !context.chart.luck || !context.seeds.is_empty();
@@ -180,6 +243,9 @@ pub(crate) fn build(mut context: Context<'_>) -> Result<Option<Guide>, String> {
         return Ok(None);
     }
     let score = context.score(&selected, true)?;
+    if !score.valid {
+        return Ok(None);
+    }
     let mut best = score.clone();
     let mut actions = Vec::new();
     let mut candidates = Vec::new();

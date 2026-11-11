@@ -15,6 +15,7 @@ pub(crate) struct SharedInput<'a> {
     pub seeded: bool,
     pub floor: f64,
     pub on_candidate: Option<CandidateListener<'a>>,
+    pub sections: Option<&'a sections::Plan>,
 }
 
 struct SongObjective<'k, 'a> {
@@ -499,6 +500,7 @@ impl Objective for Combined<'_, '_> {
         self.songs.iter().all(|song| song.adapter.feasible_assignment(members, assigned, from, options))
     }
     fn feasible_team(&mut self, team: &Team, _power: f64) -> Result<bool, String> {
+        if !self.eligible(&team.members) { return Ok(false); }
         for song in &mut self.songs {
             let kernel = &song.adapter.kernel;
             let members: Vec<_> = team.members.iter().map(|&index| kernel.members[index].clone()).collect();
@@ -854,8 +856,10 @@ pub(crate) fn search_shared(input: SharedInput<'_>) -> Result<search::Output, St
         seeded,
         floor,
         mut on_candidate,
+        sections,
     } = input;
     let started = (env.now)();
+    let section_charts = sections.map(|_| charts.iter().map(|chart| chart.converted_judgements(&chart.judgements).unwrap()).collect::<Vec<_>>());
     let mut windows = Vec::with_capacity(charts.len());
     for chart in charts.iter() {
         let window = env.min_just_window_ms.map(|minimum| crate::just_window::Prepared::new(env.master, chart, env.members, env.snaps, minimum, &seeds)).transpose()?;
@@ -936,7 +940,9 @@ pub(crate) fn search_shared(input: SharedInput<'_>) -> Result<search::Output, St
             levels.sort_by_key(|&level| (level != preferred, std::cmp::Reverse(level)));
         }
     }
-    let mut hits = Vec::new();
+    let mut hits=Vec::new();
+    if let Some(plan)=sections {for hit in plan.incumbents.borrow().iter().chain(plan.reference_hit.iter()) {offer(&mut hits,env.members,hit.clone());}}
+    if let Some(callback)=on_candidate.as_deref_mut().filter(|_|!hits.is_empty()) {callback(&ranked(&hits,k));}
     let mut stats = search::Stats::default();
     if !seeded && (initial.is_empty() || levels.len() > 1 && kernels.iter().any(|kernel| kernel.chart.luck)) {
         let mut objective = PowerSeed {
@@ -1005,7 +1011,7 @@ pub(crate) fn search_shared(input: SharedInput<'_>) -> Result<search::Output, St
             cooperative_floor,
         );
         objective.k = k;
-        objective.floor = current.get(k - 1).map_or(floor, |hit| hit.key.max(floor));
+        objective.floor = if sections.is_some() { f64::NEG_INFINITY } else { current.get(k - 1).map_or(floor, |hit| hit.key.max(floor)) };
         if seeded {
             objective.completed = initial.clone();
         }
@@ -1024,9 +1030,7 @@ pub(crate) fn search_shared(input: SharedInput<'_>) -> Result<search::Output, St
                 callback(&ranked(&hits, k));
             }
         };
-        let out = env.run(
-            &mut objective,
-            Run {
+        let run = Run {
                 constraints,
                 k,
                 deadline,
@@ -1037,10 +1041,12 @@ pub(crate) fn search_shared(input: SharedInput<'_>) -> Result<search::Output, St
                 } else {
                     floor
                 },
-            },
-            None,
-            Some(&mut accept),
-        )?;
+            };
+        let out = if let Some(plan) = sections {
+            let floor_rank=current.get(k-1).map(|hit|[hit.key,hit.detail["sectionTie"][0].as_f64().unwrap_or(0.0),hit.detail["sectionTie"][1].as_f64().unwrap_or(0.0)]);
+            let mut target = sections::Wrapper::new(&mut objective, &env, section_charts.as_ref().unwrap(), music, plan, floor_rank);
+            env.run(&mut target, run, None, Some(&mut accept))?
+        } else { env.run(&mut objective, run, None, Some(&mut accept))? };
         stats.add(&out.stats);
         if !out.proven {
             proven = false;

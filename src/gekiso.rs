@@ -1,4 +1,5 @@
 //! Gekiso context simulation, nominal lottery expectation and per-order scores.
+pub(crate) mod sections;
 use crate::{
     chart::Source,
     full::{
@@ -2009,9 +2010,13 @@ pub(crate) fn replay_order(
     replay_order_mode(master, chart, deck, power, order_index, (0, false)).map(|value| (value.score, value.ranges))
 }
 pub(crate) struct ReplayedOrder {
+    pub valid:bool,
+    pub ranks:[i32;3],
     pub score: f64,
+    pub base_score:f64,
     pub ranges: [f64; 3],
     pub combos: [i32; 3],
+    pub perfects:[i32;3],
     pub missions: [i32; 3],
     pub combo_frames: Vec<i32>,
 }
@@ -2023,6 +2028,10 @@ pub(crate) fn replay_order_mode(
     order_index: usize,
     mode: (i32, bool),
 ) -> Result<ReplayedOrder, String> {
+    replay_order_scene(master,chart,deck,power,order_index,mode,None)
+}
+pub(crate) fn replay_order_scene(master:&Master,chart:&Chart,deck:&[Performer],power:i32,order_index:usize,
+    mode:(i32,bool),scene:Option<&sections::ReplayScene<'_>>)->Result<ReplayedOrder,String> {
     let (seed, trace_combo) = mode;
     let order = &live::orders()[order_index];
     let events = chart
@@ -2050,6 +2059,25 @@ pub(crate) fn replay_order_mode(
         (seed, false),
     )?;
     chart.fixed_life(&mut model);
+    let mut displaced=HashMap::default();
+    if let Some(scene)=scene {
+        model.just_window=scene.window.cloned();
+        if let Some(opponents)=scene.opponents {model.gk.as_mut().unwrap().section_opponents=Some(Arc::new(opponents.clone()));}
+        if let Some(inputs)=scene.deliveries {
+            for (note,&grade) in chart.notes.iter().zip(&chart.judgements) {
+                if grade!=6 {continue;}
+                let original=chart.play.frames.partition_point(|frame|frame.time_ms<note.time_ms);
+                let Some(&target)=inputs.get(&note.id).filter(|&&target|target!=chart.play.frames[original].time_ms) else{continue;};
+                if !chart.setup.fevers.iter().zip(&chart.setup.missions).any(|(&(start,end),&mission)|mission==3 && start<=target && target<end) {
+                    return Ok(ReplayedOrder {valid:false,ranks:[1;3],score:0.0,base_score:0.0,ranges:[0.0;3],combos:[0;3],perfects:[0;3],missions:[0;3],combo_frames:Vec::new()});
+                }
+                let delivered=chart.play.frames.partition_point(|frame|frame.time_ms<target);
+                let before=if delivered==0 {0}else{chart.play.frames[delivered-1].time_ms+1};
+                displaced.insert(note.id,(note.judgement_type,note.time_ms,before,chart.play.frames[delivered].time_ms));
+            }
+        }
+        if !displaced.is_empty() && model.just_window.is_none() {model.just_window=Some(crate::just_window::Trace::new(master));}
+    }
     let generation = crate::cancellation_generation();
     let mut combo_frames = Vec::new();
     for (k, frame) in chart.play.frames.iter().enumerate() {
@@ -2057,28 +2085,40 @@ pub(crate) fn replay_order_mode(
             return Err("cancelled".into());
         }
         let count = if trace_combo { model.gk.as_ref().map_or(0, |g| g.controller.combo_bonus_count()) } else { 0 };
+        let reachable=|model:&Model<'_>|frame.judged.iter().filter_map(|note|displaced.get(&note.note_id)).all(|&(kind,note,first,last)|
+            model.just_window.as_ref().and_then(|trace|trace.current.get(&kind)).is_some_and(|&(before,after)|first.max(note-before)<=last.min(note+after)));
+        if !displaced.is_empty() && !reachable(&model) {return Ok(ReplayedOrder {valid:false,ranks:[1;3],score:0.0,base_score:0.0,ranges:[0.0;3],combos:[0;3],perfects:[0;3],missions:[0;3],combo_frames:Vec::new()});}
         model.frame(frame.time_ms, &frame.judged, chart.play.dt[k])?;
+        if !displaced.is_empty() && !reachable(&model) {return Ok(ReplayedOrder {valid:false,ranks:[1;3],score:0.0,base_score:0.0,ranges:[0.0;3],combos:[0;3],perfects:[0;3],missions:[0;3],combo_frames:Vec::new()});}
+        if scene.is_some_and(|scene|scene.window.is_some()) {if let Some(trace)=&mut model.just_window {trace.record_probe(k);}}
         if let Some(g) = model.gk.as_ref().filter(|_| trace_combo) {
             combo_frames.extend(g.controller.combo_bonus_times(count).map(|time| live::FrameClock::default().frame_time(time)));
         }
     }
     let mut ranges = [0.0; 3];
     let mut combos = [0; 3];
+    let mut perfects=[0;3];
     let mut missions = [0; 3];
+    let mut ranks=[1;3];
     if let Some(g) = &model.gk {
         for (score, state) in ranges.iter_mut().zip(&g.controller.states) {
             *score = state.score() as f64;
         }
         for (combo, state) in combos.iter_mut().zip(&g.controller.states) { *combo = state.max_combo; }
+        for (perfect,state) in perfects.iter_mut().zip(&g.controller.states) {*perfect=state.perfect;}
         for ((value, state), &mission) in missions.iter_mut().zip(&g.controller.states).zip(&chart.setup.missions) {
             *value = match mission { 1 => state.max_combo, 2 => state.luck.total_bonus, 3 => state.just, _ => 0 };
         }
+        for bonus in &g.rank_bonus {if bonus.range<3 {ranks[bonus.range]=bonus.rank;}}
     }
-    Ok(ReplayedOrder { score: model.score.score.score as f64, ranges, combos, missions, combo_frames })
+    let valid=scene.and_then(|scene|scene.minimum).is_none_or(|minimum|model.just_window.as_ref().and_then(|trace|trace.minimum).is_none_or(|window|window[0].min(window[1]) as f64>=minimum));
+    let bonus=model.gk.as_ref().map_or(0,|g|g.rank_bonus.iter().fold(0_i32,|sum,row|sum.wrapping_add(row.bonus)));
+    Ok(ReplayedOrder { valid,ranks,score: model.score.score.score as f64,base_score:model.score.score.score.wrapping_sub(bonus) as f64, ranges, combos,perfects, missions, combo_frames })
 }
 type ReplayValue = (f64, [f64; 3]);
 type ReplayObserver<'a> = dyn Fn(f64, usize, f64) -> bool + Sync + 'a;
-struct ReplayTree<'a> {
+type ReplayDetail<'a> = dyn Fn(&Model<'_>, &[usize]) + Sync + 'a;
+struct ReplayTree<'a,const SECTIONS:bool> {
     chart: &'a Chart,
     events: &'a [Vec<(usize, i32)>],
     chronological: Vec<usize>,
@@ -2087,8 +2127,9 @@ struct ReplayTree<'a> {
     upper: &'a [f64],
     multiplicities: &'a [usize],
     stopped: AtomicBool,
+    detail: Option<&'a ReplayDetail<'a>>,
 }
-impl ReplayTree<'_> {
+impl<const SECTIONS:bool> ReplayTree<'_,SECTIONS> {
     fn advance(&self, model: &mut Model<'_>, from: usize, to: usize) -> Result<(), String> {
         for k in from..to {
             if self.generation != crate::cancellation_generation() {
@@ -2096,6 +2137,7 @@ impl ReplayTree<'_> {
             }
             let frame = &self.chart.play.frames[k];
             model.frame(frame.time_ms, &frame.judged, self.chart.play.dt[k])?;
+            if SECTIONS { if let Some(trace)=&mut model.just_window {trace.record_probe(k);} }
         }
         Ok(())
     }
@@ -2126,6 +2168,7 @@ impl ReplayTree<'_> {
         });
         self.advance(&mut model, from, until)?;
         if until == self.chart.play.frames.len() {
+            if let Some(detail) = self.detail { detail(&model, orders); }
             let mut ranges = [0.0; 3];
             if let Some(g) = &model.gk {
                 for (score, state) in ranges.iter_mut().zip(&g.controller.states) {
@@ -2200,20 +2243,13 @@ pub(crate) fn replay_orders_with_cutoff(
     replay_orders_observed(master, chart, deck, seeds, power, Some(observe))
 }
 
-fn replay_orders_observed(
-    master: &Master,
-    chart: &Chart,
-    deck: &[Performer],
-    seeds: &[i32],
-    power: i32,
-    observe: Option<&(dyn Fn(f64, usize) -> bool + Sync)>,
-) -> Result<Option<ReplayedScores>, String> {
-    if deck.len() != 5 {
-        return Err("a team requires five performers".into());
-    }
-    if chart.luck && seeds.is_empty() {
-        return Err("full Gekisou replay requires explicit lottery seeds".into());
-    }
+pub(crate) fn replay_random(master:&Master,chart:&Chart,deck:&[Performer])->bool {
+    chart.luck || replay_random_skills(master,chart,deck)
+}
+pub(crate) fn replay_random_skills(master:&Master,chart:&Chart,deck:&[Performer])->bool {
+    replay_condition(master,chart,deck,4011)
+}
+pub(crate) fn replay_condition(master:&Master,chart:&Chart,deck:&[Performer],kind:i32)->bool {
     let random_row = |rows: &[crate::master::SkillEffect], level: i32| {
         rows.iter().filter(|r| r.level == level).any(|row| {
             [
@@ -2224,11 +2260,10 @@ fn replay_orders_observed(
             ]
             .iter()
             .flat_map(|g| master.condition_sets.get(g).into_iter().flatten().flatten())
-            .any(|id| master.conditions[id].kind == 4011)
+            .any(|id| master.conditions[id].kind == kind)
         })
     };
-    let random = chart.luck
-        || deck.iter().any(|p| {
+    deck.iter().any(|p| {
             p.live_skill.is_some_and(|(id, level)| {
                 master
                     .live_skills
@@ -2256,7 +2291,23 @@ fn replay_orders_observed(
                     })
                     .is_some_and(|s| random_row(&s.effects, level))
             })
-        });
+        })
+}
+fn replay_orders_observed(
+    master: &Master,
+    chart: &Chart,
+    deck: &[Performer],
+    seeds: &[i32],
+    power: i32,
+    observe: Option<&(dyn Fn(f64, usize) -> bool + Sync)>,
+) -> Result<Option<ReplayedScores>, String> {
+    if deck.len() != 5 {
+        return Err("a team requires five performers".into());
+    }
+    if chart.luck && seeds.is_empty() {
+        return Err("full Gekisou replay requires explicit lottery seeds".into());
+    }
+    let random=replay_random(master,chart,deck);
     let runs = if seeds.is_empty() || !random {
         vec![seeds.first().copied().unwrap_or(0)]
     } else {
@@ -2376,7 +2427,7 @@ fn replay_selected_orders(
     for &index in &indices {
         multiplicities[index] += 1;
     }
-    let tree = ReplayTree {
+    let tree = ReplayTree::<false> {
         chart,
         events: &event_orders,
         chronological,
@@ -2385,6 +2436,7 @@ fn replay_selected_orders(
         upper: &upper,
         multiplicities: &multiplicities,
         stopped: AtomicBool::new(false),
+        detail: None,
     };
     #[cfg(target_arch = "wasm32")]
     let jobs = vec![(0..event_orders.len()).collect::<Vec<_>>()];

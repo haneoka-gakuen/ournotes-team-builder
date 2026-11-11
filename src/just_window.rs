@@ -41,6 +41,8 @@ pub(crate) fn delta(master: &Master, value: i32) -> i32 {
 pub(crate) struct Trace {
     pub current: HashMap<i32, (i32, i32)>,
     active: HashMap<Key, Vec<(i32, i32, i32)>>,
+    probes: Option<Arc<HashMap<usize,Vec<i32>>>>,
+    pub(crate) minimum: Option<[i32;2]>,
 }
 impl Trace {
     pub(crate) fn new(master: &Master) -> Self {
@@ -52,6 +54,17 @@ impl Trace {
                 .map(|(&key, &value)| (key, value))
                 .collect(),
             active: HashMap::default(),
+            probes:None,
+            minimum:None,
+        }
+    }
+    pub(crate) fn record_probe(&mut self,frame:usize) {
+        if let Some(kinds)=self.probes.as_ref().and_then(|probes|probes.get(&frame)) {
+            for kind in kinds {
+                if let Some(&(before,after))=self.current.get(kind) {
+                    let value=self.minimum.get_or_insert([before,after]);value[0]=value[0].min(before);value[1]=value[1].min(after);
+                }
+            }
         }
     }
     pub(crate) fn enable(&mut self, master: &Master, key: Key, value: i32, targets: &[i32]) {
@@ -157,6 +170,14 @@ pub(crate) struct Prepared {
     force_model: bool,
     nominal: bool,
     dominance_safe: bool,
+}
+impl Prepared {
+    pub(crate) fn capture_trace(&self,master:&Master)->Trace {
+        let mut trace=Trace::new(master);
+        let mut probes:HashMap<usize,Vec<i32>>=HashMap::default();
+        for probe in &self.probes {probes.entry(probe.frame).or_default().push(probe.kind);}
+        trace.probes=Some(Arc::new(probes));trace
+    }
 }
 
 struct Assignment {

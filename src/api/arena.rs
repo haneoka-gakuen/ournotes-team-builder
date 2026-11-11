@@ -6,6 +6,7 @@ impl Engine {
     fn call_view(&self, master: Master) -> Engine {
         let mut scoped = Engine::from_master(master);
         scoped.trusted_scores = self.trusted_scores;
+        scoped.section_scenes=self.section_scenes.clone();
         #[cfg(not(target_arch = "wasm32"))]
         {
             scoped.worker_budget = self.worker_budget;
@@ -58,6 +59,7 @@ impl Engine {
             }
         }
         let mut scoped_input = input.clone();
+        if rule["objective"]=="sections" {scoped_input["request"]["sectionArena"]=rule.clone();}
         let members: Vec<_> = master::rows(&request["members"])
             .into_iter()
             .filter(|row| {
@@ -139,6 +141,9 @@ impl Engine {
         started: f64,
         now: &dyn Fn() -> f64,
     ) -> Result<Value, String> {
+        if input["request"]["goal"]["arena"]["objective"] == "sections" {
+            return self.run_arena_sections(input, started, now);
+        }
         let arena = input["request"]["goal"]["arena"].is_object();
         let (mut scoped, scoped_input, songs, sources) = if arena {
             self.arena_view(input)?
@@ -290,6 +295,7 @@ impl Engine {
                 && master::number(&request["k"], 1.0) == 1.0,
             floor,
             on_candidate: Some(&mut publish),
+            sections: None,
         })?;
         let hits: Vec<_> = output
             .hits
@@ -329,6 +335,10 @@ pub(super) fn arena_hit(
             let mut row = hit_json(&child, &songs[i], members, snaps, Some(&compiled[i]), true);
             row["comboBonus"] = child.detail["comboBonus"].clone();
             row["score"]["rangeScores"] = child.detail["scores"]["rangeScores"].clone();
+            if !child.detail["sectionPerformance"].is_null() {
+                row["sectionSummary"] = child.detail["sectionPerformance"].clone();
+                row["score"]["rangeScores"] = child.detail["sectionPerformance"]["rangeScores"].clone();
+            }
             row
         })
         .collect();
@@ -355,7 +365,11 @@ pub(super) fn arena_hit(
             .sum::<f64>()
             / count)
         .collect::<Vec<_>>());
-    row["score"] = json!({"mean":hit.key,"min":avg("min"),"max":avg("max"),"median":avg("median"),"orders":[],"ranks":{},"bestOrder":[],"worstOrder":[]});
+    row["score"] = json!({"mean":avg("mean"),"min":avg("min"),"max":avg("max"),"median":avg("median"),"orders":[],"ranks":{},"bestOrder":[],"worstOrder":[]});
+    if !hit.detail["sectionPerformance"].is_null() {
+        row["sectionPerformance"] = hit.detail["sectionPerformance"].clone();
+        row["sectionRanking"] = hit.detail["sectionTie"].clone();
+    }
     row["aggregate"] = json!({"kind":"mean","songs":parts});
     row
 }

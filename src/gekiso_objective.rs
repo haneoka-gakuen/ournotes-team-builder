@@ -1,5 +1,6 @@
 //! Gekiso context caches and safe level/support bounds for exact search.
 mod shared;
+pub(crate) mod sections;
 use crate::{
     full::conditions::Performer,
     gekiso::{self, Chart, Context},
@@ -10628,7 +10629,7 @@ fn ranked(hits: &[Hit], k: usize) -> Vec<Hit> {
     hits
 }
 pub(crate) fn compare_score_hits(a: &Hit, b: &Hit) -> std::cmp::Ordering {
-    a.key.total_cmp(&b.key).then_with(|| {
+    a.key.total_cmp(&b.key).then_with(|| sections::tie(&a.detail, &b.detail)).then_with(|| {
         a.detail["scores"]["mean"]
             .as_f64()
             .unwrap_or(f64::NEG_INFINITY)

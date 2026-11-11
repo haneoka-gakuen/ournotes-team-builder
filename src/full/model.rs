@@ -382,6 +382,7 @@ pub struct GekisoLive {
     previous_lots: Vec<i32>,
     previous_lot_ms: i32,
     pub rank_bonus: Vec<RankBonus>,
+    pub(crate) section_opponents: Option<Arc<Vec<[crate::gekiso::sections::Standing; 3]>>>,
 }
 #[derive(Clone)]
 pub struct Model<'a> {
@@ -528,6 +529,7 @@ impl<'a> Model<'a> {
                 previous_lots: Vec::new(),
                 previous_lot_ms: 0,
                 rank_bonus: Vec::new(),
+                section_opponents: None,
                 ranks: setup
                     .ranks
                     .iter()
@@ -921,6 +923,12 @@ impl<'a> Model<'a> {
         ConditionIndices { selected, all: 0..self.condition.len() }
     }
     pub fn frame(&mut self, time: i32, judged: &[JudgedNote], dt: f64) -> Result<(), String> {
+        self.frame_inner::<false>(time,judged,dt)
+    }
+    pub(crate) fn count_frame(&mut self,time:i32,judged:&[JudgedNote],dt:f64)->Result<(),String> {
+        self.frame_inner::<true>(time,judged,dt)
+    }
+    fn frame_inner<const COUNTS_ONLY:bool>(&mut self, time: i32, judged: &[JudgedNote], dt: f64) -> Result<(), String> {
         self.frame_time = time;
         self.frame_rank = self.previous_rank.take();
         if let Some(g) = &mut self.gk {
@@ -992,7 +1000,7 @@ impl<'a> Model<'a> {
         for (n, converted) in &self.results {
             self.life.note_damage(n.time_ms, *converted as usize);
             let life = self.life.at(n.time_ms);
-            if self.master.live.note_percent.contains_key(&n.op) {
+            if !COUNTS_ONLY && self.master.live.note_percent.contains_key(&n.op) {
                 let j = converted + 1;
                 let score_type = if (0..9).contains(&j) {
                     [0, 0, 6, 5, 4, 3, 2, 1, 0][j as usize]
@@ -1004,13 +1012,13 @@ impl<'a> Model<'a> {
                     .add_note(n.time_ms, life, n.id, n.op, score_type);
             }
         }
-        self.score.score.calculate(
+        if !COUNTS_ONLY {self.score.score.calculate(
             time,
             &self.combo,
             self.gk
                 .as_ref()
                 .map(|g| &g.controller as &dyn score::GekisoCombo),
-        )?;
+        )?;}
         let input = FrameInput {
             time,
             music_length: self.params.music_length,
@@ -1207,22 +1215,22 @@ impl<'a> Model<'a> {
         self.enabled
             .retain(|&index| self.live[index].parent != effects::STAY);
         self.life.sync(time);
-        self.score.score.calculate(
+        if !COUNTS_ONLY {self.score.score.calculate(
             time,
             &self.combo,
             self.gk
                 .as_ref()
                 .map(|g| &g.controller as &dyn score::GekisoCombo),
-        )?;
+        )?;}
         if self.gk.is_some() {
-            self.after(time)?;
+            self.after::<COUNTS_ONLY>(time)?;
         }
         if self.record_trace {
             self.trace.push((time, self.score.score.score));
         }
         Ok(())
     }
-    fn after(&mut self, time: i32) -> Result<(), String> {
+    fn after<const COUNTS_ONLY:bool>(&mut self, time: i32) -> Result<(), String> {
         let g = self.gk.as_mut().unwrap();
         self.gk_judged.clear();
         self.gk_judged.extend(
@@ -1270,19 +1278,24 @@ impl<'a> Model<'a> {
             return Ok(());
         };
         let range = &g.controller.ranges[index];
-        let s0 = self
+        let s0 = if COUNTS_ONLY {0}else{self
             .score
             .score
-            .calculate(range.start, &self.combo, Some(&g.controller))?;
-        let s1 = self
+            .calculate(range.start, &self.combo, Some(&g.controller))?};
+        let s1 = if COUNTS_ONLY {0}else{self
             .score
             .score
-            .calculate(range.end, &self.combo, Some(&g.controller))?;
+            .calculate(range.end, &self.combo, Some(&g.controller))?};
         g.controller.states[index].start_score = s0;
         g.controller.states[index].end_score = s1;
         if index < g.factors.len() {
             let own = g.controller.states[index].score();
-            let rank = g.ranks.get(index).copied().unwrap_or(1);
+            let rank = if let Some(opponents) = &g.section_opponents {
+                let own = crate::gekiso::sections::Standing::from_state(
+                    &g.controller.states[index], g.controller.ranges[index].mission,
+                );
+                1 + opponents.iter().filter(|opponent| opponent[index].beats(&own)).count().min(4) as i32
+            } else { g.ranks.get(index).copied().unwrap_or(1) };
             let percent = g.factors[index][rank as usize - 1];
             let product = own as i64 * percent as i64;
             let bonus = crate::num::i32((product as f64 / 100.0).trunc());
