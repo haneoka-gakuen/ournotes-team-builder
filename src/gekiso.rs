@@ -54,6 +54,7 @@ pub struct Chart {
     pub combo_factor: Vec<f64>,
     pub judge_frac: [f64; 7],
     pub span: (usize, usize),
+    pub(crate) delivery_radius_ms: i32,
     pub(crate) deterministic_ranges: OnceLock<Option<Vec<(i32, i32)>>>,
     pub(crate) factor_operations: OnceLock<usize>,
     curves: HashMap<Vec<u64>, Arc<Recorded>>,
@@ -113,6 +114,7 @@ impl Context {
             .sum::<usize>();
         if let Some(trace) = &self.rush_trace {
             bytes += trace.capacity() * std::mem::size_of::<ReplayCommand>();
+            bytes += trace.iter().map(|command| match command { ReplayCommand::Input(notes) => notes.capacity() * std::mem::size_of::<crate::full::play::JudgedNote>(), _ => 0 }).sum::<usize>();
         }
         if let Some(nominal) = &self.nominal {
             bytes += std::mem::size_of::<Nominal>()
@@ -212,6 +214,7 @@ impl Chart {
             self.setup.ranks.clone(),
         )?;
         chart.music_type = self.music_type;
+        chart.delivery_radius_ms = chart.delivery_radius_ms.max(self.delivery_radius_ms);
         Ok(chart)
     }
     fn from_full(
@@ -309,6 +312,9 @@ impl Chart {
         let luck = setup.missions.iter().take(ranges.len()).any(|&m| m == 2);
         let difficulty_factor = f(f(f(crate::num::i32(full.level - 5.0) as f64) * f(0.005)) + 1.0);
         let music_length = full.last_timing + 1000;
+        let delivery_radius_ms = play.frames.iter().flat_map(|frame| frame.judged.iter().map(move |judged| (frame.time_ms, judged.note_id)))
+            .map(|(time,id)| (i64::from(time)-i64::from(full.notes[(id-1) as usize].time_ms)).abs().min(i64::from(i32::MAX)) as i32)
+            .max().unwrap_or(0);
         Ok(Self {
             factored:Mutex::new(factored::Cache::default()),
             music_type: 0,
@@ -328,6 +334,7 @@ impl Chart {
             combo_factor,
             judge_frac,
             span,
+            delivery_radius_ms,
             deterministic_ranges: OnceLock::new(),
             factor_operations: OnceLock::new(),
             curves: HashMap::default(),
@@ -378,6 +385,7 @@ impl Chart {
             combo_factor: self.combo_factor.clone(),
             judge_frac: self.judge_frac,
             span: self.span,
+            delivery_radius_ms: self.delivery_radius_ms,
             deterministic_ranges: self.deterministic_ranges.clone(),
             factor_operations: self.factor_operations.clone(),
             curves: HashMap::default(),
@@ -867,6 +875,7 @@ impl RushSupportPlan {
                         });
                     }
                 }
+                ReplayCommand::Input(_) | ReplayCommand::Ordinary(_, _) | ReplayCommand::Rank(_, _, _) => {}
             }
         }
         let mut result = Context {
@@ -1033,7 +1042,7 @@ fn context_fixed_observed<'a>(
         .map(|(i, n)| (n.id, i))
         .collect();
     let mut factor_commands = 0;
-    let whole=uses_full_replay(master,chart,seeds);
+    let whole=uses_full_replay(master,chart,seeds)||template.is_some_and(|model|model.live_life.is_some());
     let mut life=whole.then(||vec![master.live.life_base as i32;n]);
     let mut live_life=whole.then(||vec![master.live.life_base as i32;chart.full.events.len()]);
     let mut factor_peak = 0.0_f64;
@@ -1100,7 +1109,7 @@ fn context_fixed_observed<'a>(
                 rush_support[i] |= at > 0 && states[at - 1].1 > 0;
             }
         }
-        if trace_rush {
+        if trace_rush || model.score.score.factored_record {
             rush_trace = model.score.score.replay.take().map(compact_replay);
         }
         rush_changes += model.score.score.rush_factor_changes();
@@ -1701,20 +1710,6 @@ pub fn score_orders(
 ) -> Result<Scores, String> {
     score_orders_selected(master, chart, ctx, power, slots, settle, None, None)
 }
-fn independent_orders(master:&Master,chart:&Chart,ctx:&Context,power:i32,slots:&[Slot])->Result<Option<ReplayedScores>,String> {
-    let draws:Vec<_>=if ctx.draws.is_empty(){vec![ctx]}else{ctx.draws.iter().map(Arc::as_ref).collect()};
-    let mut scores=vec![0.0;120];let mut ranges=[[0.0;3];120];
-    for draw in &draws {
-        if draw.gk.iter().any(|value|!value.is_finite()||*value<0.0)||draw.up.iter().zip(&draw.luck).any(|(up,luck)|up!=luck||!luck.is_finite()||*luck<=0.0) {return Ok(None);}
-        if slots.iter().any(|slot|slot.effects.iter().any(|effect|effect.gate.kind!=0))&&draw.live_life.is_none(){return Ok(None);}
-        let mut current=[[0.0;3];120];
-        let result=score_orders_selected(master,chart,draw,power,slots,true,None,Some(&mut current))?;
-        if result.scores.iter().any(|score|!score.is_finite()||*score<0.0||*score>=i32::MAX as f64) {return Ok(None);}
-        for order in 0..120 {scores[order]+=result.scores[order];for range in 0..3 {ranges[order][range]+=current[order][range];}}
-    }
-    for order in 0..120 {scores[order]/=draws.len() as f64;for value in &mut ranges[order] {*value/=draws.len() as f64;}}
-    Ok(Some(ReplayedScores{scores:live::summarize(power,scores),range_scores:std::array::from_fn(|range|ranges.iter().map(|row|row[range]).sum::<f64>()/120.0)}))
-}
 #[allow(clippy::too_many_arguments)]
 fn score_orders_selected(
     master: &Master,
@@ -1814,7 +1809,7 @@ fn score_orders_selected(
             .any(|e| e.gate.kind != 0));
     let mut life_cache = HashMap::<[i32; 5], (Vec<i32>, Vec<i32>)>::default();
     for &order_index in &plan.representatives {
-        if selected.is_some_and(|orders| !orders.contains(&order_index)) {
+        if selected.is_some_and(|orders| !orders.iter().any(|&order|plan.sources[order]==order_index)) {
             continue;
         }
         if generation != crate::cancellation_generation() {
@@ -2360,15 +2355,11 @@ fn replay_orders_observed(
     power: i32,
     observe: Option<&(dyn Fn(f64, usize) -> bool + Sync)>,
 ) -> Result<Option<ReplayedScores>, String> {
-    if observe.is_none() {
-        if let Some(scores)=factored::scores(master,chart,deck,seeds,power)? {
-            #[cfg(debug_assertions)] {
-                let full=replay_orders_original(master,chart,deck,seeds,power,None)?.unwrap();
-                debug_assert_eq!(scores.scores.scores,full.scores.scores,"factored ordinary orders");
-                debug_assert_eq!(scores.range_scores,full.range_scores,"factored section scores");
-            }
-            return Ok(Some(scores));
+    if let Some(scores)=factored::scores(master,chart,deck,seeds,power)? {
+        if let Some(observe)=observe {
+            for &score in &scores.scores.scores {if !observe(score,1) {return Ok(None);}}
         }
+        return Ok(Some(scores));
     }
     replay_orders_original(master,chart,deck,seeds,power,observe)
 }
@@ -2409,6 +2400,9 @@ pub(crate) fn replay_bounded_mean(
     ceilings: &[f64],
     cutoff: crate::search::Cutoff,
 ) -> Result<Option<ReplayedScores>, String> {
+    if let Some(scores)=factored::scores(master,chart,deck,&[0],power)? {
+        return Ok((scores.scores.mean>cutoff.key || !cutoff.prune_equal && scores.scores.mean==cutoff.key).then_some(scores));
+    }
     let remaining = ceilings.iter().fold(0.0_f64, |sum, &value| (sum + value).next_up());
     let state = std::sync::Mutex::new((remaining, 0.0_f64));
     let observe = |score: f64, count: usize, upper: f64| {

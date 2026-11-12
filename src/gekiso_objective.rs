@@ -10827,13 +10827,373 @@ fn seed_key(env: &Environment<'_>, criterion: Criterion, k: usize, seeds: &[i32]
     ])
     .to_string()
 }
+struct ReplayGradeCeiling {
+    grades: Vec<usize>,
+    counters: Option<HashMap<i32, i32>>,
+}
+fn replay_grade_ceiling(
+    master: &Master,
+    chart: &Chart,
+    members: &[Member],
+    snaps: &[Snap],
+) -> Option<ReplayGradeCeiling> {
+    if !chart.setup.missions.iter().all(|&mission| mission == 3) {
+        return None;
+    }
+    let mut conversions = Vec::new();
+    let mut ordinary = Vec::new();
+    let mut gk = Vec::new();
+    for member in members {
+        ordinary.extend(
+            master
+                .live_skills
+                .get(&member.card.live_skill_id)?
+                .iter()
+                .filter(|row| row.level == member.growth.live_skill_level),
+        );
+        if let Some(skill) = master
+            .gekiso_skills
+            .get(&member.card.gekiso_skill_id)
+            .filter(|skill| matches!(skill.mission_type, 3 | 4))
+        {
+            gk.extend(
+                skill
+                    .effects
+                    .iter()
+                    .filter(|row| row.level == member.growth.gekiso_skill_level),
+            );
+        }
+    }
+    for snap in snaps {
+        for (id, level) in snap
+            .card
+            .support_skills
+            .into_iter()
+            .zip(snap.skill_levels)
+            .filter(|&(id, _)| id != 0)
+        {
+            ordinary.extend(
+                master
+                    .support_skills
+                    .get(&id)?
+                    .iter()
+                    .filter(|row| row.level == level),
+            );
+        }
+        for (id, level) in snap
+            .card
+            .gekiso_support_skills
+            .into_iter()
+            .zip(snap.gekiso_skill_levels)
+            .filter(|&(id, _)| id != 0)
+        {
+            if let Some(skill) = master
+                .gekiso_support_skills
+                .get(&id)
+                .filter(|skill| matches!(skill.mission_type, 3 | 4))
+            {
+                gk.extend(skill.effects.iter().filter(|row| row.level == level));
+            }
+        }
+    }
+    if ordinary
+        .iter()
+        .any(|row| !matches!(row.kind, 2000 | 2001 | 2004 | 3000 | 3001 | 12006 | 15000))
+        || gk.iter().any(|row| {
+            !matches!(
+                row.kind,
+                2000 | 2001 | 3004 | 4004 | 12006 | 13000 | 13002 | 13003 | 13004 | 13005
+            )
+        })
+    {
+        return None;
+    }
+    let mut conversion_targets = HashMap::<i32, Vec<usize>>::default();
+    for row in ordinary.iter().chain(&gk).copied().filter(|row| matches!(row.kind, 12006 | 13005)) {
+        let targets = conversion_targets.entry(row.id).or_default();
+        for id in &row.targets {
+            let grade = master.targets.get(id)?.judgement as usize;
+            if !targets.contains(&grade) { targets.push(grade); }
+        }
+    }
+    for row in ordinary
+        .iter()
+        .chain(&gk)
+        .copied()
+        .filter(|row| row.kind == 12006)
+    {
+        if (1..=6).contains(&row.value) {
+            for &grade in &conversion_targets[&row.id] {
+                conversions.push((grade, row.value as usize));
+            }
+        }
+    }
+    let raw_counters = chart
+        .judge_frac
+        .windows(2)
+        .all(|values| values[0] <= values[1])
+        && ordinary.iter().chain(&gk).all(|row| {
+            row.kind != 12006
+                || row.value != 6
+                    && !(row.value == 5
+                        && conversion_targets[&row.id].contains(&6))
+        })
+        && gk.iter().all(|row| {
+            if row.kind == 13005 {
+                return row.targets.iter().any(|id| master.targets[id].judgement == 5)
+                    && row.targets.iter().all(|id| (1..=5).contains(&master.targets[id].judgement));
+            }
+            if row.kind == 2001 {
+                return master
+                    .cumulative
+                    .get(&row.cumulative_id)
+                    .is_some_and(|counter| {
+                        counter.kind == 1000
+                            && !counter.targets.is_empty()
+                            && counter
+                                .targets
+                                .iter()
+                                .all(|id| master.targets[id].judgement == 6)
+                    });
+            }
+            true
+        });
+    let grade_ceiling = |grade: usize| {
+        conversions.iter().filter(|&&(from, _)| from == grade)
+            .map(|&(_, to)| to).chain(std::iter::once(grade))
+            .max_by(|&a, &b| chart.judge_frac[a].total_cmp(&chart.judge_frac[b]).then(a.cmp(&b)))
+            .unwrap()
+    };
+    let counters = raw_counters.then(|| chart.play.frames.iter().flat_map(|frame| &frame.judged)
+        .map(|note| (note.note_id, grade_ceiling(note.judgement as usize) as i32))
+        .collect());
+    Some(ReplayGradeCeiling {
+        grades: chart
+            .notes
+            .iter()
+            .zip(&chart.judgements)
+            .map(|(note, &grade)| {
+                conversions
+                    .iter()
+                    .filter(|&&(from, to)| {
+                        from == grade
+                            && (to != 6 || master.live.just_types.contains(&note.judgement_type))
+                    })
+                    .map(|&(_, to)| to)
+                    .chain(std::iter::once(grade))
+                    .max_by(|&a, &b| {
+                        chart.judge_frac[a]
+                            .total_cmp(&chart.judge_frac[b])
+                            .then(a.cmp(&b))
+                    })
+                    .unwrap()
+            })
+            .collect(),
+        counters,
+    })
+}
+fn replay_combo_ceiling(
+    master: &Master,
+    chart: &Chart,
+    members: &[Member],
+    snaps: &[Snap],
+) -> Vec<f64> {
+    let total = chart
+        .play
+        .frames
+        .iter()
+        .map(|frame| frame.judged.len())
+        .sum::<usize>();
+    let mut multiplicities = HashMap::default();
+    for &(event, _) in &chart.full.events {
+        *multiplicities.entry(event).or_insert(0usize) += 1;
+    }
+    let activations = multiplicities.values().copied().max().unwrap_or(0);
+    let possible = |group: i32, actor: &Performer| {
+        group == 0
+            || master.condition_sets.get(&group).is_none_or(|sets| {
+                sets.iter().any(|set| {
+                    set.iter().all(|id| {
+                        let c = &master.conditions[id];
+                        c.kind != 5000
+                            || c.targets.iter().any(|id| {
+                                crate::full::conditions::performer_matches(
+                                    actor,
+                                    &master.targets[id],
+                                )
+                            }) == c.positive
+                    })
+                })
+            })
+    };
+    let quota = |row: &SkillEffect, actor: &Performer, live: bool| -> usize {
+        if !matches!(row.kind, 12006 | 13005)
+            || row.kind == 12006 && !(3..=6).contains(&row.value)
+            || !row
+                .targets
+                .iter()
+                .any(|id| matches!(master.targets[id].judgement, 1 | 2))
+            || !possible(row.condition_group, actor)
+            || !live && !possible(row.trigger_group, actor)
+        {
+            return 0;
+        }
+        if row.limit_count <= 0 {
+            return total;
+        }
+        let mut executions = if live { activations } else { total };
+        if !live && row.trigger_type == 1 {
+            if row.execute_limit > 0 && row.reset_group == 0 {
+                executions = executions.min(row.execute_limit as usize);
+            }
+            let triggered = master
+                .condition_sets
+                .get(&row.trigger_group)
+                .is_some_and(|sets| {
+                    !sets.is_empty()
+                        && sets.iter().all(|set| {
+                            set.iter().any(|id| {
+                                let c = &master.conditions[id];
+                                c.positive && matches!(c.kind, 4010 | 5020)
+                            })
+                        })
+                });
+            if triggered {
+                executions = executions.min(activations);
+            }
+        }
+        executions
+            .saturating_mul(row.limit_count as usize)
+            .min(total)
+    };
+    let mut member_budgets: Vec<_> = members
+        .iter()
+        .map(|member| {
+            let actor = Performer::from_member(master, member, None);
+            let live = master
+                .live_skills
+                .get(&member.card.live_skill_id)
+                .into_iter()
+                .flatten()
+                .filter(|row| row.level == member.growth.live_skill_level)
+                .map(|row| quota(row, &actor, true));
+            let gk = master
+                .gekiso_skills
+                .get(&member.card.gekiso_skill_id)
+                .filter(|skill| {
+                    skill.mission_type == 4 || chart.setup.missions.contains(&skill.mission_type)
+                })
+                .into_iter()
+                .flat_map(|skill| &skill.effects)
+                .filter(|row| row.level == member.growth.gekiso_skill_level)
+                .map(|row| quota(row, &actor, false));
+            live.chain(gk)
+                .fold(0usize, |sum, value| sum.saturating_add(value).min(total))
+        })
+        .collect();
+    let mut snap_budgets: Vec<_> = snaps
+        .iter()
+        .map(|snap| {
+            members
+                .iter()
+                .map(|member| {
+                    let actor = Performer::from_member(master, member, Some(snap));
+                    let live = snap
+                        .card
+                        .support_skills
+                        .into_iter()
+                        .zip(snap.skill_levels)
+                        .flat_map(|(id, level)| {
+                            master
+                                .support_skills
+                                .get(&id)
+                                .into_iter()
+                                .flatten()
+                                .filter(move |row| row.level == level)
+                        })
+                        .map(|row| quota(row, &actor, false));
+                    let gk = snap
+                        .card
+                        .gekiso_support_skills
+                        .into_iter()
+                        .zip(snap.gekiso_skill_levels)
+                        .flat_map(|(id, level)| {
+                            master
+                                .gekiso_support_skills
+                                .get(&id)
+                                .filter(|skill| {
+                                    skill.mission_type == 4
+                                        || chart.setup.missions.contains(&skill.mission_type)
+                                })
+                                .into_iter()
+                                .flat_map(|skill| &skill.effects)
+                                .filter(move |row| row.level == level)
+                        })
+                        .map(|row| quota(row, &actor, false));
+                    live.chain(gk)
+                        .fold(0usize, |sum, value| sum.saturating_add(value).min(total))
+                })
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+    member_budgets.sort_unstable_by(|a, b| b.cmp(a));
+    snap_budgets.sort_unstable_by(|a, b| b.cmp(a));
+    let budget = member_budgets
+        .into_iter()
+        .take(5)
+        .chain(snap_budgets.into_iter().take(5))
+        .fold(0usize, |sum, value| sum.saturating_add(value).min(total));
+    let mut times = Vec::new();
+    let mut breaks = Vec::new();
+    let mut delivery = vec![0usize; chart.full.notes.len() + 1];
+    for (index, frame) in chart.play.frames.iter().enumerate() {
+        for note in &frame.judged {
+            times.push(note.time_ms);
+            delivery[note.note_id as usize] = index;
+            if matches!(note.judgement, 1 | 2) {
+                breaks.push((note.time_ms, index));
+            }
+        }
+    }
+    times.sort_unstable();
+    breaks.sort_unstable();
+    chart
+        .notes
+        .iter()
+        .map(|note| {
+            let before = times.partition_point(|&time| time < note.time_ms);
+            let last = breaks
+                .iter()
+                .rev()
+                .filter(|&&(time, frame)| {
+                    time < note.time_ms && frame <= delivery[note.id as usize]
+                })
+                .nth(budget);
+            let count = last.map_or(before, |&(time, _)| {
+                before - times.partition_point(|&at| at < time)
+            });
+            let value = master
+                .live
+                .combo
+                .get(&0)
+                .into_iter()
+                .flatten()
+                .filter(|&&(required, _)| required <= count)
+                .map(|&(_, value)| value)
+                .fold(0.0_f64, f64::max)
+                .min(1.0);
+            crate::num::f(value + 1.0)
+        })
+        .collect()
+}
 fn replay_bound(
     master: &Master,
     chart: &Chart,
     members: &[Member],
     snaps: &[Snap],
 ) -> Result<Option<crate::rewards::DeterministicBound>, String> {
-    if chart.luck {
+    if !(0.0..=1.0).contains(&master.live.life_onus) {
         return Ok(None);
     }
     // Remove LIFE gates only in the upper model; exact settlement keeps them.
@@ -10853,7 +11213,7 @@ fn replay_bound(
                                     master
                                         .conditions
                                         .get(id)
-                                        .is_none_or(|c| c.kind != 2000 && c.kind != 2001)
+                                        .is_none_or(|c| !(2000..=2003).contains(&c.kind))
                                 })
                                 .collect()
                         })
@@ -10862,13 +11222,158 @@ fn replay_bound(
             })
             .collect(),
     );
-    let optimistic = chart.all_just(&relaxed)?;
+    let mut optimistic = chart.all_just(&relaxed)?;
+    optimistic.combo_factor = replay_combo_ceiling(master, chart, members, snaps);
+    if chart.luck {
+        let best = (1..=6)
+            .max_by(|&a, &b| {
+                chart.judge_frac[a]
+                    .total_cmp(&chart.judge_frac[b])
+                    .then(a.cmp(&b))
+            })
+            .unwrap();
+        optimistic.judgements.fill(best);
+        for frame in &mut optimistic.play.frames {
+            for note in &mut frame.judged {
+                note.judgement = 6;
+            }
+        }
+        return Ok(crate::rewards::DeterministicBound::with_luck_cap(
+            &relaxed,
+            &optimistic,
+            members,
+            snaps,
+            crate::rewards::maximum_combo(&relaxed, members, &chart.setup.missions),
+            None,
+            None,
+        ));
+    }
+    if let Some(ReplayGradeCeiling { grades, counters }) = replay_grade_ceiling(master, chart, members, snaps) {
+        // Conversion quotas already bound the longest attainable normal combo.
+        if let Some(counters) = counters {
+            for frame in &mut optimistic.play.frames {
+                for note in &mut frame.judged {
+                    note.judgement = counters[&note.note_id];
+                }
+            }
+        }
+        optimistic.judgements = grades;
+    }
     Ok(crate::rewards::DeterministicBound::new(
         &relaxed,
         &optimistic,
         members,
         snaps,
     ))
+}
+fn replay_support_key(master: &Master, actor: &Performer, global_converters: &HashSet<i32>) -> Option<Vec<u64>> {
+    if actor.support_skills.len() > 1 {
+        return None;
+    }
+    let mut protected = Vec::new();
+    if let Some((id, level)) = actor.live_skill {
+        protected.extend(
+            master
+                .live_skills
+                .get(&id)?
+                .iter()
+                .filter(|row| row.level == level)
+                .map(|row| row.id),
+        );
+    }
+    if let Some((id, level)) = actor.gekisou_skill {
+        protected.extend(
+            master
+                .gekiso_skills
+                .get(&id)?
+                .effects
+                .iter()
+                .filter(|row| row.level == level)
+                .map(|row| row.id),
+        );
+    }
+    for &(id, level) in &actor.gekisou_support_skills {
+        protected.extend(
+            master
+                .gekiso_support_skills
+                .get(&id)?
+                .effects
+                .iter()
+                .filter(|row| row.level == level)
+                .map(|row| row.id),
+        );
+    }
+    let mut key = Vec::new();
+    for &(id, level) in &actor.support_skills {
+        let mut rows: Vec<_> = master
+            .support_skills
+            .get(&id)?
+            .iter()
+            .filter(|row| row.level == level)
+            .collect();
+        rows.sort_by_key(|row| row.id);
+        for row in rows {
+            if !matches!(row.kind, 15000 | 12006 | 3000 | 3001) || row.cumulative_id != 0 {
+                return None;
+            }
+            for group in [row.trigger_group, row.release_group, row.reset_group] {
+                if group == 0 {
+                    continue;
+                }
+                if !master
+                    .condition_sets
+                    .get(&group)?
+                    .iter()
+                    .flatten()
+                    .all(|id| {
+                        let condition = &master.conditions[id];
+                        matches!(condition.kind, 4010 | 5020 | 5000) && condition.positive
+                    })
+                {
+                    return None;
+                }
+            }
+            if row.condition_group != 0 {
+                let mut enabled = false;
+                for set in master.condition_sets.get(&row.condition_group)? {
+                    let mut matched = true;
+                    for id in set {
+                        let condition = &master.conditions[id];
+                        if condition.kind != 5000 {
+                            return None;
+                        }
+                        matched &= condition.targets.iter().any(|id| {
+                            crate::full::conditions::performer_matches(actor, &master.targets[id])
+                        }) == condition.positive;
+                    }
+                    enabled |= matched;
+                }
+                if !enabled {
+                    continue;
+                }
+            }
+            key.extend([
+                row.kind as u64,
+                row.value as u64,
+                row.seconds.to_bits(),
+                row.trigger_type as u64,
+                row.trigger_group as u64,
+                row.release_group as u64,
+                row.reset_group as u64,
+                row.execute_limit as u64,
+                row.limit_count as u64,
+                row.max_value as u64,
+                if protected.contains(&row.id) || global_converters.contains(&row.id) {
+                    row.id as u64
+                } else {
+                    u64::MAX
+                },
+                row.targets.len() as u64,
+            ]);
+            key.extend(row.targets.iter().map(|&id| id as u64));
+        }
+    }
+    Some(key)
 }
 struct ReplayObjective<'a> {
     master: &'a Master,
@@ -10880,10 +11385,31 @@ struct ReplayObjective<'a> {
     bonuses: Vec<i32>,
     bound: Option<crate::rewards::DeterministicBound>,
     coefficient: f64,
-    shapes: HashMap<Performer, u32>,
+    shapes: HashMap<(Performer, Vec<u64>), u32>,
+    conversion_rows: HashSet<i32>,
+    shape_ids: Vec<u32>,
+    alias_allowed: bool,
+    base_power: f64,
     just_window: Option<crate::just_window::Prepared>,
 }
+impl ReplayObjective<'_> {
+    fn shape_id(&mut self, member: usize, snap: i32) -> u32 {
+        let index = member * (self.snaps.len() + 1) + (snap + 1) as usize;
+        if self.shape_ids[index] == u32::MAX {
+            let mut actor = Performer::from_member(self.master, &self.members[member], (snap >= 0).then(|| &self.snaps[snap as usize]));
+            actor.gekisou_support_skills.retain(|&(id,_)| self.master.gekiso_support_skills.get(&id).is_some_and(|skill| skill.mission_type==4 || self.chart.setup.missions.contains(&skill.mission_type)));
+            let key = self.alias_allowed.then(||replay_support_key(self.master,&actor,&self.conversion_rows)).flatten();
+            if key.is_some() { actor.support_skills.clear(); }
+            let next = self.shapes.len() as u32;
+            self.shape_ids[index] = *self.shapes.entry((actor, key.unwrap_or_default())).or_insert(next);
+        }
+        self.shape_ids[index]
+    }
+}
 impl Objective for ReplayObjective<'_> {
+    fn needs_power_cap(&self)->bool { true }
+    fn prepare_dominance(&mut self, power:f64) { self.alias_allowed=power*self.coefficient < i32::MAX as f64; }
+    fn prepare_assignment_power(&mut self,power:f64) {self.base_power=power;}
     fn prepare_power(&mut self, power: Arc<Vec<f64>>, _width: usize) {
         if let Some(bound) = &mut self.bound { bound.snapshot_power(power); }
     }
@@ -10910,24 +11436,18 @@ impl Objective for ReplayObjective<'_> {
             0.0,
             self.bound
                 .as_ref()
-                .map_or(0.0, |b| b.weight(member, snap, false)),
+                .map_or(0.0, |b| b.weight(member, snap, self.criterion != Criterion::Max)),
         )
     }
     fn conditional_snap_dominance(&self) -> bool {
         true
     }
     fn snap_dominance(&mut self, member: usize, snap: i32) -> Vec<f64> {
-        let p = Performer::from_member(
-            self.master,
-            &self.members[member],
-            (snap >= 0).then(|| &self.snaps[snap as usize]),
-        );
-        let next = self.shapes.len() as u32;
-        let id = *self.shapes.entry(p).or_insert(next) as f64;
+        let id = self.shape_id(member, snap) as f64;
         vec![id, -id]
     }
     fn exchange_snap_equivalent(&mut self, member: usize, a: i32, b: i32) -> bool {
-        self.snap_dominance(member, a) == self.snap_dominance(member, b)
+        self.shape_id(member, a) == self.shape_id(member, b)
     }
     fn bound(&mut self, totals: Totals) -> f64 {
         self.bound.as_ref().map_or_else(
@@ -10971,11 +11491,12 @@ impl Objective for ReplayObjective<'_> {
         t: Totals,
         assigned: &[i32],
         from: usize,
-        _limit: f64,
+        limit: f64,
     ) -> Option<f64> {
-        self.bound
-            .as_mut()
-            .map(|b| b.score_ceiling(members, assigned, from, t.power, self.criterion))
+        self.bound.as_mut().map(|b| {
+            let upper=b.score_ceiling(members,assigned,from,t.power,self.criterion);
+            if upper<limit {upper} else {upper.min(b.joint_score_ceiling(members,assigned,from,self.base_power,(t,limit),self.criterion))}
+        })
     }
     fn product_base(&self) -> Option<f64> {
         self.bound.as_ref().map(|b| b.base)
@@ -11013,6 +11534,11 @@ impl Objective for ReplayObjective<'_> {
         };
         if let Some(window) = &mut self.just_window {
             if let Some(value) = window.measure(self.master, self.chart, team, power as i32)? { result.detail["justWindow"] = json!(value); }
+        }
+        #[cfg(debug_assertions)]
+        if let Some(bound) = &mut self.bound {
+            let upper=bound.fixed_score_ceiling(&team.members,&team.snaps,power,self.criterion);
+            debug_assert!(result.key<=upper,"replay score {} exceeds certificate {}",result.key,upper);
         }
         Ok(result)
     }
@@ -11444,7 +11970,12 @@ fn search_levels(
                 None,
             ),
             bound: replay_bound(env.master, chart, env.members, env.snaps)?,
+            conversion_rows: env.master.live_skills.values().flatten().chain(env.master.gekiso_skills.values().flat_map(|skill|&skill.effects))
+                .chain(env.master.gekiso_support_skills.values().flat_map(|skill|&skill.effects)).filter(|row|matches!(row.kind,12006|13005)).map(|row|row.id).collect(),
             shapes: HashMap::default(),
+            shape_ids: vec![u32::MAX; env.members.len() * (env.snaps.len() + 1)],
+            alias_allowed: false,
+            base_power: 0.0,
             just_window,
         };
         let mut candidate = |hits: &[Hit]| {

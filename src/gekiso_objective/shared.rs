@@ -87,6 +87,7 @@ impl<'k, 'a> Combined<'k, 'a> {
         warm_seed: bool,
         cooperative_floor: bool,
     ) -> Self {
+        let mut power_domains: Vec<(Vec<power::SlotBase>, Arc<Vec<f64>>, f64)> = Vec::new();
         let songs: Vec<_> = adapters
             .into_iter()
             .zip(music)
@@ -99,7 +100,11 @@ impl<'k, 'a> Combined<'k, 'a> {
                     .iter()
                     .map(|m| power::slot_base(master, player, m, Some(music), 0))
                     .collect();
-                let snap_power: Arc<Vec<f64>> = Arc::new(
+                let cached = power_domains.iter().find(|(known, _, _)| known.len() == bases.len() && known.iter().zip(&bases).all(|(a,b)| a.common == b.common && a.fixed_points == b.fixed_points));
+                let (snap_power, power_cap) = if let Some((_, points, cap)) = cached {
+                    (Arc::clone(points), *cap)
+                } else {
+                    let snap_power: Arc<Vec<f64>> = Arc::new(
                     members
                         .iter()
                         .enumerate()
@@ -149,6 +154,9 @@ impl<'k, 'a> Combined<'k, 'a> {
                     .into_iter()
                     .take(5)
                     .fold(0.0_f64, |sum, v| (sum + v).next_up());
+                    power_domains.push((bases.clone(), Arc::clone(&snap_power), power_cap));
+                    (snap_power, power_cap)
+                };
                 let weights = (0..members.len())
                     .flat_map(|m| (0..width).map(move |j| (m, j)))
                     .map(|(m, j)| {

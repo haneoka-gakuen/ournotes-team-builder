@@ -240,6 +240,8 @@ fn reduce(damage: i32, bp: i32) -> i32 {
 }
 #[derive(Clone)]
 pub struct Life {
+    frozen: Option<[(i32, i32); 2]>,
+    frozen_phase: usize,
     initial: i32,
     damage: [f64; 7],
     maximum: i32,
@@ -263,6 +265,8 @@ impl Life {
     pub fn new(initial: i32, damage: [f64; 7], music_length: i32) -> Self {
         let length = frame(music_length).wrapping_add(2).max(1) as usize;
         Self {
+            frozen: None,
+            frozen_phase: 0,
             initial,
             damage,
             maximum: initial,
@@ -283,7 +287,14 @@ impl Life {
         }
     }
     pub fn maximum(&self) -> i32 {
-        self.maximum
+        self.frozen.map_or(self.maximum, |values| values[self.frozen_phase].1)
+    }
+    pub(crate) fn freeze_frame(&mut self, values: [(i32, i32); 2]) {
+        self.frozen = Some(values);
+        self.frozen_phase = 0;
+    }
+    pub(crate) fn enter_phase(&mut self, phase: usize) {
+        if self.frozen.is_some() { self.frozen_phase = phase - 1; }
     }
     fn frame_of(&self, time: i32) -> usize {
         (frame(time) as usize).min(self.frames - 1)
@@ -319,6 +330,7 @@ impl Life {
         }
     }
     pub fn note_damage(&mut self, time: i32, judgement: usize) {
+        if self.frozen.is_some() { return; }
         if judgement == 0 || judgement == 7 {
             return;
         }
@@ -456,6 +468,7 @@ impl Life {
     }
     #[cfg(not(target_arch = "wasm32"))]
     pub fn at(&mut self, time: i32) -> i32 {
+        if let Some(values) = self.frozen { return values[self.frozen_phase].0; }
         if self.commands.is_empty() {
             return self.initial;
         }
@@ -487,6 +500,7 @@ impl Life {
 
     #[cfg(target_arch = "wasm32")]
     pub fn at(&mut self, time: i32) -> i32 {
+        if let Some(values) = self.frozen { return values[self.frozen_phase].0; }
         if self.commands.is_empty() {
             return self.initial;
         }

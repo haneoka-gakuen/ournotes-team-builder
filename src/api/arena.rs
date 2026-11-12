@@ -2,6 +2,10 @@
 use super::*;
 use crate::{gekiso, gekiso_objective, search};
 
+fn scoped_input(input: &Value) -> Value {
+    Value::Object(input.as_object().unwrap().iter().filter(|(key, _)| key.as_str() != "charts")
+        .map(|(key, value)| (key.clone(), value.clone())).collect())
+}
 impl Engine {
     fn call_view(&self, master: Master) -> Engine {
         let mut scoped = Engine::from_master(master);
@@ -12,6 +16,14 @@ impl Engine {
             scoped.worker_budget = self.worker_budget;
         }
         scoped
+    }
+    fn inherit_chart(&self, scoped: &mut Engine, key: (i32, i32)) {
+        if scoped.charts.contains_key(&key) { return; }
+        let mut chart = self.charts[&key].clone();
+        chart.song = scoped.master.songs[&key.0].clone();
+        scoped.charts.insert(key, chart);
+        scoped.sources.insert(key, self.sources[&key].clone());
+        scoped.chart_order.push_back(key);
     }
 
     pub(super) fn arena_view(
@@ -58,7 +70,9 @@ impl Engine {
                 return Err("arena-song-band".into());
             }
         }
-        let mut scoped_input = input.clone();
+        let mut scoped_input = scoped_input(input);
+        let preload = songs.len() <= CHART_CACHE_LIMIT;
+        let mut scoped = self.call_view(master);
         if rule["objective"]=="sections" {scoped_input["request"]["sectionArena"]=rule.clone();}
         let members: Vec<_> = master::rows(&request["members"])
             .into_iter()
@@ -81,6 +95,9 @@ impl Engine {
         let mut sources = Vec::with_capacity(songs.len());
         for song in &songs {
             self.load_source(input, song)?;
+            if preload {
+                self.inherit_chart(&mut scoped, (master::int(&song["songId"]), master::int(&song["difficulty"])));
+            }
             sources.push(
                 self.sources[&(
                     master::int(&song["songId"]),
@@ -89,18 +106,18 @@ impl Engine {
                     .clone(),
             );
         }
-        scoped_input["charts"] = json!(songs
+        scoped_input["charts"] = if preload { json!([]) } else { json!(songs
             .iter()
             .zip(&sources)
             .map(|(song, source)| json!({"song":song,"source":source}))
-            .collect::<Vec<_>>());
-        Ok((self.call_view(master), scoped_input, songs, sources))
+            .collect::<Vec<_>>()) };
+        Ok((scoped, scoped_input, songs, sources))
     }
 
     pub(super) fn song_rule_view(&mut self, input: &Value) -> Result<(Engine, Value), String> {
         let request = &input["request"];
         let master = crate::song_rules::view(&self.master, &request["songRules"])?;
-        let mut scoped = input.clone();
+        let mut scoped = scoped_input(input);
         scoped["request"]["songRules"] = Value::Null;
         let mut songs: Vec<Value> = [
             &request["goal"]["songs"],
@@ -118,9 +135,15 @@ impl Engine {
                 songs.push(song.clone());
             }
         }
-        let mut charts = Vec::with_capacity(songs.len());
+        let preload = songs.len() <= CHART_CACHE_LIMIT;
+        let mut engine = self.call_view(master);
+        let mut charts = Vec::new();
         for song in songs {
             self.load_source(input, &song)?;
+            if preload {
+                self.inherit_chart(&mut engine, (master::int(&song["songId"]), master::int(&song["difficulty"])));
+                continue;
+            }
             let source = self
                 .sources
                 .get(&(
@@ -132,7 +155,7 @@ impl Engine {
             charts.push(json!({"song":song,"source":source}));
         }
         scoped["charts"] = json!(charts);
-        Ok((self.call_view(master), scoped))
+        Ok((engine, scoped))
     }
 
     pub(super) fn run_arena(

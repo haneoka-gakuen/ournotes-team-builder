@@ -692,6 +692,7 @@ pub(crate) fn top_character_bonus(members: &[Member], values: &[f64]) -> f64 {
     top_five(characters.into_values())
 }
 pub struct EventObjective {
+    pub(crate) certify_rank: bool,
     pub core: Option<LiveCore>,
     pub chart: Option<Chart>,
     pub route: Route,
@@ -793,6 +794,7 @@ impl EventObjective {
             max_other,
         );
         Self {
+            certify_rank: false,
             core: chart
                 .filter(|_| played)
                 .map(|c| LiveCore::new(master, c, members, snaps, play)),
@@ -1766,6 +1768,23 @@ impl Objective for EventObjective {
     fn exact(&mut self, team: &Team, power: f64, _slots: &[f64]) -> Result<Exact, String> {
         let bonus = self.team_bonus(team);
         let other = self.other_bonus(team);
+        let certificate = if self.certify_rank {
+            self.core.as_mut().map(|core| core.order_bounds(team, power as i32 as f64))
+                .and_then(|(lows, highs)| {
+                    let mut ranks = Vec::with_capacity(lows.len());
+                    let (mut minimum, mut maximum) = (f64::INFINITY, f64::NEG_INFINITY);
+                    for (low, high) in lows.into_iter().zip(highs) {
+                        let high = high.min(self.score_cap);
+                        if !low.is_finite() || !high.is_finite() || low > high || self.rank(low) != self.rank(high) {
+                            return None;
+                        }
+                        ranks.push(self.rank(low));
+                        minimum = minimum.min(low);
+                        maximum = maximum.max(high);
+                    }
+                    Some((ranks, minimum, maximum))
+                })
+        } else { None };
         let Some(core) = &mut self.core else {
             let mean = self.value(bonus, self.skip_rank);
             let direct = self.direct(bonus, self.skip_rank);
@@ -1775,13 +1794,22 @@ impl Objective for EventObjective {
                 detail: json!({"mean":mean,"bonus":bonus,"directMean":direct,"otherMean":other_mean,"directMin":direct,"directMax":direct,"challengePoints":self.route.cp(self.skip_rank)}),
             });
         };
-        let scores = core.evaluate(team, power as i32)?;
-        let mut per_order = Vec::with_capacity(scores.scores.len());
+        #[cfg(debug_assertions)]
+        if let Some((ranks, low, high)) = &certificate {
+            let scores = core.evaluate(team, power as i32)?;
+            debug_assert!(scores.scores.iter().zip(ranks).all(|(&score, &rank)| *low <= score && score <= *high
+                && chart::score_rank(self.chart.as_ref().unwrap(), score) == rank),
+                "ordinary reward rank certificate");
+        }
+        let scores = if certificate.is_none() { Some(core.evaluate(team, power as i32)?) } else { None };
+        let order_ranks = certificate.as_ref().map(|value| value.0.clone()).unwrap_or_else(|| {
+            scores.as_ref().unwrap().scores.iter().map(|&score| self.rank(score)).collect()
+        });
+        let mut per_order = Vec::with_capacity(order_ranks.len());
         let mut ranks = BTreeMap::<i32, i32>::new();
         let (mut total, mut cp, mut reward_sum, mut direct_min, mut direct_max, mut other_sum) =
             (0.0, 0.0, 0.0, f64::INFINITY, f64::NEG_INFINITY, 0.0);
-        for &score in &scores.scores {
-            let rank = self.rank(score);
+        for &rank in &order_ranks {
             *ranks.entry(rank).or_default() += 1;
             let value = self.value(bonus, rank);
             per_order.push(value);
@@ -1793,7 +1821,7 @@ impl Objective for EventObjective {
             direct_max = direct_max.max(reward);
             other_sum += self.other(other, rank);
         }
-        let count = scores.scores.len() as f64;
+        let count = order_ranks.len() as f64;
         let mean = (total / count).clamp(
             per_order.iter().copied().fold(f64::INFINITY, f64::min),
             per_order.iter().copied().fold(f64::NEG_INFINITY, f64::max),
@@ -1802,8 +1830,7 @@ impl Objective for EventObjective {
         let mut other_max = f64::NEG_INFINITY;
         let mut key_min = f64::INFINITY;
         let mut key_max = f64::NEG_INFINITY;
-        for &score in &scores.scores {
-            let rank = self.rank(score);
+        for &rank in &order_ranks {
             let other = self.other(other, rank);
             other_min = other_min.min(other);
             other_max = other_max.max(other);
@@ -1812,9 +1839,14 @@ impl Objective for EventObjective {
             key_max = key_max.max(key);
         }
         let other_mean = (other_sum / count).clamp(other_min, other_max);
+        let mut detail = json!({"scores":scores.as_deref(),"perOrder":per_order,"mean":mean,"bonus":bonus,"ranks":ranks,"rewardSum":reward_sum,"comparisonSum":total,"directMin":direct_min,"directMax":direct_max,"directMean":reward_sum/count,"otherMean":other_mean,"challengePoints":cp/count});
+        if let Some((_, low, high)) = certificate {
+            detail["pendingScores"] = json!(true);
+            detail["rankCertificate"] = json!({"ranks":detail["ranks"],"orders":order_ranks.len(),"scoreLow":low,"scoreHigh":high});
+        }
         Ok(Exact {
             key: (mean + self.tie * other_mean).clamp(key_min, key_max),
-            detail: json!({"scores":&*scores,"perOrder":per_order,"mean":mean,"bonus":bonus,"ranks":ranks,"rewardSum":reward_sum,"comparisonSum":total,"directMin":direct_min,"directMax":direct_max,"directMean":reward_sum/count,"otherMean":other_mean,"challengePoints":cp/count}),
+            detail,
         })
     }
 }

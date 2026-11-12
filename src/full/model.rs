@@ -908,6 +908,71 @@ impl<'a> Model<'a> {
             target.0 = source.0;
         }
     }
+    pub(crate) fn sparse_score_frames(&self) -> bool {
+        fn stable(checker: &Checker) -> bool {
+            match &checker.test {
+                Test::Fixed(_) | Test::Life { .. } | Test::SameMember(_)
+                | Test::JudgementMatch { .. } | Test::JudgementCount { .. } => true,
+                Test::And(items) | Test::Or(items) => items.iter().all(stable),
+                Test::Not(inner) => stable(inner),
+                _ => false,
+            }
+        }
+        fn cumulative(counter: &Cumulative) -> bool {
+            matches!(counter, Cumulative::Fixed(_) | Cumulative::Life { .. } | Cumulative::Judgements { .. })
+        }
+        fn release(checker: &Checker) -> bool {
+            matches!(checker.idle_input(), Some(super::conditions::IdleInput::Never
+                | super::conditions::IdleInput::Member(_) | super::conditions::IdleInput::Judgement))
+        }
+        self.gk.is_none()
+            && self.rows.iter().all(|row| (2000..=2005).contains(&row.kind) || row.kind == 15000)
+            && self.live.iter().flat_map(|skill| &skill.effects).all(|effect| {
+                effect.condition.as_ref().is_none_or(stable)
+                    && effect.release.as_ref().is_none_or(release)
+                    && effect.cumulative.as_ref().is_none_or(cumulative)
+            })
+            && self.condition.iter().all(|condition| condition.updater.effects.iter().all(|effect| {
+                effect.reset.is_none()
+                    && effect.release.as_ref().is_none_or(release)
+                    && effect.cumulative.as_ref().is_none_or(cumulative)
+                    && if effect.trigger_type == effects::ONE_SHOT {
+                        effect.trigger.as_ref().is_some_and(release)
+                            && effect.condition.as_ref().is_none_or(stable)
+                    } else {
+                        effect.trigger_type == effects::SUSTAINED && effect.act <= 0.0
+                            && [&effect.trigger, &effect.condition].into_iter().flatten()
+                                .all(|checker| matches!(checker.test, Test::Fixed(_)))
+                    }
+            }))
+    }
+    pub(crate) fn next_score_frame(&self, time: i32) -> i32 {
+        fn wake(state: &State, seconds: f64, time: i32) -> i32 {
+            match state.state {
+                effects::STAY => i32::MAX,
+                effects::EXECUTING if seconds <= 0.0 => i32::MAX,
+                effects::EXECUTING => {
+                    let duration = f(f(seconds * 1000.0) + state.extended_ms);
+                    let elapsed = f(time.wrapping_sub(state.execute_ms) as f64);
+                    if duration < elapsed || !duration.is_finite() || duration >= 16_000_000.0 {
+                        time
+                    } else {
+                        state.execute_ms.saturating_add(core::floor_i32_f64(duration).saturating_add(1))
+                    }
+                }
+                _ => time,
+            }
+        }
+        let live = self.enabled.iter().flat_map(|&index| &self.live[index].effects)
+            .map(|effect| wake(&effect.state, effect.act, time));
+        let supports = self.condition.iter().flat_map(|condition| {
+            condition.updater.updaters.iter().map(|updater| {
+                wake(&updater.state, condition.updater.effects[updater.effect].act, time)
+            })
+        });
+        live.chain(supports).chain(self.by_time.get(self.fired).map(|&index| self.events[index].1))
+            .min().unwrap_or(i32::MAX)
+    }
     fn condition_indices(&mut self) -> ConditionIndices {
         let mut selected = self.condition_schedule.as_ref().map(|schedule| schedule.select(
             &self.frame_events, !self.judged.is_empty(), self.frame_rank, self.gk.as_ref(),
@@ -999,6 +1064,10 @@ impl<'a> Model<'a> {
             self.current_combo = 0;
         }
         self.current_combo = self.current_combo.wrapping_add(added);
+        let factored_record = !COUNTS_ONLY && self.score.score.factored_record;
+        if factored_record {
+            self.score.score.replay.as_mut().unwrap().push(score::ReplayCommand::Input(self.judged.iter().map(|&(note_id, judgement, time_ms)| super::play::JudgedNote { note_id, judgement, time_ms }).collect()));
+        }
         for (n, converted) in &self.results {
             self.life.note_damage(n.time_ms, *converted as usize);
             let life = self.life.at(n.time_ms);
@@ -1066,7 +1135,10 @@ impl<'a> Model<'a> {
         }
         let mut listed = std::mem::take(&mut self.listed);
         let mut updated = std::mem::take(&mut self.updated);
+        let mut phase_life = [(0, 0); 2];
         for phase in 1..=2 {
+            self.life.enter_phase(phase as usize);
+            if factored_record { phase_life[phase as usize - 1] = (self.life.at(time), self.life.maximum()); }
             if phase==2 && !self.frame_events.is_empty() {
                 if let Some(record)=&mut self.live_life {
                     let life=self.life.at(time);
@@ -1223,6 +1295,7 @@ impl<'a> Model<'a> {
         self.enabled
             .retain(|&index| self.live[index].parent != effects::STAY);
         self.life.sync(time);
+        if factored_record { self.score.score.replay.as_mut().unwrap().push(score::ReplayCommand::Ordinary(time, phase_life)); }
         if !COUNTS_ONLY {self.score.score.calculate(
             time,
             &self.combo,
@@ -1308,6 +1381,7 @@ impl<'a> Model<'a> {
             let product = own as i64 * percent as i64;
             let bonus = crate::num::i32((product as f64 / 100.0).trunc());
             self.score.score.add_fixed(range.end, bonus);
+            if self.score.score.factored_record { self.score.score.replay.as_mut().unwrap().push(score::ReplayCommand::Rank(index, range.end, percent)); }
             g.rank_bonus.push(RankBonus {
                 range: index,
                 rank,

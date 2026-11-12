@@ -982,7 +982,7 @@ fn possible_healthy_group(master: &Master, group: i32) -> bool {
         })
     })
 }
-fn maximum_combo(master: &Master, members: &[Member], missions: &[i32]) -> f64 {
+pub(crate) fn maximum_combo(master: &Master, members: &[Member], missions: &[i32]) -> f64 {
     let mut bonuses: Vec<_> = members
         .iter()
         .map(|m| {
@@ -1589,6 +1589,7 @@ struct PreparedPulse {
     mask: u8,
     judgement: usize,
 }
+#[derive(Clone)]
 struct PreparedWindow {
     delta: f64,
     mask: u8,
@@ -1631,6 +1632,72 @@ impl PreparedSlot {
         key
     }
 }
+fn cumulative_windows(
+    factor: &live::Cumulative,
+    chart: &gekiso::Chart,
+    times: &[i32],
+) -> Option<Vec<PreparedWindow>> {
+    if factor.value < 0 || factor.unit <= 0 || factor.cap < 1 || times.len() >= (1 << 23) {
+        return None;
+    }
+    if factor.value == 0 {
+        return Some(Vec::new());
+    }
+    let cap = if factor.maximum > 0 {
+        factor.cap.min(
+            ((i64::from(factor.maximum) + i64::from(factor.value) - 1) / i64::from(factor.value))
+                as i32,
+        )
+    } else {
+        factor.cap
+    };
+    if cap > 256 || i64::from(factor.value) * i64::from(cap) > i64::from(i32::MAX / 10) {
+        return None;
+    }
+    let duration = factor.bound_duration_ms();
+    let padding = chart.delivery_radius_ms.saturating_add(40);
+    let mut previous = 0.0_f64;
+    let mut windows = Vec::new();
+    for step in 1..=cap {
+        let value = f(f(factor.mill(step.checked_mul(factor.unit)?) as f64) / 100000.0);
+        let delta = up(value - previous);
+        previous = value;
+        if delta <= 0.0 {
+            continue;
+        }
+        let intervals = chart
+            .full
+            .events
+            .iter()
+            .take(5)
+            .map(|&(_, at)| {
+                let before = times.partition_point(|&time| time < at.saturating_sub(padding));
+                let threshold = before
+                    .saturating_add((step as usize).saturating_mul(factor.unit as usize))
+                    .saturating_sub(1);
+                let end = chart
+                    .times
+                    .partition_point(|&time| time < at.saturating_add(duration));
+                let first = times
+                    .get(threshold)
+                    .map(|&time| time.saturating_sub(padding).max(at));
+                let start = first
+                    .map_or(end, |first| {
+                        chart.times.partition_point(|&time| time < first)
+                    })
+                    .min(end);
+                (start, end)
+            })
+            .collect();
+        windows.push(PreparedWindow {
+            delta,
+            mask: 0,
+            duration,
+            intervals,
+        });
+    }
+    Some(windows)
+}
 impl BoundPreparation {
     fn new(
         master: &Master,
@@ -1662,6 +1729,9 @@ impl BoundPreparation {
         let mut row_ids = Vec::new();
         let mut templates = HashMap::<Vec<u64>, u32>::default();
         let mut prepared_skills = None;
+        let mut count_times: Vec<_> = chart.full.notes.iter().filter(|note|crate::full::play::is_judged(note.op)).map(|note|note.time_ms).collect();
+        count_times.sort_unstable();
+        let mut cumulative_cache = HashMap::default();
         for (member_index, member) in members.iter().enumerate() {
             for (snap_index, snap) in std::iter::once(None)
                 .chain(snaps.iter().map(Some))
@@ -1786,9 +1856,7 @@ impl BoundPreparation {
                                                 .iter()
                                                 .flat_map(|f| &f.judged)
                                                 .filter(|j| {
-                                                    j.judgement == 5
-                                                        && start <= j.time_ms
-                                                        && j.time_ms <= end
+                                                    start <= j.time_ms && j.time_ms <= end
                                                 })
                                                 .count();
                                             let budget = mul(
@@ -1904,19 +1972,16 @@ impl BoundPreparation {
                     let delta = f(factor.at_cap() as f64 / 100000.0);
                     let duration = factor.bound_duration_ms();
                     shape.push((duration, delta));
-                    let intervals = chart
-                        .full
-                        .events
-                        .iter()
-                        .take(5)
-                        .map(|&(_, time)| {
-                            let start = chart.times.partition_point(|&t| t < time);
-                            let end =
-                                chart.times.partition_point(|&t| t < time + duration);
-                            (start, end)
-                        })
-                        .collect();
-                    normal_windows.push(PreparedWindow { delta, mask: 0, duration, intervals });
+                    let key=(factor.unit,factor.value,factor.maximum,factor.cap,duration);
+                    let windows = cumulative_cache.entry(key).or_insert_with(|| cumulative_windows(factor,chart,&count_times));
+                    if let Some(windows) = windows {
+                        normal_windows.extend(windows.iter().cloned());
+                    } else {
+                        let intervals = chart.full.events.iter().take(5).map(|&(_,time)| {
+                            (chart.times.partition_point(|&t|t<time),chart.times.partition_point(|&t|t<time.saturating_add(duration)))
+                        }).collect();
+                        normal_windows.push(PreparedWindow { delta, mask: 0, duration, intervals });
+                    }
                 }
                 score_rows.sort_unstable();
                 let conversion_key = if chart.accuracy.great == 0.0 { Vec::new() } else { slot.conversion_signature().unwrap_or_default() };
@@ -2147,22 +2212,26 @@ impl CumulativeLayout {
             .map(|n| n.id)
             .collect();
         let mut convertible = Vec::new();
+        let mut other = Vec::new();
         for frame in &chart.play.frames {
             for note in &frame.judged {
                 if note.judgement == 6 {
                     just.push(note.time_ms);
                 } else if note.judgement == 5 {
                     perfect.push(note.time_ms);
-                    if compatible.contains(&note.note_id) {
-                        convertible.push(note.time_ms);
-                    }
+                } else if (1..=4).contains(&note.judgement) {
+                    other.push(note.time_ms);
+                }
+                if (1..=5).contains(&note.judgement) && compatible.contains(&note.note_id) {
+                    convertible.push(note.time_ms);
                 }
             }
         }
         just.sort_unstable();
         perfect.sort_unstable();
         convertible.sort_unstable();
-        let causal = if plans.iter().flatten().flatten().all(|r| r.2 == 0.0) {
+        other.sort_unstable();
+        let causal = if other.is_empty() && plans.iter().flatten().flatten().all(|r| r.2 == 0.0) {
             let mut budgets = Vec::with_capacity(perfect.len() + 1);
             for count in 0..=perfect.len() {
                 let mut options: Vec<_> = plans
@@ -2233,6 +2302,7 @@ impl CumulativeLayout {
                 let j = just.partition_point(|&t| t <= end) - just.partition_point(|&t| t < start);
                 let p = perfect.partition_point(|&t| t <= end)
                     - perfect.partition_point(|&t| t < start);
+                let o = other.partition_point(|&t| t <= end) - other.partition_point(|&t| t < start);
                 let available = convertible.partition_point(|&t| t <= end)
                     - convertible.partition_point(|&t| t < start);
                 let mut extras: Vec<_> = plans
@@ -2263,7 +2333,7 @@ impl CumulativeLayout {
                 }
                 Some(CounterFrame {
                     just: j as f64,
-                    combo: (j + p) as f64,
+                    combo: (j + p + o) as f64,
                     extras: capacities,
                     mission: chart.setup.missions[range],
                 })
@@ -2274,6 +2344,7 @@ impl CumulativeLayout {
             let to = end.saturating_add(40);
             let j = just.partition_point(|&t| t <= to) - just.partition_point(|&t| t < start);
             let p = perfect.partition_point(|&t| t <= to) - perfect.partition_point(|&t| t < start);
+            let o = other.partition_point(|&t| t <= to) - other.partition_point(|&t| t < start);
             let available = convertible.partition_point(|&t| t <= to)
                 - convertible.partition_point(|&t| t < start);
             let mut extras: Vec<_> = plans
@@ -2302,7 +2373,7 @@ impl CumulativeLayout {
                     *value = causal[i][c].partition_point(|&t| t <= to) as f64;
                 }
             }
-            let maximum = (j + p) as f64;
+            let maximum = (j + p + o) as f64;
             limits.push((chart.setup.missions[i], j as f64, capacities, maximum));
         }
         Some(Self { counts, limits })
@@ -4405,7 +4476,7 @@ impl DeterministicBound {
                 (rounding - 1.0).next_up(),
             ),
         ) / chart.full.converted as f64);
-        let minimum_judge = if great { chart.judge_frac[3..=6].iter().copied().fold(f64::INFINITY, f64::min) } else { chart.judge_frac[5].min(chart.judge_frac[6]) };
+        let minimum_judge = if great { chart.judge_frac[3..=6].iter().copied().fold(f64::INFINITY, f64::min) } else { chart.judgements.iter().map(|&grade|chart.judge_frac[grade]).fold(f64::INFINITY,f64::min) };
         let minimum_coefficient = (chart.note_frac.iter().fold(0.0_f64, |sum, &frac| {
             let term = (((master.live.adjustment * chart.difficulty_factor).next_down() * frac)
                 .next_down()
@@ -4462,7 +4533,7 @@ impl DeterministicBound {
             let mut gains = Vec::new();
             let mut region_gains = vec![Vec::new(); ranges.len()];
             for (i, note) in chart.notes.iter().enumerate() {
-                if !eligible.contains(&note.id) || chart.judgements[i] != 5 {
+                if !eligible.contains(&note.id) || !(1..=5).contains(&chart.judgements[i]) {
                     continue;
                 }
                 let mut factor = add(1.0, positive);
@@ -4475,7 +4546,7 @@ impl DeterministicBound {
                     }
                 }
                 let gain = mul(
-                    mul(raw_weights[i], up(fraction - chart.judge_frac[5])),
+                    mul(raw_weights[i], up(fraction - chart.judge_frac[chart.judgements[i]])),
                     factor,
                 );
                 gains.push(gain);
@@ -5584,6 +5655,12 @@ impl DeterministicBound {
         if criterion == crate::objectives::Criterion::Mean {
             self.window_score_bound.as_ref().map_or(original, |bound| original.min(bound.upper(assigned, from)))
         } else { original }
+    }
+    #[cfg(debug_assertions)]
+    pub(crate) fn fixed_score_ceiling(&mut self,members:&[usize],snaps:&[i32],power:f64,criterion:crate::objectives::Criterion)->f64 {
+        let count=members.iter().zip(snaps).filter(|&(&member,&snap)|self.converters[member*self.width+(snap+1)as usize]).count().min(self.capacity);
+        let ids=std::array::from_fn(|slot|self.ids[members[slot]*self.width+(snaps[slot]+1)as usize][count]);
+        mul(power,self.score_coefficient(ids,criterion))
     }
     fn repeated_order_floor(&mut self, mut ids: [u32; 5]) -> Option<(f64, usize)> {
         ids.sort_unstable();

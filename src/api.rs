@@ -75,6 +75,7 @@ impl SharedFloors {
         floor
     }
 }
+pub(crate) const CHART_CACHE_LIMIT:usize=128;
 pub struct Engine {
     planner_base: Option<Master>,
     planner_key: Option<(i32,bool)>,
@@ -207,7 +208,7 @@ impl Engine {
         self.completed_gekiso.get_mut().clear();
         self.reward_cache.replace(None);
         self.chart_order.retain(|&old| old != key);
-        if self.charts.len() >= 4 && !self.charts.contains_key(&key) {
+        if self.charts.len() >= CHART_CACHE_LIMIT && !self.charts.contains_key(&key) {
             if let Some(key) = self.chart_order.pop_front() {
                 self.charts.remove(&key);
                 self.sources.remove(&key);
@@ -2007,7 +2008,7 @@ impl Engine {
                 (w("challengePoints") / main, other / main)
             });
             let make_event = || {
-                let objective = EventObjective::new(
+                let mut objective = EventObjective::new(
                     &self.master,
                     &cards.members,
                     &cards.snaps,
@@ -2020,6 +2021,8 @@ impl Engine {
                     exchange,
                     score_cap,
                 );
+                objective.certify_rank = request["rewardPhase"]["kind"] == "primary"
+                    && request["rewardPhase"]["certifyRanks"] == true;
                 match weights {
                     Some((cp, other)) => objective.with_weights(cp, other),
                     None => objective,
@@ -2044,10 +2047,12 @@ impl Engine {
             }
             let mut objective: Box<dyn Objective> = if let Some(plan) = &plan {
                 use crate::reward_plan::{Context, Metric, Ranked, Source};
-                Box::new(Ranked::new(Source::Ordinary(Box::new(EventObjective::new(
+                let mut event = EventObjective::new(
                     &self.master, &cards.members, &cards.snaps, chart, route.clone(),
                     plan.anchor() == Metric::Points, &goal["play"], true, 0.0, None, score_cap,
-                ))), Context { plan: plan.clone(), source_anchor: plan.anchor(), route: route.clone(), chart, members: &cards.members,
+                );
+                event.certify_rank = request["certifyRewardRanks"] == true && !plan.score_tie();
+                Box::new(Ranked::new(Source::Ordinary(Box::new(event)), Context { plan: plan.clone(), source_anchor: plan.anchor(), route: route.clone(), chart, members: &cards.members,
                     snaps: &cards.snaps, k, floor: f64::NEG_INFINITY, skip_rank: self.master.params.skip_rank, observations: 120 }))
             } else if cp_measure {
                 Box::new(ChallengePoints::new(
@@ -2316,6 +2321,11 @@ impl Engine {
             let hits:Vec<_>=output.hits.iter().map(|hit|{
                 let d=&hit.detail;let mut value=json!({"song":song,"members":hit.team.members.iter().map(|&i|&cards.members[i].key).collect::<Vec<_>>(),"snaps":hit.team.snaps.iter().map(|&j|if j<0{None}else{Some(&cards.snaps[j as usize].key)}).collect::<Vec<_>>(),"power":hit.power,"slotPowers":hit.slot_powers,"key":hit.key,"event":{"mean":master::number(&d["mean"],0.0)/exchange.map(|(_,d)|d).unwrap_or(1.0),"bonusPercent":master::number(&d["bonus"],0.0)/100.0,"challengePoints":master::number(&d["challengePoints"],0.0),"directMean":d["directMean"],"otherMean":d["otherMean"],"perPlayMin":master::number(&d["directMin"],master::rows(&d["perOrder"]).into_iter().map(|v|master::number(v,0.0)).reduce(f64::min).unwrap_or_else(||master::number(&d["mean"],0.0))),"perPlayMax":master::number(&d["directMax"],master::rows(&d["perOrder"]).into_iter().map(|v|master::number(v,0.0)).reduce(f64::max).unwrap_or_else(||master::number(&d["mean"],0.0)))}});
                 if pt {value["event"]["rewardSum"]=d["rewardSum"].clone();value["event"]["comparisonSum"]=d["comparisonSum"].clone();value["event"]["orders"]=json!(120);value["event"]["directMean"]=json!(master::number(&d["rewardSum"],0.0)/120.0);value["event"]["convertedMean"]=json!(exchange.map(|(n,den)|master::number(&d["challengePoints"],0.0)*n/den).unwrap_or(0.0));}
+                if d["pendingScores"] == true {
+                    value["score"] = Value::Null;
+                    value["pendingScores"] = json!(true);
+                    value["event"]["rankCertificate"] = d["rankCertificate"].clone();
+                }
                 if let Some(chart)=chart.filter(|_|!d["scores"].is_null()){
                     let scores=&d["scores"];let values:Vec<_>=master::rows(&scores["scores"]).iter().map(|v|master::number(v,0.0)).collect();let mut sorted=values.clone();sorted.sort_by(f64::total_cmp);let mut ranks=BTreeMap::<i32,i32>::new();for &v in &values{*ranks.entry(chart::score_rank(chart,v)).or_default()+=1;}let keys=|order:usize|live::orders()[order].map(|slot|cards.members[hit.team.members[slot]].key.clone());value["score"]=json!({"mean":scores["mean"],"min":scores["min"],"max":scores["max"],"median":(sorted[59]+sorted[60])/2.0,"orders":values,"bestOrder":keys(master::int(&scores["maxOrder"]) as usize),"worstOrder":keys(master::int(&scores["minOrder"]) as usize),"ranks":ranks});
                 }crate::reward_plan::decorate(&mut value, d);value

@@ -85,7 +85,7 @@ pub fn execute(input: &Value) -> Result<Value, String> {
                     generation: Arc::new(AtomicU64::new(0)),
                 }),
             );
-        let mut response = json!({"handle":id});
+        let mut response = json!({"handle":id,"chartCacheLimit":crate::api::CHART_CACHE_LIMIT});
         if input["trustedScores"] == true {
             response["cooperativeFloor"] = json!(cfg!(not(target_arch = "wasm32")));
         }
