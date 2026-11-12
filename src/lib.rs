@@ -1,5 +1,6 @@
 //! Portable team-building core. Native and WASM share algorithms and numeric
 //! semantics; process management, network access and Flutter stay outside.
+mod skill_roles;
 pub mod api;
 pub mod assignment;
 pub mod chart;
@@ -8,6 +9,7 @@ pub mod event;
 pub mod event_growth;
 pub mod full;
 pub mod gekiso;
+mod gekiso_guide;
 pub mod gekiso_objective;
 mod just_bound;
 pub(crate) mod just_window;
@@ -342,7 +344,7 @@ pub unsafe extern "C" fn haneoka_evaluate_json(input: *const c_char) -> *mut c_c
             serde_json::from_value(input["chart"].clone()).map_err(|e| e.to_string())?,
         )?;
         engine
-            .evaluate(&input["request"], &input["team"], song_id, difficulty)
+            .evaluate_one(&input)
             .map(|value| value.to_string())
     });
     let text = match result {

@@ -141,8 +141,26 @@ pub(crate) fn rush_windows(
     {
         return Ok(None);
     }
+    let mut required = vec![false; chart.play.frames.len() + 1];
+    for (index, frame) in chart.play.frames.iter().enumerate() { required[index] = !frame.judged.is_empty(); }
+    for time in chart.full.events.iter().map(|event| event.1).chain(chart.setup.fevers.iter()
+        .flat_map(|&(start, end)| [start.saturating_sub(4000), start, end]))
+        .chain(model.gk.as_ref().unwrap().controller.ranges.iter().flat_map(|range|
+            [range.start.saturating_sub(4000), range.start, range.end])) {
+        let at = chart.play.frames.partition_point(|frame| frame.time_ms < time);
+        required[at] = true;
+    }
+    let mut next = vec![chart.span.1; required.len()];
+    let mut after = chart.span.1;
+    for index in (chart.span.0..chart.span.1).rev() {
+        if required[index] { after = index; }
+        next[index] = after;
+    }
+    let damage_free = chart.judgements.iter().all(|&grade| master.live.damage[grade] == 0.0)
+        && model.rows.iter().all(|row| (11000..=11005).contains(&row.kind) || [2000, 3004].contains(&row.kind));
     let mut initial = Some(model);
     for (index, &seed) in seeds.iter().enumerate() {
+        if crate::clock::preparation_expired(){return Ok(None);}
         if generation != crate::cancellation_generation() {
             return Err("cancelled".into());
         }
@@ -152,10 +170,15 @@ pub(crate) fn rush_windows(
             initial.as_ref().unwrap().clone()
         };
         model.random = Random::new(seed);
-        for k in chart.span.0..chart.span.1 {
-            if k & 63 == 0 && generation != crate::cancellation_generation() {
-                return Err("cancelled".into());
+        let (mut k, mut quiet, mut visited) = (chart.span.0, 0, 0usize);
+        while k < chart.span.1 {
+            if visited & 63 == 0 {
+                // The WASM clock can yield to candidate-floor and cancellation messages.
+                let now=crate::clock::milliseconds();
+                if crate::clock::preparation_expired_at(now){return Ok(None);}
+                if generation != crate::cancellation_generation() { return Err("cancelled".into()); }
             }
+            visited += 1;
             let input = &chart.play.frames[k];
             frame(
                 &mut model,
@@ -175,6 +198,14 @@ pub(crate) fn rush_windows(
             {
                 break;
             }
+            let stable = damage_free && input.judged.is_empty() && model.frame_events.is_empty()
+                && model.frame_rank.is_none() && model.previous_rank.is_none()
+                && g.controller.updates.is_empty() && g.previous_lots.is_empty()
+                && g.controller.states.iter().all(|state| [gekisou::WAIT, gekisou::STANDBY, gekisou::PLAYING, gekisou::FINISH].contains(&state.state)
+                    && state.luck.lots == 0)
+                && model.condition.iter().all(|condition| condition.updater.can_pause_lottery());
+            quiet = if stable { quiet + 1 } else { 0 };
+            k = if quiet >= 2 { next[k + 1] } else { k + 1 };
         }
         let mut support = model.score.score.note_factor_commands();
         support.sort_by_key(|command| command.0);
@@ -245,9 +276,7 @@ fn frame(
         model.life.note_damage(note_time, converted as usize);
         model.life.at(note_time);
     }
-    for condition in &mut model.condition {
-        condition.updater.begin_frame();
-    }
+    let indices = model.condition_indices();
     let mut listed = std::mem::take(&mut model.listed);
     let mut updated = std::mem::take(&mut model.updated);
     let input = FrameInput {
@@ -272,11 +301,14 @@ fn frame(
             }),
             record: false,
         };
-        for (i, condition) in model.condition.iter_mut().enumerate() {
+        for i in indices.clone() {
+            let condition = &mut model.condition[i];
+            if phase == 1 { condition.updater.begin_frame(); }
             updated.clear();
-            condition
-                .updater
-                .update(phase, &input, &mut ctx, &mut updated)?;
+            condition.updater.update(phase, &input, &mut ctx, &mut updated)?;
+            if let Some(schedule) = &mut model.condition_schedule {
+                schedule.update_running(i, condition.updater.executing());
+            }
             for &u in &updated {
                 let updater = &condition.updater.updaters[u];
                 let effect = &condition.updater.effects[updater.effect];

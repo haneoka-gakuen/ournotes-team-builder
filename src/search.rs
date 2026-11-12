@@ -21,6 +21,7 @@ pub struct Team {
     pub members: Vec<usize>,
     pub snaps: Vec<i32>,
 }
+#[derive(Clone)]
 pub struct Exact {
     pub key: f64,
     pub detail: Value,
@@ -149,6 +150,9 @@ pub trait Objective {
     fn snap_bonus(&self, _snap: usize) -> f64 {
         0.0
     }
+    /// Equal identities share every slot program tested by snap_dominance.
+    /// Equal vectors must also imply equal skill values within each objective.
+    fn snap_program_identity(&self) -> Option<usize> { None }
     fn snap_dominance(&mut self, _member: usize, _snap: i32) -> Vec<f64> {
         Vec::new()
     }
@@ -174,6 +178,13 @@ pub trait Objective {
     ) -> Option<[f64; 3]> {
         None
     }
+    fn ranking_score_upper(
+        &mut self,
+        _members: &[usize],
+        _totals: Totals,
+        _assigned: &[i32],
+        _from: usize,
+    ) -> Option<f64> { None }
     fn member_bound(&mut self, _members: &[usize], _totals: Totals, _left: usize) -> Option<f64> {
         None
     }
@@ -227,6 +238,7 @@ pub trait Objective {
     fn partial_assignment_domains(&self) -> bool {
         true
     }
+    fn partial_refined_assignment_domains(&self) -> bool { self.partial_assignment_domains() }
     fn roster_bound(&mut self, _members: &[usize], _totals: Totals, _limit: f64) -> Option<f64> {
         None
     }
@@ -295,6 +307,13 @@ pub trait Objective {
     fn leaf_bound(&mut self, _team: &Team, _totals: Totals) -> Option<f64> {
         None
     }
+    /// Conservative primary and tie ceilings for a complete physical assignment.
+    fn leaf_rank_upper(&mut self, _team: &Team, _totals: Totals) -> Option<[f64; 3]> { None }
+    fn rank_floor(&self) -> Option<[f64; 3]> { None }
+    fn ranked_bounds(&self)->bool {false}
+    fn leaf_rank_ties(&self) -> bool { false }
+    fn roster_rank_upper(&mut self, _members:&[usize]) -> Option<[f64;3]> {None}
+    fn domain_rank_upper(&mut self) -> Option<[f64;3]> {None}
     fn interval(&mut self, team: &Team, totals: Totals) -> (f64, f64);
     fn exact(&mut self, team: &Team, power: f64, slot_powers: &[f64]) -> Result<Exact, String>;
     fn exact_value(&mut self, team: &Team, power: f64, slot_powers: &[f64]) -> Result<f64, String> {
@@ -329,6 +348,7 @@ pub struct Constraints {
     pub max_bonus: Option<f64>,
     pub member_floor: Option<MemberFloor>,
     pub member_floors: Vec<MemberFloor>,
+    pub skill_roles: Option<crate::skill_roles::Limits>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -341,8 +361,8 @@ pub struct Hit {
     #[serde(skip)]
     pub totals: Totals,
 }
-#[derive(Default, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase",default)]
 pub struct Stats {
     pub leaders: usize,
     pub member_nodes: usize,
@@ -584,6 +604,7 @@ struct Runner<'a, O: Objective + ?Sized> {
     started: f64,
     last_notify: f64,
     generation: u64,
+    visit_polls: u8,
     width: usize,
     bases: Vec<SlotBase>,
     snap_power: Arc<Vec<f64>>,
@@ -676,6 +697,7 @@ pub(crate) fn valid_seed(members: &[Member], snaps: &[Snap], c: &Constraints, se
     {
         return false;
     }
+    if c.skill_roles.as_ref().is_some_and(|roles| !roles.accepts(&seed.members, &seed.snaps)) { return false; }
     seed.members.iter().enumerate().all(|(slot, member)| {
         c.bindings.get(member).map_or_else(
             || seed.snaps[slot] < 0 || !c.bindings.values().any(|&snap| snap == seed.snaps[slot]),
@@ -712,7 +734,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
     fn new(mut input: Input<'a, O>) -> Self {
         let started = (input.now)();
         let generation = crate::cancellation_generation();
-        let team_filter = input.objective.has_team_filter();
+        let team_filter = input.objective.has_team_filter() || input.constraints.skill_roles.is_some();
         input.k = input.k.max(1);
         let n = input.members.len();
         let s = input.snaps.len();
@@ -898,6 +920,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                             let (x, y) = (&values[a], &values[b]);
                             if (input.constraints.max_bonus.is_none() || y[3] == x[3])
                                 && input.objective.filter_snap_dominates(i, other, j)
+                                && input.constraints.skill_roles.as_ref().is_none_or(|roles| roles.mask(i, other) == roles.mask(i, j))
                                 && y[..4].iter().zip(&x[..4]).all(|(y, x)| y >= x)
                                 && (y[4..].iter().zip(&x[4..]).all(|(y, x)| y >= x)
                                     || input.objective.numeric_snap_dominance(
@@ -954,6 +977,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             started,
             last_notify: started,
             generation,
+            visit_polls: 0,
             width,
             bases,
             snap_power,
@@ -1001,6 +1025,10 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
     fn expired(&self) -> bool {
         self.generation != crate::cancellation_generation()
             || self.input.deadline != f64::INFINITY && (self.input.now)() > self.input.deadline
+    }
+    fn visit_expired(&mut self) -> bool {
+        self.visit_polls = self.visit_polls.wrapping_add(1);
+        self.timed_out || self.visit_polls & 63 == 0 && self.expired()
     }
     fn report_pending(&mut self) {
         if self.input.on_candidate.is_none() || self.hits.is_empty() {
@@ -1193,6 +1221,10 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         }
         Ok(())
     }
+    fn feasible_team(&mut self, team: &Team, power: f64) -> Result<bool, String> {
+        if self.input.constraints.skill_roles.as_ref().is_some_and(|roles| !roles.accepts(&team.members, &team.snaps)) { return Ok(false); }
+        self.input.objective.feasible_team(team, power)
+    }
     fn seed_valid(&self, seed: &Team) -> bool {
         valid_seed(
             self.input.members,
@@ -1307,7 +1339,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         {
             return Ok(false);
         }
-        if self.team_filter && !self.input.objective.feasible_team(&seed, power)? {
+        if self.team_filter && !self.feasible_team(&seed, power)? {
             return Ok(false);
         }
         let exact = self.input.objective.exact(&seed, power, &powers)?;
@@ -1529,7 +1561,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                 {
                     continue;
                 }
-                if self.team_filter && !self.input.objective.feasible_team(&origin, totals.power)? {
+                if self.team_filter && !self.feasible_team(&origin, totals.power)? {
                     continue;
                 }
                 let initial = self.input.objective.exact(&origin, totals.power, &powers)?;
@@ -1705,7 +1737,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                                 continue;
                             }
                             if self.team_filter
-                                && !self.input.objective.feasible_team(&next, totals.power)?
+                                && !self.feasible_team(&next, totals.power)?
                             {
                                 continue;
                             }
@@ -2232,7 +2264,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         {
             return Ok(());
         }
-        if self.expired() {
+        if self.visit_expired() {
             self.timed_out = true;
             self.unexplored = self.unexplored.max(bound);
             return Ok(());
@@ -2260,6 +2292,17 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             || self.input.streaming
                 && (a.exact_low > upper
                     || !self.input.objective.score_ties() && a.exact_low == upper)
+    }
+    fn rank_limit(&self) -> Option<[f64;3]> {
+        let known=if self.hits.len()>=self.input.k {let last=&self.hits[self.input.k-1];let tie=self.input.objective.tie_rank(last);Some([last.key,tie[0],tie[1]])}else{None};
+        match (known,self.input.objective.rank_floor()) {
+            (Some(a),Some(b))=>Some(if a[0].total_cmp(&b[0]).then_with(||a[1].total_cmp(&b[1])).then_with(||a[2].total_cmp(&b[2])).is_lt(){b}else{a}),
+            (a,b)=>a.or(b),
+        }
+    }
+    fn rank_pruned(&self, upper:[f64;3], floor:[f64;3])->bool {
+        let order=upper[0].total_cmp(&floor[0]).then_with(||upper[1].total_cmp(&floor[1])).then_with(||upper[2].total_cmp(&floor[2]));
+        order.is_lt() || order.is_eq() && self.input.objective.leaf_rank_ties()
     }
     fn assignment_bound(&mut self, a: &Assignment, totals: Totals, from: usize) -> f64 {
         self.input
@@ -2532,6 +2575,13 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             members: a.team.clone(),
             snaps: picks,
         };
+        if let Some(floor)=self.input.objective.ranked_bounds().then(||self.rank_limit()).flatten() {
+            if let Some(upper) = self.input.objective.leaf_rank_upper(&team, totals) {
+                if self.rank_pruned(upper,floor) {
+                    return Ok(());
+                }
+            }
+        }
         if self
             .input
             .objective
@@ -2540,7 +2590,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         {
             return Ok(());
         }
-        if self.team_filter && !self.input.objective.feasible_team(&team, totals.power)? {
+        if self.team_filter && !self.feasible_team(&team, totals.power)? {
             return Ok(());
         }
         let (low, high) = self.input.objective.interval(&team, totals);
@@ -2588,6 +2638,11 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         Ok(())
     }
     fn assign(&mut self, team: Vec<usize>) -> Result<(), String> {
+        if let Some(floor)=self.input.objective.ranked_bounds().then(||self.rank_limit()).flatten() {
+            if let Some(upper)=self.input.objective.roster_rank_upper(&team) {
+                if self.rank_pruned(upper,floor) {return Ok(());}
+            }
+        }
         let set_key = self.set_key(&team);
         let exact_low = self
             .retained
@@ -2974,7 +3029,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             ..Totals::default()
         };
         if let Some(domains) = self.input.objective.assignment_domains(&a.team, &a.options) {
-            return self.snap_domains(&mut a, &domains, 0, &mut Vec::new(), totals);
+            return self.snap_domains(&mut a, &domains, 0, &mut Vec::new(), totals, false);
         }
         self.walk_domain(&mut a, totals)
     }
@@ -2985,11 +3040,16 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         slot: usize,
         selected: &mut Vec<&'d Vec<i32>>,
         totals: Totals,
+        refined: bool,
     ) -> Result<(), String> {
-        if self.expired() {
+        if self.visit_expired() {
             self.timed_out = true;
             self.unexplored = f64::INFINITY;
             return Ok(());
+        }
+        if slot == 0 && domains.iter().all(|row| row.len() == 1) {
+            let mut selected = domains.iter().map(|row| &row[0]).collect();
+            return self.snap_domains(a, domains, domains.len(), &mut selected, totals, refined);
         }
         if slot > 0 {
             self.stats.snap_nodes += 1;
@@ -2997,7 +3057,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                 self.report_pending();
             }
         }
-        if slot > 0 && (slot == domains.len() || self.input.objective.partial_assignment_domains()) {
+        if slot > 0 && (slot == domains.len() || if refined { self.input.objective.partial_refined_assignment_domains() } else { self.input.objective.partial_assignment_domains() }) {
             let mut fixed = [-1; 5];
             for (index, domain) in selected.iter().enumerate() {
                 if domain.len() == 1 && domain[0] >= 0 {
@@ -3043,6 +3103,11 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                 &a.options,
                 slot == domains.len(),
             );
+            if let Some(floor)=self.input.objective.ranked_bounds().then(||self.rank_limit()).flatten() {
+                if let Some(upper)=self.input.objective.domain_rank_upper() {
+                    if self.rank_pruned(upper,floor) {return Ok(());}
+                }
+            }
             let order_limit = self.assignment_necessary_limit(a);
             let bound = self.input.objective.assignment_order_bound(
                 &a.team,
@@ -3074,7 +3139,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             }
             if slot == domains.len() {
                 if let Some(refined) = self.input.objective.refine_assignment_domains(&a.team, &a.options) {
-                    return self.snap_domains(a, &refined, 0, &mut Vec::new(), totals);
+                    return self.snap_domains(a, &refined, 0, &mut Vec::new(), totals, true);
                 }
                 let upper = self.remaining_bound(a, 0, totals);
                 if upper < self.assignment_limit(a) || self.cannot_improve_set(a, upper) {
@@ -3095,7 +3160,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                     continue;
                 }
                 selected.push(domain);
-                self.snap_domains(a, domains, slot + 1, selected, totals)?;
+                self.snap_domains(a, domains, slot + 1, selected, totals, refined)?;
                 selected.pop();
             }
         }
@@ -3159,6 +3224,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             self.unexplored = self.unexplored.max(bound);
             return Ok(());
         }
+        if self.input.constraints.skill_roles.as_ref().is_some_and(|roles| !roles.feasible(&a.team, &a.assigned, slot, &a.options)) { return Ok(()); }
         if self.team_filter
             && !self.input.objective.feasible_assignment(&a.team, &a.assigned, slot, &a.options)
         {
@@ -3665,6 +3731,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                         for &better in &original {
                             if better == worse
                                 || !self.input.objective.filter_member_dominates(better, worse)
+                                || self.input.constraints.skill_roles.as_ref().is_some_and(|roles| roles.masks[better] != roles.masks[worse])
                                 || self.input.constraints.bindings.contains_key(&better)
                                 || self.member_bonus[better] < self.member_bonus[worse]
                                 || self.input.constraints.max_bonus.is_some()

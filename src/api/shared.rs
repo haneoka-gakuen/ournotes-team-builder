@@ -1,5 +1,6 @@
 //! Equal-weight objectives retain one formation across every selected chart.
 use super::*;
+use std::cmp::Ordering;
 use crate::{
     event::{EventObjective, Route, RouteKind},
     objectives::{Criterion, LiveCore, LiveObjective},
@@ -21,6 +22,7 @@ struct SongObjective<'a> {
     opening: Vec<i32>,
     member_base: Vec<f64>,
     domain_power: Vec<f64>,
+    ranking_totals: Totals,
 }
 struct LinearGroup {
     song: usize,
@@ -74,6 +76,7 @@ struct Combined<'a> {
     songs: Vec<SongObjective<'a>>,
     linear_groups: Vec<LinearGroup>,
     power_groups: Vec<usize>,
+    program_groups: Vec<usize>,
     leader_profiles: Vec<power::LeaderProfile>,
     options: Vec<Vec<i32>>,
     min_combo: i32,
@@ -93,28 +96,41 @@ struct Combined<'a> {
     priority: Vec<f64>,
     floor: f64,
     reward_grid: Option<usize>,
-    reward_cutoff: Option<Vec<(f64, f64)>>,
+    reward_cutoff: Option<Vec<RankCutoff>>,
     k: usize,
 }
 
-fn cannot_improve_reward(
-    sums: [f64; 3],
+struct RankCutoff {
+    value: Fraction,
+    lower: f64,
+    upper: f64,
+    next: Option<f64>,
+}
+
+fn rank_bound_order(
+    sums: impl IntoIterator<Item = f64>,
     songs: usize,
-    cutoff: &[(f64, f64)],
-    retain_equal: bool,
-) -> bool {
-    for (sum, &(current, next)) in sums.into_iter().zip(cutoff) {
+    cutoff: &[RankCutoff],
+) -> Ordering {
+    for (sum, level) in sums.into_iter().zip(cutoff) {
         let upper = (sum / songs as f64).next_up();
-        if upper < current {
-            return true;
+        if upper < level.lower {
+            return Ordering::Less;
         }
         // A bound below the next attainable value can at most tie this level.
-        if upper.partial_cmp(&next) != Some(std::cmp::Ordering::Less) {
-            return false;
+        if let Some(next) = level.next {
+            if upper < next { continue; }
+            return Ordering::Greater;
+        }
+        if upper > level.upper { return Ordering::Greater; }
+        let Some(value) = Fraction::from_value(sum) else { return Ordering::Greater; };
+        match value.divided(songs as u32).cmp(&level.value) {
+            Ordering::Less => return Ordering::Less,
+            Ordering::Greater => return Ordering::Greater,
+            Ordering::Equal => {}
         }
     }
-    // An equal reward rank cannot replace the retained winner in a top-one search.
-    !retain_equal
+    Ordering::Equal
 }
 
 impl Combined<'_> {
@@ -240,6 +256,24 @@ impl Combined<'_> {
                 .min((fixed + self.joint_matching.maximum_upper(&weights, columns)).next_up()),
         )
     }
+    fn program_domains(&mut self, members: &[usize], options: &[Vec<i32>], refined: bool) -> Option<Vec<Vec<Vec<i32>>>> {
+        if self.event { return None; }
+        let mut combined: Option<Vec<Vec<Vec<i32>>>> = None;
+        for song in &mut self.songs {
+            let next = if refined { song.objective.refine_assignment_domains(members, options) }
+                else { song.objective.assignment_domains(members, options) };
+            let Some(next) = next else { continue; };
+            if let Some(groups) = &mut combined {
+                for (row, next) in groups.iter_mut().zip(next) {
+                    *row = row.iter().flat_map(|group| next.iter().filter_map(|other| {
+                        let shared: Vec<_> = group.iter().copied().filter(|snap| other.contains(snap)).collect();
+                        (!shared.is_empty()).then_some(shared)
+                    })).collect();
+                }
+            } else { combined = Some(next); }
+        }
+        combined.filter(|rows| !refined || rows.iter().any(|row| row.len() > 1))
+    }
     fn eligible(&self, team: &Team) -> bool {
         self.songs.iter().all(|song| {
             song.opening.is_empty()
@@ -258,6 +292,8 @@ impl Combined<'_> {
         }
         let width = self.snaps.len() + 1;
         let mut sum = 0.0_f64;
+        let mut power_sum = 0.0_f64;
+        let score_tie = self.plan.as_ref().is_some_and(Plan::score_tie);
         let mut rank_sums = self.reward_cutoff.as_ref().map(|_| [0.0_f64; 3]);
         for song in &mut self.songs {
             let mut t = Totals::default();
@@ -287,6 +323,8 @@ impl Combined<'_> {
                 t.skill_low += skill_low;
                 t.bonus += song.objective.member_bonus(m) + bonus;
             }
+            power_sum = (power_sum + t.power).next_up();
+            if score_tie { song.ranking_totals = t; }
             let bound = song.objective.bound(t);
             let ranked = rank_sums.as_ref().and_then(|_| {
                 song.objective.ranked_assignment_upper(members, t, assigned, from)
@@ -310,7 +348,22 @@ impl Combined<'_> {
         let bound = joint.min((sum / self.songs.len() as f64).next_up());
         if let (Some(mut sums), Some(cutoff)) = (rank_sums, &self.reward_cutoff) {
             sums[0] = sum;
-            if cannot_improve_reward(sums, self.songs.len(), cutoff, self.k > 1) {
+            let rewards = self.plan.as_ref().unwrap().levels.len();
+            match rank_bound_order(sums.into_iter().take(rewards), self.songs.len(), &cutoff[..rewards]) {
+                Ordering::Less => return bound.min(self.floor.next_down()),
+                Ordering::Greater => return bound,
+                Ordering::Equal => {}
+            }
+            let score_sum = if score_tie {
+                self.songs.iter_mut().fold(0.0_f64, |sum, song| {
+                    let score = song.objective.ranking_score_upper(members, song.ranking_totals, assigned, from).unwrap_or(f64::INFINITY);
+                    (sum + score).next_up()
+                })
+            } else { 0.0 };
+            let tail = [score_sum, power_sum];
+            let from = if score_tie { 0 } else if self.plan.as_ref().is_some_and(Plan::power_tie) { 1 } else { 2 };
+            let order = rank_bound_order(tail[from..].iter().copied(), self.songs.len(), &cutoff[rewards..]);
+            if order.is_lt() || order.is_eq() && self.k == 1 {
                 return bound.min(self.floor.next_down());
             }
         }
@@ -396,10 +449,19 @@ impl Objective for Combined<'_> {
         let hit = hits.get(self.k - 1);
         self.floor = hit.map_or(f64::NEG_INFINITY, |hit| hit.key);
         self.reward_cutoff = self.reward_grid.and_then(|grid| {
-            crate::reward_plan::ranking(&hit?.detail["rewardRanking"])?
+            let ranks = crate::reward_plan::ranking(&hit?.detail["rewardRanking"])?;
+            let rewards = self.plan.as_ref().unwrap().levels.len();
+            let power = self.plan.as_ref().is_some_and(Plan::power_tie);
+            let count = ranks.len();
+            Some(ranks
                 .into_iter()
-                .map(|level| Some((level.lower(), level.next_grid_lower(grid)?)))
-                .collect()
+                .enumerate()
+                .map(|(index, value)| RankCutoff {
+                    lower: value.lower(), upper: value.upper(),
+                    next: if index < rewards { value.next_grid_lower(grid) }
+                        else if power && index + 1 == count { value.next_grid_lower(self.songs.len()) } else { None },
+                    value,
+                }).collect())
         });
     }
     fn seed_objective(&self) -> Option<Box<dyn Objective>> {
@@ -419,21 +481,15 @@ impl Objective for Combined<'_> {
     }
     fn snap_dominance(&mut self, member: usize, snap: i32) -> Vec<f64> {
         let width = self.snaps.len() + 1;
-        self.songs
-            .iter_mut()
-            .flat_map(|song| {
-                let mut values = song.objective.snap_dominance(member, snap);
-                values.push(
-                    song.snap_power
-                        [member * width + if snap < 0 { width - 1 } else { snap as usize }],
-                );
-                values.push(
-                    song.skills[member * width + if snap < 0 { width - 1 } else { snap as usize }]
-                        .1,
-                );
-                values
-            })
-            .collect()
+        let col = if snap < 0 { width - 1 } else { snap as usize };
+        let mut values = Vec::new();
+        for index in 0..self.songs.len() {
+            let song = &mut self.songs[index];
+            if self.program_groups[index] == index { values.extend(song.objective.snap_dominance(member, snap)); }
+            if self.power_groups[index] == index { values.push(song.snap_power[member * width + col]); }
+            if song.objective.snap_program_identity().is_none() { values.push(song.skills[member * width + col].1); }
+        }
+        values
     }
     fn score_ties(&self) -> bool {
         self.event
@@ -636,7 +692,14 @@ impl Objective for Combined<'_> {
         let profile = power::leader_profile(self.master, &self.members[leader]);
         let width = self.snaps.len() + 1;
         let mut valid = true;
-        for song in &mut self.songs {
+        for index in 0..self.songs.len() {
+            let representative = self.power_groups[index];
+            if representative != index {
+                self.songs[index].member_base = self.songs[representative].member_base.clone();
+                self.songs[index].domain_power = self.songs[representative].domain_power.clone();
+                continue;
+            }
+            let song = &mut self.songs[index];
             song.member_base = self
                 .members
                 .iter()
@@ -811,6 +874,51 @@ impl Objective for Combined<'_> {
                 .collect();
         }
     }
+    fn assignment_domains(&mut self, members: &[usize], options: &[Vec<i32>]) -> Option<Vec<Vec<Vec<i32>>>> {
+        self.program_domains(members, options, false)
+    }
+    fn refine_assignment_domains(&mut self, members: &[usize], options: &[Vec<i32>]) -> Option<Vec<Vec<Vec<i32>>>> {
+        self.program_domains(members, options, true)
+    }
+    fn partial_assignment_domains(&self) -> bool { self.songs.iter().all(|song| song.objective.partial_assignment_domains()) }
+    fn partial_refined_assignment_domains(&self) -> bool { self.songs.iter().all(|song| song.objective.partial_refined_assignment_domains()) }
+    fn prepare_assignment_domain(&mut self, members: &[usize], options: &[Vec<i32>], complete: bool) {
+        self.options = options.to_vec();
+        for song in &mut self.songs { song.objective.prepare_assignment_domain(members, options, complete); }
+    }
+    fn assignment_order_bound(&mut self, members: &[usize], _t: Totals, assigned: &[i32], from: usize, limit: f64) -> Option<f64> {
+        if self.event { return None; }
+        let coarse = self.upper(members, assigned, from);
+        if coarse < limit { return Some(coarse); }
+        let width = self.snaps.len() + 1;
+        let totals: Vec<_> = self.songs.iter().map(|song| {
+            let mut t = Totals::default();
+            for (slot, &member) in members.iter().enumerate() {
+                let choices = if slot < from { std::slice::from_ref(&assigned[slot]) } else { self.options[slot].as_slice() };
+                let (mut power, mut skill) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+                for &snap in choices {
+                    if slot >= from && snap >= 0 && assigned[..from].contains(&snap) { continue; }
+                    let col = if snap < 0 { width - 1 } else { snap as usize };
+                    power = power.max(song.slots[slot][col]);
+                    skill = skill.max(song.skills[member * width + col].1);
+                }
+                t.power = (t.power + power).next_up(); t.skill = (t.skill + skill).next_up();
+            }
+            t
+        }).collect();
+        let mut bounds: Vec<_> = self.songs.iter_mut().zip(&totals).map(|(song, &t)| song.objective.bound(t)
+            .min(song.objective.cheap_assignment_bound(members, t, assigned, from))).collect();
+        let count = bounds.len() as f64;
+        for (index, song) in self.songs.iter_mut().enumerate() {
+            let others = bounds.iter().enumerate().filter(|&(other, _)| other != index)
+                .fold(0.0_f64, |sum, (_, &value)| (sum + value).next_up());
+            let target = if limit.is_finite() { (limit * count - others).max(0.0) } else { 0.0 };
+            if let Some(value) = song.objective.assignment_order_bound(members, totals[index], assigned, from, target) { bounds[index] = bounds[index].min(value); }
+            let upper = (bounds.iter().fold(0.0_f64, |sum, &value| (sum + value).next_up()) / count).next_up();
+            if upper < limit { return Some(coarse.min(upper)); }
+        }
+        Some(coarse.min((bounds.iter().fold(0.0_f64, |sum, &value| (sum + value).next_up()) / count).next_up()))
+    }
     fn cheap_assignment_bound(
         &mut self,
         members: &[usize],
@@ -936,7 +1044,7 @@ impl Objective for Combined<'_> {
         if let Some(window) = crate::just_window::aggregate(parts.iter().map(|part| &part["detail"]["justWindow"])) { detail["justWindow"] = window; }
         let mut key = mean(&["key"]);
         if let Some(plan) = &self.plan {
-            let ranks: Vec<_> = (0..plan.levels.len())
+            let ranks: Vec<_> = (0..plan.levels.len() + plan.tail_len())
                 .map(|i| {
                     Fraction::mean(
                         &parts
@@ -1137,7 +1245,7 @@ impl Engine {
                             master::int(&goal["gekiso"]["luckSamples"]),
                             exchange,
                         );
-                    if let Some(minimum) = crate::just_window::target(&goal["gekiso"]["minJustWindowMs"])? { objective.set_min_just_window(minimum)?; }
+                    if let Some(minimum) = crate::just_window::Policy::read(&goal["gekiso"])? { objective.set_min_just_window(minimum)?; }
                     crate::reward_plan::Source::Gekiso(Box::new(objective))
                 } else {
                     crate::reward_plan::Source::Ordinary(Box::new(EventObjective::new(
@@ -1236,54 +1344,26 @@ impl Engine {
                     )
                 })
                 .collect();
-            let mut snap_power = Vec::new();
-            let mut skills = Vec::new();
-            for (m, member) in cards.members.iter().enumerate() {
-                for (s, snap) in cards
-                    .snaps
-                    .iter()
-                    .map(Some)
-                    .chain(std::iter::once(None))
-                    .enumerate()
-                {
-                    snap_power.push(power::snap_points(
-                        &self.master,
-                        &bases[m],
-                        member,
-                        snap,
-                        snap.map_or(0, |s| power::snap_event_percent(&effects, s, 2)),
-                    ) as f64);
-                    skills.push(objective.skill(m, if s == width - 1 { -1 } else { s as i32 }));
-                }
-            }
-            let mut caps: Vec<_> = cards
-                .members
-                .iter()
-                .enumerate()
-                .map(|(m, member)| {
-                    (bases[m].fixed_points
-                        + profiles
-                            .iter()
-                            .map(|p| {
-                                power::leader_points(
-                                    &bases[m],
-                                    &power::leader_percent_bound(&self.master, p, member),
-                                )
-                            })
-                            .max()
-                            .unwrap_or(0)) as f64
-                        + snap_power[m * width..(m + 1) * width]
-                            .iter()
-                            .copied()
-                            .fold(0.0, f64::max)
-                })
-                .collect();
-            caps.sort_by(|a, b| b.total_cmp(a));
-            let cap = caps
-                .iter()
-                .take(5)
-                .fold(0.0_f64, |sum, v| (sum + v).next_up());
-            let snap_power = Arc::new(snap_power);
+            let shared = objectives.iter().find(|song: &&SongObjective<'_>| song.bases.iter().zip(&bases).all(|(a, b)| a.common == b.common && a.fixed_points == b.fixed_points));
+            let snap_power = shared.map(|song| Arc::clone(&song.snap_power));
+            let shared_cap = shared.map(|song| song.cap);
+            let master = &self.master;
+            let snap_power = snap_power.unwrap_or_else(|| Arc::new(cards.members.iter().enumerate().flat_map(|(m, member)| {
+                let base = &bases[m];
+                let effects = &effects;
+                cards.snaps.iter().map(Some).chain(std::iter::once(None)).map(move |snap|
+                    power::snap_points(master, base, member, snap, snap.map_or(0, |s| power::snap_event_percent(effects, s, 2))) as f64)
+            }).collect()));
+            let skills = (0..cards.members.len()).flat_map(|m| (0..width).map(move |s| (m, s)))
+                .map(|(m, s)| objective.skill(m, if s == width - 1 { -1 } else { s as i32 })).collect();
+            let cap = shared_cap.unwrap_or_else(|| {
+                let mut caps: Vec<_> = cards.members.iter().enumerate().map(|(m, member)| {
+                    (bases[m].fixed_points + profiles.iter().map(|p| power::leader_points(&bases[m], &power::leader_percent_bound(&self.master, p, member))).max().unwrap_or(0)) as f64
+                        + snap_power[m * width..(m + 1) * width].iter().copied().fold(0.0, f64::max)
+                }).collect();
+                caps.sort_by(|a, b| b.total_cmp(a));
+                caps.iter().take(5).fold(0.0_f64, |sum, value| (sum + value).next_up())
+            });
             objective.prepare_power(Arc::clone(&snap_power), width);
             let opening = if battle && chart.song.missions.iter().any(|m| *m == 1 || *m == 4) {
                 crate::gekiso_objective::opening_combo_bonuses(
@@ -1308,6 +1388,7 @@ impl Engine {
                 opening,
                 member_base: Vec::new(),
                 domain_power: Vec::new(),
+                ranking_totals: Totals::default(),
             });
         }
         let affine = (effects.is_empty()
@@ -1361,10 +1442,13 @@ impl Engine {
         for group in &linear_groups {
             for &song in &group.songs { power_groups[song] = group.song; }
         }
+        let mut seen_programs = std::collections::HashMap::new();
+        let program_groups = objectives.iter().enumerate().map(|(index, song)| song.objective.snap_program_identity()
+            .map_or(index, |identity| *seen_programs.entry(identity).or_insert(index))).collect();
         // Ordinary event settlement averages integer reward units (1/10,000)
         // over the same complete set of skill orders on every chart.
-        let reward_grid = if !battle && plan.as_ref().is_some_and(|plan| {
-            plan.criterion == crate::reward_plan::Aggregation::Mean && plan.levels.len() > 1
+        let reward_grid = if plan.as_ref().is_some_and(|plan| {
+            plan.power_tie() || !battle && plan.criterion == crate::reward_plan::Aggregation::Mean && plan.levels.len() > 1
         }) {
             (crate::live::orders().len() * 10_000).checked_mul(songs.len())
         } else {
@@ -1379,6 +1463,7 @@ impl Engine {
             songs: objectives,
             linear_groups,
             power_groups,
+            program_groups,
             leader_profiles: profiles,
             options: Vec::new(),
             min_combo: master::int(&goal["gekiso"]["minComboBonus"]).max(1),

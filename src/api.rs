@@ -16,8 +16,10 @@ use std::sync::Weak;
 use std::sync::{Arc, Mutex};
 mod gekiso_result_cache;
 mod arena;
+mod arena_sections;
 mod shared;
 mod reward_plan;
+mod planner;
 use gekiso_result_cache::CompletedGekiso;
 
 type CachedScoreCap = (String, f64, Vec<crate::search::Team>);
@@ -74,6 +76,9 @@ impl SharedFloors {
     }
 }
 pub struct Engine {
+    planner_base: Option<Master>,
+    planner_key: Option<(i32,bool)>,
+    planner_views: VecDeque<((i32,bool),Box<Engine>)>,
     pub(crate) growth_source: Option<Arc<Value>>,
     pub(crate) event_growth: Option<crate::event_growth::Search>,
     pub master: Master,
@@ -83,6 +88,9 @@ pub struct Engine {
     live_cache: RefCell<Option<(String, crate::objectives::LiveCore)>>,
     gekiso_cache: RefCell<Option<(String, crate::gekiso::Chart)>>,
     completed_gekiso: RefCell<CompletedGekiso>,
+    section_cache:Option<Box<arena_sections::Cache>>,
+    section_multiple:Option<arena_sections::Multiple>,
+    section_scenes:Arc<Mutex<VecDeque<arena_sections::Scene>>>,
     reward_cache: RefCell<Option<(Value, crate::rewards::SettlementCache)>>,
     score_caps: RefCell<VecDeque<CachedScoreCap>>,
     pub(crate) scored_seeds: SharedScores,
@@ -146,6 +154,9 @@ impl Engine {
     }
     pub fn from_master(master: Master) -> Self {
         Self {
+            planner_base: None,
+            planner_key: None,
+            planner_views: VecDeque::new(),
             growth_source: None,
             event_growth: None,
             master,
@@ -155,6 +166,9 @@ impl Engine {
             live_cache: RefCell::new(None),
             gekiso_cache: RefCell::new(None),
             completed_gekiso: RefCell::new(CompletedGekiso::default()),
+            section_cache:None,
+            section_multiple:None,
+            section_scenes:Arc::new(Mutex::new(VecDeque::new())),
             reward_cache: RefCell::new(None),
             score_caps: RefCell::new(VecDeque::new()),
             scored_seeds: SharedScores::default(),
@@ -376,6 +390,8 @@ impl Engine {
         };
         let mut sampled_settlement = None;
         let mut range_scores = None;
+        let mut section_summary=None;
+        let mut section_window=None;
         let scores = if is_gekiso {
             let source = self
                 .sources
@@ -444,6 +460,8 @@ impl Engine {
                 )?
             };
             range_scores = result.get("rangeScores").cloned();
+            section_summary=result.get("sectionSummary").cloned();
+            section_window=result.get("justWindow").cloned();
             serde_json::from_value::<live::Scores>(result).map_err(|e| e.to_string())?
         } else {
             let mut input = chart::prepare(
@@ -510,8 +528,10 @@ impl Engine {
         if let Some(ranges) = range_scores {
             result["score"]["rangeScores"] = ranges;
         }
-        if is_gekiso {
-            if let Some(minimum) = crate::just_window::target(&request["gekiso"]["minJustWindowMs"])? {
+        if let Some(summary)=section_summary {result["sectionSummary"]=summary;}
+        if let Some(window)=section_window {result["justWindow"]=window;}
+        else if is_gekiso {
+            if let Some(minimum) = crate::just_window::Policy::read(&request["gekiso"])? {
                 let source = self.sources.get(&(song_id, difficulty)).ok_or("missing-chart")?;
                 let accuracy = serde_json::from_value(request["gekiso"]["accuracy"].clone()).map_err(|e| e.to_string())?;
                 let mut gk = crate::gekiso::Chart::new(&self.master, source, chart.difficulty.play_level, chart.song.missions.clone(), accuracy, gekiso_ranks(&request["gekiso"]))?;
@@ -656,6 +676,7 @@ fn constraints(
             .map(|v| crate::num::round(v * 100.0)),
         max_bonus: None,
         member_floor: None,
+        skill_roles: crate::skill_roles::Limits::prepare(master, &input["skillRoles"], members, snaps, &input["skillRoleMissions"]),
         member_floors: master::rows(&input["minMissionMembers"]).iter().enumerate()
             .filter_map(|(index, minimum)| {
                 let minimum = minimum.as_f64()?;
@@ -1391,6 +1412,7 @@ impl Engine {
         song: &Value,
         source: &crate::chart::Source,
     ) -> Result<Value, String> {
+        if request["sectionArena"]["objective"]=="sections" {return self.evaluate_section_team(request,team,song,source);}
         if request["songRules"].is_object() {
             let scoped = Engine::from_master(crate::song_rules::view(&self.master,&request["songRules"])?);
             let mut request = request.clone();request["songRules"] = Value::Null;
@@ -1671,7 +1693,7 @@ impl Engine {
             ))
         };
         chart.music_type = music.music_type;
-        let minimum_just_window = crate::just_window::target(&goal["minJustWindowMs"])?;
+        let minimum_just_window = crate::just_window::Policy::read(goal)?;
         let floor = if minimum_just_window.is_some() { f64::NEG_INFINITY } else {
             request["floors"][format!("{song_id}:{difficulty}")].as_f64().unwrap_or(f64::NEG_INFINITY)
         };
@@ -1732,7 +1754,7 @@ impl Engine {
                     constraints: constraints.clone(),
                     now,
                     generation,
-                    min_just_window_ms: minimum_just_window,
+                    window_policy: minimum_just_window,
                 },
                 chart: &mut chart,
                 seeds: seeds.clone(),
@@ -2539,6 +2561,10 @@ impl Engine {
         started: f64,
         now: &dyn Fn() -> f64,
     ) -> Result<Value, String> {
+        let request=&input["request"];
+        let deadline=request["deadline"].as_f64().unwrap_or_else(||request["timeLimitMs"].as_f64().map_or(f64::INFINITY,|ms|started+ms));
+        let _preparation=crate::clock::enter_preparation_deadline(crate::clock::milliseconds()+(deadline-now()).max(0.0));
+        if input["request"]["goal"]["arena"]["objective"]!="sections" {self.section_cache=None;self.section_multiple=None;}
         crate::reset_search_floor();
         if self.trusted_scores
             && input["request"]["cooperativeFloor"] == true
@@ -2594,6 +2620,7 @@ impl Engine {
                 return self.run_inner(&single, started, now);
             }
         }
+        if input["request"]["goal"]["arena"]["objective"]=="sections" {return self.run_arena_sections(input,started,now);}
         if input["request"]["songRules"].is_object() {
             let (mut scoped, scoped_input) = self.song_rule_view(input)?;
             let mut result = scoped.run(&scoped_input, started, now)?;
@@ -2602,6 +2629,9 @@ impl Engine {
         }
         if input["request"]["goal"]["arena"].is_object() {
             return self.run_arena(input, started, now);
+        }
+        if self.planner_scope(input).is_some() {
+            return self.with_planner(input,|scoped,input|scoped.run(input,started,now));
         }
         if input["request"]["goal"]["kind"] == "event" && !input["request"]["goal"]["rewardPlan"].is_null()
             && (input["request"]["resolveRewardPlan"] == true || !input["request"]["goal"]["rewardPlan"]["autoCp"].is_null()) {
@@ -2892,7 +2922,7 @@ impl Engine {
             master::int(&goal["gekiso"]["luckSamples"]),
             exchange,
         );
-        if let Some(minimum) = crate::just_window::target(&goal["gekiso"]["minJustWindowMs"])? {
+        if let Some(minimum) = crate::just_window::Policy::read(&goal["gekiso"])? {
             objective.set_min_just_window(minimum)?;
         }
         let deadline = request["deadline"].as_f64().unwrap_or_else(|| {
@@ -2995,7 +3025,7 @@ impl Engine {
             .to_string()
         });
         objective.live_floor = self.trusted_scores
-            && crate::just_window::target(&goal["gekiso"]["minJustWindowMs"])?.is_none()
+            && crate::just_window::Policy::read(&goal["gekiso"])?.is_none()
             && identity.is_some()
             && (phase.is_some() || single_lex)
             && request["noFloor"] != true
@@ -3510,7 +3540,7 @@ impl Engine {
                     master::int(&goal["gekiso"]["luckSamples"]),
                     None,
                 );
-                if let Some(minimum) = crate::just_window::target(&goal["gekiso"]["minJustWindowMs"])? {
+                if let Some(minimum) = crate::just_window::Policy::read(&goal["gekiso"])? {
                     secondary.set_min_just_window(minimum)?;
                 }
                 secondary.constrain_other(target, exchange, output.proven);
@@ -4071,6 +4101,8 @@ fn compare_hits(a: &Value, b: &Value) -> std::cmp::Ordering {
     let ranking = crate::reward_plan::compare(&b["rewardRanking"], &a["rewardRanking"]);
     ranking.unwrap_or_else(|| master::number(&b["key"], 0.0)
         .total_cmp(&master::number(&a["key"], 0.0))
+        .then_with(|| master::number(&b["sectionRanking"][0],0.0).total_cmp(&master::number(&a["sectionRanking"][0],0.0)))
+        .then_with(|| master::number(&b["sectionRanking"][1],0.0).total_cmp(&master::number(&a["sectionRanking"][1],0.0)))
         .then_with(|| master::number(&b["event"]["otherMean"], 0.0).total_cmp(&master::number(&a["event"]["otherMean"], 0.0)))
         .then_with(|| master::number(&b["score"]["mean"], 0.0).total_cmp(&master::number(&a["score"]["mean"], 0.0))))
         .then_with(|| master::int(&a["song"]["songId"]).cmp(&master::int(&b["song"]["songId"])))
@@ -4091,6 +4123,7 @@ impl Engine {
             let (mut scoped, scoped_input, _, _) = self.arena_view(input)?;
             return scoped.evaluate_all(&scoped_input);
         }
+        if self.planner_scope(input).is_some() { return self.with_planner(input,Self::evaluate_all); }
         let request = &input["request"];
         let mut out = Vec::new();
         for song in master::rows(&request["songs"]) {
@@ -4113,6 +4146,7 @@ impl Engine {
             let (mut scoped, scoped_input, _, _) = self.arena_view(input)?;
             return scoped.timeline(&scoped_input);
         }
+        if self.planner_scope(input).is_some() { return self.with_planner(input,Self::timeline); }
         let request = &input["request"];
         let song = &request["song"];
         self.load_source(input, song)?;
@@ -4208,13 +4242,48 @@ impl Engine {
         }
         let mut out = json!({"durationMs":duration,"density":density,"fever":chart.fevers,"windows":windows,"cachedCharts":self.cached_chart_keys()});
         if request["timing"].is_object() {
-            out["timing"] = self.order_timing(request, &song["songId"], &song["difficulty"])?;
+            if request["timing"]["gekiso"].is_object() {
+                let analysis=self.gekiso_timing_guide(request, &song["songId"], &song["difficulty"])?;
+                out["guide"]=analysis["guide"].clone();out["windowProfile"]=analysis["windowProfile"].clone();
+            } else {
+                out["timing"] = self.order_timing(request, &song["songId"], &song["difficulty"])?;
+            }
         }
         Ok(out)
     }
 }
 
 impl Engine {
+    fn gekiso_timing_guide(&self, request: &Value, song_id: &Value, difficulty: &Value) -> Result<Value, String> {
+        use crate::full::conditions::Performer;
+        let (song_id, difficulty) = (master::int(song_id), master::int(difficulty));
+        let mut evaluation = request["timing"].clone();
+        for key in ["members", "snaps", "unknownPolicy"] { evaluation[key] = request[key].clone(); }
+        let team = json!({"members": request["memberKeys"], "snaps": request["snapKeys"], "leader": request["memberKeys"][0]});
+        let resolved = self.resolve_team(&evaluation, &team, song_id)?;
+        let order: Vec<usize> = master::integers(&request["order"]).into_iter().map(|slot| slot as usize).collect();
+        let Some(index) = live::orders().iter().position(|row| row[..] == order[..]) else { return Ok(Value::Null) };
+        let compiled = self.charts.get(&(song_id, difficulty)).ok_or("missing-chart")?;
+        let source = self.sources.get(&(song_id, difficulty)).ok_or("missing-chart")?;
+        let setup = &evaluation["gekiso"];
+        let accuracy = serde_json::from_value(setup["accuracy"].clone()).map_err(|error| error.to_string())?;
+        let mut chart = crate::gekiso::Chart::new(&self.master, source, compiled.difficulty.play_level, compiled.song.missions.clone(), accuracy, gekiso_ranks(setup))?;
+        chart.music_type = resolved.music.music_type;
+        let deck = resolved.members.iter().zip(&resolved.snaps).map(|(member, snap)| Performer::from_member(&self.master, member, snap.as_ref())).collect();
+        let scene=request["sectionArena"]["objective"]=="sections";
+        let count=master::int(&setup["seeds"]);
+        let seeds:Vec<_>=(0..if count>0 {count}else if scene {32}else{0}).collect();
+        let opponents=if scene {self.section_opponents(&request["sectionArena"],&chart,source,song_id,&seeds)?}else{None};
+        let minimum=crate::just_window::Policy::read(setup)?;
+        let selected_snaps:Vec<_>=resolved.snaps.iter().flatten().cloned().collect();
+        let window=minimum.map(|minimum|crate::just_window::Prepared::new(&self.master,&chart,&resolved.members,&selected_snaps,minimum,&seeds)
+            .map(|prepared|prepared.capture_trace(&self.master,&chart))).transpose()?;
+        let input = chart::prepare(&self.master, compiled, resolved.power.total as i32, resolved.slots, Some(chart.judgements.clone()), 1.0, 100.0);
+        Ok(json!(crate::gekiso_guide::build(crate::gekiso_guide::Context {
+            master: &self.master, compiled, chart, deck, input, power: resolved.power.total as i32,
+            order: index, seeds,opponents,window,minimum,preserve_base:scene,
+        })?))
+    }
     /// Best judgement timing of one normal-live order (`live::timing`), from the
     /// evaluation context in `request.timing`.
     fn order_timing(&self, request: &Value, song_id: &Value, difficulty: &Value) -> Result<Value, String> {
@@ -4341,5 +4410,61 @@ pub(crate) fn normalize_hit(hit: &mut Value) {
         for key in ["score", "skipScore", "event", "potential"] {
             object.entry(key).or_insert(Value::Null);
         }
+    }
+}
+
+impl Engine {
+    pub fn sample(&mut self, input: &Value) -> Result<Value, String> {
+        if input["request"]["songRules"].is_object() {
+            let (mut scoped, input) = self.song_rule_view(input)?; return scoped.sample(&input);
+        }
+        if input["request"]["gekiso"]["arena"].is_object() {
+            let (mut scoped, input, _, _) = self.arena_view(input)?; return scoped.sample(&input);
+        }
+        if self.planner_scope(input).is_some() { return self.with_planner(input,Self::sample); }
+        let request = &input["request"]; let song = &request["songs"][0];
+        self.load_source(input, song)?;
+        let id = master::int(&song["songId"]); let difficulty = master::int(&song["difficulty"]);
+        let ResolvedTeam { members, snaps, music, power, slots, .. } = self.resolve_team(request, &request["team"], id)?;
+        let compiled = self.charts.get(&(id, difficulty)).ok_or("missing-chart")?;
+        let index = request["order"].as_u64().filter(|&index| index < 120).ok_or("invalid-skill-order")? as usize;
+        let mistakes = &request["play"]["mistakes"];
+        let selected: Vec<usize> = master::rows(&mistakes["indices"]).iter().map(|value| value.as_u64().map(|value| value as usize).ok_or("invalid-mistake-index")).collect::<Result<_,_>>()?;
+        let grade = mistakes["judgement"].as_u64().unwrap_or(1) as usize;
+        if ![1,4].contains(&grade) { return Err("invalid-mistake-judgement".into()); }
+        let (score, life, notes, grades) = if request["gekiso"].is_object() {
+            use crate::full::{conditions::Performer, model::Model};
+            let source = self.sources.get(&(id,difficulty)).ok_or("missing-chart")?;
+            let accuracy = serde_json::from_value(request["gekiso"]["accuracy"].clone()).map_err(|error| error.to_string())?;
+            let mut chart = crate::gekiso::Chart::new(&self.master, source, compiled.difficulty.play_level, compiled.song.missions.clone(), accuracy, gekiso_ranks(&request["gekiso"]))?;
+            chart.music_type = music.music_type;
+            let section_scene=request["sectionArena"]["objective"]=="sections";
+            let count=master::int(&request["gekiso"]["seeds"]);
+            let seeds:Vec<_>=(0..if count>0 {count}else{32}).collect();
+            let opponents=if section_scene {self.section_opponents(&request["sectionArena"],&chart,source,id,&seeds)?}else{None};
+            if selected.iter().any(|&index| index >= chart.notes.len()) { return Err("invalid-mistake-index".into()); }
+            let changed: BTreeMap<_,_> = selected.iter().map(|&index| (chart.notes[index].id, live::native_judgement(chart.notes[index].judgement_type, grade))).collect();
+            for frame in &mut chart.play.frames { for note in &mut frame.judged { if let Some(&grade) = changed.get(&note.note_id) { note.judgement = grade as i32; } } }
+            let order = &live::orders()[index];
+            let deck: Vec<_> = members.iter().zip(&snaps).map(|(member,snap)| Performer::from_member(&self.master, member, snap.as_ref())).collect();
+            let events: Vec<_> = chart.full.events.iter().map(|&(event,time)| (order[event], time)).collect();
+            let mut params = chart.params(); params.power = power.total as i32; params.music_type = music.music_type;
+            let mut model = Model::new(&self.master, &deck, &chart.full.notes, &events, params, Some(&chart.setup), (0,false))?;
+            if section_scene {chart.fixed_life(&mut model);}
+            if let Some(samples)=opponents {model.gk.as_mut().unwrap().section_opponents=Some(Arc::new(samples[0].clone()));}
+            let mut life = model.life.current;
+            for (index,frame) in chart.play.frames.iter().enumerate() { model.frame(frame.time_ms, &frame.judged, chart.play.dt[index])?; life = life.min(model.life.current); }
+            let notes: Vec<_> = chart.notes.iter().enumerate().map(|(index,note)| json!({"index":index,"timeMs":note.time_ms,"op":note.op,"judgementType":note.judgement_type})).collect();
+            (model.score.score.score as f64, life as f64, notes, Vec::<usize>::new())
+        } else {
+            if selected.iter().any(|&index| index >= compiled.times.len()) { return Err("invalid-mistake-index".into()); }
+            let grades = live::judgements_for_types(&compiled.judgement_types, &request["play"]);
+            let mut prepared = chart::prepare(&self.master, compiled, power.total as i32, slots, grades, 1.0, 100.0);
+            prepared.clock = live::FrameClock::for_play(&request["play"]);
+            let (score,life,grades) = live::sample(&prepared,index)?;
+            let notes: Vec<_> = compiled.times.iter().enumerate().map(|(index,&time)| json!({"index":index,"timeMs":time,"op":compiled.note_types[index],"judgementType":compiled.judgement_types[index]})).collect();
+            (score, life, notes, grades)
+        };
+        Ok(json!({"score":score,"lowestLife":life,"notes":if request["includeNotes"] == true { notes } else { Vec::new() },"judgements":grades,"cachedCharts":self.cached_chart_keys()}))
     }
 }

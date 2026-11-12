@@ -138,7 +138,7 @@ pub fn execute(input: &Value) -> Result<Value, String> {
                 Ok(search.response())
             }
             "qualify" => {
-                Ok(json!({"issues":crate::pt::validate(&engine.master,&input["request"])?}))
+                engine.qualify(input)
             }
             "run" => {
                 engine.import_scores(&input["scoredSeeds"]);
@@ -151,6 +151,7 @@ pub fn execute(input: &Value) -> Result<Value, String> {
             "growth" => engine.growth(input, started, &clock::milliseconds),
             "rates" => engine.rates(input),
             "evaluateAll" => engine.evaluate_all(input),
+            "sample" => engine.sample(input),
             "timeline" => engine.timeline(input),
             "chart" => {
                 let song = &input["song"];
@@ -166,12 +167,7 @@ pub fn execute(input: &Value) -> Result<Value, String> {
                 )?;
                 Ok(json!({"ready":true,"cachedCharts":engine.cached_chart_keys()}))
             }
-            "evaluate" => engine.evaluate(
-                &input["request"],
-                &input["team"],
-                master::int(&input["song"]["songId"]),
-                master::int(&input["song"]["difficulty"]),
-            ),
+            "evaluate" => engine.evaluate_one(input),
             _ => Err(format!("unknown-context-operation:{op}")),
         }
     })

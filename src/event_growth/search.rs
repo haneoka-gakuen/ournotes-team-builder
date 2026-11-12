@@ -17,11 +17,13 @@ pub(super) struct Ranked {
     pub configuration: Configuration,
     variation: i32,
     dimensions: usize,
+    distance: i32,
 }
 #[derive(Clone, Eq, PartialEq)]
 pub(super) struct Bound {
     variation: i32,
     dimensions: usize,
+    distance: i32,
     vip: i32,
     instruments: Vec<(i32, i32)>,
 }
@@ -30,6 +32,7 @@ impl Ord for Bound {
         self.variation
             .cmp(&other.variation)
             .then(self.dimensions.cmp(&other.dimensions))
+            .then(self.distance.cmp(&other.distance))
             .then(other.vip.cmp(&self.vip))
             .then_with(|| {
                 self.instruments
@@ -51,6 +54,7 @@ impl Ranked {
         Bound {
             variation: self.variation,
             dimensions: self.dimensions,
+            distance: self.distance,
             vip: self.configuration.vip_bonus,
             instruments: self
                 .configuration
@@ -121,7 +125,6 @@ pub(super) struct Tier {
     pub vip: i32,
     vip_rank: i32,
     minimums: Vec<i32>,
-    item_min: i32,
     rank_span: i32,
     item_span: i32,
     queue: BinaryHeap<Node>,
@@ -144,8 +147,7 @@ pub(super) struct Tier {
 }
 impl Tier {
     pub fn new(problem: Arc<Problem>, vip: i32, vip_rank: i32, budget: i32, scout: bool) -> Self {
-        // Scouts try common high-growth values first. Certified tiers cover the legal domain.
-        let minimums = vec![if scout { 15 } else { 1 }; problem.caps.len()];
+        let minimums = problem.minimums.clone();
         let kernels = Arc::clone(&problem.kernels[&vip]);
         let mut tier = Self {
             deltas: Arc::clone(&problem.deltas),
@@ -160,7 +162,6 @@ impl Tier {
             vip,
             vip_rank,
             minimums,
-            item_min: if scout { 50 } else { 0 },
             rank_span: if scout {
                 1
             } else {
@@ -183,15 +184,11 @@ impl Tier {
         };
         if tier
             .problem
-            .caps
+            .maximums
             .iter()
             .zip(&tier.minimums)
             .any(|(cap, min)| cap < min)
-            || tier
-                .problem
-                .bands
-                .iter()
-                .any(|band| band.cap < tier.item_min)
+            || tier.problem.bands.iter().any(|band| band.max < band.min)
             || tier.problem.primary_totals.is_empty()
             || budget == 0 && tier.problem.conflict
         {
@@ -201,7 +198,7 @@ impl Tier {
         let physical_span = tier.problem.unseen_span
             + tier
                 .problem
-                .caps
+                .maximums
                 .iter()
                 .zip(&tier.minimums)
                 .map(|(cap, min)| (cap - min).clamp(0, super::RANK_SPAN))
@@ -246,19 +243,19 @@ impl Tier {
                 }
             }
         }
-        let root = Node {
+        let mut root = Node {
             lo: tier
                 .minimums
                 .iter()
                 .map(|rank| rank - 1)
-                .chain(tier.problem.bands.iter().map(|_| tier.item_min))
+                .chain(tier.problem.bands.iter().map(|band| band.min))
                 .collect(),
             hi: tier
                 .problem
-                .caps
+                .maximums
                 .iter()
                 .map(|rank| rank - 1 + tier.problem.totals.last().unwrap().bonus / 5)
-                .chain(tier.problem.bands.iter().map(|band| band.cap))
+                .chain(tier.problem.bands.iter().map(|band| band.max))
                 .collect(),
             bound: tier.empty_bound(),
             order: 0,
@@ -271,20 +268,19 @@ impl Tier {
             sum_range: None,
             profile: None,
         };
+        if !tier.tighten(&mut root) {
+            tier.pruned += 1;
+            return tier;
+        }
         if scout {
-            let mut node = root;
-            if tier.tighten(&mut node) {
-                tier.queue.push(node);
-            } else {
-                tier.pruned += 1;
-            }
+            tier.queue.push(root);
         } else {
             let roles = tier.problem.ids.len();
             let bands = tier.problem.bands.len();
             let records = tier.problem.readings.len();
             let maxima: Vec<_> = tier
                 .problem
-                .caps
+                .maximums
                 .iter()
                 .zip(&tier.minimums)
                 .map(|(cap, min)| (cap - min).clamp(0, super::RANK_SPAN))
@@ -292,7 +288,7 @@ impl Tier {
                     tier.problem
                         .bands
                         .iter()
-                        .map(|band| (band.cap - tier.item_min).clamp(0, super::ITEM_SPAN)),
+                        .map(|band| (band.max - band.min).clamp(0, super::ITEM_SPAN)),
                 )
                 .chain([tier.global_span / 5])
                 .collect();
@@ -317,7 +313,7 @@ impl Tier {
                         .bands
                         .iter()
                         .enumerate()
-                        .map(|(b, band)| (band.cap - spans[roles + b], band.cap))
+                        .map(|(b, band)| (band.max - spans[roles + b], band.max))
                         .collect();
                     tier.order += 1;
                     node.order = tier.order;
@@ -512,7 +508,7 @@ impl Tier {
             .map(|j| self.minimums[j] - offsets.ranks.iter().map(|r| r[j]).min().unwrap())
             .collect();
         let upper: Vec<_> = (0..size)
-            .map(|j| ctx.caps[j] - offsets.ranks.iter().map(|r| r[j]).max().unwrap())
+            .map(|j| ctx.maximums[j] - offsets.ranks.iter().map(|r| r[j]).max().unwrap())
             .collect();
         let mut gauges = Vec::new();
         for &total in &ctx.primary_totals {
@@ -669,7 +665,7 @@ impl Tier {
                     .collect();
                 let high: Vec<_> = self
                     .problem
-                    .caps
+                    .maximums
                     .iter()
                     .enumerate()
                     .map(|(i, &cap)| cap.min(node.hi[i] - offset + 1))
@@ -695,6 +691,7 @@ impl Tier {
         Bound {
             variation: self.budget,
             dimensions: ((self.budget + maximum - 1) / maximum) as usize,
+            distance: 0,
             vip: self.vip,
             instruments: Vec::new(),
         }
@@ -704,6 +701,39 @@ impl Tier {
         if let Some(offsets) = &node.offsets {
             bound.dimensions = offsets.dimensions();
         }
+        let size = self.problem.ids.len();
+        let gear_distance: i32 = self
+            .problem
+            .bands
+            .iter()
+            .enumerate()
+            .map(|(i, band)| {
+                (band.preferred.clamp(node.lo[size + i], node.hi[size + i]) - band.preferred).abs()
+            })
+            .sum();
+        // Effective character bonuses can be decomposed through any equivalent total-rank tier.
+        let rank_distance = self
+            .problem
+            .primary_totals
+            .iter()
+            .filter_map(|total| {
+                let offset = total.bonus / 5;
+                let mut distance = 0;
+                for i in 0..size {
+                    let lo = self.minimums[i].max(node.lo[i] - offset + 1);
+                    let hi = self.problem.maximums[i].min(node.hi[i] - offset + 1);
+                    if lo > hi {
+                        return None;
+                    }
+                    distance +=
+                        (self.problem.preferred[i].clamp(lo, hi) - self.problem.preferred[i]).abs()
+                            * 5;
+                }
+                Some(distance)
+            })
+            .min()
+            .unwrap_or(0);
+        bound.distance = gear_distance + rank_distance;
         bound.instruments = self
             .problem
             .bands
@@ -717,7 +747,7 @@ impl Tier {
                         upper + offsets.iter().map(|row| row[i]).max().unwrap(),
                     )
                 } else {
-                    (upper, band.cap.min(upper + self.item_span))
+                    (upper, band.max.min(upper + self.item_span))
                 }
             })
             .collect();
@@ -764,7 +794,7 @@ impl Tier {
                     } else {
                         0
                     })
-                .clamp(self.item_min, problem.bands[band].cap);
+                .clamp(problem.bands[band].min, problem.bands[band].max);
                 self.kernel(observation, slot, flat)[gear as usize]
             })
             .sum::<i64>();
@@ -810,7 +840,7 @@ impl Tier {
         for slot in 0..5 {
             let role = reading.characters[slot];
             let mut options = vec![(0, 0, 0)];
-            for n in 1..=(ctx.caps[role] - self.minimums[role])
+            for n in 1..=(ctx.maximums[role] - self.minimums[role])
                 .min(super::RANK_SPAN)
                 .min(self.budget / 5)
             {
@@ -836,7 +866,7 @@ impl Tier {
             let mut options = vec![(0, 0, 0)];
             for n in 1..=super::ITEM_SPAN
                 .min(self.budget)
-                .min(ctx.bands[band].cap - self.item_min)
+                .min(ctx.bands[band].max - ctx.bands[band].min)
             {
                 let mut range = (0, 0);
                 for slot in 0..5 {
@@ -1006,7 +1036,7 @@ impl Tier {
                 .map(|i| self.minimums[i].max(node.lo[i] - offset + 1))
                 .collect();
             let hi: Vec<_> = (0..size)
-                .map(|i| ctx.caps[i].min(node.hi[i] - offset + 1))
+                .map(|i| ctx.maximums[i].min(node.hi[i] - offset + 1))
                 .collect();
             let sum_lo = lo.iter().sum::<i32>();
             let sum_hi = hi.iter().sum::<i32>();
@@ -1137,54 +1167,57 @@ impl Tier {
         if self.scout {
             let size = self.problem.ids.len();
             node.hint = Some(
-                (0..size)
-                    .flat_map(|i| (i + 1..size).map(move |j| (i, j)))
-                    .map(|(i, j)| {
-                        let gap = (node.lo[i] - node.hi[j])
-                            .max(node.lo[j] - node.hi[i])
-                            .max(0) as i64;
-                        gap * gap
-                    })
-                    .sum(),
+                node.bound.distance as i64 * 1000
+                    + (0..size)
+                        .flat_map(|i| (i + 1..size).map(move |j| (i, j)))
+                        .map(|(i, j)| {
+                            let gap = (node.lo[i] - self.problem.preferred[i] - node.hi[j]
+                                + self.problem.preferred[j])
+                                .max(
+                                    node.lo[j] - self.problem.preferred[j] - node.hi[i]
+                                        + self.problem.preferred[i],
+                                )
+                                .max(0) as i64;
+                            gap * gap
+                        })
+                        .sum::<i64>(),
             );
         }
         true
     }
     fn canonical(&self, flat: &[i32]) -> Vec<Canonical> {
-        let options: Vec<_> = self
-            .problem
-            .primary_totals
-            .iter()
-            .filter_map(|&total| {
-                if self
-                    .active_total
-                    .is_some_and(|selected| selected.bonus != total.bonus)
-                {
-                    return None;
-                }
-                let levels: Vec<_> = flat
-                    .iter()
-                    .map(|value| value - total.bonus / 5 + 1)
-                    .collect();
-                if levels
-                    .iter()
-                    .enumerate()
-                    .any(|(i, &value)| value < self.minimums[i] || value > self.problem.caps[i])
-                {
-                    return None;
-                }
-                let sum = levels.iter().sum::<i32>();
-                let range = Range {
-                    min: total.min.max(sum + self.problem.unseen_count),
-                    max: total.max.min(sum + self.problem.unseen_cap),
-                };
-                (range.min <= range.max).then_some(Canonical {
-                    levels,
-                    total,
-                    range,
+        let options: Vec<_> =
+            self.problem
+                .primary_totals
+                .iter()
+                .filter_map(|&total| {
+                    if self
+                        .active_total
+                        .is_some_and(|selected| selected.bonus != total.bonus)
+                    {
+                        return None;
+                    }
+                    let levels: Vec<_> = flat
+                        .iter()
+                        .map(|value| value - total.bonus / 5 + 1)
+                        .collect();
+                    if levels.iter().enumerate().any(|(i, &value)| {
+                        value < self.minimums[i] || value > self.problem.maximums[i]
+                    }) {
+                        return None;
+                    }
+                    let sum = levels.iter().sum::<i32>();
+                    let range = Range {
+                        min: total.min.max(sum + self.problem.unseen_count),
+                        max: total.max.min(sum + self.problem.unseen_cap),
+                    };
+                    (range.min <= range.max).then_some(Canonical {
+                        levels,
+                        total,
+                        range,
+                    })
                 })
-            })
-            .collect();
+                .collect();
         options
     }
     pub fn advance(&mut self) -> Option<Arc<Ranked>> {
@@ -1205,8 +1238,8 @@ impl Tier {
                     for band in 0..self.problem.bands.len() {
                         let low = offsets.iter().map(|row| row[band]).min().unwrap();
                         let high = offsets.iter().map(|row| row[band]).max().unwrap();
-                        domain.lo[size + band] = self.item_min - low;
-                        domain.hi[size + band] = self.problem.bands[band].cap - high;
+                        domain.lo[size + band] = self.problem.bands[band].min - low;
+                        domain.hi[size + band] = self.problem.bands[band].max - high;
                     }
                     if self.tighten_differences(&mut domain).is_some() {
                         self.seed_gauges(domain);
@@ -1402,7 +1435,7 @@ impl Tier {
         let ctx = &self.problem;
         let configuration = &mut ranked.configuration;
         let mut equivalents = Vec::new();
-        for shift in -ctx.caps.iter().max().unwrap()..=*ctx.caps.iter().max().unwrap() {
+        for shift in -ctx.maximums.iter().max().unwrap()..=*ctx.maximums.iter().max().unwrap() {
             let mut witnesses = Vec::new();
             let mut outside = Range {
                 min: ctx.unseen_count,
@@ -1413,7 +1446,7 @@ impl Tier {
                 if levels
                     .iter()
                     .enumerate()
-                    .any(|(i, rank)| *rank < self.minimums[i] || *rank > ctx.caps[i])
+                    .any(|(i, rank)| *rank < self.minimums[i] || *rank > ctx.maximums[i])
                 {
                     break;
                 }
@@ -1544,6 +1577,25 @@ impl Tier {
                 .max()
                 .unwrap(),
         };
+        ranked.distance = equivalents
+            .iter()
+            .map(|equivalent| {
+                let witness = &equivalent.witnesses[0];
+                witness
+                    .levels
+                    .iter()
+                    .zip(&ctx.preferred)
+                    .map(|(level, center)| (level - center).abs() * 5)
+                    .sum::<i32>()
+                    + witness
+                        .instruments
+                        .iter()
+                        .zip(&ctx.bands)
+                        .map(|(level, band)| (level - band.preferred).abs())
+                        .sum::<i32>()
+            })
+            .min()
+            .unwrap();
         configuration.equivalents = equivalents;
         true
     }
@@ -1753,6 +1805,7 @@ impl Tier {
             configuration,
             variation,
             dimensions,
+            distance: 0,
         })
     }
 
@@ -1912,7 +1965,7 @@ impl Tier {
             if levels
                 .iter()
                 .enumerate()
-                .any(|(i, &level)| level < self.minimums[i] || level > ctx.caps[i])
+                .any(|(i, &level)| level < self.minimums[i] || level > ctx.maximums[i])
             {
                 return Vec::new();
             }
@@ -1931,7 +1984,7 @@ impl Tier {
             if instruments
                 .iter()
                 .enumerate()
-                .any(|(i, &level)| level < self.item_min || level > ctx.bands[i].cap)
+                .any(|(i, &level)| level < ctx.bands[i].min || level > ctx.bands[i].max)
             {
                 return Vec::new();
             }
@@ -1973,13 +2026,14 @@ impl Tier {
         let reading = &ctx.readings[observation];
         let mut min_gear: Vec<_> = gears
             .iter()
-            .map(|value| self.item_min.max(value - self.item_span))
+            .enumerate()
+            .map(|(i, value)| ctx.bands[i].min.max(value - self.item_span))
             .collect();
         let mut max_gear: Vec<_> = ctx
             .bands
             .iter()
             .zip(gears)
-            .map(|(band, value)| band.cap.min(value + self.item_span))
+            .map(|(band, value)| band.max.min(value + self.item_span))
             .collect();
         if let Some(offsets) = &self.active_offsets {
             for band in 0..gears.len() {
@@ -1997,7 +2051,7 @@ impl Tier {
             .levels
             .iter()
             .enumerate()
-            .map(|(i, value)| ctx.caps[i].min(value + self.rank_span))
+            .map(|(i, value)| ctx.maximums[i].min(value + self.rank_span))
             .collect();
         let mut result = Vec::new();
         let order: Vec<_> = reading

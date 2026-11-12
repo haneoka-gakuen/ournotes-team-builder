@@ -99,6 +99,7 @@ struct LivePool {
 struct CondSkill {
     member: usize,
     skill_type: i32,
+    steady_rows: bool,
     updater: ConditionUpdater,
 }
 #[derive(Clone)]
@@ -381,6 +382,7 @@ pub struct GekisoLive {
     previous_lots: Vec<i32>,
     previous_lot_ms: i32,
     pub rank_bonus: Vec<RankBonus>,
+    pub(crate) section_opponents: Option<Arc<Vec<[crate::gekiso::sections::Standing; 3]>>>,
 }
 #[derive(Clone)]
 pub struct Model<'a> {
@@ -419,6 +421,7 @@ pub struct Model<'a> {
     pub record: Option<LuckRecord>,
     pub record_trace: bool,
     pub(crate) just_window: Option<crate::just_window::Trace>,
+    pub(crate) live_life: Option<Vec<(i32,i32)>>,
     rush_observers: Vec<ConditionUpdater>,
     combo_observer: Option<ComboObserver>,
     pub(crate) rush_support_commands: Vec<(i32, i32)>,
@@ -527,6 +530,7 @@ impl<'a> Model<'a> {
                 previous_lots: Vec::new(),
                 previous_lot_ms: 0,
                 rank_bonus: Vec::new(),
+                section_opponents: None,
                 ranks: setup
                     .ranks
                     .iter()
@@ -591,6 +595,7 @@ impl<'a> Model<'a> {
             },
             record_trace: false,
             just_window: None,
+            live_life: None,
             rush_observers: Vec::new(),
             combo_observer: None,
             rush_support_commands: Vec::new(),
@@ -889,9 +894,11 @@ impl<'a> Model<'a> {
                 release: factory.group(row.release_group, member)?,
             });
         }
+        let steady_rows = effects.iter().all(|effect| !self.rows[effect.row].while_executing);
         self.condition.push(CondSkill {
             member,
             skill_type,
+            steady_rows,
             updater: ConditionUpdater::new(effects, gate)?,
         });
         Ok(())
@@ -901,7 +908,29 @@ impl<'a> Model<'a> {
             target.0 = source.0;
         }
     }
+    fn condition_indices(&mut self) -> ConditionIndices {
+        let mut selected = self.condition_schedule.as_ref().map(|schedule| schedule.select(
+            &self.frame_events, !self.judged.is_empty(), self.frame_rank, self.gk.as_ref(),
+        ));
+        if self.record.is_none() {
+            if let (Some(selected), Some(g)) = (&mut selected, &self.gk) {
+                let changed = !self.frame_events.is_empty() || !self.judged.is_empty() || self.frame_rank.is_some()
+                    || !g.controller.updates.is_empty() || !g.previous_lots.is_empty();
+                for i in (ConditionIndices { selected: Some(*selected), all: 0..self.condition.len() }) {
+                    let condition = &mut self.condition[i];
+                    if condition.steady_rows && condition.updater.idle_lottery_frame(changed) { *selected &= !(1 << i); }
+                }
+            }
+        }
+        ConditionIndices { selected, all: 0..self.condition.len() }
+    }
     pub fn frame(&mut self, time: i32, judged: &[JudgedNote], dt: f64) -> Result<(), String> {
+        self.frame_inner::<false>(time,judged,dt)
+    }
+    pub(crate) fn count_frame(&mut self,time:i32,judged:&[JudgedNote],dt:f64)->Result<(),String> {
+        self.frame_inner::<true>(time,judged,dt)
+    }
+    fn frame_inner<const COUNTS_ONLY:bool>(&mut self, time: i32, judged: &[JudgedNote], dt: f64) -> Result<(), String> {
         self.frame_time = time;
         self.frame_rank = self.previous_rank.take();
         if let Some(g) = &mut self.gk {
@@ -973,7 +1002,7 @@ impl<'a> Model<'a> {
         for (n, converted) in &self.results {
             self.life.note_damage(n.time_ms, *converted as usize);
             let life = self.life.at(n.time_ms);
-            if self.master.live.note_percent.contains_key(&n.op) {
+            if !COUNTS_ONLY && self.master.live.note_percent.contains_key(&n.op) {
                 let j = converted + 1;
                 let score_type = if (0..9).contains(&j) {
                     [0, 0, 6, 5, 4, 3, 2, 1, 0][j as usize]
@@ -985,13 +1014,13 @@ impl<'a> Model<'a> {
                     .add_note(n.time_ms, life, n.id, n.op, score_type);
             }
         }
-        self.score.score.calculate(
+        if !COUNTS_ONLY {self.score.score.calculate(
             time,
             &self.combo,
             self.gk
                 .as_ref()
                 .map(|g| &g.controller as &dyn score::GekisoCombo),
-        )?;
+        )?;}
         let input = FrameInput {
             time,
             music_length: self.params.music_length,
@@ -1028,18 +1057,7 @@ impl<'a> Model<'a> {
             self.enabled
                 .sort_by_key(|&i| self.live[i].key as i64 * 10 + self.live[i].index as i64);
         }
-        let selected_conditions = self.condition_schedule.as_ref().map(|schedule| {
-            schedule.select(
-                &self.frame_events,
-                !self.judged.is_empty(),
-                self.frame_rank,
-                self.gk.as_ref(),
-            )
-        });
-        let condition_indices = ConditionIndices {
-            selected: selected_conditions,
-            all: 0..self.condition.len(),
-        };
+        let condition_indices = self.condition_indices();
         for observer in &mut self.rush_observers {
             observer.begin_frame();
         }
@@ -1049,6 +1067,12 @@ impl<'a> Model<'a> {
         let mut listed = std::mem::take(&mut self.listed);
         let mut updated = std::mem::take(&mut self.updated);
         for phase in 1..=2 {
+            if phase==2 && !self.frame_events.is_empty() {
+                if let Some(record)=&mut self.live_life {
+                    let life=self.life.at(time);
+                    record.extend(self.frame_events.iter().map(|&(_,at)|(at,life)));
+                }
+            }
             listed.clear();
             {
                 let mut ctx = Context {
@@ -1199,22 +1223,22 @@ impl<'a> Model<'a> {
         self.enabled
             .retain(|&index| self.live[index].parent != effects::STAY);
         self.life.sync(time);
-        self.score.score.calculate(
+        if !COUNTS_ONLY {self.score.score.calculate(
             time,
             &self.combo,
             self.gk
                 .as_ref()
                 .map(|g| &g.controller as &dyn score::GekisoCombo),
-        )?;
+        )?;}
         if self.gk.is_some() {
-            self.after(time)?;
+            self.after::<COUNTS_ONLY>(time)?;
         }
         if self.record_trace {
             self.trace.push((time, self.score.score.score));
         }
         Ok(())
     }
-    fn after(&mut self, time: i32) -> Result<(), String> {
+    fn after<const COUNTS_ONLY:bool>(&mut self, time: i32) -> Result<(), String> {
         let g = self.gk.as_mut().unwrap();
         self.gk_judged.clear();
         self.gk_judged.extend(
@@ -1262,19 +1286,24 @@ impl<'a> Model<'a> {
             return Ok(());
         };
         let range = &g.controller.ranges[index];
-        let s0 = self
+        let s0 = if COUNTS_ONLY {0}else{self
             .score
             .score
-            .calculate(range.start, &self.combo, Some(&g.controller))?;
-        let s1 = self
+            .calculate(range.start, &self.combo, Some(&g.controller))?};
+        let s1 = if COUNTS_ONLY {0}else{self
             .score
             .score
-            .calculate(range.end, &self.combo, Some(&g.controller))?;
+            .calculate(range.end, &self.combo, Some(&g.controller))?};
         g.controller.states[index].start_score = s0;
         g.controller.states[index].end_score = s1;
         if index < g.factors.len() {
             let own = g.controller.states[index].score();
-            let rank = g.ranks.get(index).copied().unwrap_or(1);
+            let rank = if let Some(opponents) = &g.section_opponents {
+                let own = crate::gekiso::sections::Standing::from_state(
+                    &g.controller.states[index], g.controller.ranges[index].mission,
+                );
+                1 + opponents.iter().filter(|opponent| opponent[index].beats(&own)).count().min(4) as i32
+            } else { g.ranks.get(index).copied().unwrap_or(1) };
             let percent = g.factors[index][rank as usize - 1];
             let product = own as i64 * percent as i64;
             let bonus = crate::num::i32((product as f64 / 100.0).trunc());
@@ -1768,8 +1797,8 @@ impl<'a> Model<'a> {
     fn update_just_window(&mut self, row: &Row, state: &State, key: Key) -> Result<(), String> {
         if let Some(trace) = &mut self.just_window {
             if row.limit != 0 { return Err("just-window-effect".into()); }
-            if state.state == effects::EXECUTE { trace.enable(self.master, key, row.value, &row.targets); }
-            else if state.state == effects::END { trace.disable(key); }
+            if state.state == effects::EXECUTE { trace.enable(self.master, key, row.value, &row.targets,self.frame_time); }
+            else if state.state == effects::END { trace.disable(key,self.frame_time); }
         }
         Ok(())
     }

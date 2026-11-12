@@ -313,6 +313,7 @@ pub struct Event {
     pub challenge_points: BTreeMap<i32, i32>,
     pub live_rewards: Vec<Reward>,
     pub challenge_rewards: Vec<Reward>,
+    pub planner_rules: Value,
 }
 #[derive(Clone)]
 pub struct Boost {
@@ -827,6 +828,7 @@ pub fn compile(data: &Value) -> Result<Master, String> {
                 end_at: event["endAt"].clone(),
                 item_id,
                 music_id: int(&event["musicId"]),
+                planner_rules: event["plannerRules"].clone(),
                 effects: effects.iter().map(EventEffect::from).collect(),
                 live_points: points("MasterLiveEventPoint", "liveEventPointGroup"),
                 challenge_points: points(

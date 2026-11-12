@@ -372,6 +372,7 @@ pub struct State {
     pub max_combo: i32,
     pub just: i32,
     pub raw_just: i32,
+    pub perfect: i32,
     pub cumulative: i32,
     pub start_score: i32,
     pub end_score: i32,
@@ -390,6 +391,7 @@ impl Default for State {
             max_combo: 0,
             just: 0,
             raw_just: 0,
+            perfect: 0,
             cumulative: 0,
             start_score: 0,
             end_score: 0,
@@ -633,6 +635,10 @@ impl Controller {
             .push((time, bonus as f64, self.sequence.wrapping_sub(1)));
         self.flag();
         id
+    }
+    pub(crate) fn combo_bonus_count(&self) -> usize { self.combo_stack.len() }
+    pub(crate) fn combo_bonus_times(&self, after: usize) -> impl Iterator<Item = i32> + '_ {
+        self.combo_stack[after..].iter().filter_map(|&(time, delta, _)| (delta > 0.0).then_some(time))
     }
     pub fn subtract_combo_bonus(&mut self, time: i32, id: i32) -> Result<(), String> {
         let bonus = self
@@ -992,6 +998,9 @@ impl Controller {
     ) -> Result<(), String> {
         if judgement == 0 || judgement == 7 {
             return Ok(());
+        }
+        if judgement == 5 || judgement == 6 {
+            self.states[index].perfect = self.states[index].perfect.wrapping_add(1);
         }
         self.history[index].push((time, judgement, self.sequence));
         self.sequence = self.sequence.wrapping_add(1);

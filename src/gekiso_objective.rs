@@ -1,5 +1,6 @@
 //! Gekiso context caches and safe level/support bounds for exact search.
 mod shared;
+pub(crate) mod sections;
 use crate::{
     full::conditions::Performer,
     gekiso::{self, Chart, Context},
@@ -951,7 +952,7 @@ pub struct Kernel<'a> {
     combo_scripts: Option<crate::reward_trace::Scripts>,
     last_combo_key: Option<(Vec<Performer>, String)>,
     fixed_preparations: HashMap<Option<usize>, Arc<crate::rewards::BoundPreparation>>,
-    global_fixed_preparation: Option<Arc<crate::rewards::BoundPreparation>>,
+    bound_preparation: Option<Arc<crate::rewards::BoundPreparation>>,
     fixed_combo_trace_order: VecDeque<String>,
     fixed_luck_counts: HashMap<(String, usize), Option<Arc<crate::rewards::LuckEnvelope>>>,
     fixed_luck_count_order: VecDeque<(String, usize)>,
@@ -973,12 +974,14 @@ pub struct Kernel<'a> {
     chain_choices: HashMap<(i32, [u32; 5], u8), Arc<ChainChoice>>,
     chain_choice_order: VecDeque<(i32, [u32; 5], u8)>,
     healthy: bool,
+    steady_life: bool,
     owner_local: bool,
     regional_gains: HashMap<(i32, Vec<u32>, u32), f64>,
     regional_gain_order: VecDeque<(i32, Vec<u32>, u32)>,
     gain_probe: Option<Performer>,
     luck_envelopes: HashMap<Vec<u32>, Arc<Weights>>,
     order_bounds: HashMap<[u32; 5], f64>,
+    shared_mean_coefficients: HashMap<[u32; 5], f64>,
     order_estimates: HashMap<([u32; 5], [u32; 5]), f64>,
     choice_domains: HashMap<Vec<i32>, u32>,
     next_choice_base: u64,
@@ -1162,6 +1165,7 @@ fn collect_luck_envelope(
     let tasks: Vec<_> = (0..workers).collect();
     crate::parallel::map(&tasks, |&worker| -> Result<(), ()> {
         for index in (worker..jobs).step_by(workers) {
+            if crate::clock::preparation_expired(){return Err(());}
             if crate::cancellation_generation() != generation {
                 return Err(());
             }
@@ -1556,8 +1560,8 @@ impl<'a> Kernel<'a> {
             vec![0]
         };
         let prepared = crate::skills::prepare(master, members, snaps);
-        let healthy = chart.accuracy.great == 0.0
-            && chart.accuracy.miss_every == 0
+        let steady_life = chart.accuracy.miss_every == 0
+            && chart.judgements.iter().all(|&grade| master.live.damage[grade] == 0.0)
             && crate::support_aliases::stable_life_conditions(
                 master,
                 members,
@@ -1574,15 +1578,16 @@ impl<'a> Kernel<'a> {
                     })
                 })
             && prepared.slots.iter().all(|s| {
-                s.effects.iter().all(|e| {
+                s.recovery >= 0 && s.effects.iter().all(|e| {
                     e.gate.blocks(master.live.life_base)
                         == e.gate.blocks(2.0 * master.live.life_base)
                 }) && s
                     .convert
                     .as_ref()
-                    .is_none_or(|c| !c.judgements.contains(&6))
+                    .is_none_or(|c| !c.judgements.contains(&6) && master.live.damage[c.judgement] == 0.0)
             });
-        let slots = if healthy { prepared.for_gekiso(master.live.life_base) }
+        let healthy = chart.accuracy.great == 0.0 && steady_life;
+        let slots = if steady_life { prepared.for_gekiso(master.live.life_base, !healthy) }
             else { Arc::clone(&prepared.slots) };
         let cache = std::mem::take(&mut chart.contexts);
         let cache_order = std::mem::take(&mut chart.context_order);
@@ -1752,7 +1757,7 @@ impl<'a> Kernel<'a> {
             combo_scripts: None,
             last_combo_key: None,
             fixed_preparations: HashMap::default(),
-            global_fixed_preparation: None,
+            bound_preparation: None,
             fixed_combo_trace_order: VecDeque::new(),
             fixed_luck_counts: HashMap::default(),
             fixed_luck_count_order: VecDeque::new(),
@@ -1774,12 +1779,14 @@ impl<'a> Kernel<'a> {
             chain_choices: HashMap::default(),
             chain_choice_order: VecDeque::new(),
             healthy,
+            steady_life,
             owner_local: member_fields.owner_local(),
             regional_gains: HashMap::default(),
             regional_gain_order: VecDeque::new(),
             gain_probe,
             luck_envelopes: HashMap::default(),
             order_bounds: HashMap::default(),
+            shared_mean_coefficients: HashMap::default(),
             order_estimates: HashMap::default(),
             choice_domains: HashMap::default(),
             next_choice_base: 0,
@@ -2048,11 +2055,13 @@ impl<'a> Kernel<'a> {
         };
         #[cfg(not(target_arch = "wasm32"))]
         let value = match shared {
-            Some(shared) => shared.cell(&key).get_or_init(compute).clone(),
+            Some(shared) => {let cell=shared.cell(&key);if let Some(value)=cell.get(){value.clone()}else{let value=compute();if value.is_some()||!crate::clock::preparation_expired(){let _=cell.set(value.clone());}value}},
             None => compute(),
         };
         #[cfg(target_arch = "wasm32")]
         let value = compute();
+
+        if value.is_none()&&crate::clock::preparation_expired(){return None;}
 
         let limit = if cfg!(target_arch = "wasm32") {
             luck_envelope_limit(self.chart.notes.len()).min(128)
@@ -4708,6 +4717,18 @@ impl Kernel<'_> {
             detail: json!({"pendingScores":true}),
         })
     }
+    fn bounded_mean_evaluate(&mut self, team: &Team, power: i32, cutoff: search::Cutoff) -> Result<Option<search::Evaluation>, String> {
+        if self.chart.luck || !self.seeds.is_empty() || self.criterion != Criterion::Mean { return Ok(None); }
+        let Some(ceilings) = self.max_order_bounds(team, power) else { return Ok(None); };
+        self.exact_calls += 1;
+        let deck = self.original_deck(team);
+        let Some(scores) = gekiso::replay_bounded_mean(self.master, self.chart, &deck, power, &ceilings, cutoff)? else {
+            return Ok(Some(search::Evaluation::Pruned(if cutoff.prune_equal { cutoff.key } else { cutoff.key.next_down() })));
+        };
+        let mut detail = json!({"scores":scores,"seeds":1,"comboBonus":if self.chart.setup.missions.iter().any(|m| *m==1 || *m==4) {Some(1+team.members.iter().map(|&i|self.opening_bonuses[i]).sum::<i32>())} else {None}});
+        self.decorate_window(team, power, &mut detail)?;
+        Ok(Some(search::Evaluation::Exact(Exact { key: scores.scores.mean, detail })))
+    }
     fn deterministic_coefficient(&mut self, team: &Team) -> Option<f64> {
         if self.chart.luck || !self.healthy || !self.owner_local || self.just_context.is_none() {
             return None;
@@ -4765,7 +4786,13 @@ impl Kernel<'_> {
         coefficient
     }
     fn deterministic_order_bound(&mut self, team: &Team, power: f64, limit: f64) -> Option<f64> {
-        if self.chart.luck || !self.healthy {
+        if self.chart.luck || !self.steady_life {
+            return None;
+        }
+        if !self.healthy && (!self.owner_local
+            || !self.chart.setup.missions.iter().all(|&mission| mission == 1)
+            || team.members.iter().zip(&team.snaps).any(|(&member, &snap)| self.slot(member, snap).convert.is_some()))
+        {
             return None;
         }
         let key = std::array::from_fn(|slot| self.shape_id(team.members[slot], team.snaps[slot]));
@@ -6782,17 +6809,17 @@ impl<'k, 'a> Adapter<'k, 'a> {
                     kernel.snaps,
                     1.0 + level as f64,
                     (None, global_luck.as_deref()),
-                    &mut kernel.global_fixed_preparation,
+                    &mut kernel.bound_preparation,
                 )
             } else if !surrogate && !estimate && !kernel.chart.luck {
                 if kernel.maximum_level > 0 {
-                    crate::rewards::DeterministicBound::with_combo(
+                    crate::rewards::DeterministicBound::with_combo_preparation(
                         kernel.master,
                         kernel.chart,
                         kernel.members,
                         kernel.snaps,
                         1.0 + level as f64,
-                        None,
+                        (None, &mut kernel.bound_preparation),
                     )
                 } else {
                     crate::rewards::DeterministicBound::new(
@@ -6895,7 +6922,7 @@ impl<'k, 'a> Adapter<'k, 'a> {
     ) -> Option<f64> {
         if !self.combo_attempted {
             self.combo_attempted = true;
-            if !self.kernel.healthy {
+            if !self.kernel.healthy && self.deterministic.is_none() {
                 return None;
             }
             let script = self.kernel.combo_script(members)?;
@@ -6967,13 +6994,13 @@ impl<'k, 'a> Adapter<'k, 'a> {
                     return None;
                 }
                 if !self.kernel.combo_bounds.contains_key(&script) {
-                    let mut model = crate::rewards::DeterministicBound::with_combo(
+                    let mut model = crate::rewards::DeterministicBound::with_combo_preparation(
                         self.kernel.master,
                         self.kernel.chart,
                         self.kernel.members,
                         self.kernel.snaps,
                         1.0 + self.level as f64,
-                        Some(&script),
+                        (Some(&script), &mut self.kernel.bound_preparation),
                     )?;
                     model.coefficient_limit = 256;
                     model.snapshot_power(Arc::clone(&self.snapshot_power));
@@ -7222,6 +7249,17 @@ impl<'k, 'a> Adapter<'k, 'a> {
         self.fixed_leaf_order.retain(|old| old != &key);
         self.fixed_leaf_order.push_back(key);
         Some(Arc::clone(self.fixed_leaf_models.get(&key)?))
+    }
+    fn selected_luck_score_ceiling(&mut self, team: &Team, power: f64) -> Option<f64> {
+        if !self.kernel.chart.luck || self.kernel.seeds.is_empty()
+            || self.kernel.chart.setup.missions.iter().any(|&mission| mission != 2)
+            || !self.kernel.healthy || !self.kernel.owner_local
+            || gekiso::uses_full_replay(self.kernel.master, self.kernel.chart, &self.kernel.seeds)
+            || self.kernel.has_converter(team) { return None; }
+        let deck = self.kernel.original_deck(team);
+        let slots = team.members.iter().zip(&team.snaps)
+            .map(|(&member, &snap)| Arc::new(self.kernel.slot(member, snap).clone())).collect::<Vec<_>>();
+        self.kernel.seeded_rush_bound(&deck, &slots, power as i32).ok().flatten()
     }
     fn fixed_converted_score_ceiling(&mut self, team: &Team, power: f64) -> Option<f64> {
         let (_, _, supports) = self.fixed_conversion_trace(team)?;
@@ -9180,7 +9218,8 @@ impl Objective for Adapter<'_, '_> {
             let tight = self
                 .fixed_luck_score_ceiling(&team.members, &team.snaps, 5, t.power)
                 .map_or(upper, |value| upper.min(value));
-            let converted = self.fixed_converted_score_ceiling(team, t.power);
+            let converted = self.selected_luck_score_ceiling(team, t.power)
+                .or_else(|| self.fixed_converted_score_ceiling(team, t.power));
             let no_rng = if converted.is_none() {
                 self.fixed_no_rng_score_ceiling(team, t.power)
             } else {
@@ -9365,7 +9404,7 @@ impl Objective for Adapter<'_, '_> {
             }
             self.fixed_local_power = Arc::new(powers);
         }
-        if self.kernel.healthy
+        if (self.kernel.healthy || self.deterministic.is_some())
             && (self.kernel.chart.luck && !self.kernel.seeds.is_empty()
                 || self
                     .kernel
@@ -10111,6 +10150,9 @@ impl Objective for Adapter<'_, '_> {
                 }
             }
         }
+        if !self.estimate && !self.surrogate && cutoff.key.is_finite() {
+            if let Some(evaluation) = self.kernel.bounded_mean_evaluate(team, power as i32, cutoff)? { return Ok(evaluation); }
+        }
         self.exact(team, power, slots)
             .map(search::Evaluation::Exact)
     }
@@ -10225,7 +10267,7 @@ pub struct Environment<'a> {
     pub constraints: search::Constraints,
     pub now: &'a dyn Fn() -> f64,
     pub generation: u64,
-    pub min_just_window_ms: Option<f64>,
+    pub window_policy: Option<crate::just_window::Policy>,
 }
 struct Run {
     constraints: search::Constraints,
@@ -10590,7 +10632,7 @@ fn ranked(hits: &[Hit], k: usize) -> Vec<Hit> {
     hits
 }
 pub(crate) fn compare_score_hits(a: &Hit, b: &Hit) -> std::cmp::Ordering {
-    a.key.total_cmp(&b.key).then_with(|| {
+    a.key.total_cmp(&b.key).then_with(|| sections::tie(&a.detail, &b.detail)).then_with(|| {
         a.detail["scores"]["mean"]
             .as_f64()
             .unwrap_or(f64::NEG_INFINITY)
@@ -10842,6 +10884,9 @@ struct ReplayObjective<'a> {
     just_window: Option<crate::just_window::Prepared>,
 }
 impl Objective for ReplayObjective<'_> {
+    fn prepare_power(&mut self, power: Arc<Vec<f64>>, _width: usize) {
+        if let Some(bound) = &mut self.bound { bound.snapshot_power(power); }
+    }
     fn filter_member_dominates(&self, better: usize, worse: usize) -> bool { self.just_window.as_ref().is_none_or(|window| window.member_dominates(better, worse)) }
     fn filter_permutation_invariant(&self) -> bool { self.just_window.as_ref().is_none_or(crate::just_window::Prepared::permutation_invariant) }
 
@@ -11139,7 +11184,8 @@ fn native_levels(
         env.music,
         env.generation,
     );
-    let min_just_window_ms = env.min_just_window_ms;
+    let window_policy = env.window_policy;
+    let preparation_deadline=crate::clock::preparation_deadline();
     std::thread::scope(|scope| {
         for (worker, (levels, mut chart)) in jobs.into_iter().enumerate() {
             let send = send.clone();
@@ -11149,6 +11195,7 @@ fn native_levels(
             let shared_floor = shared_floor.clone();
             let seed = &seed;
             scope.spawn(move || {
+                let _preparation=crate::clock::enter_preparation_deadline(preparation_deadline);
                 let level_count = levels.len();
                 let _floor_scope = shared_floor.map(crate::enter_search_floor);
                 let mut completed = 0;
@@ -11191,7 +11238,7 @@ fn native_levels(
                                         constraints,
                                         now: &now,
                                         generation,
-                                        min_just_window_ms,
+                                        window_policy,
                                     },
                                     chart: &mut chart,
                                     seeds: seed.seeds.clone(),
@@ -11365,7 +11412,7 @@ fn search_levels(
         mut on_candidate,
         mut progress,
     } = input;
-    let just_window = env.min_just_window_ms.map(|minimum| crate::just_window::Prepared::new(env.master, chart, env.members, env.snaps, minimum, &seeds)).transpose()?;
+    let just_window = env.window_policy.map(|minimum| crate::just_window::Prepared::new(env.master, chart, env.members, env.snaps, minimum, &seeds)).transpose()?;
     if just_window.as_ref().is_some_and(|window| window.impossible_with(&env.constraints)) {
         return Ok(search::Output { hits: Vec::new(), proven: true, bound: None, stats: search::Stats::default() });
     }
@@ -11445,7 +11492,7 @@ fn search_levels(
     let mut kernel = Kernel::new(env.master, env.members, env.snaps, chart, seeds, criterion);
     kernel.just_window = just_window;
     if let Some(bounds) = shared_bounds {
-        kernel.global_fixed_preparation = bounds.preparation.clone();
+        kernel.bound_preparation = bounds.preparation.clone();
         kernel.global_fixed_luck = bounds.luck.clone();
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -11460,7 +11507,7 @@ fn search_levels(
     kernel.seed_preview = seed_only;
     kernel.live_floor = cooperative_floor
         && k == 1
-        && criterion == Criterion::Max
+        && matches!(criterion, Criterion::Mean | Criterion::Max)
         && kernel.chart.luck
         && kernel.seeds.len() >= 16;
     if kernel.chart.luck && !kernel.seeds.is_empty() {
@@ -11729,7 +11776,7 @@ fn search_levels(
     let seed_key = format!(
         "{}:{minimum}:{seed_variant:?}:{:?}",
         seed_key(&env, criterion, k, &kernel.seeds),
-        env.min_just_window_ms.map(f64::to_bits),
+        env.window_policy.map(crate::just_window::Policy::key),
     );
     let cached = if seeded || fixed_assignment {
         Some(Vec::new())
@@ -12000,7 +12047,7 @@ fn search_levels(
                     hits: hits.clone(),
                     queue,
                     bounds: SharedLevelBounds {
-                        preparation: kernel.global_fixed_preparation.clone(),
+                        preparation: kernel.bound_preparation.clone(),
                         luck: kernel.global_fixed_luck.clone(),
                         luck_cache: Arc::clone(kernel.shared_fixed_luck.get_or_insert_with(|| {
                             Arc::new(SharedLuckCache::new(kernel.chart.notes.len()))

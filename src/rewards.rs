@@ -1059,9 +1059,13 @@ pub(crate) struct FixedRegionRows {
     converted: f64,
     width: usize,
 }
+#[derive(Clone, Copy)]
+struct FixedEnvelope { events: [f64; 5], mean: f64 }
 struct FixedMemberRows {
     rows: Vec<[f64; 5]>,
-    envelopes: Mutex<VecDeque<(u128, [f64; 5])>>,
+    means: Vec<f64>,
+    maxima: Vec<f64>,
+    envelopes: Mutex<VecDeque<(u128, FixedEnvelope)>>,
 }
 impl FixedRegionRows {
     pub(crate) fn new(
@@ -1107,11 +1111,13 @@ impl FixedRegionRows {
                     })
                 })
                 .collect::<Vec<_>>();
-            let bytes = rows.capacity() * std::mem::size_of::<[f64; 5]>();
+            let means: Vec<_> = rows.iter().map(|row| up(row.iter().copied().fold(0.0, add) / 5.0)).collect();
+            let maxima: Vec<_> = rows.iter().map(|row| row.iter().copied().fold(f64::NEG_INFINITY, f64::max)).collect();
+            let bytes = rows.capacity() * std::mem::size_of::<[f64; 5]>() + (means.capacity() + maxima.capacity()) * std::mem::size_of::<f64>();
             self.bytes.fetch_add(bytes, Ordering::Relaxed);
             self.allocated.fetch_add(bytes, Ordering::Relaxed);
             FixedMemberRows {
-                rows,
+                rows, means, maxima,
                 envelopes: Mutex::new(VecDeque::new()),
             }
         })
@@ -1119,16 +1125,18 @@ impl FixedRegionRows {
     fn member_rows(&self, member: usize) -> &[[f64; 5]] {
         &self.member(member).rows
     }
-    fn member_envelope(&self, member: usize, choices: &[i32]) -> [f64; 5] {
+    fn member_envelope(&self, member: usize, choices: &[i32]) -> FixedEnvelope {
         let member = self.member(member);
         let calculate = || {
             let mut row = [0.0_f64; 5];
+            let mut mean = 0.0_f64;
             for &snap in choices {
+                mean = mean.max(member.means[(snap + 1) as usize]);
                 for (value, high) in row.iter_mut().zip(member.rows[(snap + 1) as usize]) {
                     *value = value.max(high);
                 }
             }
-            row
+            FixedEnvelope { events: row, mean }
         };
         if self.width > 128 {
             return calculate();
@@ -1146,7 +1154,7 @@ impl FixedRegionRows {
             envelopes.pop_front();
         }
         envelopes.push_back((key, row));
-        let bytes = (envelopes.capacity() - capacity) * std::mem::size_of::<(u128, [f64; 5])>();
+        let bytes = (envelopes.capacity() - capacity) * std::mem::size_of::<(u128, FixedEnvelope)>();
         self.bytes.fetch_add(bytes, Ordering::Relaxed);
         self.allocated.fetch_add(bytes, Ordering::Relaxed);
         row
@@ -1167,6 +1175,7 @@ pub(crate) struct FixedRegionBound {
     powers: Arc<Vec<f64>>,
     options: Vec<Vec<i32>>,
     envelopes: [[f64; 5]; 5],
+    mean_envelopes: [f64; 5],
     matching: crate::assignment::Scratch,
     matrix: Vec<Vec<f64>>,
     event_pricing: Option<FixedEventPricing>,
@@ -1192,6 +1201,7 @@ impl FixedRegionBound {
             powers,
             options: vec![Vec::new(); 5],
             envelopes: [[0.0; 5]; 5],
+            mean_envelopes: [0.0; 5],
             matching: crate::assignment::Scratch::default(),
             matrix: Vec::new(),
             event_pricing: None,
@@ -1206,8 +1216,21 @@ impl FixedRegionBound {
                 continue;
             }
             self.event_pricing = None;
-            self.envelopes[slot] = self.rows.member_envelope(self.members[slot], choices);
+            let envelope = self.rows.member_envelope(self.members[slot], choices);
+            self.envelopes[slot] = envelope.events;
+            self.mean_envelopes[slot] = envelope.mean;
             self.options[slot].clone_from(choices);
+        }
+    }
+    pub(crate) fn prepare_prefix(&mut self, options: &[Vec<i32>], assigned: &[i32], from: usize) {
+        for (slot, choices) in options.iter().enumerate() {
+            let choices = if slot < from { std::slice::from_ref(&assigned[slot]) } else { choices.as_slice() };
+            if self.options[slot] == choices { continue; }
+            self.event_pricing = None;
+            let envelope = self.rows.member_envelope(self.members[slot], choices);
+            self.envelopes[slot] = envelope.events;
+            self.mean_envelopes[slot] = envelope.mean;
+            self.options[slot].clear(); self.options[slot].extend_from_slice(choices);
         }
     }
     pub(crate) fn score_ceiling(
@@ -1226,9 +1249,9 @@ impl FixedRegionBound {
             }
         });
         let variable = if criterion == Criterion::Mean {
-            rows.iter().fold(0.0, |sum, row| {
-                add(sum, up(row.iter().copied().fold(0.0, add) / 5.0))
-            })
+            (0..5).fold(0.0, |sum, slot| add(sum, if slot < from {
+                self.rows.member(self.members[slot]).means[(assigned[slot] + 1) as usize]
+            } else { self.mean_envelopes[slot] }))
         } else {
             let mut dp = [if criterion == Criterion::Min {
                 f64::INFINITY
@@ -1401,20 +1424,10 @@ impl FixedRegionBound {
         } else {
             None
         };
-        let value = |slot: usize, row: [f64; 5]| {
-            if let Some(order) = order {
-                row[order[slot]]
-            } else if criterion == crate::objectives::Criterion::Max {
-                row.into_iter().fold(f64::NEG_INFINITY, f64::max)
-            } else {
-                up(row.into_iter().fold(0.0, add) / 5.0)
-            }
-        };
-        let coefficient = self
-            .envelopes
-            .iter()
-            .enumerate()
-            .fold(self.base, |sum, (slot, &row)| add(sum, value(slot, row)));
+        let coefficient = if criterion == crate::objectives::Criterion::Mean {
+            self.mean_envelopes.iter().copied().fold(self.base, add)
+        } else { self.envelopes.iter().enumerate().fold(self.base, |sum, (slot, row)| add(sum,
+            if let Some(order) = order { row[order[slot]] } else { row.iter().copied().fold(f64::NEG_INFINITY, f64::max) })) };
         let ratio = (coefficient / totals.power.max(1.0)).sqrt();
         if !ratio.is_finite() || ratio <= 0.0 {
             return f64::INFINITY;
@@ -1430,7 +1443,8 @@ impl FixedRegionBound {
             let mut event_rows = [[[f64::NEG_INFINITY; 2]; 5]; 5];
             for (slot, row) in self.matrix.iter_mut().enumerate() {
                 row.fill(-1e100);
-                let profiles = self.rows.member_rows(self.members[slot]);
+                let member = self.rows.member(self.members[slot]);
+                let profiles = &member.rows;
                 for &snap in &self.options[slot] {
                     let power = self.powers[slot * self.width
                         + if snap < 0 {
@@ -1438,7 +1452,7 @@ impl FixedRegionBound {
                         } else {
                             snap as usize
                         }];
-                    let coefficients = profiles[(snap + 1) as usize];
+                    let coefficients = &profiles[(snap + 1) as usize];
                     if criterion == crate::objectives::Criterion::Max {
                         let column = if snap < 0 {
                             self.width - 1 + slot
@@ -1452,7 +1466,9 @@ impl FixedRegionBound {
                                 .max(add(mul(lambda, power), up(coefficient / lambda)));
                         }
                     }
-                    let weight = value(slot, coefficients);
+                    let weight = if let Some(order) = order { coefficients[order[slot]] }
+                        else if criterion == crate::objectives::Criterion::Max { member.maxima[(snap + 1) as usize] }
+                        else { member.means[(snap + 1) as usize] };
                     row[if snap < 0 {
                         self.width - 1 + slot
                     } else {
@@ -1554,6 +1570,7 @@ pub(crate) struct BoundPreparation {
     row_ids: Vec<u32>,
     member_rows: Vec<Vec<u32>>,
     capacity: usize,
+    great_factors: OnceLock<Vec<(f64, f64)>>,
 }
 struct PreparedSlot {
     positive: f64,
@@ -1562,7 +1579,21 @@ struct PreparedSlot {
     score_rows: Vec<[i32; 5]>,
     normal: (usize, f64),
     shape: Vec<(i32, f64)>,
-    windows: Vec<(f64, Vec<(usize, usize)>)>,
+    windows: Vec<PreparedWindow>,
+    conversion_key: Vec<u64>,
+    pulse: Option<PreparedPulse>,
+}
+struct PreparedPulse {
+    duration: i32,
+    quota: usize,
+    mask: u8,
+    judgement: usize,
+}
+struct PreparedWindow {
+    delta: f64,
+    mask: u8,
+    duration: i32,
+    intervals: Vec<(usize, usize)>,
 }
 impl PreparedSlot {
     fn template_key(&self) -> Vec<u64> {
@@ -1586,12 +1617,17 @@ impl PreparedSlot {
             key.extend([duration as u64, delta.to_bits()]);
         }
         key.push(self.windows.len() as u64);
-        for (delta, intervals) in &self.windows {
-            key.extend([delta.to_bits(), intervals.len() as u64]);
-            for &(start, end) in intervals {
+        for window in &self.windows {
+            key.extend([window.delta.to_bits(), u64::from(window.mask), window.duration as u64, window.intervals.len() as u64]);
+            for &(start, end) in &window.intervals {
                 key.extend([start as u64, end as u64]);
             }
         }
+        key.push(self.conversion_key.len() as u64);
+        key.extend_from_slice(&self.conversion_key);
+        if let Some(pulse) = &self.pulse {
+            key.extend([1, pulse.duration as u64, pulse.quota as u64, u64::from(pulse.mask), pulse.judgement as u64]);
+        } else { key.push(0); }
         key
     }
 }
@@ -1861,7 +1897,8 @@ impl BoundPreparation {
                             (start, end)
                         })
                         .collect();
-                    normal_windows.push((delta, intervals));
+                    let mask = if effect.kind == 2000 {0} else {effect.judgements.iter().fold(0u8,|mask,&grade|mask | (1 << grade))};
+                    normal_windows.push(PreparedWindow { delta, mask, duration: window_ms(effect.seconds, slot.extension_ms), intervals });
                 }
                 for factor in &slot.cumulative {
                     let delta = f(factor.at_cap() as f64 / 100000.0);
@@ -1879,9 +1916,30 @@ impl BoundPreparation {
                             (start, end)
                         })
                         .collect();
-                    normal_windows.push((delta, intervals));
+                    normal_windows.push(PreparedWindow { delta, mask: 0, duration, intervals });
                 }
                 score_rows.sort_unstable();
+                let conversion_key = if chart.accuracy.great == 0.0 { Vec::new() } else { slot.conversion_signature().unwrap_or_default() };
+                let pulse = if chart.accuracy.great != 0.0 && slot.convert.as_ref().is_some_and(|convert| convert.judgements.contains(&4)) {
+                    let convert = slot.convert.as_ref().unwrap();
+                    let snapshot = snap?;
+                    let rows: Vec<_> = snapshot.card.support_skills.iter().zip(snapshot.skill_levels)
+                        .flat_map(|(id, level)| master.support_skills.get(id).into_iter().flatten()
+                            .filter(move |row| row.level == level && row.kind == 12006))
+                        .filter(|row| static_gk_group(master, row.condition_group, &p) != Some(false)).collect();
+                    if rows.len() != 1 { return None; }
+                    let row = rows[0];
+                    let pulse = master.condition_sets.get(&row.trigger_group).is_some_and(|sets| sets.len() == 1
+                        && sets[0].len() == 1 && master.conditions.get(&sets[0][0])
+                            .is_some_and(|condition| condition.positive && [4010, 5020].contains(&condition.kind)));
+                    if !pulse || row.trigger_type != 1 || row.cumulative_id != 0 || row.reset_group != 0 { return None; }
+                    let duration = convert.seconds.map_or_else(
+                        || window_ms(slot.effects.first().map(|effect| effect.seconds).unwrap_or(5.0), slot.extension_ms),
+                        |seconds| window_ms(seconds, 0.0)).saturating_add(slot.extension_ms.abs().ceil() as i32);
+                    Some(PreparedPulse { duration,
+                        quota: convert.limit.map_or(chart.notes.len(), |limit| limit.ceil().max(1.0).min(chart.notes.len() as f64) as usize),
+                        mask: convert.judgements.iter().fold(0, |mask, &grade| mask | (1 << grade)), judgement: convert.judgement })
+                } else { None };
                 let slot = PreparedSlot {
                     positive,
                     converts,
@@ -1890,6 +1948,8 @@ impl BoundPreparation {
                     normal: (actions, absolute),
                     shape,
                     windows: normal_windows,
+                    conversion_key,
+                    pulse,
                 };
                 let key = slot.template_key();
                 let next = slots.len() as u32;
@@ -1925,12 +1985,14 @@ impl BoundPreparation {
             row_ids,
             member_rows,
             capacity,
+            great_factors: OnceLock::new(),
         })
     }
 }
 enum ComboSource<'a> {
     None,
     Actors(&'a [Performer]),
+    PreparedActors(&'a [Performer], Arc<BoundPreparation>),
     Trace(Arc<crate::reward_trace::ComboTrace>),
     Prepared(
         Option<Arc<crate::reward_trace::ComboTrace>>,
@@ -2435,6 +2497,7 @@ pub(crate) struct ConverterPartition {
 struct FixedScoreOptions {
     options: Vec<i32>,
     envelopes: [u32; 6],
+    means: [f64; 6],
     normal: (usize, f64),
     converter: bool,
     minimum_conversion: f64,
@@ -2516,6 +2579,7 @@ pub(crate) struct DeterministicBound {
     fixed_score_options: Vec<Option<FixedScoreOptions>>,
     option_minimum_conversion: Vec<f64>,
     option_envelopes: Vec<[u32; 6]>,
+    option_means: Vec<[f64; 6]>,
     option_converters: Vec<bool>,
     score_frontiers: Vec<PowerFrontiers>,
     pricing_frontiers: PricingFrontiers,
@@ -2528,10 +2592,12 @@ pub(crate) struct DeterministicBound {
     ids: Vec<[u32; 6]>,
     converters: Vec<bool>,
     shared: Vec<[f64; 5]>,
+    shared_means: Vec<f64>,
     intern: HashMap<[u64; 5], u32>,
     global: Vec<[u32; 6]>,
     suffix: Vec<[u32; 6]>,
     assignment: [[u32; 5]; 6],
+    assignment_means: [[f64; 5]; 6],
     assignment_converters: [bool; 5],
     coefficients: HashMap<[u32; 5], Arc<Vec<f64>>>,
     coefficient_order: VecDeque<[u32; 5]>,
@@ -3694,6 +3760,14 @@ impl DeterministicBound {
             prefixes: Mutex::new(std::array::from_fn(|_| None)),
         }));
     }
+    pub(crate) fn assignment_mean_rows(&self, members: &[usize]) -> Option<(f64, Vec<f64>)> {
+        if self.capacity != 0 { return None; }
+        let rows = members.iter().flat_map(|&member| (0..self.width).map(move |column| {
+            let id = self.ids[member * self.width + column][0] as usize;
+            up(up(self.shared_means[id]) / self.converted)
+        })).collect();
+        Some((up(self.base / self.converted), rows))
+    }
     pub(crate) fn fixed_component(&self) -> Option<FixedComponent> {
         (self.capacity == 0).then(|| FixedComponent {
             base: self.base,
@@ -3725,30 +3799,24 @@ impl DeterministicBound {
             None,
         )
     }
-    pub(crate) fn with_combo(
+    pub(crate) fn with_combo_preparation(
         master: &Master,
         chart: &gekiso::Chart,
         members: &[Member],
         snaps: &[Snap],
         combo_multiplier: f64,
-        script: Option<&[Performer]>,
+        source: (Option<&[Performer]>, &mut Option<Arc<BoundPreparation>>),
     ) -> Option<Self> {
-        if chart.luck {
-            return None;
-        }
-        Self::with_envelope(
-            master,
-            chart,
-            members,
-            snaps,
-            combo_multiplier,
-            script.map_or(ComboSource::None, ComboSource::Actors),
-            None,
-        )
-        .map(|mut bound| {
-            bound.preparation = None;
-            bound
-        })
+        if chart.luck { return None; }
+        let script = match (source.0, source.1.as_ref()) {
+            (Some(actors), Some(prepared)) => ComboSource::PreparedActors(actors, Arc::clone(prepared)),
+            (None, Some(prepared)) => ComboSource::Prepared(None, Arc::clone(prepared)),
+            (Some(actors), None) => ComboSource::Actors(actors),
+            (None, None) => ComboSource::None,
+        };
+        let mut bound = Self::with_envelope(master, chart, members, snaps, combo_multiplier, script, None)?;
+        *source.1 = bound.preparation.take();
+        Some(bound)
     }
     pub(crate) fn with_combo_trace(
         master: &Master,
@@ -3963,8 +4031,30 @@ impl DeterministicBound {
             }
         }
 
-        if chart.accuracy.great != 0.0
-            || chart.accuracy.miss_every != 0
+        let great = chart.accuracy.great != 0.0;
+        let ordinary = great.then(|| crate::skills::prepare(master, members, snaps));
+        let great_script = match &script {
+            ComboSource::None => true,
+            ComboSource::Prepared(None, _) => true,
+            ComboSource::Actors(actors) | ComboSource::PreparedActors(actors, _) => actors.iter().all(|actor| actor.gekisou_skill.is_none_or(|(id, level)| {
+                master.gekiso_skills[&id].effects.iter().filter(|row| row.level == level)
+                    .all(|row| row.cumulative_id == 0 || master.cumulative.get(&row.cumulative_id)
+                        .is_some_and(|counter| [7000, 7001].contains(&counter.kind)))
+            })),
+            _ => false,
+        };
+        if great && (!great_script
+            || master.live.life_base <= 0.0
+            || chart.setup.missions.iter().any(|&mission| mission != 1)
+            || chart.judgements.iter().any(|&grade| master.live.damage[grade] != 0.0)
+            || !crate::support_aliases::stable_life_conditions(master, members, snaps, &chart.setup.missions)
+            || master.gekiso_skills.values().chain(master.gekiso_support_skills.values())
+                .flat_map(|skill| &skill.effects).any(|row| row.kind == 3004 && row.value < 0)
+            || ordinary.as_ref().unwrap().slots.iter().any(|slot| slot.recovery < 0 || slot.convert.as_ref()
+                .is_some_and(|convert| !(3..=5).contains(&convert.judgement) || master.live.damage[convert.judgement] != 0.0
+                    || convert.judgements.contains(&4) && convert.judgement != 5)))
+        { return None; }
+        if chart.accuracy.miss_every != 0
             || chart
                 .setup
                 .missions
@@ -4027,6 +4117,7 @@ impl DeterministicBound {
                 )?)),
                 None,
             ),
+            ComboSource::PreparedActors(actors, prepared) => (Some(Arc::new(crate::reward_trace::ComboTrace::new(master, chart, actors)?)), Some(prepared)),
             ComboSource::Trace(trace) => (Some(trace), None),
             ComboSource::Prepared(trace, prepared) => (trace, Some(prepared)),
         };
@@ -4132,6 +4223,13 @@ impl DeterministicBound {
             beta_weights.push(beta);
         }
         let all = *prefix.last()?;
+        let judgement_prefixes: Option<[Vec<f64>; 7]> = great.then(|| std::array::from_fn(|grade| {
+            let mut prefix=vec![0.0];
+            for (index,&judgement) in chart.judgements.iter().enumerate() {
+                prefix.push(add(*prefix.last().unwrap(),if judgement==grade {beta_weights[index]}else{0.0}));
+            }
+            prefix
+        }));
         let mut windows = CumulativeWindows::new(
             master,
             chart,
@@ -4179,9 +4277,14 @@ impl DeterministicBound {
             template_commands.push(windows.commands(&slot.score_rows));
             support_gains.push(windows.gain(chart, &slot.score_rows));
             let mut row = [0.0; 5];
-            for &(delta, ref intervals) in &slot.windows {
-                for (event, &(start, end)) in intervals.iter().enumerate() {
-                    let weight = (prefix[end] - prefix[start]).max(0.0) + 32.0 * f64::EPSILON * all;
+            for window in &slot.windows {
+                let (delta, mask) = (window.delta, window.mask);
+                for (event, &(start, end)) in window.intervals.iter().enumerate() {
+                    let sum = if mask != 0 {
+                        judgement_prefixes.as_ref().map(|prefixes| (0..7).filter(|&grade|mask & (1 << grade)!=0)
+                            .map(|grade|(prefixes[grade][end]-prefixes[grade][start]).max(0.0)).fold(0.0,add))
+                    }else{None};
+                    let weight = sum.unwrap_or_else(||(prefix[end]-prefix[start]).max(0.0)) + (if great {4 * chart.notes.len() + 64} else {32}) as f64 * f64::EPSILON * all;
                     row[event] = add(row[event], mul(delta, up(weight)));
                 }
             }
@@ -4214,6 +4317,53 @@ impl DeterministicBound {
         }
         positives.sort_by(|a, b| b.total_cmp(a));
         let positive = positives.into_iter().take(5).fold(0.0, add);
+        if great {
+            // Each supported pulse converts at most its quota inside one skill
+            // window. Credit its largest note gains, independently of all other
+            // pulses; duplicate credits only raise the score ceiling.
+            let support_tail = (master.live.after_ms.max(0.0).ceil() as i32).saturating_add(1000);
+            let factors = prepared.great_factors.get_or_init(|| chart.times.iter().map(|&time| {
+                let mut factor = if ranges.iter().any(|&(start,end)| start <= time && time <= end.saturating_add(support_tail)) {
+                    add(1.0,positive)
+                } else {1.0};
+                let mut perfect=0.0;
+                for &(_,start) in chart.full.events.iter().take(5) {
+                    let elapsed = i64::from(time)-i64::from(start);
+                    if elapsed < -40 {continue;}
+                    let envelope = ordinary_shapes.iter().map(|shape| shape.iter()
+                        .filter(|&&(duration,_)| elapsed < i64::from(duration)+40)
+                        .map(|&(_,delta)|delta).fold(0.0,add)).fold(0.0,f64::max);
+                    factor=add(factor,envelope);
+                    let channel=prepared.slots.iter().map(|slot| slot.windows.iter()
+                        .filter(|window| window.mask & (1 << 5)!=0 && window.mask & (1 << 4)==0 && elapsed < i64::from(window.duration)+40)
+                        .map(|window|window.delta).fold(0.0,add)).fold(0.0,f64::max);
+                    perfect=add(perfect,channel);
+                }
+                (factor,perfect)
+            }).collect());
+            let mut gains = vec![[0.0_f64; 5]; profiles.len()];
+            for (target, slot) in prepared.slots.iter().enumerate() {
+                let Some(pulse) = &slot.pulse else { continue; };
+                for (event, &(_, start)) in chart.full.events.iter().take(5).enumerate() {
+                    let from = start.saturating_sub(40);
+                    let end = start.saturating_add(pulse.duration).saturating_add(40);
+                    let first = chart.times.partition_point(|&time| time < from);
+                    let after = chart.times.partition_point(|&time| time <= end);
+                    let mut values: Vec<_> = (first..after).filter_map(|note| {
+                        let grade = chart.judgements[note];
+                        let delta = chart.judge_frac[pulse.judgement] - chart.judge_frac[grade];
+                        (delta > 0.0 && pulse.mask & (1 << grade) != 0)
+                            .then(|| mul(raw_weights[note],add(mul(up(delta),factors[note].0),mul(chart.judge_frac[grade],factors[note].1))))
+                    }).collect();
+                    values.sort_unstable_by(|a,b| b.total_cmp(a));
+                    let gain = values.into_iter().take(pulse.quota).fold(0.0, add);
+                    gains[target][event] = gains[target][event].max(gain);
+                }
+            }
+            for (profile,gains) in profiles.iter_mut().zip(gains) {
+                for (value,gain) in profile.iter_mut().zip(gains) { *value=add(*value,gain); }
+            }
+        }
         let u = 2.0_f64.powi(-24);
         let mut errors = [0.0; 6];
         for c in 0..=5 {
@@ -4255,7 +4405,7 @@ impl DeterministicBound {
                 (rounding - 1.0).next_up(),
             ),
         ) / chart.full.converted as f64);
-        let minimum_judge = chart.judge_frac[5].min(chart.judge_frac[6]);
+        let minimum_judge = if great { chart.judge_frac[3..=6].iter().copied().fold(f64::INFINITY, f64::min) } else { chart.judge_frac[5].min(chart.judge_frac[6]) };
         let minimum_coefficient = (chart.note_frac.iter().fold(0.0_f64, |sum, &frac| {
             let term = (((master.live.adjustment * chart.difficulty_factor).next_down() * frac)
                 .next_down()
@@ -4276,6 +4426,7 @@ impl DeterministicBound {
         );
         let width = snaps.len() + 1;
         let capacity = prepared.capacity;
+        if great && capacity > 0 { return None; }
         let (prefix_gain, regional_prefix) = if capacity == 0 {
             (vec![0.0], vec![vec![0.0]; ranges.len()])
         } else {
@@ -4366,6 +4517,7 @@ impl DeterministicBound {
             fixed_score_options: vec![None; members.len()],
             option_minimum_conversion: vec![f64::INFINITY; members.len()],
             option_envelopes: vec![[0; 6]; members.len()],
+            option_means: vec![[0.0; 6]; members.len()],
             option_converters: vec![false; members.len()],
             score_frontiers: vec![Vec::new(); members.len()],
             pricing_frontiers: vec![vec![None; capacity + 1]; members.len()],
@@ -4382,10 +4534,12 @@ impl DeterministicBound {
             ids: Vec::new(),
             converters: Vec::new(),
             shared: Vec::new(),
+            shared_means: Vec::new(),
             intern: HashMap::default(),
             global: Vec::new(),
             suffix: Vec::new(),
             assignment: [[0; 5]; 6],
+            assignment_means: [[0.0; 5]; 6],
             assignment_converters: [false; 5],
             coefficients: HashMap::default(),
             coefficient_order: VecDeque::new(),
@@ -4508,6 +4662,7 @@ impl DeterministicBound {
         let next = self.shared.len() as u32;
         *self.intern.entry(key).or_insert_with(|| {
             self.shared.push(row);
+            self.shared_means.push(row.into_iter().fold(0.0, add) / 5.0);
             next
         })
     }
@@ -4600,13 +4755,15 @@ impl DeterministicBound {
             if self.option_cache[m].as_ref() != Some(&options[slot]) {
                 self.pricing_frontiers[m].fill(None);
                 let mut raw_envelopes = [[0.0; 5]; 6];
+                let mut raw_means = [0.0_f64; 6];
                 let mut offers = Vec::new();
                 for (c, params) in self.duals.iter().enumerate() {
                     let mut envelope = [0.0_f64; 5];
                     let cells = vec![None; params.len()];
                     for &snap in &options[slot] {
-                        let row =
-                            self.shared[self.ids[m * self.width + (snap + 1) as usize][c] as usize];
+                        let profile = self.ids[m * self.width + (snap + 1) as usize][c] as usize;
+                        let row = self.shared[profile];
+                        raw_means[c] = raw_means[c].max(up(self.shared_means[profile]));
                         for (event, value) in envelope.iter_mut().enumerate() {
                             *value = value.max(row[event]);
                         }
@@ -4618,6 +4775,7 @@ impl DeterministicBound {
                     .iter()
                     .any(|&snap| self.converters[m * self.width + (snap + 1) as usize]);
                 self.option_envelopes[m] = raw_envelopes.map(|row| self.intern(row));
+                self.option_means[m] = raw_means;
                 self.dual_offers[m] = offers;
                 self.option_minimum_conversion[m] = options[slot]
                     .iter()
@@ -4628,6 +4786,7 @@ impl DeterministicBound {
             self.assignment_converters[slot] = self.option_converters[m];
             for c in 0..=5 {
                 self.assignment[c][slot] = self.option_envelopes[m][c];
+                self.assignment_means[c][slot] = self.option_means[m][c];
             }
         }
     }
@@ -4978,6 +5137,7 @@ impl DeterministicBound {
             {
                 let row = self.fixed_score_options[member].as_ref().unwrap();
                 self.option_envelopes[member] = row.envelopes;
+                self.option_means[member] = row.means;
                 self.option_normal[member] = row.normal;
                 self.option_converters[member] = row.converter;
                 self.option_minimum_conversion[member] = row.minimum_conversion;
@@ -4987,6 +5147,7 @@ impl DeterministicBound {
                 || price && self.score_frontiers[member].is_empty()
             {
                 let mut rows = [[0.0_f64; 5]; 6];
+                let mut means = [0.0_f64; 6];
                 let mut normal = (0usize, 0.0_f64);
                 let mut frontiers: PowerFrontiers = if price {
                     (0..=self.capacity)
@@ -4999,8 +5160,9 @@ impl DeterministicBound {
                     let bound = self.normal_bounds[member * self.width + (snap + 1) as usize];
                     normal = (normal.0.max(bound.0), normal.1.max(bound.1));
                     for (c, row) in rows.iter_mut().enumerate().take(self.capacity + 1) {
-                        let values = self.shared
-                            [self.ids[member * self.width + (snap + 1) as usize][c] as usize];
+                        let profile = self.ids[member * self.width + (snap + 1) as usize][c] as usize;
+                        let values = self.shared[profile];
+                        means[c] = means[c].max(up(self.shared_means[profile]));
                         for (event, value) in row.iter_mut().enumerate() {
                             *value = value.max(values[event]);
                             if price {
@@ -5046,6 +5208,7 @@ impl DeterministicBound {
                     self.score_frontiers[member].clear();
                 }
                 self.option_envelopes[member] = rows.map(|row| self.intern(row));
+                self.option_means[member] = means;
                 self.option_normal[member] = normal;
                 self.option_converters[member] = options[slot]
                     .iter()
@@ -5059,6 +5222,7 @@ impl DeterministicBound {
                     self.fixed_score_options[member] = Some(FixedScoreOptions {
                         options: options[slot].clone(),
                         envelopes: self.option_envelopes[member],
+                        means: self.option_means[member],
                         normal: self.option_normal[member],
                         converter: self.option_converters[member],
                         minimum_conversion: self.option_minimum_conversion[member],
@@ -5068,6 +5232,7 @@ impl DeterministicBound {
             self.assignment_converters[slot] = self.option_converters[member];
             for c in 0..=self.capacity {
                 self.assignment[c][slot] = self.option_envelopes[member][c];
+                self.assignment_means[c][slot] = self.option_means[member][c];
             }
         }
         let (actions, absolute) = members
@@ -5407,7 +5572,12 @@ impl DeterministicBound {
                 self.assignment[c][slot]
             }
         });
-        let coefficient = self.score_coefficient(ids, criterion);
+        let coefficient = if criterion == crate::objectives::Criterion::Mean {
+            let variable = (0..5).fold(0.0, |sum, slot| add(sum, if slot < from {
+                up(self.shared_means[ids[slot] as usize])
+            } else { self.assignment_means[c][slot] }));
+            up(add(self.base, variable) / self.converted)
+        } else { self.score_coefficient(ids, criterion) };
         let coefficient = self.with_normal_error(coefficient, self.assignment_normal_error);
         let deduction = self.conversion_overlap(members, assigned, from);
         let original = mul(power, (coefficient - deduction).next_up().max(0.0));
@@ -5477,9 +5647,7 @@ impl DeterministicBound {
         } else {
             let rows = ids.map(|id| self.shared[id as usize]);
             let variable = if criterion == Criterion::Mean {
-                rows.iter().fold(0.0, |sum, row| {
-                    add(sum, up(row.iter().copied().fold(0.0, add) / 5.0))
-                })
+                ids.iter().fold(0.0, |sum, &id| add(sum, up(self.shared_means[id as usize])))
             } else {
                 let initial = if criterion == Criterion::Max {
                     f64::NEG_INFINITY
@@ -5991,7 +6159,7 @@ impl DeterministicBound {
         let id = self.ids[member * self.width + (snap + 1) as usize][self.capacity];
         let row = &self.shared[id as usize];
         if mean {
-            row.iter().copied().fold(0.0, add) / 5.0
+            self.shared_means[id as usize]
         } else {
             row.iter().copied().fold(0.0, f64::max)
         }
@@ -6270,7 +6438,7 @@ pub struct RewardObjective<'a> {
     member_dominance: HashMap<(usize, usize), MemberDominance>,
 }
 impl<'a> RewardObjective<'a> {
-    pub(crate) fn set_min_just_window(&mut self, minimum: f64) -> Result<(), String> {
+    pub(crate) fn set_min_just_window(&mut self, minimum: crate::just_window::Policy) -> Result<(), String> {
         if !self.gekiso.setup.missions.contains(&3) {
             return Ok(());
         }
@@ -6306,6 +6474,9 @@ impl<'a> RewardObjective<'a> {
     }
     pub(crate) fn maximum_assignment_score(&mut self, members: &[usize], assigned: &[i32], from: usize, power: f64) -> Option<f64> {
         Some(self.assignment_model()?.score_ceiling(members, assigned, from, power, crate::objectives::Criterion::Max))
+    }
+    pub(crate) fn mean_assignment_score(&mut self, members: &[usize], assigned: &[i32], from: usize, power: f64) -> Option<f64> {
+        Some(self.assignment_model()?.score_ceiling(members, assigned, from, power, crate::objectives::Criterion::Mean))
     }
     pub(crate) fn maximum_member_score(&mut self, members: &[usize], from: usize, power: f64) -> Option<f64> {
         Some(self.deterministic.as_mut()?.member_score_ceiling(members, from, power, crate::objectives::Criterion::Max))
@@ -7101,7 +7272,9 @@ impl<'a> RewardObjective<'a> {
     fn lex_bound(&self, primary: f64, other: f64, mean: f64) -> f64 {
         if let Some(best) = self.lex_cutoff() {
             let tied_out = if self.reward_only_ties {
-                !self.tie_other_reward || other < best[1] || self.reward_ties_complete && other == best[1]
+                if self.tie_other_reward {
+                    other < best[1] || self.reward_ties_complete && other == best[1]
+                } else { self.reward_ties_complete }
             } else { other < best[1] || other == best[1] && mean <= best[2] };
             if primary == best[0] && tied_out {
                 return primary.next_down();

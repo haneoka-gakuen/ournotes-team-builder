@@ -1,4 +1,7 @@
-//! Steady JUST input windows after range-opening activation; scoring judgements stay unchanged.
+//! Native JUST windows and per-range coverage; scoring judgements stay unchanged.
+mod coverage;
+pub use coverage::Policy;
+pub(crate) use coverage::{Segment, Statistics};
 use crate::{
     full::{
         conditions::{performer_matches, Performer},
@@ -41,6 +44,9 @@ pub(crate) fn delta(master: &Master, value: i32) -> i32 {
 pub(crate) struct Trace {
     pub current: HashMap<i32, (i32, i32)>,
     active: HashMap<Key, Vec<(i32, i32, i32)>>,
+    probes: Option<Arc<HashMap<usize,Vec<i32>>>>,
+    pub(crate) minimum: Option<[i32;2]>,
+    capture: Option<coverage::Capture>,
 }
 impl Trace {
     pub(crate) fn new(master: &Master) -> Self {
@@ -52,12 +58,26 @@ impl Trace {
                 .map(|(&key, &value)| (key, value))
                 .collect(),
             active: HashMap::default(),
+            probes:None,
+            minimum:None,
+            capture:None,
         }
     }
-    pub(crate) fn enable(&mut self, master: &Master, key: Key, value: i32, targets: &[i32]) {
+    pub(crate) fn record_probe(&mut self,frame:usize) {
+        if let Some(kinds)=self.probes.as_ref().and_then(|probes|probes.get(&frame)) {
+            for kind in kinds {
+                if let Some(&(before,after))=self.current.get(kind) {
+                    let value=self.minimum.get_or_insert([before,after]);value[0]=value[0].min(before);value[1]=value[1].min(after);
+                }
+            }
+        }
+        if let Some(capture)=&mut self.capture {capture.point(frame,&self.current);}
+    }
+    pub(crate) fn enable(&mut self, master: &Master, key: Key, value: i32, targets: &[i32],time:i32) {
         if targets.first().copied().unwrap_or(3) > 6 {
             return;
         }
+        if let Some(capture)=&mut self.capture {capture.advance(time,&self.current);}
         let percent = value as f32 / 10000.0;
         let mut changed = Vec::new();
         for (&kind, &(base_before, base_after)) in &master.live.just_windows {
@@ -75,8 +95,9 @@ impl Trace {
         }
         self.active.insert(key, changed);
     }
-    pub(crate) fn disable(&mut self, key: Key) {
+    pub(crate) fn disable(&mut self, key: Key,time:i32) {
         if let Some(changed) = self.active.remove(&key) {
+            if let Some(capture)=&mut self.capture {capture.advance(time,&self.current);}
             for (kind, before, after) in changed {
                 let current = self.current.get_mut(&kind).unwrap();
                 current.0 = current.0.wrapping_sub(before);
@@ -84,14 +105,89 @@ impl Trace {
             }
         }
     }
+    pub(crate) fn window(&self,policy:Policy)->Option<Window> {
+        let [before_ms,after_ms]=self.minimum?;
+        let mut window=Window{before_ms,after_ms,meets_target:false,coverage:self.capture.as_ref().map(|capture|capture.finish(&self.current))};
+        window.meets_target=policy.allows(&window);Some(window)
+    }
+    pub(crate) fn result(&self)->Option<Window> {self.capture.as_ref().and_then(|capture|self.window(capture.policy))}
+    pub(crate) fn relocate(&mut self,frames:&[crate::full::play::Frame]) {
+        if let Some(capture)=&mut self.capture {
+            capture.relocate(frames);
+            self.probes=Some(Arc::new(capture.points.iter().map(|(&frame,points)|(frame,points.iter().map(|p|p.kind).collect())).collect()));
+        }
+    }
+    fn chart(master:&Master,chart:&Chart,policy:Policy)->Self {
+        let mut trace=Self::new(master);
+        let notes:HashMap<_,_>=chart.full.notes.iter().map(|note|(note.id,note)).collect();
+        let mut probes=Vec::new();
+        for (frame,row) in chart.play.frames.iter().enumerate() {
+            for judged in &row.judged {
+                let note=notes[&judged.note_id];
+                if !crate::full::play::is_judged(note.op)||!master.live.just_types.contains(&note.judgement_type) {continue;}
+                for (range,&(start,end)) in chart.setup.fevers.iter().enumerate().take(3) {
+                    if chart.setup.missions[range]==3 && row.time_ms>=start && row.time_ms<end {
+                        let (before,after)=master.live.just_windows[&note.judgement_type];
+                        probes.push(Probe{id:note.id,range,frame,kind:note.judgement_type,before,after,cap_before:0,cap_after:0,timed:0,activated:true,full_active:true});
+                    }
+                }
+            }
+        }
+        trace.probes=Some(Arc::new(probes.iter().fold(HashMap::<_,Vec<_>>::default(),|mut map,p|{map.entry(p.frame).or_default().push(p.kind);map})));
+        trace.capture=Some(coverage::Capture::new(policy,chart,&probes));trace
+    }
 }
 
-#[derive(Clone, Copy, Serialize)]
+#[derive(Serialize)]
+#[serde(rename_all="camelCase")]
+pub(crate) struct WindowProfile {pub window:Window,pub segments:Vec<Segment>,pub sampled:bool}
+pub(crate) struct ProfileInput<'a> {
+    pub master:&'a Master,pub chart:&'a Chart,pub deck:&'a [Performer],pub power:i32,pub order:usize,
+    pub seeds:&'a [i32],pub opponents:Option<&'a crate::gekiso::sections::OpponentSamples>,pub minimum:Option<Policy>,
+}
+pub(crate) fn describe(input:ProfileInput<'_>)->Result<Option<WindowProfile>,String> {
+    let ProfileInput{master,chart,deck,power,order,seeds,opponents,minimum}=input;
+    if !chart.setup.missions.contains(&3)||master.live.just_windows.is_empty() {return Ok(None);}
+    let base=master.live.just_windows.get(&1).or_else(||master.live.just_windows.values().next()).unwrap();
+    let policy=Policy{minimum_ms:minimum.map_or((base.0.min(base.1)+1) as f64,|p|p.minimum_ms),min_coverage:0.0,min_duration_ms:0.0,min_continuous_ms:0.0,partial:true};
+    let mut template=Trace::chart(master,chart,policy);
+    template.capture.as_mut().unwrap().curve=Some(Vec::new());
+    let independent=deck.iter().all(|actor|!profile(master,chart,actor).dynamic);
+    let runs=if independent||seeds.is_empty(){&[0][..]}else{seeds};
+    let mut window:Option<Window>=None;let mut segments=Vec::new();
+    for (sample,&seed) in runs.iter().enumerate() {
+        let events:Vec<_>=chart.full.events.iter().map(|&(event,time)|(live::orders()[order][event],time)).collect();
+        let mut params=chart.params();params.power=power;params.music_type=chart.music_type;
+        let mut model=Model::new(master,deck,&chart.full.notes,&events,params,Some(&chart.setup),(seed,false))?;
+        chart.fixed_life(&mut model);model.just_window=Some(template.clone());
+        if let Some(cases)=opponents {model.gk.as_mut().unwrap().section_opponents=Some(Arc::new(cases[seed as usize%cases.len()].clone()));}
+        let generation=crate::cancellation_generation();
+        for (frame,row) in chart.play.frames.iter().enumerate() {
+            if crate::cancellation_generation()!=generation {return Err("cancelled".into());}
+            model.just_window.as_mut().unwrap().record_probe(frame);
+            model.frame(row.time_ms,&row.judged,chart.play.dt[frame])?;
+        }
+        let trace=model.just_window.as_mut().unwrap();
+        if sample==0 {let capture=trace.capture.as_mut().unwrap();capture.advance(capture.ranges.iter().map(|r|r.1).max().unwrap_or(0),&trace.current);segments=capture.curve.take().unwrap();}
+        if let Some(value)=trace.result(){if let Some(window)=&mut window {window.merge(value);}else{window=Some(value);}}
+    }
+    Ok(window.map(|window|WindowProfile{window,segments,sampled:!independent&&crate::gekiso::replay_random(master,chart,deck)}))
+}
+
+#[derive(Clone, Copy, Debug, Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Window {
     pub before_ms: i32,
     pub after_ms: i32,
     pub meets_target: bool,
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    pub coverage:Option<Statistics>,
+}
+impl Window {
+    pub(crate) fn merge(&mut self,other:Self) {
+        self.before_ms=self.before_ms.min(other.before_ms);self.after_ms=self.after_ms.min(other.after_ms);self.meets_target&=other.meets_target;
+        if let Some(other)=other.coverage {if let Some(own)=&mut self.coverage {own.merge(&other);}else{self.coverage=Some(other);}}
+    }
 }
 pub(crate) fn aggregate<'a>(windows: impl Iterator<Item = &'a Value>) -> Option<Value> {
     let mut result: Option<Window> = None;
@@ -108,6 +204,7 @@ pub(crate) fn aggregate<'a>(windows: impl Iterator<Item = &'a Value>) -> Option<
                 before_ms: before,
                 after_ms: after,
                 meets_target: meets,
+                coverage:None,
             });
         }
     }
@@ -129,9 +226,14 @@ impl Profile {
                 sum + self.timed[index] as i64
             })
     }
+    fn at(&self,phase:Probe)->i64 {
+        (if phase.full_active {self.full as i64}else{0})+(0..4).filter(|&index|phase.timed&(1<<index)!=0).map(|index|self.timed[index] as i64).sum::<i64>()
+    }
 }
 #[derive(Clone, Copy)]
 struct Probe {
+    id:i32,
+    range:usize,
     frame: usize,
     before: i32,
     after: i32,
@@ -140,9 +242,24 @@ struct Probe {
     kind: i32,
     timed: u8,
     activated: bool,
+    full_active:bool,
+}
+
+#[derive(Clone,Copy)]
+struct Span {range:usize,start:i32,end:i32,mask:u8}
+fn group_phases(probes:&[Probe])->Vec<Probe> {
+    let mut phases:Vec<Probe>=Vec::new();
+    for &probe in probes {
+        if !phases.iter().any(|p|same_phase(*p,probe)) {phases.push(probe);}
+    }
+    phases
+}
+fn same_phase(a:Probe,b:Probe)->bool {
+    a.timed==b.timed&&a.activated==b.activated&&a.full_active==b.full_active&&a.cap_before==b.cap_before&&a.cap_after==b.cap_after&&a.before==b.before&&a.after==b.after
 }
 
 pub(crate) struct Prepared {
+    policy:Policy,
     minimum: f64,
     width: usize,
     members: Arc<Vec<Member>>,
@@ -151,12 +268,21 @@ pub(crate) struct Prepared {
     probes: Vec<Probe>,
     phases: Vec<Probe>,
     phase_values: Vec<Vec<f64>>,
+    phase_notes:Vec<[u32;3]>,
+    spans:Vec<Span>,
     assignment: Option<Assignment>,
     seeds: Vec<i32>,
     cache: HashMap<(Vec<usize>, Vec<i32>, i32), Option<Window>>,
-    force_model: bool,
     nominal: bool,
     dominance_safe: bool,
+}
+impl Prepared {
+    pub(crate) fn capture_trace(&self,master:&Master,chart:&Chart)->Trace {
+        let mut trace=Trace::new(master);
+        let mut probes:HashMap<usize,Vec<i32>>=HashMap::default();
+        for probe in &self.probes {probes.entry(probe.frame).or_default().push(probe.kind);}
+        trace.probes=Some(Arc::new(probes));trace.capture=Some(coverage::Capture::new(self.policy,chart,&self.probes));trace
+    }
 }
 
 struct Assignment {
@@ -348,14 +474,16 @@ fn profile(master: &Master, chart: &Chart, actor: &Performer) -> Profile {
 }
 
 impl Prepared {
-    pub(crate) fn new(
+    pub(crate) fn new<P:Into<Policy>>(
         master: &Master,
         chart: &Chart,
         members: &[Member],
         snaps: &[Snap],
-        minimum: f64,
+        policy: P,
         seeds: &[i32],
     ) -> Result<Self, String> {
+        let policy=policy.into();
+        let minimum=policy.minimum_ms;
         let width = snaps.len() + 1;
         let mut probes = Vec::new();
         if chart.setup.missions.contains(&3) {
@@ -387,7 +515,7 @@ impl Prepared {
                 }
                 for judged in &frame.judged {
                     let note = notes[&judged.note_id];
-                    if note.op != 1 {
+                    if !policy.partial && note.op != 1 || policy.partial && !crate::full::play::is_judged(note.op) {
                         continue;
                     }
                     for (range, &(start, end)) in chart.setup.fevers.iter().enumerate().take(3) {
@@ -427,6 +555,8 @@ impl Prepared {
                             .copied()
                             .ok_or("just-window-timing")?;
                         per_range[range].push(Probe {
+                            id:note.id,
+                            range,
                             frame: frame_index,
                             before,
                             after,
@@ -435,35 +565,20 @@ impl Prepared {
                             kind: note.judgement_type,
                             timed,
                             activated,
+                            full_active:activated,
                         });
                     }
                 }
             }
             for rows in per_range {
-                if rows.iter().any(|row| row.activated) {
+                if !policy.partial && rows.iter().any(|row| row.activated) {
                     probes.extend(rows.into_iter().filter(|row| row.activated));
                 } else {
                     probes.extend(rows);
                 }
             }
         }
-        let mut phases: Vec<Probe> = Vec::new();
-        for &probe in &probes {
-            if let Some(previous) = phases.iter_mut().find(|p| {
-                p.timed == probe.timed
-                    && p.activated == probe.activated
-                    && p.cap_before == probe.cap_before
-                    && p.cap_after == probe.cap_after
-                    && p.before == probe.before
-                    && p.after == probe.after
-            }) {
-                previous.before = previous.before.min(probe.before);
-                previous.after = previous.after.min(probe.after);
-            } else {
-                phases.push(probe);
-            }
-        }
-        let mut profiles: Vec<Profile> = members
+        let profiles: Vec<Profile> = members
             .iter()
             .flat_map(|member| {
                 snaps
@@ -475,22 +590,24 @@ impl Prepared {
                     })
             })
             .collect();
-        let maximum = profiles.iter().map(|row| row.extra(15)).max().unwrap_or(0) * 5;
-        if phases.iter().any(|phase| {
-            [
-                (phase.before, phase.cap_before),
-                (phase.after, phase.cap_after),
-            ]
-            .iter()
-            .any(|&(base, cap)| cap > base && maximum > (cap - base) as i64)
-        }) {
-            for row in &mut profiles {
-                if row.extra(15) != 0 {
-                    row.dynamic = true;
+        let mut spans=Vec::new();
+        if policy.partial {
+            let basis=coverage::basis(master,chart,members,snaps,&profiles)?;
+            for probe in &mut probes {
+                let mask=basis.before[probe.frame];probe.timed=mask&15;probe.full_active=mask&16!=0;probe.activated=mask!=0;
+            }
+            for (range,&(start,end)) in chart.setup.fevers.iter().enumerate().take(3).filter(|&(i,_)|chart.setup.missions[i]==3) {
+                let mut at=start;let mut mask=0;
+                for &(time,next) in &basis.changes {
+                    if time>=end {break;}
+                    if time>at {spans.push(Span{range,start:at,end:time,mask});at=time;}
+                    mask=next;
                 }
+                if at<end {spans.push(Span{range,start:at,end,mask});}
             }
         }
-        if profiles.iter().all(|profile| !profile.dynamic) {
+        let mut phases=group_phases(&probes);
+        if !policy.partial && profiles.iter().all(|profile| !profile.dynamic) {
             let mut distinct: Vec<Probe> = Vec::new();
             for phase in phases {
                 let redundant = distinct.iter().any(|old| {
@@ -501,7 +618,7 @@ impl Prepared {
                         && old.activated == phase.activated
                         && profiles
                             .iter()
-                            .all(|row| row.extra(old.timed) == row.extra(phase.timed))
+                            .all(|row| row.at(*old) == row.at(phase))
                 });
                 if !redundant {
                     distinct.push(phase);
@@ -515,7 +632,7 @@ impl Prepared {
                     .iter()
                     .map(|row| {
                         if phase.activated {
-                            row.extra(phase.timed)
+                            row.at(*phase)
                         } else {
                             0
                         }
@@ -540,13 +657,16 @@ impl Prepared {
                         } else if !phase.activated {
                             0.0
                         } else {
-                            row.extra(phase.timed) as f64
+                            row.at(*phase) as f64
                         }
                     })
                     .collect()
             })
             .collect();
+        let mut phase_notes=vec![[0;3];phases.len()];
+        if policy.partial {for probe in &probes {let index=phases.iter().position(|phase|same_phase(*phase,*probe)).unwrap();phase_notes[index][probe.range]+=1;}}
         Ok(Self {
+            policy,
             minimum,
             width,
             members: Arc::new(members.to_vec()),
@@ -555,6 +675,8 @@ impl Prepared {
             probes,
             phases,
             phase_values,
+            phase_notes,
+            spans,
             assignment: None,
             seeds: if seeds.is_empty() {
                 vec![0]
@@ -562,7 +684,6 @@ impl Prepared {
                 seeds.to_vec()
             },
             cache: HashMap::default(),
-            force_model: false,
             nominal: seeds.is_empty(),
             dominance_safe,
         })
@@ -574,10 +695,7 @@ impl Prepared {
         team: &Team,
         power: i32,
     ) -> Result<Option<Window>, String> {
-        self.force_model = true;
-        let result = self.measure(master, chart, team, power);
-        self.force_model = false;
-        result
+        self.measure(master, chart, team, power)
     }
     pub(crate) fn active(&self) -> bool {
         !self.probes.is_empty()
@@ -621,7 +739,7 @@ impl Prepared {
         })
     }
     pub(crate) fn pricing_constraints(&self) -> Option<Vec<(f64, &[f64])>> {
-        if !self.dominance_safe || !self.active() {
+        if self.policy.partial || !self.dominance_safe || !self.active() {
             return None;
         }
         Some(
@@ -639,6 +757,16 @@ impl Prepared {
     pub(crate) fn impossible(&self) -> bool {
         self.impossible_with(&Constraints::default())
     }
+    fn partial_possible(&self,possible:&[bool])->bool {
+        (0..3).all(|range| {
+            let notes=self.phase_notes.iter().map(|counts|counts[range]).sum::<u32>();
+            if notes==0 {return true;}
+            let covered=self.phase_notes.iter().zip(possible).filter(|(_,possible)|**possible).map(|(counts,_)|counts[range]).sum::<u32>();
+            let duration=self.spans.iter().filter(|span|span.range==range).map(|span|(span.end-span.start) as f64).sum::<f64>();
+            covered>0 && covered as f64/notes as f64+1e-12>=self.policy.min_coverage
+                && duration+1e-8>=self.policy.min_duration_ms.max(self.policy.min_continuous_ms)
+        })
+    }
     pub(crate) fn impossible_with(&self, constraints: &Constraints) -> bool {
         if self.phases.is_empty() { return false; }
         let mut fixed: HashSet<_> = constraints.required_members.iter().copied()
@@ -650,8 +778,11 @@ impl Prepared {
         let characters: HashSet<_> = fixed.iter().map(|&member| self.members[member].card.character_id).collect();
         if fixed.len() > 5 || characters.len() != fixed.len()
             || fixed.iter().any(|member| constraints.excluded_members.contains(member)) { return true; }
-        for (phase, values) in self.phases.iter().zip(&self.phase_values) {
-            if (phase.cap_before as f64) < self.minimum || (phase.cap_after as f64) < self.minimum { return true; }
+        let mut possible=self.policy.partial.then(||vec![true;self.phases.len()]);
+        for (index,(phase, values)) in self.phases.iter().zip(&self.phase_values).enumerate() {
+            if (phase.cap_before as f64) < self.minimum || (phase.cap_after as f64) < self.minimum {
+                if self.policy.partial {possible.as_mut().unwrap()[index]=false;continue;}return true;
+            }
             let mut fixed_upper = 0.0;
             let mut free = HashMap::<i32, f64>::default();
             let mut fixed_base = 0.0;
@@ -706,9 +837,11 @@ impl Prepared {
                 ceiling = ceiling.min(base + snaps);
             }
             if ceiling >= i32::MIN as f64 && ceiling <= i32::MAX as f64
-                && (phase.before as f64 + ceiling < self.minimum || phase.after as f64 + ceiling < self.minimum) { return true; }
+                && (phase.before as f64 + ceiling < self.minimum || phase.after as f64 + ceiling < self.minimum) {
+                    if self.policy.partial {possible.as_mut().unwrap()[index]=false;}else{return true;}
+                }
         }
-        false
+        possible.as_ref().is_some_and(|possible|!self.partial_possible(possible))
     }
     pub(crate) fn prepare_assignment(&mut self, members: &[usize], options: &[Vec<i32>]) {
         self.assignment = None;
@@ -728,7 +861,8 @@ impl Prepared {
         let Some(assignment) = self.assignment.as_ref().filter(|a| a.members == members) else {
             return self.possible(members, assigned, from, options);
         };
-        for ((phase, values), best) in self.phases.iter().zip(&self.phase_values).zip(&assignment.best) {
+        let mut possible=self.policy.partial.then(||vec![true;self.phases.len()]);
+        for (index,((phase, values), best)) in self.phases.iter().zip(&self.phase_values).zip(&assignment.best).enumerate() {
             let mut upper = 0.0;
             for (slot, &member) in members.iter().enumerate() {
                 upper += if slot < from {
@@ -740,9 +874,11 @@ impl Prepared {
                 };
             }
             if upper < i32::MIN as f64 || upper > i32::MAX as f64 { continue; }
-            if phase.before as f64 + upper < self.minimum || phase.after as f64 + upper < self.minimum { return false; }
+            if phase.before as f64 + upper < self.minimum || phase.after as f64 + upper < self.minimum {
+                if self.policy.partial {possible.as_mut().unwrap()[index]=false;}else{return false;}
+            }
         }
-        true
+        possible.as_ref().is_none_or(|possible|self.partial_possible(possible))
     }
     pub(crate) fn possible(
         &self,
@@ -754,7 +890,8 @@ impl Prepared {
         if self.phases.is_empty() || options.len() != members.len() {
             return true;
         }
-        for (phase, values) in self.phases.iter().zip(&self.phase_values) {
+        let mut possible=self.policy.partial.then(||vec![true;self.phases.len()]);
+        for (index,(phase, values)) in self.phases.iter().zip(&self.phase_values).enumerate() {
             let mut upper = 0.0;
             for (slot, &member) in members.iter().enumerate() {
                 let value = |snap: i32| {
@@ -783,10 +920,10 @@ impl Prepared {
             if phase.before as f64 + upper < self.minimum
                 || phase.after as f64 + upper < self.minimum
             {
-                return false;
+                if self.policy.partial {possible.as_mut().unwrap()[index]=false;}else{return false;}
             }
         }
-        true
+        possible.as_ref().is_none_or(|possible|self.partial_possible(possible))
     }
     pub(crate) fn allows(
         &mut self,
@@ -813,6 +950,7 @@ impl Prepared {
         let mut timed = [0i32; 4];
         let mut dynamic = false;
         let mut random = false;
+        let mut maximum_extra=0_i64;
         for (&member, &snap) in team.members.iter().zip(&team.snaps) {
             let row = self.profiles[member * self.width
                 + if snap < 0 {
@@ -826,32 +964,51 @@ impl Prepared {
             }
             dynamic |= row.dynamic;
             random |= row.random;
+            maximum_extra+=row.extra(15);
         }
+        dynamic|=master.live.just_windows.iter().any(|(kind,&(early,late))| {
+            let &(cap_early,cap_late)=master.live.miss_windows.get(kind).unwrap_or(&(0,0));
+            maximum_extra>i64::from((cap_early-early).min(cap_late-late))
+        });
         let (mut before, mut after) = (i32::MAX, i32::MAX);
-        if !dynamic && !self.force_model {
-            for phase in &self.phases {
+        if !dynamic {
+            let mut capture=self.policy.partial.then(||coverage::Capture::new(self.policy,chart,&[]));
+            for (index,phase) in self.phases.iter().enumerate() {
                 let extra = if !phase.activated {
                     0
                 } else {
                     (0..4)
                         .filter(|&index| phase.timed & (1 << index) != 0)
-                        .fold(full, |sum, index| sum.wrapping_add(timed[index]))
+                        .fold(if phase.full_active {full}else{0}, |sum, index| sum.wrapping_add(timed[index]))
                 };
-                before = before.min(
+                let early=
                     phase.before.wrapping_add(
                         extra
                             .min(phase.cap_before.saturating_sub(phase.before))
                             .max(0),
-                    ),
-                );
-                after = after.min(
+                    );
+                let late=
                     phase.after.wrapping_add(
                         extra
                             .min(phase.cap_after.saturating_sub(phase.after))
                             .max(0),
-                    ),
-                );
+                    );
+                before=before.min(early);after=after.min(late);
+                if let Some(capture)=&mut capture {for range in 0..3 {capture.add_points(range,self.phase_notes[index][range],early,late);}}
             }
+            if let Some(capture)=&mut capture {
+                let &(base_before,base_after)=master.live.just_windows.get(&1).or_else(||master.live.just_windows.values().next()).unwrap();
+                let &(cap_before,cap_after)=master.live.miss_windows.get(&1).or_else(||master.live.miss_windows.values().next()).unwrap();
+                for span in &self.spans {
+                    let extra=(0..4).filter(|&index|span.mask&(1<<index)!=0).fold(if span.mask&16!=0 {full}else{0},|sum,index|sum.wrapping_add(timed[index]));
+                    capture.interval(span.range,span.start,span.end,base_before.saturating_add(extra).min(cap_before),base_after.saturating_add(extra).min(cap_after));
+                }
+                capture.complete_static();
+            }
+            let mut result=Window{before_ms:before,after_ms:after,meets_target:false,
+                coverage:capture.map(|capture|capture.finish(&HashMap::default()))};
+            result.meets_target=self.policy.allows(&result);
+            Ok(Some(result))
         } else {
             if dynamic && self.nominal && (chart.luck || random) {
                 return Err("just-window-random".into());
@@ -872,7 +1029,8 @@ impl Prepared {
                     )
                 })
                 .collect();
-            let probe_frames: HashSet<_> = self.probes.iter().map(|probe| probe.frame).collect();
+            let trace=self.capture_trace(master,chart);
+            let mut result:Option<Window>=None;
             for &seed in self
                 .seeds
                 .iter()
@@ -896,43 +1054,22 @@ impl Prepared {
                         Some(&chart.setup),
                         (seed, false),
                     )?;
-                    model.just_window = Some(Trace::new(master));
+                    chart.fixed_life(&mut model);
+                    model.just_window = Some(trace.clone());
                     for (index, frame) in chart.play.frames.iter().enumerate() {
-                        if probe_frames.contains(&index) {
-                            for probe in self.probes.iter().filter(|probe| probe.frame == index) {
-                                let current =
-                                    model.just_window.as_ref().unwrap().current[&probe.kind];
-                                before = before.min(if probe.activated {
-                                    current.0
-                                } else {
-                                    probe.before
-                                });
-                                after = after.min(if probe.activated {
-                                    current.1
-                                } else {
-                                    probe.after
-                                });
-                            }
-                        }
+                        model.just_window.as_mut().unwrap().record_probe(index);
                         model.frame(frame.time_ms, &frame.judged, chart.play.dt[index])?;
+                    }
+                    if let Some(window)=model.just_window.as_ref().unwrap().window(self.policy) {
+                        if let Some(result)=&mut result {result.merge(window);}else{result=Some(window);}
                     }
                 }
             }
-            let value = Some(Window {
-                before_ms: before,
-                after_ms: after,
-                meets_target: before as f64 >= self.minimum && after as f64 >= self.minimum,
-            });
             if self.cache.len() >= 128 {
                 self.cache.clear();
             }
-            self.cache.insert(key, value);
-            return Ok(value);
+            self.cache.insert(key, result);
+            Ok(result)
         }
-        Ok(Some(Window {
-            before_ms: before,
-            after_ms: after,
-            meets_target: before as f64 >= self.minimum && after as f64 >= self.minimum,
-        }))
     }
 }

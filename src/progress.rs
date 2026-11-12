@@ -14,6 +14,7 @@ pub type Callback = extern "C" fn(*const c_char);
 type HitIdentity = (Vec<usize>, Vec<i32>, u64, u64);
 #[derive(Default)]
 struct State {
+    section_reference: bool,
     callback: Option<Callback>,
     members: Vec<String>,
     snaps: Vec<String>,
@@ -44,6 +45,14 @@ pub fn with_callback<T>(callback: Option<Callback>, run: impl FnOnce() -> T) -> 
     let _restore = Restore(previous);
     run()
 }
+pub(crate) fn section_reference<T>(run: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore { fn drop(&mut self) { STATE.with(|state| state.borrow_mut().section_reference = self.0); } }
+    let previous = STATE.with(|state| { let mut state=state.borrow_mut();let prior=state.section_reference;state.section_reference=true;prior });
+    let _restore=Restore(previous);
+    run()
+}
+fn mark_reference(value: &mut Value) { value["key"]=json!(-1);value["sectionReference"]=json!(true); }
 pub fn keys(members: &[Member], snaps: &[Snap]) {
     STATE.with(|s| {
         let mut s = s.borrow_mut();
@@ -78,7 +87,8 @@ pub(crate) fn emit_document(value: &Value) {
         let now = crate::clock::milliseconds();
         if now - state.last < 250.0 { return; }
         state.last = now;
-        let text = CString::new(value.to_string()).expect("JSON contains no NUL");
+        let marked = state.section_reference.then(|| { let mut value=value.clone();for hit in value["hits"].as_array_mut().into_iter().flatten() {mark_reference(hit);}value });
+        let text = CString::new(marked.as_ref().unwrap_or(value).to_string()).expect("JSON contains no NUL");
         callback(text.as_ptr());
     });
 }
@@ -165,6 +175,7 @@ fn hit_json(state: &State, hit: &Hit) -> Value {
     }
     crate::reward_plan::decorate(&mut value, detail);
     crate::api::normalize_hit(&mut value);
+    if state.section_reference {mark_reference(&mut value);}
     value
 }
 pub fn emit(hits: &[Hit]) {
@@ -182,7 +193,7 @@ fn emit_hits(hits: &[Hit], advance_throttle: bool) {
             return;
         };
         let now = crate::clock::milliseconds();
-        if hits.is_empty() || now - state.last < 250.0 {
+        if hits.is_empty() || hits.len() > 1 && !state.last_hits.is_empty() && now - state.last < 250.0 {
             return;
         }
         let identity: Vec<_> = hits

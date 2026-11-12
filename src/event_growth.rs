@@ -27,6 +27,30 @@ struct Request {
     sources: Value,
     primary_challenge_id: Option<i32>,
     rank_range: Option<RankRange>,
+    #[serde(default)]
+    preferences: Preferences,
+}
+#[derive(Clone, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct Preferences {
+    vip_bonus: Option<i32>,
+    character_levels: BTreeMap<i32, i32>,
+    instrument_levels: BTreeMap<i32, i32>,
+    character_radius: i32,
+    instrument_radius: i32,
+    allow_growth: bool,
+}
+impl Default for Preferences {
+    fn default() -> Self {
+        Self {
+            vip_bonus: None,
+            character_levels: BTreeMap::new(),
+            instrument_levels: BTreeMap::new(),
+            character_radius: 3,
+            instrument_radius: 10,
+            allow_growth: false,
+        }
+    }
 }
 #[derive(Clone, Copy, Deserialize)]
 struct RankRange {
@@ -147,6 +171,9 @@ struct Band {
     id: i32,
     items: Vec<(i32, i32)>,
     cap: i32,
+    min: i32,
+    max: i32,
+    preferred: i32,
 }
 struct Problem {
     master: Arc<Master>,
@@ -155,6 +182,9 @@ struct Problem {
     originals: Vec<(i32, usize)>,
     ids: Vec<i32>,
     caps: Vec<i32>,
+    minimums: Vec<i32>,
+    maximums: Vec<i32>,
+    preferred: Vec<i32>,
     all_caps: BTreeMap<i32, i32>,
     unseen_cap: i32,
     unseen_count: i32,
@@ -165,6 +195,7 @@ struct Problem {
     vips: Vec<(i32, i32)>,
     max_flat: i32,
     conflict: bool,
+    allow_growth: bool,
     kernels: BTreeMap<i32, search::KernelBank>,
     deltas: search::DeltaBank,
     marginals: BTreeMap<i32, search::MarginalBank>,
@@ -356,6 +387,7 @@ impl Problem {
         data: &Value,
         request: &Request,
         mut originals: Vec<Reading>,
+        all_caps: &BTreeMap<i32, i32>,
     ) -> Result<Self, String> {
         if !master.events.contains_key(&request.event_id) {
             return Err("missingRules".into());
@@ -386,8 +418,6 @@ impl Problem {
         {
             return Err("missingRules".into());
         }
-        let all_caps = limits::calculate(master, data, &request.sources, request.as_of)
-            .map_err(|_| "missingRules")?;
         originals.sort_by_key(|row| {
             (
                 request
@@ -403,6 +433,26 @@ impl Problem {
             .into_iter()
             .collect();
         let caps: Vec<_> = ids.iter().map(|id| all_caps[id]).collect();
+        let preferred: Vec<_> = ids
+            .iter()
+            .map(|id| {
+                request
+                    .preferences
+                    .character_levels
+                    .get(id)
+                    .copied()
+                    .unwrap_or(18)
+            })
+            .collect();
+        let minimums: Vec<_> = preferred
+            .iter()
+            .map(|level| (level - request.preferences.character_radius).max(10))
+            .collect();
+        let maximums: Vec<_> = preferred
+            .iter()
+            .zip(&caps)
+            .map(|(level, cap)| (level + request.preferences.character_radius).min(*cap))
+            .collect();
         let mut bands = Vec::new();
         for band_id in originals
             .iter()
@@ -447,9 +497,19 @@ impl Problem {
             if items.is_empty() {
                 return Err("missingRules".into());
             }
+            let cap = items.iter().map(|row| row.1).sum();
+            let preferred = request
+                .preferences
+                .instrument_levels
+                .get(&band_id)
+                .copied()
+                .unwrap_or(75);
             bands.push(Band {
                 id: band_id,
-                cap: items.iter().map(|row| row.1).sum(),
+                cap,
+                min: (preferred - request.preferences.instrument_radius).max(40),
+                max: (preferred + request.preferences.instrument_radius).min(cap),
+                preferred,
                 items,
             });
         }
@@ -530,7 +590,16 @@ impl Problem {
         for (&rank, &bonus) in master.vip_bonus.iter() {
             vips.entry(bonus).or_insert(rank);
         }
-        let vips: Vec<_> = vips.into_iter().rev().collect();
+        let vips: Vec<_> = vips
+            .into_iter()
+            .rev()
+            .filter(|(bonus, _)| {
+                request
+                    .preferences
+                    .vip_bonus
+                    .is_none_or(|selected| selected == *bonus)
+            })
+            .collect();
         let kernel_count = readings.len() * 5 * (max_flat as usize + 1);
         let kernels = vips
             .iter()
@@ -555,8 +624,11 @@ impl Problem {
             originals: mapping,
             ids,
             caps,
+            minimums,
+            maximums,
+            preferred,
             bands,
-            all_caps,
+            all_caps: all_caps.clone(),
             totals,
             primary_totals,
             marginals: vips
@@ -566,6 +638,7 @@ impl Problem {
             vips,
             max_flat,
             conflict,
+            allow_growth: request.preferences.allow_growth,
             deltas: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             kernels,
         })
@@ -627,6 +700,21 @@ impl Search {
         }) {
             return Err("invalid character rank range".into());
         }
+        if !(0..=50).contains(&request.preferences.character_radius)
+            || !(0..=1000).contains(&request.preferences.instrument_radius)
+            || request
+                .preferences
+                .character_levels
+                .values()
+                .any(|level| !(10..=1000).contains(level))
+            || request
+                .preferences
+                .instrument_levels
+                .values()
+                .any(|level| !(40..=1000).contains(level))
+        {
+            return Err("invalid growth search preferences".into());
+        }
         let mut rejected_challenges = Vec::new();
         let prepared = (|| {
             let compiled = Arc::new((*master).clone());
@@ -663,6 +751,8 @@ impl Search {
             {
                 return Err("missingGrowth".into());
             }
+            let all_caps = limits::calculate(master, data, &request.sources, request.as_of)
+                .map_err(|_| "missingRules")?;
             let mut problems = Vec::new();
             if let Some(total) = request
                 .total
@@ -685,8 +775,9 @@ impl Search {
                         Ok(reading) if contexts.insert(reading.signature.clone()) => {
                             let mut readings = originals.clone();
                             readings.push(reading);
-                            problems
-                                .push(Arc::new(Problem::new(&compiled, data, &request, readings)?));
+                            problems.push(Arc::new(Problem::new(
+                                &compiled, data, &request, readings, &all_caps,
+                            )?));
                         }
                         Ok(_) => {}
                         Err(error) => total_error = error,
@@ -704,7 +795,7 @@ impl Search {
                     return Err("missingGrowth".into());
                 }
                 problems.push(Arc::new(Problem::new(
-                    &compiled, data, &request, originals,
+                    &compiled, data, &request, originals, &all_caps,
                 )?));
             }
             let deltas = Arc::clone(&problems[0].deltas);
@@ -738,11 +829,16 @@ impl Search {
         match prepared {
             Ok(problems) => {
                 search.problems = problems;
-                if search
-                    .problems
-                    .iter()
-                    .all(|problem| problem.primary_totals.is_empty())
-                {
+                if search.problems.iter().all(|problem| {
+                    problem.primary_totals.is_empty()
+                        || problem.vips.is_empty()
+                        || problem
+                            .minimums
+                            .iter()
+                            .zip(&problem.maximums)
+                            .any(|(min, max)| min > max)
+                        || problem.bands.iter().any(|band| band.min > band.max)
+                }) {
                     search.complete = true;
                     search.status = "noMatch";
                 } else {
@@ -807,6 +903,7 @@ impl Search {
         self.scouts = self
             .problems
             .iter()
+            .filter(|problem| problem.allow_growth)
             .flat_map(|problem| {
                 problem.vips.iter().map(|&(bonus, rank)| {
                     let maximum = problem.ids.len() as i32 * RANK_SPAN * 5
@@ -824,6 +921,9 @@ impl Search {
             .problems
             .iter()
             .map(|problem| {
+                if !problem.allow_growth {
+                    return 0;
+                }
                 problem.ids.len() as i32 * RANK_SPAN * 5
                     + problem.bands.len() as i32 * ITEM_SPAN
                     + problem.totals.last().unwrap().bonus
