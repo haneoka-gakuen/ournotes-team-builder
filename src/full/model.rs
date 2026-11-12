@@ -421,6 +421,7 @@ pub struct Model<'a> {
     pub record: Option<LuckRecord>,
     pub record_trace: bool,
     pub(crate) just_window: Option<crate::just_window::Trace>,
+    pub(crate) live_life: Option<Vec<(i32,i32)>>,
     rush_observers: Vec<ConditionUpdater>,
     combo_observer: Option<ComboObserver>,
     pub(crate) rush_support_commands: Vec<(i32, i32)>,
@@ -594,6 +595,7 @@ impl<'a> Model<'a> {
             },
             record_trace: false,
             just_window: None,
+            live_life: None,
             rush_observers: Vec::new(),
             combo_observer: None,
             rush_support_commands: Vec::new(),
@@ -1065,6 +1067,12 @@ impl<'a> Model<'a> {
         let mut listed = std::mem::take(&mut self.listed);
         let mut updated = std::mem::take(&mut self.updated);
         for phase in 1..=2 {
+            if phase==2 && !self.frame_events.is_empty() {
+                if let Some(record)=&mut self.live_life {
+                    let life=self.life.at(time);
+                    record.extend(self.frame_events.iter().map(|&(_,at)|(at,life)));
+                }
+            }
             listed.clear();
             {
                 let mut ctx = Context {
@@ -1789,8 +1797,8 @@ impl<'a> Model<'a> {
     fn update_just_window(&mut self, row: &Row, state: &State, key: Key) -> Result<(), String> {
         if let Some(trace) = &mut self.just_window {
             if row.limit != 0 { return Err("just-window-effect".into()); }
-            if state.state == effects::EXECUTE { trace.enable(self.master, key, row.value, &row.targets); }
-            else if state.state == effects::END { trace.disable(key); }
+            if state.state == effects::EXECUTE { trace.enable(self.master, key, row.value, &row.targets,self.frame_time); }
+            else if state.state == effects::END { trace.disable(key,self.frame_time); }
         }
         Ok(())
     }

@@ -160,6 +160,7 @@ pub(crate) fn rush_windows(
         && model.rows.iter().all(|row| (11000..=11005).contains(&row.kind) || [2000, 3004].contains(&row.kind));
     let mut initial = Some(model);
     for (index, &seed) in seeds.iter().enumerate() {
+        if crate::clock::preparation_expired(){return Ok(None);}
         if generation != crate::cancellation_generation() {
             return Err("cancelled".into());
         }
@@ -173,7 +174,8 @@ pub(crate) fn rush_windows(
         while k < chart.span.1 {
             if visited & 63 == 0 {
                 // The WASM clock can yield to candidate-floor and cancellation messages.
-                let _ = crate::clock::milliseconds();
+                let now=crate::clock::milliseconds();
+                if crate::clock::preparation_expired_at(now){return Ok(None);}
                 if generation != crate::cancellation_generation() { return Err("cancelled".into()); }
             }
             visited += 1;

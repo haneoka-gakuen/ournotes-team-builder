@@ -841,6 +841,47 @@ impl Objective for Combined<'_, '_> {
     }
 }
 
+fn initial_hit(env: &Environment<'_>, charts: &mut [Chart], music: &[Music], seeds: &[i32], team: &Team, minimum: i32, deadline: f64) -> Result<Option<Hit>, String> {
+    if !search::valid_seed(env.members, env.snaps, &env.constraints, team) { return Ok(None); }
+    let members: Vec<_> = team.members.iter().map(|&index| env.members[index].clone()).collect();
+    let mut selected = Vec::new();
+    let snaps: Vec<_> = team.snaps.iter().map(|&index| {
+        if index < 0 { None } else {
+            selected.push(env.snaps[index as usize].clone());
+            Some(env.snaps[index as usize].clone())
+        }
+    }).collect();
+    let local = Team { members: (0..5).collect(), snaps: team.snaps.iter().scan(0, |next, &index| {
+        Some(if index < 0 { -1 } else { let value = *next; *next += 1; value })
+    }).collect() };
+    let mut details = Vec::with_capacity(charts.len());
+    let mut total = 0.0;
+    let mut powers = 0.0;
+    let mut slot_powers = vec![0.0; 5];
+    for (chart, music) in charts.iter_mut().zip(music) {
+        if (env.now)() >= deadline || env.generation != crate::cancellation_generation() { return Ok(None); }
+        let power = power::team_power(env.master, env.player, &members, &snaps, 0, Some(music), &[])?;
+        let mut kernel = Kernel::new(env.master, &members, &selected, chart, seeds.to_vec(), Criterion::Mean);
+        let bonus: f64 = kernel.bonuses.iter().map(|&value| value as f64).sum();
+        if env.constraints.min_bonus.is_some_and(|minimum| bonus < minimum)
+            || env.constraints.max_bonus.is_some_and(|maximum| bonus > maximum)
+            || !kernel.meets_combo(&local.members, minimum.max(1)) { return Ok(None); }
+        kernel.just_window = env.window_policy.map(|policy| crate::just_window::Prepared::new(env.master, kernel.chart, &members, &selected, policy, seeds)).transpose()?;
+        if !kernel.feasible_team(&local, power.total as f64)? { return Ok(None); }
+        let mut score = kernel.exact(&local, power.total as i32, true)?;
+        kernel.decorate_window(&local, power.total as i32, &mut score.detail)?;
+        total += score.key;
+        powers += power.total as f64;
+        for (sum, value) in slot_powers.iter_mut().zip(&power.slots) { *sum += *value as f64; }
+        details.push(json!({"detail":score.detail,"power":power.total,"slotPowers":power.slots}));
+    }
+    let count = charts.len() as f64;
+    for value in &mut slot_powers { *value /= count; }
+    let mut detail = json!({"songs":details});
+    if let Some(window) = crate::just_window::aggregate(details.iter().map(|part| &part["detail"]["justWindow"])) { detail["justWindow"] = window; }
+    Ok(Some(Hit { team: team.clone(), power: powers/count, slot_powers, key: total/count, detail, totals: Totals::default() }))
+}
+
 pub(crate) fn search_shared(input: SharedInput<'_>) -> Result<search::Output, String> {
     let SharedInput {
         env,
@@ -859,10 +900,36 @@ pub(crate) fn search_shared(input: SharedInput<'_>) -> Result<search::Output, St
         sections,
     } = input;
     let started = (env.now)();
+    let mut early = None;
+    if !seeded && sections.is_none() {
+        if initial.is_empty() {
+            let mut objective = PowerSeed { bonuses: combo_bonuses(env.master, env.members, &charts[0].setup.missions) };
+            let mut trial = env.constraints.clone();
+            if charts.len()>8 && charts.iter().all(|chart|!chart.luck&&chart.setup.missions.iter().all(|&mission|mission==3))
+                && trial.required_snaps.is_empty() && trial.bindings.values().all(|&snap|snap<0) {
+                let eligible: Vec<_> = env.members.iter().map(|member| gekiso::seed_actor(env.master,&charts[0],&Performer::from_member(env.master,member,None))).collect();
+                if trial.required_members.iter().chain(trial.bindings.keys()).all(|&index|eligible[index])
+                    && trial.leader.is_none_or(|index|index<0||eligible[index as usize]) {
+                    trial.no_snaps=true;
+                    trial.excluded_members.extend(eligible.iter().enumerate().filter_map(|(index,&yes)|(!yes).then_some(index)));
+                }
+            }
+            let warm = crate::progress::with_callback(None, || env.run(&mut objective, Run { constraints: trial, k: 1,
+                deadline: deadline.min(started + 40.0), seeds: Vec::new(), shard: None, floor: f64::NEG_INFINITY }, None, None))?;
+            if let Some(hit) = warm.hits.first() { initial.push(hit.team.clone()); }
+        }
+        if let Some(team) = initial.first() {
+            early = initial_hit(&env, charts, music, &seeds, team, min_combo_bonus, deadline)?;
+            if let (Some(hit), Some(callback)) = (&early, on_candidate.as_deref_mut()) { callback(std::slice::from_ref(hit)); }
+        }
+    }
+    if (env.now)() >= deadline {
+        return Ok(search::Output { hits: early.into_iter().collect(), proven: false, bound: None, stats: search::Stats { elapsed_ms: (env.now)()-started, ..Default::default() } });
+    }
     let section_charts = sections.map(|_| charts.iter().map(|chart| chart.converted_judgements(&chart.judgements).unwrap()).collect::<Vec<_>>());
     let mut windows = Vec::with_capacity(charts.len());
     for chart in charts.iter() {
-        let window = env.min_just_window_ms.map(|minimum| crate::just_window::Prepared::new(env.master, chart, env.members, env.snaps, minimum, &seeds)).transpose()?;
+        let window = env.window_policy.map(|minimum| crate::just_window::Prepared::new(env.master, chart, env.members, env.snaps, minimum, &seeds)).transpose()?;
         if window.as_ref().is_some_and(|window| window.impossible_with(&env.constraints)) {
             return Ok(search::Output { hits: Vec::new(), proven: true, bound: None, stats: search::Stats::default() });
         }
@@ -941,6 +1008,7 @@ pub(crate) fn search_shared(input: SharedInput<'_>) -> Result<search::Output, St
         }
     }
     let mut hits=Vec::new();
+    if let Some(hit) = early { offer(&mut hits, env.members, hit); }
     if let Some(plan)=sections {for hit in plan.incumbents.borrow().iter().chain(plan.reference_hit.iter()) {offer(&mut hits,env.members,hit.clone());}}
     if let Some(callback)=on_candidate.as_deref_mut().filter(|_|!hits.is_empty()) {callback(&ranked(&hits,k));}
     let mut stats = search::Stats::default();
@@ -948,7 +1016,7 @@ pub(crate) fn search_shared(input: SharedInput<'_>) -> Result<search::Output, St
         let mut objective = PowerSeed {
             bonuses: kernels[0].bonuses.clone(),
         };
-        let warm = env.run(
+        let warm = crate::progress::with_callback(None, || env.run(
             &mut objective,
             Run {
                 constraints: env.constraints.clone(),
@@ -960,7 +1028,7 @@ pub(crate) fn search_shared(input: SharedInput<'_>) -> Result<search::Output, St
             },
             None,
             None,
-        )?;
+        ))?;
         stats.add(&warm.stats);
         if let Some(hit) = warm.hits.first() {
             initial.push(hit.team.clone());
@@ -985,6 +1053,7 @@ pub(crate) fn search_shared(input: SharedInput<'_>) -> Result<search::Output, St
         }
         let mut adapters = Vec::new();
         for kernel in &mut kernels {
+            if (env.now)() >= deadline { proven=false; break; }
             let own_level = if same_levels {
                 level
             } else {
@@ -997,7 +1066,8 @@ pub(crate) fn search_shared(input: SharedInput<'_>) -> Result<search::Output, St
             };
             adapters.push(adapter);
         }
-        if !proven {
+        if !proven || (env.now)() >= deadline {
+            proven=false;
             break;
         }
         let current = ranked(&hits, k);

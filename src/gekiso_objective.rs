@@ -1165,6 +1165,7 @@ fn collect_luck_envelope(
     let tasks: Vec<_> = (0..workers).collect();
     crate::parallel::map(&tasks, |&worker| -> Result<(), ()> {
         for index in (worker..jobs).step_by(workers) {
+            if crate::clock::preparation_expired(){return Err(());}
             if crate::cancellation_generation() != generation {
                 return Err(());
             }
@@ -2054,11 +2055,13 @@ impl<'a> Kernel<'a> {
         };
         #[cfg(not(target_arch = "wasm32"))]
         let value = match shared {
-            Some(shared) => shared.cell(&key).get_or_init(compute).clone(),
+            Some(shared) => {let cell=shared.cell(&key);if let Some(value)=cell.get(){value.clone()}else{let value=compute();if value.is_some()||!crate::clock::preparation_expired(){let _=cell.set(value.clone());}value}},
             None => compute(),
         };
         #[cfg(target_arch = "wasm32")]
         let value = compute();
+
+        if value.is_none()&&crate::clock::preparation_expired(){return None;}
 
         let limit = if cfg!(target_arch = "wasm32") {
             luck_envelope_limit(self.chart.notes.len()).min(128)
@@ -10264,7 +10267,7 @@ pub struct Environment<'a> {
     pub constraints: search::Constraints,
     pub now: &'a dyn Fn() -> f64,
     pub generation: u64,
-    pub min_just_window_ms: Option<f64>,
+    pub window_policy: Option<crate::just_window::Policy>,
 }
 struct Run {
     constraints: search::Constraints,
@@ -11181,7 +11184,8 @@ fn native_levels(
         env.music,
         env.generation,
     );
-    let min_just_window_ms = env.min_just_window_ms;
+    let window_policy = env.window_policy;
+    let preparation_deadline=crate::clock::preparation_deadline();
     std::thread::scope(|scope| {
         for (worker, (levels, mut chart)) in jobs.into_iter().enumerate() {
             let send = send.clone();
@@ -11191,6 +11195,7 @@ fn native_levels(
             let shared_floor = shared_floor.clone();
             let seed = &seed;
             scope.spawn(move || {
+                let _preparation=crate::clock::enter_preparation_deadline(preparation_deadline);
                 let level_count = levels.len();
                 let _floor_scope = shared_floor.map(crate::enter_search_floor);
                 let mut completed = 0;
@@ -11233,7 +11238,7 @@ fn native_levels(
                                         constraints,
                                         now: &now,
                                         generation,
-                                        min_just_window_ms,
+                                        window_policy,
                                     },
                                     chart: &mut chart,
                                     seeds: seed.seeds.clone(),
@@ -11407,7 +11412,7 @@ fn search_levels(
         mut on_candidate,
         mut progress,
     } = input;
-    let just_window = env.min_just_window_ms.map(|minimum| crate::just_window::Prepared::new(env.master, chart, env.members, env.snaps, minimum, &seeds)).transpose()?;
+    let just_window = env.window_policy.map(|minimum| crate::just_window::Prepared::new(env.master, chart, env.members, env.snaps, minimum, &seeds)).transpose()?;
     if just_window.as_ref().is_some_and(|window| window.impossible_with(&env.constraints)) {
         return Ok(search::Output { hits: Vec::new(), proven: true, bound: None, stats: search::Stats::default() });
     }
@@ -11771,7 +11776,7 @@ fn search_levels(
     let seed_key = format!(
         "{}:{minimum}:{seed_variant:?}:{:?}",
         seed_key(&env, criterion, k, &kernel.seeds),
-        env.min_just_window_ms.map(f64::to_bits),
+        env.window_policy.map(crate::just_window::Policy::key),
     );
     let cached = if seeded || fixed_assignment {
         Some(Vec::new())

@@ -36,7 +36,7 @@ pub(crate) struct Observation {
     pub total_score: f64,
     pub bonus: f64,
     pub ranks: [i32; 3],
-    pub window: Option<[i32; 2]>,
+    pub window: Option<crate::just_window::Window>,
 }
 impl Observation {
     fn from_model(model: &Model<'_>) -> Self {
@@ -63,7 +63,7 @@ impl Observation {
                 .fold(0_i32, |sum, row| sum.wrapping_add(row.bonus))
         });
         value.base_score = model.score.score.score.wrapping_sub(bonus) as f64;
-        value.window = model.just_window.as_ref().and_then(|trace| trace.minimum);
+        value.window = model.just_window.as_ref().and_then(|trace| trace.result());
         value
     }
 }
@@ -73,7 +73,7 @@ pub(crate) struct ReplayScene<'a> {
     pub opponents: Option<&'a Vec<[Standing; 3]>>,
     pub deliveries: Option<&'a std::collections::HashMap<i32, i32>>,
     pub window: Option<&'a crate::just_window::Trace>,
-    pub minimum: Option<f64>,
+    pub minimum: Option<crate::just_window::Policy>,
 }
 
 pub(crate) fn metrics(

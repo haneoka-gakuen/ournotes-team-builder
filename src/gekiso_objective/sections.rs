@@ -28,7 +28,7 @@ pub(crate) struct Summary {
     pub all_win: Option<f64>,
     pub samples: usize,
     pub sampled: bool,
-    pub window: Option<[i32; 2]>,
+    pub window: Option<crate::just_window::Window>,
 }
 impl Summary {
     pub fn of(rows: &[Observation], opponents: bool, random: bool) -> Self {
@@ -60,7 +60,7 @@ impl Summary {
         result.window = rows
             .iter()
             .filter_map(|row| row.window)
-            .reduce(|a, b| [a[0].min(b[0]), a[1].min(b[1])]);
+            .reduce(|mut a, b| {a.merge(b);a});
         if opponents {
             result.wins = Some(std::array::from_fn(|range| {
                 rows.iter().filter(|row| row.ranks[range] == 1).count() as f64 / n
@@ -87,7 +87,7 @@ pub(crate) struct Plan {
     pub base_bounds: bool,
     pub reference_hit: Option<Hit>,
     pub score_ceiling: Option<f64>,
-    pub minimum_window: Option<f64>,
+    pub minimum_window: Option<crate::just_window::Policy>,
     pub window_traces: Vec<Option<crate::just_window::Trace>>,
 }
 impl Plan {
@@ -100,7 +100,7 @@ impl Plan {
             summaries
                 .iter()
                 .filter_map(|row| row.window)
-                .any(|window| (window[0].min(window[1]) as f64) < minimum)
+                .any(|window| !minimum.allows(&window))
         }) {
             return Exact {
                 key: f64::NEG_INFINITY,
@@ -144,10 +144,9 @@ impl Plan {
         if let Some(window) = summaries
             .iter()
             .filter_map(|row| row.window)
-            .reduce(|a, b| [a[0].min(b[0]), a[1].min(b[1])])
+            .reduce(|mut a, b| {a.merge(b);a})
         {
-            exact.detail["justWindow"] =
-                json!({"beforeMs":window[0],"afterMs":window[1],"meetsTarget":true});
+            exact.detail["justWindow"] = json!(window);
         }
         exact
     }
@@ -946,7 +945,7 @@ impl Objective for Wrapper<'_, '_> {
                 })
                 .collect();
             details.push(json!({"power":power.total,"slotPowers":power.slots,"detail":{"scores":live::summarize(power.total as i32, scores),"sectionPerformance":summary,
-                "justWindow":summary.window.map(|window|json!({"beforeMs":window[0],"afterMs":window[1],"meetsTarget":self.plan.minimum_window.is_none_or(|min|window[0].min(window[1]) as f64>=min)}))}}));
+                "justWindow":summary.window}}));
             summaries.push(summary);
         }
         let exact = self.plan.rank(&summaries, &details);

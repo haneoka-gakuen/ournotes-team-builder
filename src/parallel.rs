@@ -93,6 +93,7 @@ where
     let slots: Vec<Mutex<Option<Result<R, E>>>> = items.iter().map(|_| Mutex::new(None)).collect();
     let cancel = crate::local_cancellation();
     let budget = BUDGET.with(std::cell::Cell::get);
+    let deadline=crate::clock::preparation_deadline();
     let work = || loop {
         let i = next.fetch_add(1, Ordering::Relaxed);
         if i >= items.len() || failed.load(Ordering::Relaxed) {
@@ -109,6 +110,7 @@ where
             let cancel = cancel.clone();
             scope.spawn(|| {
                 let _budget = enter_budget(budget);
+                let _deadline=crate::clock::enter_preparation_deadline(deadline);
                 match cancel {
                     Some(generation) => crate::with_cancellation(generation, work),
                     None => work(),

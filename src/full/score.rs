@@ -127,6 +127,7 @@ pub trait GekisoCombo {
 }
 #[derive(Clone)]
 pub struct Observation {
+    pub life: i32,
     pub score_type: i32,
     pub note: f64,
     pub gk: f64,
@@ -195,6 +196,7 @@ impl<'a> Calculator<'a> {
             self.observations.push((
                 note_id,
                 Observation {
+                    life,
                     score_type,
                     note: self.factors.note,
                     gk,

@@ -6438,7 +6438,7 @@ pub struct RewardObjective<'a> {
     member_dominance: HashMap<(usize, usize), MemberDominance>,
 }
 impl<'a> RewardObjective<'a> {
-    pub(crate) fn set_min_just_window(&mut self, minimum: f64) -> Result<(), String> {
+    pub(crate) fn set_min_just_window(&mut self, minimum: crate::just_window::Policy) -> Result<(), String> {
         if !self.gekiso.setup.missions.contains(&3) {
             return Ok(());
         }

@@ -1,5 +1,6 @@
 //! Gekiso context simulation, nominal lottery expectation and per-order scores.
 pub(crate) mod sections;
+mod factored;
 use crate::{
     chart::Source,
     full::{
@@ -21,7 +22,7 @@ use std::{
     collections::HashSet,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, OnceLock,
+        Arc, Mutex, OnceLock,
     },
 };
 #[derive(Clone)]
@@ -35,6 +36,7 @@ pub struct Recorded {
     pub curve: luck::Output,
 }
 pub struct Chart {
+    factored:Mutex<factored::Cache>,
     pub music_type: i32,
     pub full: play::Chart,
     pub setup: Setup,
@@ -82,6 +84,8 @@ pub struct Nominal {
 }
 #[derive(Clone)]
 pub struct Context {
+    pub(crate) life: Option<Arc<Vec<i32>>>,
+    pub(crate) live_life: Option<Arc<Vec<i32>>>,
     pub judgement: Vec<usize>,
     pub gk: Vec<f64>,
     pub up: Vec<f64>,
@@ -100,6 +104,8 @@ impl Context {
             + self.judgement.capacity() * std::mem::size_of::<usize>()
             + (self.gk.capacity() + self.up.capacity() + self.luck.capacity()) * 8
             + self.draws.capacity() * std::mem::size_of::<Arc<Context>>();
+        if let Some(life)=&self.life {bytes+=life.capacity()*4;}
+        if let Some(life)=&self.live_life {bytes+=life.capacity()*4;}
         bytes += self
             .draws
             .iter()
@@ -304,6 +310,7 @@ impl Chart {
         let difficulty_factor = f(f(f(crate::num::i32(full.level - 5.0) as f64) * f(0.005)) + 1.0);
         let music_length = full.last_timing + 1000;
         Ok(Self {
+            factored:Mutex::new(factored::Cache::default()),
             music_type: 0,
             full,
             setup,
@@ -353,6 +360,7 @@ impl Chart {
             }
         }
         Some(Self {
+            factored:Mutex::new(factored::Cache::default()),
             music_type: self.music_type,
             full: self.full.clone(),
             setup: self.setup.clone(),
@@ -565,6 +573,17 @@ pub fn context_fixed(
     deck: &[Performer],
     seeds: &[i32],
 ) -> Result<Context, String> {
+    if let Some(context)=factored::just_context(master,chart,deck){
+        #[cfg(debug_assertions)]{
+            let (original,_)=context_fixed_observed(master,chart,deck,seeds,false,false,None)?;
+            debug_assert_eq!(context.judgement,original.judgement,"constant JUST judgements");
+            debug_assert_eq!(context.gk,original.gk,"constant JUST factors");
+            debug_assert_eq!(context.up,original.up,"constant JUST score factors");
+            debug_assert_eq!(context.luck,original.luck,"constant JUST lottery");
+            if original.life.is_some(){debug_assert_eq!(context.life,original.life,"constant JUST LIFE");debug_assert_eq!(context.live_life,original.live_life,"constant JUST gates");}
+        }
+        return Ok(context);
+    }
     let n = chart.notes.len();
     if chart.luck && seeds.len() > 1 {
         let reduced: Vec<_> = deck.iter().map(Performer::gekiso_only).collect();
@@ -609,6 +628,8 @@ pub fn context_fixed(
                 .collect()
         };
         return Ok(Context {
+            life: None,
+            live_life: None,
             judgement: last.judgement.clone(),
             gk: last.gk.clone(),
             up: average(|draw| &draw.up),
@@ -661,6 +682,8 @@ pub(crate) fn context_fixed_luck_trace(
             .collect()
     };
     Ok(Context {
+        life: None,
+        live_life: None,
         judgement: last.judgement.clone(),
         gk: last.gk.clone(),
         up: average(|draw| &draw.up),
@@ -847,6 +870,8 @@ impl RushSupportPlan {
             }
         }
         let mut result = Context {
+            life: base.life.clone(),
+            live_life: base.live_life.clone(),
             judgement: base.judgement.clone(),
             gk: base.gk.clone(),
             up: base.up.clone(),
@@ -1008,6 +1033,9 @@ fn context_fixed_observed<'a>(
         .map(|(i, n)| (n.id, i))
         .collect();
     let mut factor_commands = 0;
+    let whole=uses_full_replay(master,chart,seeds);
+    let mut life=whole.then(||vec![master.live.life_base as i32;n]);
+    let mut live_life=whole.then(||vec![master.live.life_base as i32;chart.full.events.len()]);
     let mut factor_peak = 0.0_f64;
     let mut rush_changes = 0;
     let mut rush_trace = None;
@@ -1046,9 +1074,15 @@ fn context_fixed_observed<'a>(
             make_model(seed)?
         };
         model.score.score.calculator.factors_only = true;
-        for k in chart.span.0..chart.span.1 {
+        model.live_life=whole.then(Vec::new);
+        for k in if whole {0..chart.play.frames.len()}else{chart.span.0..chart.span.1} {
             let frame = &chart.play.frames[k];
             model.frame(frame.time_ms, &frame.judged, chart.play.dt[k])?;
+        }
+        if let Some(lives)=&mut live_life {
+            for (event,&(_,at)) in chart.full.events.iter().enumerate() {
+                if let Some(&(_,life))=model.live_life.as_ref().unwrap().iter().find(|&&(time,_)|time==at){lives[event]=life;}
+            }
         }
         if observe_rush {
             model.rush_support_commands.sort_by_key(|&(time, _)| time);
@@ -1082,6 +1116,7 @@ fn context_fixed_observed<'a>(
         for (id, o) in &model.score.score.calculator.observations {
             if let Some(&i) = index.get(id) {
                 judgement[i] = (7 - o.score_type) as usize;
+                if let Some(life)=&mut life {life[i]=o.life;}
                 gk[i] = o.gk;
                 note_up[i] = o.note;
                 note_luck[i] = o.luck;
@@ -1098,6 +1133,8 @@ fn context_fixed_observed<'a>(
     }
     Ok((
         Context {
+            life:life.map(Arc::new),
+            live_life:live_life.map(Arc::new),
             judgement,
             gk,
             up,
@@ -1252,6 +1289,8 @@ fn expected(master: &Master, chart: &mut Chart, deck: &[Performer]) -> Result<Co
         probabilities[3][i] = both.max(0.0);
     }
     Ok(Context {
+        life: None,
+        live_life: None,
         judgement,
         gk,
         up,
@@ -1660,7 +1699,21 @@ pub fn score_orders(
     slots: &[Slot],
     settle: bool,
 ) -> Result<Scores, String> {
-    score_orders_selected(master, chart, ctx, power, slots, settle, None)
+    score_orders_selected(master, chart, ctx, power, slots, settle, None, None)
+}
+fn independent_orders(master:&Master,chart:&Chart,ctx:&Context,power:i32,slots:&[Slot])->Result<Option<ReplayedScores>,String> {
+    let draws:Vec<_>=if ctx.draws.is_empty(){vec![ctx]}else{ctx.draws.iter().map(Arc::as_ref).collect()};
+    let mut scores=vec![0.0;120];let mut ranges=[[0.0;3];120];
+    for draw in &draws {
+        if draw.gk.iter().any(|value|!value.is_finite()||*value<0.0)||draw.up.iter().zip(&draw.luck).any(|(up,luck)|up!=luck||!luck.is_finite()||*luck<=0.0) {return Ok(None);}
+        if slots.iter().any(|slot|slot.effects.iter().any(|effect|effect.gate.kind!=0))&&draw.live_life.is_none(){return Ok(None);}
+        let mut current=[[0.0;3];120];
+        let result=score_orders_selected(master,chart,draw,power,slots,true,None,Some(&mut current))?;
+        if result.scores.iter().any(|score|!score.is_finite()||*score<0.0||*score>=i32::MAX as f64) {return Ok(None);}
+        for order in 0..120 {scores[order]+=result.scores[order];for range in 0..3 {ranges[order][range]+=current[order][range];}}
+    }
+    for order in 0..120 {scores[order]/=draws.len() as f64;for value in &mut ranges[order] {*value/=draws.len() as f64;}}
+    Ok(Some(ReplayedScores{scores:live::summarize(power,scores),range_scores:std::array::from_fn(|range|ranges.iter().map(|row|row[range]).sum::<f64>()/120.0)}))
 }
 #[allow(clippy::too_many_arguments)]
 fn score_orders_selected(
@@ -1671,6 +1724,7 @@ fn score_orders_selected(
     slots: &[Slot],
     settle: bool,
     selected: Option<&[usize]>,
+    mut range_observer:Option<&mut [[f64;3];120]>,
 ) -> Result<Scores, String> {
     if !ctx.draws.is_empty() {
         let plan = selected
@@ -1687,7 +1741,7 @@ fn score_orders_selected(
             let result = if let Some(scores) = planned {
                 scores
             } else {
-                score_orders_selected(master, chart, draw, power, slots, settle, selected)?
+                score_orders_selected(master, chart, draw, power, slots, settle, selected, None)?
             };
             for (order, &value) in result.scores.iter().enumerate() {
                 scores[order] += value / ctx.seeds as f64;
@@ -1702,7 +1756,7 @@ fn score_orders_selected(
     }
     let generation = crate::cancellation_generation();
     // Full single-seed plays can reuse the sparse note states used for multiple draws.
-    if chart.luck
+    if range_observer.is_none() && chart.luck
         && selected.is_none()
         && ctx.seeds == 1
         && ctx.nominal.is_none()
@@ -1752,11 +1806,12 @@ fn score_orders_selected(
         .enumerate()
         .map(|(i, n)| (n.id, i))
         .collect();
-    let needs_life = ctx.judgement.iter().any(|&j| damage[j] != 0.0)
+    let native_life=range_observer.is_some()&&ctx.life.is_some();
+    let needs_life = !native_life && (ctx.judgement.iter().any(|&j| damage[j] != 0.0)
         || slots
             .iter()
             .flat_map(|s| &s.effects)
-            .any(|e| e.gate.kind != 0);
+            .any(|e| e.gate.kind != 0));
     let mut life_cache = HashMap::<[i32; 5], (Vec<i32>, Vec<i32>)>::default();
     for &order_index in &plan.representatives {
         if selected.is_some_and(|orders| !orders.contains(&order_index)) {
@@ -1808,7 +1863,7 @@ fn score_orders_selected(
             channel: [0.0; 7],
             active: Vec::new(),
             climbing: Vec::new(),
-            factor: f(0.0),
+            factor: if native_life {f(1.0)}else{f(0.0)},
             convert_end: None,
             convert_judgements: Vec::new(),
             convert_left: 0.0,
@@ -1833,7 +1888,7 @@ fn score_orders_selected(
                     for effect in &slot.effects {
                         if effect
                             .gate
-                            .blocks(lives.map_or(master.live.life_base, |l| l.1[event] as f64))
+                            .blocks(if native_life {ctx.live_life.as_ref().map_or(master.live.life_base,|values|values[event] as f64)}else{lives.map_or(master.live.life_base, |l| l.1[event] as f64)})
                         {
                             continue;
                         }
@@ -1934,16 +1989,16 @@ fn score_orders_selected(
                     }) * f(c * up))
                         / count)
                     .floor();
-                    if lives.map_or(master.live.life_base as i32, |l| l.0[i]) <= 0 {
+                    if if native_life {ctx.life.as_ref().unwrap()[i]}else{lives.map_or(master.live.life_base as i32, |l| l.0[i])} <= 0 {
                         value = f(onus * value).floor();
                     }
                     outcomes[4 * i + mask] = value;
                     x += nominal.probabilities[mask][i] * value;
                 }
             } else {
-                let up = f(f(ctx.up[i] / ctx.luck[i]) + live);
+                let up = if native_life {live}else{f(f(ctx.up[i] / ctx.luck[i]) + live)};
                 x = f(f(f(ctx.luck[i]) * f(c * up)) / count).floor();
-                if lives.map_or(master.live.life_base as i32, |l| l.0[i]) <= 0 {
+                if if native_life {ctx.life.as_ref().unwrap()[i]}else{lives.map_or(master.live.life_base as i32, |l| l.0[i])} <= 0 {
                     x = f(onus * x).floor();
                 }
             }
@@ -1973,9 +2028,11 @@ fn score_orders_selected(
             }
         }
         scores[order_index] = score;
+        if let Some(observer)=&mut range_observer {observer[order_index]=std::array::from_fn(|i|range_score.get(i).copied().unwrap_or(0.0));}
     }
     for (index, &source) in plan.sources.iter().enumerate() {
         scores[index] = scores[source];
+        if let Some(observer)=&mut range_observer {observer[index]=observer[source];}
     }
     Ok(live::summarize(power, scores))
 }
@@ -2088,9 +2145,9 @@ pub(crate) fn replay_order_scene(master:&Master,chart:&Chart,deck:&[Performer],p
         let reachable=|model:&Model<'_>|frame.judged.iter().filter_map(|note|displaced.get(&note.note_id)).all(|&(kind,note,first,last)|
             model.just_window.as_ref().and_then(|trace|trace.current.get(&kind)).is_some_and(|&(before,after)|first.max(note-before)<=last.min(note+after)));
         if !displaced.is_empty() && !reachable(&model) {return Ok(ReplayedOrder {valid:false,ranks:[1;3],score:0.0,base_score:0.0,ranges:[0.0;3],combos:[0;3],perfects:[0;3],missions:[0;3],combo_frames:Vec::new()});}
+        if scene.is_some_and(|scene|scene.window.is_some()) {if let Some(trace)=&mut model.just_window {trace.record_probe(k);}}
         model.frame(frame.time_ms, &frame.judged, chart.play.dt[k])?;
         if !displaced.is_empty() && !reachable(&model) {return Ok(ReplayedOrder {valid:false,ranks:[1;3],score:0.0,base_score:0.0,ranges:[0.0;3],combos:[0;3],perfects:[0;3],missions:[0;3],combo_frames:Vec::new()});}
-        if scene.is_some_and(|scene|scene.window.is_some()) {if let Some(trace)=&mut model.just_window {trace.record_probe(k);}}
         if let Some(g) = model.gk.as_ref().filter(|_| trace_combo) {
             combo_frames.extend(g.controller.combo_bonus_times(count).map(|time| live::FrameClock::default().frame_time(time)));
         }
@@ -2111,7 +2168,7 @@ pub(crate) fn replay_order_scene(master:&Master,chart:&Chart,deck:&[Performer],p
         }
         for bonus in &g.rank_bonus {if bonus.range<3 {ranks[bonus.range]=bonus.rank;}}
     }
-    let valid=scene.and_then(|scene|scene.minimum).is_none_or(|minimum|model.just_window.as_ref().and_then(|trace|trace.minimum).is_none_or(|window|window[0].min(window[1]) as f64>=minimum));
+    let valid=scene.and_then(|scene|scene.minimum).is_none_or(|policy|model.just_window.as_ref().and_then(|trace|trace.window(policy)).is_none_or(|window|window.meets_target));
     let bonus=model.gk.as_ref().map_or(0,|g|g.rank_bonus.iter().fold(0_i32,|sum,row|sum.wrapping_add(row.bonus)));
     Ok(ReplayedOrder { valid,ranks,score: model.score.score.score as f64,base_score:model.score.score.score.wrapping_sub(bonus) as f64, ranges, combos,perfects, missions, combo_frames })
 }
@@ -2136,8 +2193,8 @@ impl<const SECTIONS:bool> ReplayTree<'_,SECTIONS> {
                 return Err("cancelled".into());
             }
             let frame = &self.chart.play.frames[k];
-            model.frame(frame.time_ms, &frame.judged, self.chart.play.dt[k])?;
             if SECTIONS { if let Some(trace)=&mut model.just_window {trace.record_probe(k);} }
+            model.frame(frame.time_ms, &frame.judged, self.chart.play.dt[k])?;
         }
         Ok(())
     }
@@ -2221,6 +2278,8 @@ impl<const SECTIONS:bool> ReplayTree<'_,SECTIONS> {
 }
 /// Replay complete skill, conversion and LIFE state for each ordinary order
 /// and requested lottery seed, retaining each note's original LIFE snapshot.
+pub(crate) fn seed_actor(master:&Master,chart:&Chart,actor:&Performer)->bool { factored::seed_actor(master,chart,actor) }
+
 pub fn replay_orders(
     master: &Master,
     chart: &Chart,
@@ -2301,6 +2360,19 @@ fn replay_orders_observed(
     power: i32,
     observe: Option<&(dyn Fn(f64, usize) -> bool + Sync)>,
 ) -> Result<Option<ReplayedScores>, String> {
+    if observe.is_none() {
+        if let Some(scores)=factored::scores(master,chart,deck,seeds,power)? {
+            #[cfg(debug_assertions)] {
+                let full=replay_orders_original(master,chart,deck,seeds,power,None)?.unwrap();
+                debug_assert_eq!(scores.scores.scores,full.scores.scores,"factored ordinary orders");
+                debug_assert_eq!(scores.range_scores,full.range_scores,"factored section scores");
+            }
+            return Ok(Some(scores));
+        }
+    }
+    replay_orders_original(master,chart,deck,seeds,power,observe)
+}
+fn replay_orders_original(master:&Master,chart:&Chart,deck:&[Performer],seeds:&[i32],power:i32,observe:Option<&(dyn Fn(f64,usize)->bool+Sync)>)->Result<Option<ReplayedScores>,String> {
     if deck.len() != 5 {
         return Err("a team requires five performers".into());
     }
@@ -2543,7 +2615,7 @@ pub(crate) fn settle_extreme(
         {
             break;
         }
-        let exact = score_orders_selected(master, chart, ctx, power, slots, true, Some(&[order]))?;
+        let exact = score_orders_selected(master, chart, ctx, power, slots, true, Some(&[order]), None)?;
         best = if maximum {
             best.max(exact.scores[order])
         } else {

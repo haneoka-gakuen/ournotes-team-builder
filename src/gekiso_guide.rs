@@ -27,6 +27,9 @@ pub(crate) struct Guide {
     best: Option<f64>,
     actions: Vec<Action>,
 }
+#[derive(Serialize)]
+#[serde(rename_all="camelCase")]
+pub(crate) struct Analysis {pub guide:Option<Guide>,pub window_profile:Option<crate::just_window::WindowProfile>}
 #[derive(Clone)]
 struct Outcome {
     valid: bool,
@@ -75,11 +78,11 @@ pub(crate) struct Context<'a> {
     pub seeds: Vec<i32>,
     pub opponents: Option<gekiso::sections::OpponentSamples>,
     pub window: Option<crate::just_window::Trace>,
-    pub minimum: Option<f64>,
+    pub minimum: Option<crate::just_window::Policy>,
     pub preserve_base: bool,
 }
 impl Context<'_> {
-    fn score(&mut self, selected: &[i32], trace_combo: bool) -> Result<Outcome, String> {
+    fn deliver(&mut self, selected: &[i32]) {
         let positions: HashMap<_, _> = self
             .chart
             .notes
@@ -107,6 +110,9 @@ impl Context<'_> {
                 .judged
                 .sort_by_key(|note| (note.time_ms, note.note_id));
         }
+    }
+    fn score(&mut self, selected: &[i32], trace_combo: bool) -> Result<Outcome, String> {
+        self.deliver(selected);
         let mut total = 0.0;
         let mut base = 0.0;
         let mut wins = [0.0; 3];
@@ -121,6 +127,7 @@ impl Context<'_> {
             .enumerate()
             .map(|(index, note)| (note.id, selected[index]))
             .collect();
+        let window=self.window.as_ref().map(|trace|{let mut trace=trace.clone();trace.relocate(&self.chart.play.frames);trace});
         for &seed in &self.seeds {
             let scene = gekiso::sections::ReplayScene {
                 opponents: self
@@ -128,7 +135,7 @@ impl Context<'_> {
                     .as_ref()
                     .map(|samples| &samples[seed as usize % samples.len()]),
                 deliveries: Some(&deliveries),
-                window: self.window.as_ref(),
+                window: window.as_ref(),
                 minimum: self.minimum,
             };
             let value = gekiso::replay_order_scene(
@@ -192,7 +199,12 @@ impl Context<'_> {
         })
     }
 }
-pub(crate) fn build(mut context: Context<'_>) -> Result<Option<Guide>, String> {
+pub(crate) fn build(mut context: Context<'_>) -> Result<Analysis, String> {
+    let profile=|context:&Context<'_>|crate::just_window::describe(crate::just_window::ProfileInput{
+        master:context.master,chart:&context.chart,deck:&context.deck,power:context.power,order:context.order,
+        seeds:&context.seeds,opponents:context.opponents.as_ref(),minimum:context.minimum,
+    });
+    let nominal_profile=profile(&context)?;
     let compiled = context.compiled;
     if context.chart.notes.len() != compiled.times.len()
         || context
@@ -202,7 +214,7 @@ pub(crate) fn build(mut context: Context<'_>) -> Result<Option<Guide>, String> {
             .enumerate()
             .any(|(i, note)| note.time_ms != compiled.times[i] || note.op != compiled.note_types[i])
     {
-        return Ok(None);
+        return Ok(Analysis{guide:None,window_profile:nominal_profile});
     }
     if !gekiso::replay_random(context.master, &context.chart, &context.deck)
         && context.opponents.is_none()
@@ -240,11 +252,11 @@ pub(crate) fn build(mut context: Context<'_>) -> Result<Option<Guide>, String> {
         .map(|note| delivery[&note.id])
         .collect();
     if !matches!(inputs.conflict(&selected), Ok(None)) {
-        return Ok(None);
+        return Ok(Analysis{guide:None,window_profile:nominal_profile});
     }
     let score = context.score(&selected, true)?;
     if !score.valid {
-        return Ok(None);
+        return Ok(Analysis{guide:None,window_profile:nominal_profile});
     }
     let mut best = score.clone();
     let mut actions = Vec::new();
@@ -470,10 +482,11 @@ pub(crate) fn build(mut context: Context<'_>) -> Result<Option<Guide>, String> {
         }
     }
     actions.sort_by_key(|action| action.time_ms);
-    Ok(Some(Guide {
+    let window_profile=if !actions.is_empty()&&nominal_profile.is_some() {context.deliver(&selected);profile(&context)?}else{nominal_profile};
+    Ok(Analysis{window_profile,guide:Some(Guide {
         frame_rate: 60,
         score: report_scores.then_some(score.score),
         best: report_scores.then_some(best.score),
         actions,
-    }))
+    })})
 }

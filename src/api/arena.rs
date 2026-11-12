@@ -218,26 +218,7 @@ impl Engine {
                 .map(|ms| started + ms)
                 .unwrap_or(f64::INFINITY)
         });
-        let mut initial = seed_teams(request, &Value::Null, &cards.members, &cards.snaps);
-        if initial.is_empty()
-            && !(self.trusted_scores && request["seeded"] == true)
-            && songs.len() > 1
-            && now() < deadline
-        {
-            let mut trial = scoped_input.clone();
-            trial["request"]["goal"]["songs"] = json!([songs[0]]);
-            trial["charts"] = json!([{ "song": songs[0], "source": sources[0] }]);
-            trial["request"]["aggregation"] = Value::Null;
-            trial["request"]["seedOnly"] = json!(true);
-            trial["request"]["noFloor"] = json!(true);
-            trial["request"]["cooperativeFloor"] = json!(false);
-            for key in ["shard", "floors", "completed", "seeded"] {
-                trial["request"][key] = Value::Null;
-            }
-            let warm = crate::progress::with_callback(None, || scoped.run(&trial, started, now))?;
-            trial["request"]["seeds"] = warm["overall"].clone();
-            initial = seed_teams(&trial["request"], &songs[0], &cards.members, &cards.snaps);
-        }
+        let initial = seed_teams(request, &Value::Null, &cards.members, &cards.snaps);
         let shard = request["shard"].is_object().then(|| {
             (
                 master::int(&request["shard"]["index"]) as usize,
@@ -249,7 +230,7 @@ impl Engine {
                 &json!({"song":null,"hits":hits.iter().map(|hit|arena_hit(hit, &songs, &compiled, &cards.members, &cards.snaps)).collect::<Vec<_>>()}),
             );
         };
-        let minimum_just_window = crate::just_window::target(&goal["minJustWindowMs"])?;
+        let minimum_just_window = crate::just_window::Policy::read(goal)?;
         let floor = if self.trusted_scores && minimum_just_window.is_none() {
             request["floors"][format!(
                 "{}:{}",
@@ -278,7 +259,7 @@ impl Engine {
                 constraints: constraints(&self.master, &request["constraints"], &cards.members, &cards.snaps),
                 now,
                 generation: crate::cancellation_generation(),
-                min_just_window_ms: minimum_just_window,
+                window_policy: minimum_just_window,
             },
             charts: &mut charts,
             music: &music,

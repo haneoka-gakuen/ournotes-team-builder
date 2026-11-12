@@ -97,7 +97,7 @@ impl Engine {
         let seeds: Vec<_> = (0..if count > 0 { count } else { 32 }).collect();
         let opponents =
             self.section_opponents(&request["sectionArena"], &chart, source, id, &seeds)?;
-        let minimum = crate::just_window::target(&setup["minJustWindowMs"])?;
+        let minimum = crate::just_window::Policy::read(setup)?;
         let selected_snaps: Vec<_> = resolved.snaps.iter().flatten().cloned().collect();
         let trace = minimum
             .map(|minimum| {
@@ -109,7 +109,7 @@ impl Engine {
                     minimum,
                     &seeds,
                 )
-                .map(|prepared| prepared.capture_trace(&self.master))
+                .map(|prepared| prepared.capture_trace(&self.master,&chart))
             })
             .transpose()?;
         let deck: Vec<_> = resolved
@@ -146,7 +146,7 @@ impl Engine {
         result["rangeScores"] = json!(summary.range_scores);
         result["sectionSummary"] = json!(summary);
         if let Some(window) = summary.window {
-            result["justWindow"] = json!({"beforeMs":window[0],"afterMs":window[1],"meetsTarget":minimum.is_none_or(|min|window[0].min(window[1]) as f64>=min)});
+            result["justWindow"] = json!(window);
         }
         Ok(result)
     }
@@ -376,6 +376,7 @@ impl Engine {
             scoped_input["request"]["sectionArena"] = Value::Null;
             if !master::rows(&options["opponents"]).is_empty() {
                 scoped_input["request"]["goal"]["minJustWindowMs"] = Value::Null;
+                scoped_input["request"]["goal"]["justWindow"] = Value::Null;
             }
             scoped_input["request"]["cooperativeFloor"] = json!(false);
             for key in [
@@ -485,7 +486,7 @@ impl Engine {
             let request = &scoped_input["request"];
 
             let minimum_window =
-                crate::just_window::target(&input["request"]["goal"]["minJustWindowMs"])?;
+                crate::just_window::Policy::read(&input["request"]["goal"])?;
             let mut window_traces = cache.traces.clone();
             for (index, chart) in charts.iter().enumerate().skip(references.len()) {
                 if now() >= deadline {
@@ -501,7 +502,7 @@ impl Engine {
                             minimum,
                             &seeds,
                         )
-                        .map(|prepared| prepared.capture_trace(&scoped.master))
+                        .map(|prepared| prepared.capture_trace(&scoped.master,chart))
                     })
                     .transpose()?;
                 let id = master::int(&songs[index]["songId"]);
@@ -540,7 +541,7 @@ impl Engine {
                     })
                     .collect();
                 reference_parts.push(json!({"power":resolved.power.total,"slotPowers":resolved.power.slots,"detail":{"scores":live::summarize(resolved.power.total as i32,scores),"sectionPerformance":references.last().unwrap(),
-                "justWindow":references.last().unwrap().window.map(|window|json!({"beforeMs":window[0],"afterMs":window[1],"meetsTarget":minimum_window.is_none_or(|minimum|window[0].min(window[1]) as f64>=minimum)}))}}));
+                "justWindow":references.last().unwrap().window}}));
                 targets.push(opponents);
                 window_traces.push(trace);
                 cache.references = references.clone();
@@ -625,9 +626,7 @@ impl Engine {
                     ),
                     now,
                     generation: crate::cancellation_generation(),
-                    min_just_window_ms: crate::just_window::target(
-                        &request["goal"]["minJustWindowMs"],
-                    )?,
+                    window_policy: crate::just_window::Policy::read(&request["goal"])?,
                 },
                 charts: &mut cache.charts,
                 music: &music,

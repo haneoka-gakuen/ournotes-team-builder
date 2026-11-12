@@ -344,7 +344,7 @@ pub unsafe extern "C" fn haneoka_evaluate_json(input: *const c_char) -> *mut c_c
             serde_json::from_value(input["chart"].clone()).map_err(|e| e.to_string())?,
         )?;
         engine
-            .evaluate(&input["request"], &input["team"], song_id, difficulty)
+            .evaluate_one(&input)
             .map(|value| value.to_string())
     });
     let text = match result {

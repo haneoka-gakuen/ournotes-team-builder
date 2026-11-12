@@ -1245,7 +1245,7 @@ impl Engine {
                             master::int(&goal["gekiso"]["luckSamples"]),
                             exchange,
                         );
-                    if let Some(minimum) = crate::just_window::target(&goal["gekiso"]["minJustWindowMs"])? { objective.set_min_just_window(minimum)?; }
+                    if let Some(minimum) = crate::just_window::Policy::read(&goal["gekiso"])? { objective.set_min_just_window(minimum)?; }
                     crate::reward_plan::Source::Gekiso(Box::new(objective))
                 } else {
                     crate::reward_plan::Source::Ordinary(Box::new(EventObjective::new(

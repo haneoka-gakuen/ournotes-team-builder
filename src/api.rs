@@ -19,6 +19,7 @@ mod arena;
 mod arena_sections;
 mod shared;
 mod reward_plan;
+mod planner;
 use gekiso_result_cache::CompletedGekiso;
 
 type CachedScoreCap = (String, f64, Vec<crate::search::Team>);
@@ -75,6 +76,9 @@ impl SharedFloors {
     }
 }
 pub struct Engine {
+    planner_base: Option<Master>,
+    planner_key: Option<(i32,bool)>,
+    planner_views: VecDeque<((i32,bool),Box<Engine>)>,
     pub(crate) growth_source: Option<Arc<Value>>,
     pub(crate) event_growth: Option<crate::event_growth::Search>,
     pub master: Master,
@@ -150,6 +154,9 @@ impl Engine {
     }
     pub fn from_master(master: Master) -> Self {
         Self {
+            planner_base: None,
+            planner_key: None,
+            planner_views: VecDeque::new(),
             growth_source: None,
             event_growth: None,
             master,
@@ -524,7 +531,7 @@ impl Engine {
         if let Some(summary)=section_summary {result["sectionSummary"]=summary;}
         if let Some(window)=section_window {result["justWindow"]=window;}
         else if is_gekiso {
-            if let Some(minimum) = crate::just_window::target(&request["gekiso"]["minJustWindowMs"])? {
+            if let Some(minimum) = crate::just_window::Policy::read(&request["gekiso"])? {
                 let source = self.sources.get(&(song_id, difficulty)).ok_or("missing-chart")?;
                 let accuracy = serde_json::from_value(request["gekiso"]["accuracy"].clone()).map_err(|e| e.to_string())?;
                 let mut gk = crate::gekiso::Chart::new(&self.master, source, chart.difficulty.play_level, chart.song.missions.clone(), accuracy, gekiso_ranks(&request["gekiso"]))?;
@@ -1686,7 +1693,7 @@ impl Engine {
             ))
         };
         chart.music_type = music.music_type;
-        let minimum_just_window = crate::just_window::target(&goal["minJustWindowMs"])?;
+        let minimum_just_window = crate::just_window::Policy::read(goal)?;
         let floor = if minimum_just_window.is_some() { f64::NEG_INFINITY } else {
             request["floors"][format!("{song_id}:{difficulty}")].as_f64().unwrap_or(f64::NEG_INFINITY)
         };
@@ -1747,7 +1754,7 @@ impl Engine {
                     constraints: constraints.clone(),
                     now,
                     generation,
-                    min_just_window_ms: minimum_just_window,
+                    window_policy: minimum_just_window,
                 },
                 chart: &mut chart,
                 seeds: seeds.clone(),
@@ -2554,6 +2561,9 @@ impl Engine {
         started: f64,
         now: &dyn Fn() -> f64,
     ) -> Result<Value, String> {
+        let request=&input["request"];
+        let deadline=request["deadline"].as_f64().unwrap_or_else(||request["timeLimitMs"].as_f64().map_or(f64::INFINITY,|ms|started+ms));
+        let _preparation=crate::clock::enter_preparation_deadline(crate::clock::milliseconds()+(deadline-now()).max(0.0));
         if input["request"]["goal"]["arena"]["objective"]!="sections" {self.section_cache=None;self.section_multiple=None;}
         crate::reset_search_floor();
         if self.trusted_scores
@@ -2619,6 +2629,9 @@ impl Engine {
         }
         if input["request"]["goal"]["arena"].is_object() {
             return self.run_arena(input, started, now);
+        }
+        if self.planner_scope(input).is_some() {
+            return self.with_planner(input,|scoped,input|scoped.run(input,started,now));
         }
         if input["request"]["goal"]["kind"] == "event" && !input["request"]["goal"]["rewardPlan"].is_null()
             && (input["request"]["resolveRewardPlan"] == true || !input["request"]["goal"]["rewardPlan"]["autoCp"].is_null()) {
@@ -2909,7 +2922,7 @@ impl Engine {
             master::int(&goal["gekiso"]["luckSamples"]),
             exchange,
         );
-        if let Some(minimum) = crate::just_window::target(&goal["gekiso"]["minJustWindowMs"])? {
+        if let Some(minimum) = crate::just_window::Policy::read(&goal["gekiso"])? {
             objective.set_min_just_window(minimum)?;
         }
         let deadline = request["deadline"].as_f64().unwrap_or_else(|| {
@@ -3012,7 +3025,7 @@ impl Engine {
             .to_string()
         });
         objective.live_floor = self.trusted_scores
-            && crate::just_window::target(&goal["gekiso"]["minJustWindowMs"])?.is_none()
+            && crate::just_window::Policy::read(&goal["gekiso"])?.is_none()
             && identity.is_some()
             && (phase.is_some() || single_lex)
             && request["noFloor"] != true
@@ -3499,7 +3512,7 @@ impl Engine {
                     master::int(&goal["gekiso"]["luckSamples"]),
                     None,
                 );
-                if let Some(minimum) = crate::just_window::target(&goal["gekiso"]["minJustWindowMs"])? {
+                if let Some(minimum) = crate::just_window::Policy::read(&goal["gekiso"])? {
                     secondary.set_min_just_window(minimum)?;
                 }
                 secondary.constrain_other(target, exchange, output.proven);
@@ -4082,6 +4095,7 @@ impl Engine {
             let (mut scoped, scoped_input, _, _) = self.arena_view(input)?;
             return scoped.evaluate_all(&scoped_input);
         }
+        if self.planner_scope(input).is_some() { return self.with_planner(input,Self::evaluate_all); }
         let request = &input["request"];
         let mut out = Vec::new();
         for song in master::rows(&request["songs"]) {
@@ -4104,6 +4118,7 @@ impl Engine {
             let (mut scoped, scoped_input, _, _) = self.arena_view(input)?;
             return scoped.timeline(&scoped_input);
         }
+        if self.planner_scope(input).is_some() { return self.with_planner(input,Self::timeline); }
         let request = &input["request"];
         let song = &request["song"];
         self.load_source(input, song)?;
@@ -4200,7 +4215,8 @@ impl Engine {
         let mut out = json!({"durationMs":duration,"density":density,"fever":chart.fevers,"windows":windows,"cachedCharts":self.cached_chart_keys()});
         if request["timing"].is_object() {
             if request["timing"]["gekiso"].is_object() {
-                out["guide"] = self.gekiso_timing_guide(request, &song["songId"], &song["difficulty"])?;
+                let analysis=self.gekiso_timing_guide(request, &song["songId"], &song["difficulty"])?;
+                out["guide"]=analysis["guide"].clone();out["windowProfile"]=analysis["windowProfile"].clone();
             } else {
                 out["timing"] = self.order_timing(request, &song["songId"], &song["difficulty"])?;
             }
@@ -4230,10 +4246,10 @@ impl Engine {
         let count=master::int(&setup["seeds"]);
         let seeds:Vec<_>=(0..if count>0 {count}else if scene {32}else{0}).collect();
         let opponents=if scene {self.section_opponents(&request["sectionArena"],&chart,source,song_id,&seeds)?}else{None};
-        let minimum=crate::just_window::target(&setup["minJustWindowMs"])?;
+        let minimum=crate::just_window::Policy::read(setup)?;
         let selected_snaps:Vec<_>=resolved.snaps.iter().flatten().cloned().collect();
         let window=minimum.map(|minimum|crate::just_window::Prepared::new(&self.master,&chart,&resolved.members,&selected_snaps,minimum,&seeds)
-            .map(|prepared|prepared.capture_trace(&self.master))).transpose()?;
+            .map(|prepared|prepared.capture_trace(&self.master,&chart))).transpose()?;
         let input = chart::prepare(&self.master, compiled, resolved.power.total as i32, resolved.slots, Some(chart.judgements.clone()), 1.0, 100.0);
         Ok(json!(crate::gekiso_guide::build(crate::gekiso_guide::Context {
             master: &self.master, compiled, chart, deck, input, power: resolved.power.total as i32,
@@ -4377,6 +4393,7 @@ impl Engine {
         if input["request"]["gekiso"]["arena"].is_object() {
             let (mut scoped, input, _, _) = self.arena_view(input)?; return scoped.sample(&input);
         }
+        if self.planner_scope(input).is_some() { return self.with_planner(input,Self::sample); }
         let request = &input["request"]; let song = &request["songs"][0];
         self.load_source(input, song)?;
         let id = master::int(&song["songId"]); let difficulty = master::int(&song["difficulty"]);
