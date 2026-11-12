@@ -3282,11 +3282,44 @@ impl Engine {
                 generation,
             )?
         };
+        let song_key = format!("{id}:{difficulty}");
+        let floor = request["cutoff"]["key"].as_f64().unwrap_or_else(|| {
+            master::number(&request["floors"][&song_key], f64::NEG_INFINITY)
+                .max(master::number(&request["rewardCutoff"], f64::NEG_INFINITY))
+        });
+        let publish_first_seed = single_lex
+            && chart.song.missions.iter().all(|&mission| mission == 1)
+            && shard.is_none()
+            && !objective.live_floor()
+            && !objective.has_team_filter()
+            && constraints.min_bonus.is_none()
+            && constraints.max_bonus.is_none()
+            && request["cutoff"].is_null()
+            && request["rewardCutoff"].is_null()
+            && request["seedOnly"] != true
+            && floor == f64::NEG_INFINITY
+            && crate::progress::callback().is_some();
         seeds.extend(probe.hits.iter().map(|h| h.team.clone()));
         let mut best = f64::NEG_INFINITY;
         let mut rejected = Vec::<search::Team>::new();
         for hit in &probe.hits {
-            best = best.max(objective.exact(&hit.team, hit.power, &hit.slot_powers)?.key);
+            let exact = objective.exact(&hit.team, hit.power, &hit.slot_powers)?;
+            best = best.max(exact.key);
+            if publish_first_seed
+                && exact.key.is_finite()
+                && now() < deadline
+                && generation == crate::cancellation_generation()
+                && search::valid_seed(&cards.members, &cards.snaps, &constraints, &hit.team)
+            {
+                crate::progress::emit_provisional(&[search::Hit {
+                    team: hit.team.clone(),
+                    power: hit.power,
+                    slot_powers: hit.slot_powers.clone(),
+                    totals: hit.totals,
+                    key: exact.key,
+                    detail: exact.detail,
+                }]);
+            }
         }
         let ceiling = objective.reward_ceiling();
         if best < ceiling {
@@ -3441,11 +3474,6 @@ impl Engine {
                 }
             }
         }
-        let song_key = format!("{id}:{difficulty}");
-        let floor = request["cutoff"]["key"].as_f64().unwrap_or_else(|| {
-            master::number(&request["floors"][&song_key], f64::NEG_INFINITY)
-                .max(master::number(&request["rewardCutoff"], f64::NEG_INFINITY))
-        });
         let mut output = search::search_at(
             search::Input {
                 master: &self.master,
