@@ -67,6 +67,8 @@ For no-damage COMBO charts, GREAT retains judgement-specific score bounds and co
 
 `request.aggregation: "mean"` searches one formation over all `goal.songs`. Score objectives use mean scores, and event objectives average their selected rewards. Equal prepared power tables and skill-program identities share setup and dominance dimensions; every chart keeps its own score coefficients and complete result. Ordinary accuracy searches intersect each song's converter and recovery domains and prune partial domains with the individual song ceilings.
 
+For ordinary Live mean reward plans with PT as the sole primary metric, a candidate can stop replaying charts when its scored PT and the upper bounds for the remaining charts cannot reach the incumbent. Ties continue through all charts and retain the full reward and score ordering. `stats.songEvaluations` and `stats.skippedSongEvaluations` count the chart replays completed and skipped by reward evaluation.
+
 In Arena, `mode: "shared"` searches one leader, member set and snapshot assignment for the equal-weight average over every chart. Only this joint search proves the result; per-song optima are seeds.
 
 Mean-score envelopes maximize each Snapshot's complete mean contribution before combining slots. Cached means preserve directed rounding and physical Snapshot matching.
