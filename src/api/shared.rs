@@ -82,8 +82,8 @@ struct Combined<'a> {
     min_combo: i32,
     event: bool,
     prune_chart_replay: bool,
-    song_evaluations: usize,
-    skipped_song_evaluations: usize,
+    song_evaluations: u64,
+    skipped_song_evaluations: u64,
     plan: Option<Plan>,
     affine: Option<f64>,
     leader: usize,
@@ -1103,7 +1103,7 @@ impl Combined<'_> {
                 let upper = ((prefix + suffix[index]).next_up() / chart_count as f64).next_up();
                 // A PT tie can still improve another reward, score, or power.
                 if upper < *limit {
-                    self.skipped_song_evaluations += chart_count - index;
+                    self.skipped_song_evaluations += (chart_count - index) as u64;
                     return Ok(search::Evaluation::Pruned(upper));
                 }
             }
