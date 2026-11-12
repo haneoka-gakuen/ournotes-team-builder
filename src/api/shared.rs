@@ -81,6 +81,9 @@ struct Combined<'a> {
     options: Vec<Vec<i32>>,
     min_combo: i32,
     event: bool,
+    prune_chart_replay: bool,
+    song_evaluations: u64,
+    skipped_song_evaluations: u64,
     plan: Option<Plan>,
     affine: Option<f64>,
     leader: usize,
@@ -985,11 +988,64 @@ impl Objective for Combined<'_> {
         )
     }
     fn exact(&mut self, team: &Team, _power: f64, _slots: &[f64]) -> Result<Exact, String> {
+        let search::Evaluation::Exact(exact) = self.score_team(team, None)? else {
+            unreachable!("evaluation without a cutoff cannot prune");
+        };
+        Ok(exact)
+    }
+    fn evaluate(&mut self, team: &Team, power: f64, slots: &[f64], cutoff: search::Cutoff) -> Result<search::Evaluation, String> {
+        if self.prune_chart_replay && cutoff.key.is_finite() {
+            return self.score_team(team, Some(cutoff.key));
+        }
+        if !self.joint_linear() || !cutoff.key.is_finite() {
+            return self.exact(team, power, slots).map(search::Evaluation::Exact);
+        }
+        let members: Vec<_> = team.members.iter().map(|&member| self.members[member].clone()).collect();
+        let snaps: Vec<_> = team.snaps.iter().map(|&snap| (snap >= 0).then(|| self.snaps[snap as usize].clone())).collect();
+        let mut powers: Vec<Arc<power::TeamPower>> = Vec::with_capacity(self.songs.len());
+        let mut upper = Vec::with_capacity(self.songs.len());
+        let width = self.snaps.len() + 1;
+        for (index, song) in self.songs.iter_mut().enumerate() {
+            let power = if self.power_groups[index] == index { Arc::new(power::team_power(self.master, self.player, &members, &snaps, 0, Some(&song.music), self.effects)?) }
+                else { Arc::clone(&powers[self.power_groups[index]]) };
+            let mut totals = Totals { power: power.total as f64, ..Totals::default() };
+            for (&member, &snap) in team.members.iter().zip(&team.snaps) {
+                let skill = song.skills[member * width + if snap < 0 { width - 1 } else { snap as usize }];
+                totals.skill = (totals.skill + skill.1).next_up();
+                totals.skill_low = (totals.skill_low + skill.0).next_down();
+            }
+            upper.push(song.objective.interval(team, totals).1);
+            powers.push(power);
+        }
+        if powers.iter().any(|power| !(0..=i32::MAX as i64).contains(&power.total)
+            || power.slots.iter().any(|slot| !(0..=i32::MAX as i64).contains(slot))) {
+            return self.exact(team, power, slots).map(search::Evaluation::Exact);
+        }
+        let mut sum = 0.0;
+        let count = self.songs.len() as f64;
+        for (index, (song, power)) in self.songs.iter_mut().zip(&powers).enumerate() {
+            let slots: Vec<_> = power.slots.iter().map(|&value| value as f64).collect();
+            sum += song.objective.exact_value(team, power.total as f64, &slots)?;
+            let bound = (upper[index + 1..].iter().fold(sum, |sum, &value| (sum + value).next_up()) / count).next_up();
+            if bound < cutoff.key || cutoff.prune_equal && bound == cutoff.key {
+                return Ok(search::Evaluation::Pruned(bound));
+            }
+        }
+        let mean = sum / count;
+        if mean < cutoff.key || cutoff.prune_equal && mean == cutoff.key {
+            return Ok(search::Evaluation::Pruned(mean));
+        }
+        self.exact(team, power, slots).map(search::Evaluation::Exact)
+    }
+}
+
+impl Combined<'_> {
+    fn score_team(&mut self, team: &Team, cutoff: Option<f64>) -> Result<search::Evaluation, String> {
         if !self.eligible(team) {
-            return Ok(Exact {
+            return Ok(search::Evaluation::Exact(Exact {
                 key: f64::NEG_INFINITY,
                 detail: Value::Null,
-            });
+            }));
         }
         let members: Vec<_> = team
             .members
@@ -1001,9 +1057,9 @@ impl Objective for Combined<'_> {
             .iter()
             .map(|&s| (s >= 0).then(|| self.snaps[s as usize].clone()))
             .collect();
-        let mut parts = Vec::new();
-        let mut powers: Vec<Arc<power::TeamPower>> = Vec::with_capacity(self.songs.len());
-        for (index, song) in self.songs.iter_mut().enumerate() {
+        let chart_count = self.songs.len();
+        let mut powers: Vec<Arc<power::TeamPower>> = Vec::with_capacity(chart_count);
+        for (index, song) in self.songs.iter().enumerate() {
             let p = if self.power_groups[index] == index { Arc::new(power::team_power(
                 self.master,
                 self.player,
@@ -1013,12 +1069,54 @@ impl Objective for Combined<'_> {
                 Some(&song.music),
                 self.effects,
             )?) } else { Arc::clone(&powers[self.power_groups[index]]) };
-            powers.push(Arc::clone(&p));
+            powers.push(p);
+        }
+        let bound = cutoff.filter(|_| {
+            !self.songs.iter().any(|song| song.unbounded)
+                && powers.iter().all(|power| {
+                    (0..=i32::MAX as i64).contains(&power.total)
+                        && power.slots.iter().all(|slot| (0..=i32::MAX as i64).contains(slot))
+                })
+        }).and_then(|limit| {
+            let width = self.snaps.len() + 1;
+            let mut suffix = vec![0.0_f64; chart_count + 1];
+            for (index, (song, power)) in self.songs.iter_mut().zip(&powers).enumerate().rev() {
+                let mut totals = Totals { power: power.total as f64, ..Totals::default() };
+                for (&member, &snap) in team.members.iter().zip(&team.snaps) {
+                    let column = if snap < 0 { width - 1 } else { snap as usize };
+                    totals.skill = (totals.skill + song.skills[member * width + column].1).next_up();
+                    totals.bonus += song.objective.member_bonus(member);
+                    if snap >= 0 {
+                        totals.bonus += song.objective.snap_bonus(snap as usize);
+                    }
+                }
+                let upper = song.objective.bound(totals);
+                if !upper.is_finite() { return None; }
+                suffix[index] = (upper + suffix[index + 1]).next_up();
+            }
+            Some((limit, suffix))
+        });
+        let mut prefix = 0.0_f64;
+        let mut parts = Vec::with_capacity(chart_count);
+        for (index, (song, p)) in self.songs.iter_mut().zip(&powers).enumerate() {
+            if let Some((limit, suffix)) = &bound {
+                let upper = ((prefix + suffix[index]).next_up() / chart_count as f64).next_up();
+                // A PT tie can still improve another reward, score, or power.
+                if upper < *limit {
+                    self.skipped_song_evaluations += (chart_count - index) as u64;
+                    return Ok(search::Evaluation::Pruned(upper));
+                }
+            }
             let mut exact = song.objective.exact(
                 team,
                 p.total as f64,
                 &p.slots.iter().map(|&v| v as f64).collect::<Vec<_>>(),
             )?;
+            if self.prune_chart_replay { self.song_evaluations += 1; }
+            if bound.is_some() {
+                let primary = Fraction::from_json(&exact.detail["rewardRanking"][0]).unwrap();
+                prefix = (prefix + primary.upper()).next_up();
+            }
             if exact.detail["settlement"].is_object() {
                 exact.detail["otherMean"] = exact.detail["settlement"]["otherMean"].clone();
             }
@@ -1069,48 +1167,7 @@ impl Objective for Combined<'_> {
                 .json();
             }
         }
-        Ok(Exact { key, detail })
-    }
-    fn evaluate(&mut self, team: &Team, power: f64, slots: &[f64], cutoff: search::Cutoff) -> Result<search::Evaluation, String> {
-        if !self.joint_linear() || !cutoff.key.is_finite() {
-            return self.exact(team, power, slots).map(search::Evaluation::Exact);
-        }
-        let members: Vec<_> = team.members.iter().map(|&member| self.members[member].clone()).collect();
-        let snaps: Vec<_> = team.snaps.iter().map(|&snap| (snap >= 0).then(|| self.snaps[snap as usize].clone())).collect();
-        let mut powers: Vec<Arc<power::TeamPower>> = Vec::with_capacity(self.songs.len());
-        let mut upper = Vec::with_capacity(self.songs.len());
-        let width = self.snaps.len() + 1;
-        for (index, song) in self.songs.iter_mut().enumerate() {
-            let power = if self.power_groups[index] == index { Arc::new(power::team_power(self.master, self.player, &members, &snaps, 0, Some(&song.music), self.effects)?) }
-                else { Arc::clone(&powers[self.power_groups[index]]) };
-            let mut totals = Totals { power: power.total as f64, ..Totals::default() };
-            for (&member, &snap) in team.members.iter().zip(&team.snaps) {
-                let skill = song.skills[member * width + if snap < 0 { width - 1 } else { snap as usize }];
-                totals.skill = (totals.skill + skill.1).next_up();
-                totals.skill_low = (totals.skill_low + skill.0).next_down();
-            }
-            upper.push(song.objective.interval(team, totals).1);
-            powers.push(power);
-        }
-        if powers.iter().any(|power| !(0..=i32::MAX as i64).contains(&power.total)
-            || power.slots.iter().any(|slot| !(0..=i32::MAX as i64).contains(slot))) {
-            return self.exact(team, power, slots).map(search::Evaluation::Exact);
-        }
-        let mut sum = 0.0;
-        let count = self.songs.len() as f64;
-        for (index, (song, power)) in self.songs.iter_mut().zip(&powers).enumerate() {
-            let slots: Vec<_> = power.slots.iter().map(|&value| value as f64).collect();
-            sum += song.objective.exact_value(team, power.total as f64, &slots)?;
-            let bound = (upper[index + 1..].iter().fold(sum, |sum, &value| (sum + value).next_up()) / count).next_up();
-            if bound < cutoff.key || cutoff.prune_equal && bound == cutoff.key {
-                return Ok(search::Evaluation::Pruned(bound));
-            }
-        }
-        let mean = sum / count;
-        if mean < cutoff.key || cutoff.prune_equal && mean == cutoff.key {
-            return Ok(search::Evaluation::Pruned(mean));
-        }
-        self.exact(team, power, slots).map(search::Evaluation::Exact)
+        Ok(search::Evaluation::Exact(Exact { key, detail }))
     }
 }
 
@@ -1454,6 +1511,11 @@ impl Engine {
         } else {
             None
         };
+        let prune_chart_replay = event && !battle && route_kind == RouteKind::Live && songs.len() > 1
+            && plan.as_ref().is_some_and(|plan| {
+                plan.criterion == crate::reward_plan::Aggregation::Mean
+                    && matches!(plan.levels[0].as_slice(), [term] if term.metric == Metric::Points)
+            });
         let mut combined = Combined {
             master: &self.master,
             player: &player,
@@ -1468,6 +1530,9 @@ impl Engine {
             options: Vec::new(),
             min_combo: master::int(&goal["gekiso"]["minComboBonus"]).max(1),
             event,
+            prune_chart_replay,
+            song_evaluations: 0,
+            skipped_song_evaluations: 0,
             plan,
             affine,
             leader: 0,
@@ -1540,8 +1605,13 @@ impl Engine {
                 )
             })
             .collect();
+        let mut stats = json!(output.stats);
+        if combined.prune_chart_replay {
+            stats["songEvaluations"] = json!(combined.song_evaluations);
+            stats["skippedSongEvaluations"] = json!(combined.skipped_song_evaluations);
+        }
         Ok(
-            json!({"results":[{"song":null,"hits":hits,"proven":output.proven,"bound":output.bound,"stats":output.stats}],"overall":hits,"unknownCards":cards.unknown,"cachedCharts":self.cached_chart_keys(),"elapsedMs":now()-started,"stopReason":if output.proven {"complete"} else if now()>=deadline {"budget"} else {"cancelled"}}),
+            json!({"results":[{"song":null,"hits":hits,"proven":output.proven,"bound":output.bound,"stats":stats}],"overall":hits,"unknownCards":cards.unknown,"cachedCharts":self.cached_chart_keys(),"elapsedMs":now()-started,"stopReason":if output.proven {"complete"} else if now()>=deadline {"budget"} else {"cancelled"}}),
         )
     }
 }
