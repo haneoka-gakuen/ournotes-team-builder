@@ -1161,10 +1161,16 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                 .map(|i| self.hits[i].key)
                 .unwrap_or(f64::NEG_INFINITY),
         );
+        // Keep the threshold used by evaluation and its pruning check identical.
+        let floor = if self.input.objective.live_floor() {
+            self.input.floor.max(crate::search_floor())
+        } else {
+            self.input.floor
+        };
         let cutoff = Cutoff {
-            key: local.max(self.input.floor),
+            key: local.max(floor),
             prune_equal: !self.input.objective.score_ties()
-                && local >= self.input.floor
+                && local >= floor
                 && local.is_finite(),
         };
         let was_evaluated = evaluated.is_some();

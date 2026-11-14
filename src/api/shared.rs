@@ -1217,6 +1217,10 @@ impl Engine {
         }
         let cards = search_box(&self.master, request)?;
         crate::progress::keys(&cards.members, &cards.snaps);
+        if input["reportRankChecks"] == true {
+            crate::progress::song(&Value::Null);
+            crate::progress::report_rank_checks(true);
+        }
         let player = power::player_state(&self.master, &request["player"]);
         let route_kind = if goal["route"] == "challenge" {
             RouteKind::Challenge
@@ -1589,6 +1593,7 @@ impl Engine {
             on_candidate: Some(&mut publish),
             progress: None,
         })?;
+        crate::progress::flush_rank_checks();
         let hits: Vec<_> = output
             .hits
             .iter()

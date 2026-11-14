@@ -24,6 +24,10 @@ struct State {
     battle: bool,
     last: f64,
     last_hits: Vec<HitIdentity>,
+    report_rank_checks: bool,
+    last_team_check: f64,
+    checked_teams: usize,
+    reported_checks: usize,
 }
 thread_local! {static STATE:RefCell<State>=RefCell::new(State::default());}
 pub fn with_callback<T>(callback: Option<Callback>, run: impl FnOnce() -> T) -> T {
@@ -68,10 +72,49 @@ pub fn song(song: &Value) {
         s.song = song.clone();
         s.last = f64::NEG_INFINITY;
         s.last_hits.clear();
+        s.last_team_check = f64::NEG_INFINITY;
+        s.checked_teams = 0;
+        s.reported_checks = 0;
     })
 }
 pub fn mode(goal: &Value) {
     STATE.with(|s| s.borrow_mut().goal = goal.clone());
+}
+pub(crate) fn report_rank_checks(enabled: bool) {
+    STATE.with(|state| state.borrow_mut().report_rank_checks = enabled);
+}
+pub(crate) fn checked_reward_team() {
+    STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        if !state.report_rank_checks {
+            return;
+        }
+        let Some(callback) = state.callback else { return };
+        state.checked_teams += 1;
+        if state.checked_teams != 1 && (state.checked_teams & 63) != 0 {
+            return;
+        }
+        let now = crate::clock::milliseconds();
+        if now - state.last_team_check < 250.0 {
+            return;
+        }
+        state.last_team_check = now;
+        emit_rank_checks(&mut state, callback);
+    });
+}
+pub(crate) fn flush_rank_checks() {
+    STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        if state.checked_teams != state.reported_checks {
+            if let Some(callback) = state.callback {
+                emit_rank_checks(&mut state, callback);
+            }
+        }
+    });
+}
+fn emit_rank_checks(state: &mut State, callback: Callback) {
+    state.reported_checks = state.checked_teams;
+    send(Some(callback), &json!({"song":state.song,"checkedTeams":state.checked_teams}));
 }
 pub fn chart(chart: Option<&Chart>, battle: bool) {
     STATE.with(|s| {

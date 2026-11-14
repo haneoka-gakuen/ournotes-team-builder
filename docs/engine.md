@@ -30,6 +30,8 @@ Uniform role-rank/account-bonus translations are grouped as correlated `equivale
 
 A `rewardPlan` maximises a nonnegative integer-weighted sum of PT, CP and badges, followed by up to two ordered tie levels.
 
+For ordinary Live searches with a minimum rank, conservative score bounds can rule out a chart or classify a team's skill orders. When the bounds cross the rank threshold, the engine checks the exact orders. A streaming `run` with top-level `reportRankChecks: true` can also report `{ song, checkedTeams }`. Individual searches count checks per chart. A shared-team search reports all chart checks together with `song: null`. The running count includes rejected teams and repeated checks of the same formation. When a search returns, it also reports any checks since the previous update.
+
 | Target | Result |
 | --- | --- |
 | Score target | The mean-score top K is proven first. If every team reaches the target in all 120 skill orders, it is also the target optimum |
