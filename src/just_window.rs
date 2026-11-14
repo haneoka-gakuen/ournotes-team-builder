@@ -271,10 +271,13 @@ pub(crate) struct Prepared {
     probes: Vec<Probe>,
     phases: Vec<Probe>,
     phase_values: Vec<Vec<f64>>,
+    probe_headroom: i64,
+    complete_headroom: i64,
     phase_notes:Vec<[u32;3]>,
     spans:Vec<Span>,
     assignment: Option<Assignment>,
     seeds: Vec<i32>,
+    trace: Option<Trace>,
     cache: HashMap<(Vec<usize>, Vec<i32>, i32), Option<Window>>,
     nominal: bool,
     dominance_safe: bool,
@@ -676,6 +679,17 @@ impl Prepared {
                             && phase.after as i64 + extra <= phase.cap_after as i64
                     })
             }));
+        let headroom = |before: i32, after: i32, cap_before: i32, cap_after: i32| {
+            (i64::from(cap_before) - i64::from(before))
+                .min(i64::from(cap_after) - i64::from(after))
+        };
+        let probe_headroom = probes.iter().map(|probe| {
+            headroom(probe.before, probe.after, probe.cap_before, probe.cap_after)
+        }).min().unwrap_or(i64::MAX);
+        let complete_headroom = master.live.just_windows.iter().map(|(kind, &(before, after))| {
+            let &(cap_before, cap_after) = master.live.miss_windows.get(kind).unwrap_or(&(0, 0));
+            headroom(before, after, cap_before, cap_after)
+        }).min().unwrap_or(i64::MAX);
         let phase_values: Vec<Vec<f64>> = phases
             .iter()
             .map(|phase| {
@@ -706,6 +720,8 @@ impl Prepared {
             probes,
             phases,
             phase_values,
+            probe_headroom,
+            complete_headroom,
             phase_notes,
             spans,
             assignment: None,
@@ -714,6 +730,7 @@ impl Prepared {
             } else {
                 seeds.to_vec()
             },
+            trace: None,
             cache: HashMap::default(),
             nominal: seeds.is_empty(),
             dominance_safe,
@@ -730,6 +747,18 @@ impl Prepared {
     }
     pub(crate) fn active(&self) -> bool {
         !self.probes.is_empty()
+    }
+    pub(crate) fn same_steady_assignment_filter(&self, other: &Self) -> bool {
+        // These are all the chart-dependent inputs to the sustained prefix check.
+        !self.policy.partial
+            && !other.policy.partial
+            && self.width == other.width
+            && self.minimum == other.minimum
+            && self.phases.len() == other.phases.len()
+            && self.phases.iter().zip(&other.phases).all(|(a, b)| {
+                a.before == b.before && a.after == b.after
+            })
+            && self.phase_values == other.phase_values
     }
     pub(crate) fn snap_dominates(&self, member: usize, better: i32, worse: i32) -> bool {
         if better == worse || !self.active() {
@@ -975,12 +1004,33 @@ impl Prepared {
             .measure(master, chart, team, power)?
             .is_none_or(|window| window.meets_target))
     }
+    pub(crate) fn allows_with_power(
+        &mut self,
+        master: &Master,
+        chart: &Chart,
+        team: &Team,
+        power: impl FnOnce() -> Result<i32, String>,
+    ) -> Result<bool, String> {
+        Ok(self
+            .measure_with_power(master, chart, team, power, true)?
+            .is_none_or(|window| window.meets_target))
+    }
     pub(crate) fn measure(
         &mut self,
         master: &Master,
         chart: &Chart,
         team: &Team,
         power: i32,
+    ) -> Result<Option<Window>, String> {
+        self.measure_with_power(master, chart, team, || Ok(power), false)
+    }
+    fn measure_with_power(
+        &mut self,
+        master: &Master,
+        chart: &Chart,
+        team: &Team,
+        power: impl FnOnce() -> Result<i32, String>,
+        eligibility_only: bool,
     ) -> Result<Option<Window>, String> {
         if self.probes.is_empty() {
             return Ok(None);
@@ -1006,10 +1056,20 @@ impl Prepared {
             maximum_extra+=row.extra(15);
         }
         let order_dependent = dynamic;
-        dynamic |= maximum_extra > i64::from(i32::MAX) || timed.iter().any(|&value| value != 0) && master.live.just_windows.iter().any(|(kind,&(early,late))| {
-            let &(cap_early,cap_late)=master.live.miss_windows.get(kind).unwrap_or(&(0,0));
-            maximum_extra>i64::from((cap_early-early).min(cap_late-late))
-        });
+        // Permanent static expansions depend only on fixed JUST ranges and the
+        // physical formation. Skill activation order cannot move their boundaries.
+        let repeat_window = !self.policy.partial && !dynamic && !random && !chart.luck
+            && chart.setup.missions.iter().all(|&mission| mission == 3)
+            && timed == [0; 4]
+            && (0..=i64::from(i32::MAX)).contains(&maximum_extra)
+            && maximum_extra <= self.probe_headroom;
+        // Steady qualification observes the probed note kinds. Result details also
+        // retain the coverage produced by replay.
+        let equivalent_admission = eligibility_only && repeat_window
+            && chart.setup.fevers.windows(2).all(|pair| pair[0].1 < pair[1].0);
+        dynamic |= maximum_extra > i64::from(i32::MAX)
+            || maximum_extra > self.complete_headroom
+                && (timed != [0; 4] || repeat_window && !equivalent_admission);
         let (mut before, mut after) = (i32::MAX, i32::MAX);
         if !dynamic {
             let mut capture=self.policy.partial.then(||coverage::Capture::new(self.policy,chart,&[]));
@@ -1057,6 +1117,7 @@ impl Prepared {
             if order_dependent && self.nominal && (chart.luck || random) {
                 return Err("just-window-random".into());
             }
+            let power = power()?;
             let key = (team.members.clone(), team.snaps.clone(), power);
             if let Some(value) = self.cache.get(&key) {
                 return Ok(*value);
@@ -1073,14 +1134,17 @@ impl Prepared {
                     )
                 })
                 .collect();
-            let trace=self.capture_trace(master,chart);
+            if self.trace.is_none() {
+                self.trace = Some(self.capture_trace(master, chart));
+            }
+            let trace = self.trace.as_ref().unwrap();
+            let orders = live::orders();
+            let observations = if repeat_window { self.seeds.len() * orders.len() } else { 1 };
+            let seed_count = if order_dependent { self.seeds.len() } else { 1 };
+            let order_count = if order_dependent { orders.len() } else { 1 };
             let mut result:Option<Window>=None;
-            for &seed in self
-                .seeds
-                .iter()
-                .take(if order_dependent { self.seeds.len() } else { 1 })
-            {
-                for order in live::orders().iter().take(if order_dependent { 120 } else { 1 }) {
+            for &seed in self.seeds.iter().take(seed_count) {
+                for order in orders.iter().take(order_count) {
                     let events: Vec<_> = chart
                         .full
                         .events
@@ -1104,8 +1168,17 @@ impl Prepared {
                         model.just_window.as_mut().unwrap().record_probe(index);
                         model.frame(frame.time_ms, &frame.judged, chart.play.dt[index])?;
                     }
-                    if let Some(window)=model.just_window.as_ref().unwrap().window(self.policy) {
-                        if let Some(result)=&mut result {result.merge(window);}else{result=Some(window);}
+                    if let Some(window) = model.just_window.as_ref().unwrap().window(self.policy) {
+                        if let Some(result) = &mut result {
+                            result.merge(window);
+                        } else {
+                            let mut merged = window;
+                            // Preserve the statistics and floating-point accumulation of each play.
+                            for _ in 1..observations {
+                                merged.merge(window);
+                            }
+                            result = Some(merged);
+                        }
                     }
                 }
             }

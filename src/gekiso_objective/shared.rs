@@ -32,10 +32,22 @@ struct SongObjective<'k, 'a> {
     skill_choices: Vec<Vec<(i32, f64)>>,
 }
 
-struct PowerSeed {
+struct PowerSeed<'a> {
     bonuses: Vec<i32>,
+    window: Option<&'a mut crate::just_window::Prepared>,
 }
-impl Objective for PowerSeed {
+impl Objective for PowerSeed<'_> {
+    fn has_team_filter(&self) -> bool {
+        self.window.is_some()
+    }
+    fn prepare_assignment(&mut self, members: &[usize], options: &[Vec<i32>]) {
+        if let Some(window) = self.window.as_mut() {
+            window.prepare_assignment(members, options);
+        }
+    }
+    fn feasible_assignment(&self, members: &[usize], assigned: &[i32], from: usize, options: &[Vec<i32>]) -> bool {
+        self.window.as_ref().is_none_or(|window| window.possible_prepared(members, assigned, from, options))
+    }
     fn skill(&mut self, _member: usize, _snap: i32) -> (f64, f64) {
         (0.0, 0.0)
     }
@@ -69,6 +81,8 @@ struct Combined<'k, 'a> {
     affine: Option<(f64, f64, Vec<f64>)>,
     warm_seed: bool,
     cooperative_floor: bool,
+    window_filtered: bool,
+    assignment_windows: Vec<usize>,
     completed: Vec<Team>,
     floor: f64,
     k: usize,
@@ -224,6 +238,19 @@ impl<'k, 'a> Combined<'k, 'a> {
                 ))
             })
             .flatten();
+        let mut assignment_windows: Vec<usize> = Vec::new();
+        for (index, song) in songs.iter().enumerate() {
+            let Some(window) = song.adapter.kernel.just_window.as_ref().filter(|window| window.active()) else {
+                continue;
+            };
+            if !assignment_windows.iter().any(|&previous| {
+                songs[previous].adapter.kernel.just_window.as_ref()
+                    .is_some_and(|other| window.same_steady_assignment_filter(other))
+            }) {
+                assignment_windows.push(index);
+            }
+        }
+        let window_filtered = !assignment_windows.is_empty();
         Self {
             songs,
             player,
@@ -234,6 +261,8 @@ impl<'k, 'a> Combined<'k, 'a> {
             affine,
             warm_seed,
             cooperative_floor,
+            window_filtered,
+            assignment_windows,
             completed: Vec::new(),
             floor: f64::NEG_INFINITY,
             k: 1,
@@ -325,11 +354,10 @@ impl<'k, 'a> Combined<'k, 'a> {
         let mut scores = vec![0.0; self.songs.len()];
         for index in order {
             let song = &mut self.songs[index];
-            let mut score = song
+            let score = song
                 .adapter
                 .kernel
                 .exact(team, powers[if self.same_power { 0 } else { index }].total as i32, true)?;
-            song.adapter.kernel.decorate_window(team, powers[if self.same_power { 0 } else { index }].total as i32, &mut score.detail)?;
             scores[index] = score.key;
             bounds[index] = score.key;
             details[index] = json!({"detail":score.detail,"power":powers[if self.same_power { 0 } else { index }].total,"slotPowers":powers[if self.same_power { 0 } else { index }].slots});
@@ -341,6 +369,10 @@ impl<'k, 'a> Combined<'k, 'a> {
                     return Ok(search::Evaluation::Pruned(upper));
                 }
             }
+        }
+        for (index, song) in self.songs.iter_mut().enumerate() {
+            let power = powers[if self.same_power { 0 } else { index }].total as i32;
+            song.adapter.kernel.decorate_window(team, power, &mut details[index]["detail"])?;
         }
         let mut detail = json!({"songs":details});
         if let Some(window) = crate::just_window::aggregate(details.iter().map(|detail| &detail["detail"]["justWindow"])) { detail["justWindow"] = window; }
@@ -497,19 +529,41 @@ impl Objective for Combined<'_, '_> {
     fn filter_snap_dominates(&self, member: usize, better: i32, worse: i32) -> bool {
         self.songs.iter().all(|song| song.adapter.filter_snap_dominates(member, better, worse))
     }
-    fn has_team_filter(&self) -> bool { self.songs.iter().any(|song| song.adapter.has_team_filter()) }
+    fn has_team_filter(&self) -> bool { self.window_filtered }
     fn team_filter_impossible(&self) -> bool { self.songs.iter().any(|song| song.adapter.team_filter_impossible()) }
     fn feasible_assignment(&self, members: &[usize], assigned: &[i32], from: usize, options: &[Vec<i32>]) -> bool {
-        self.songs.iter().all(|song| song.adapter.feasible_assignment(members, assigned, from, options))
+        self.assignment_windows.iter().all(|&index| {
+            self.songs[index].adapter.feasible_assignment(members, assigned, from, options)
+        })
     }
     fn feasible_team(&mut self, team: &Team, _power: f64) -> Result<bool, String> {
         if !self.eligible(&team.members) { return Ok(false); }
+        let mut cards = None;
+        let mut shared_power = None;
+        let shared_music = self.songs[0].music;
         for song in &mut self.songs {
-            let kernel = &song.adapter.kernel;
-            let members: Vec<_> = team.members.iter().map(|&index| kernel.members[index].clone()).collect();
-            let snaps: Vec<_> = team.snaps.iter().map(|&index| (index >= 0).then(|| kernel.snaps[index as usize].clone())).collect();
-            let power = power::team_power(kernel.master, self.player, &members, &snaps, 0, Some(song.music), &[])?.total;
-            if !song.adapter.feasible_team(team, power as f64)? { return Ok(false); }
+            let kernel = &mut song.adapter.kernel;
+            if let Some(window) = &mut kernel.just_window {
+                let allows = window.allows_with_power(kernel.master, kernel.chart, team, || {
+                    if let Some(power) = shared_power {
+                        return Ok(power);
+                    }
+                    let (members, snaps) = cards.get_or_insert_with(|| {
+                        let members: Vec<_> = team.members.iter().map(|&index| kernel.members[index].clone()).collect();
+                        let snaps: Vec<_> = team.snaps.iter().map(|&index| (index >= 0).then(|| kernel.snaps[index as usize].clone())).collect();
+                        (members, snaps)
+                    });
+                    let music = if self.same_power { shared_music } else { song.music };
+                    let power = power::team_power(kernel.master, self.player, members, snaps, 0, Some(music), &[])?.total as f64 as i32;
+                    if self.same_power {
+                        shared_power = Some(power);
+                    }
+                    Ok(power)
+                })?;
+                if !allows {
+                    return Ok(false);
+                }
+            }
         }
         Ok(true)
     }
@@ -520,6 +574,9 @@ impl Objective for Combined<'_, '_> {
     }
     fn live_floor(&self) -> bool {
         self.cooperative_floor
+    }
+    fn live_floor_exclusive(&self) -> bool {
+        !self.window_filtered
     }
     fn canonical_leader(&self) -> bool {
         self.songs
@@ -536,6 +593,7 @@ impl Objective for Combined<'_, '_> {
             } else {
                 vec![0; self.songs[0].adapter.kernel.members.len()]
             },
+            window: None,
         }))
     }
     fn seed_ready(&self, detail: &Value) -> bool {
@@ -758,7 +816,7 @@ impl Objective for Combined<'_, '_> {
         limit: f64,
     ) -> Option<f64> {
         let coarse = self.bound(t);
-        if coarse < limit { return Some(coarse); }
+        if coarse < limit || self.window_filtered && limit == f64::NEG_INFINITY { return Some(coarse); }
         let upper = coarse.min(self.upper(members, assigned, from, true, limit));
         Some(if upper < limit { upper } else { self.joint_bound(assigned, from, t, limit).map_or(upper, |joint| upper.min(joint)) })
     }
@@ -778,6 +836,9 @@ impl Objective for Combined<'_, '_> {
         } else {
             self.floor
         };
+        if self.window_filtered && floor == f64::NEG_INFINITY {
+            return (0.0, f64::INFINITY);
+        }
         let coarse = self.upper(&team.members, &team.snaps, 5, true, floor);
         if coarse <= floor || self.songs.iter().any(|song| song.adapter.kernel.chart.luck) {
             return (0.0, coarse);
@@ -904,6 +965,8 @@ pub(crate) fn search_shared(input: SharedInput<'_>) -> Result<search::Output, St
     } = input;
     let started = (env.now)();
     let mut early = None;
+    let window_seed = env.window_policy.is_some() && k == 1 && seeds.is_empty()
+        && charts.iter().all(|chart| !chart.luck && chart.setup.missions.iter().all(|&mission| mission == 3));
     if !seeded && sections.is_none() {
         if initial.is_empty() && k == 1 && charts.len() >= 8 && env.window_policy.is_some()
             && seeds.is_empty() && charts.iter().all(|chart| chart.accuracy.great == 0.0
@@ -920,8 +983,8 @@ pub(crate) fn search_shared(input: SharedInput<'_>) -> Result<search::Output, St
             }, &[])?;
             if let Some(hit) = scout.hits.first() { initial.push(hit.team.clone()); }
         }
-        if initial.is_empty() {
-            let mut objective = PowerSeed { bonuses: combo_bonuses(env.master, env.members, &charts[0].setup.missions) };
+        if initial.is_empty() && !window_seed {
+            let mut objective = PowerSeed { bonuses: combo_bonuses(env.master, env.members, &charts[0].setup.missions), window: None };
             let mut trial = env.constraints.clone();
             if charts.len()>8 && charts.iter().all(|chart|!chart.luck&&chart.setup.missions.iter().all(|&mission|mission==3))
                 && trial.required_snaps.is_empty() && trial.bindings.values().all(|&snap|snap<0) {
@@ -952,6 +1015,29 @@ pub(crate) fn search_shared(input: SharedInput<'_>) -> Result<search::Output, St
             return Ok(search::Output { hits: Vec::new(), proven: true, bound: None, stats: search::Stats::default() });
         }
         windows.push(window);
+    }
+    if !seeded && sections.is_none() && initial.is_empty() && window_seed {
+        let window = windows.iter_mut().filter_map(Option::as_mut).find(|window| window.active());
+        let mut objective = PowerSeed {
+            bonuses: combo_bonuses(env.master, env.members, &charts[0].setup.missions),
+            window,
+        };
+        // The first chart proposes a formation. Only the all-chart settlement may publish it.
+        let warm = crate::progress::with_callback(None, || env.run(&mut objective, Run {
+            constraints: env.constraints.clone(),
+            k: 1,
+            deadline: deadline.min((env.now)() + 80.0),
+            seeds: Vec::new(),
+            shard: None,
+            floor: f64::NEG_INFINITY,
+        }, None, None))?;
+        if let Some(hit) = warm.hits.first() {
+            initial.push(hit.team.clone());
+            early = initial_hit(&env, charts, music, &seeds, &hit.team, min_combo_bonus, deadline)?;
+            if let (Some(hit), Some(callback)) = (&early, on_candidate.as_deref_mut()) {
+                callback(std::slice::from_ref(hit));
+            }
+        }
     }
     let mut kernels: Vec<_> = charts
         .iter_mut()
@@ -1033,6 +1119,7 @@ pub(crate) fn search_shared(input: SharedInput<'_>) -> Result<search::Output, St
     if !seeded && (initial.is_empty() || levels.len() > 1 && kernels.iter().any(|kernel| kernel.chart.luck)) {
         let mut objective = PowerSeed {
             bonuses: kernels[0].bonuses.clone(),
+            window: None,
         };
         let warm = crate::progress::with_callback(None, || env.run(
             &mut objective,
