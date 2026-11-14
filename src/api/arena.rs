@@ -294,8 +294,8 @@ impl Engine {
             min_combo_bonus: master::int(&goal["minComboBonus"]),
             seeded,
             cooperative_floor: self.trusted_scores
-                && minimum_just_window.is_none()
                 && request["cooperativeFloor"] == true
+                && request["noFloor"] != true
                 && master::number(&request["k"], 1.0) == 1.0,
             floor,
             on_candidate: Some(&mut publish),

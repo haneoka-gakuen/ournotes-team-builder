@@ -119,6 +119,9 @@ pub trait Objective {
     fn live_floor(&self) -> bool {
         false
     }
+    fn live_floor_exclusive(&self) -> bool {
+        !self.score_ties()
+    }
     fn needs_power_cap(&self) -> bool {
         false
     }
@@ -1071,7 +1074,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
     }
     fn cannot_improve(&self, upper: f64) -> bool {
         (self.input.objective.live_floor()
-            && !self.input.objective.score_ties()
+            && self.input.objective.live_floor_exclusive()
             && upper <= crate::search_floor())
             || (self.input.floor_exclusive && upper <= self.input.floor)
             || (self.input.streaming
