@@ -5795,29 +5795,23 @@ impl DeterministicBound {
         let mut upper = f64::INFINITY;
         for scale in [1.0, 0.75, 1.5] {
             let lambda = ratio * scale;
-            let rows: [[f64; 5]; 5] = std::array::from_fn(|slot| {
+            let price = |slot: usize, event: usize| {
                 let member = members[slot];
-                std::array::from_fn(|event| {
-                    let event = if criterion == Criterion::Mean {
-                        5
-                    } else {
-                        event
-                    };
-                    if slot < from {
-                        let snap = assigned[slot];
-                        let power = self.snapshot_power[member * self.width
-                            + if snap < 0 {
-                                self.width - 1
-                            } else {
-                                snap as usize
-                            }];
-                        let row = self.shared
-                            [self.ids[member * self.width + (snap + 1) as usize][count] as usize];
-                        let value = if event == 5 {
-                            up(row.into_iter().fold(0.0, add) / 5.0)
+                if slot < from {
+                    let snap = assigned[slot];
+                    let power = self.snapshot_power[member * self.width
+                        + if snap < 0 {
+                            self.width - 1
                         } else {
-                            row[event]
-                        };
+                            snap as usize
+                        }];
+                    let row = self.shared
+                        [self.ids[member * self.width + (snap + 1) as usize][count] as usize];
+                    let value = if event == 5 {
+                        up(row.into_iter().fold(0.0, add) / 5.0)
+                    } else {
+                        row[event]
+                    };
                         add(mul(lambda, power), up(value / lambda))
                     } else {
                         self.score_frontiers[member][count][event]
@@ -5825,11 +5819,11 @@ impl DeterministicBound {
                             .map(|&(power, value)| add(mul(lambda, power), up(value / lambda)))
                             .fold(f64::NEG_INFINITY, f64::max)
                     }
-                })
-            });
+            };
             let variable = if criterion == Criterion::Mean {
-                rows.into_iter().fold(0.0, |sum, row| add(sum, row[0]))
+                (0..5).fold(0.0, |sum, slot| add(sum, price(slot, 5)))
             } else {
+                let rows: [[f64; 5]; 5] = std::array::from_fn(|slot| std::array::from_fn(|event| price(slot, event)));
                 let mut dp = [if criterion == Criterion::Min {
                     f64::INFINITY
                 } else {

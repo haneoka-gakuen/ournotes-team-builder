@@ -905,6 +905,21 @@ pub(crate) fn search_shared(input: SharedInput<'_>) -> Result<search::Output, St
     let started = (env.now)();
     let mut early = None;
     if !seeded && sections.is_none() {
+        if initial.is_empty() && k == 1 && charts.len() >= 8 && env.window_policy.is_some()
+            && seeds.is_empty() && charts.iter().all(|chart| chart.accuracy.great == 0.0
+                && chart.accuracy.miss_every == 0 && chart.setup.missions.iter().all(|&mission| mission == 3)) {
+            let scout = search_scored(Input {
+                env: Environment { master: env.master, player: env.player, members: env.members,
+                    snaps: env.snaps, music: Some(&music[0]), constraints: env.constraints.clone(),
+                    now: env.now, generation: env.generation, window_policy: env.window_policy },
+                chart: &mut charts[0], seeds: Vec::new(), criterion: Criterion::Mean, k: 1,
+                deadline: deadline.min(started + 800.0), initial: Vec::new(), seed_only: false,
+                seed_variant: None, defer_scores: false,
+                cooperative_floor: false, min_combo_bonus, seeded: false, shard: None,
+                floor: f64::NEG_INFINITY, on_candidate: None, progress: None,
+            }, &[])?;
+            if let Some(hit) = scout.hits.first() { initial.push(hit.team.clone()); }
+        }
         if initial.is_empty() {
             let mut objective = PowerSeed { bonuses: combo_bonuses(env.master, env.members, &charts[0].setup.missions) };
             let mut trial = env.constraints.clone();
@@ -1093,8 +1108,8 @@ pub(crate) fn search_shared(input: SharedInput<'_>) -> Result<search::Output, St
         } else {
             env.constraints.clone()
         };
-        let mut seeds = if seeded { Vec::new() } else { initial.clone() };
-        seeds.extend(current.iter().map(|hit| hit.team.clone()));
+        let seeds = if seeded { Vec::new() } else { initial.iter().filter(|team| !current.iter()
+            .any(|hit| hit.team.members == team.members && hit.team.snaps == team.snaps)).cloned().collect() };
         let mut accept = |candidates: &[Hit]| {
             for hit in candidates.iter().filter(|hit| hit.key.is_finite()) {
                 offer(&mut hits, env.members, hit.clone());

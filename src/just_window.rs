@@ -258,6 +258,8 @@ fn same_phase(a:Probe,b:Probe)->bool {
     a.timed==b.timed&&a.activated==b.activated&&a.full_active==b.full_active&&a.cap_before==b.cap_before&&a.cap_after==b.cap_after&&a.before==b.before&&a.after==b.after
 }
 
+type WindowProgram = Vec<(u8, i32, i32, u64, i32)>;
+
 pub(crate) struct Prepared {
     policy:Policy,
     minimum: f64,
@@ -265,6 +267,7 @@ pub(crate) struct Prepared {
     members: Arc<Vec<Member>>,
     snaps: Arc<Vec<Snap>>,
     profiles: Vec<Profile>,
+    programs: Vec<WindowProgram>,
     probes: Vec<Probe>,
     phases: Vec<Probe>,
     phase_values: Vec<Vec<f64>>,
@@ -437,6 +440,12 @@ fn profile(master: &Master, chart: &Chart, actor: &Performer) -> Profile {
     if actor.gekisou_skill.is_none() && actor.mission_only.unwrap_or(0) == 0 {
         return out;
     }
+    let mut window_keys = HashSet::default();
+    out.dynamic |= actor.gekisou_support_skills.iter().filter_map(|&(id, level)| {
+        master.gekiso_support_skills.get(&id).map(|skill| (skill, level))
+    }).filter(|(skill, _)| skill.mission_type == 4 || chart.setup.missions.contains(&skill.mission_type))
+        .flat_map(|(skill, level)| skill.effects.iter().filter(move |row| row.level == level && row.kind == 4004))
+        .any(|row| !window_keys.insert(row.id));
     let rows = actor
         .gekisou_skill
         .into_iter()
@@ -471,6 +480,24 @@ fn profile(master: &Master, chart: &Chart, actor: &Performer) -> Profile {
         }
     }
     out
+}
+
+fn window_program(master: &Master, chart: &Chart, actor: &Performer) -> WindowProgram {
+    if actor.gekisou_skill.is_none() && actor.mission_only.unwrap_or(0) == 0 {
+        return Vec::new();
+    }
+    let mut program = Vec::new();
+    for (source, id, level) in actor.gekisou_skill.into_iter().map(|(id, level)| (4, id, level))
+        .chain(actor.gekisou_support_skills.iter().map(|&(id, level)| (5, id, level))) {
+        let skills = if source == 4 { &master.gekiso_skills } else { &master.gekiso_support_skills };
+        let Some(skill) = skills.get(&id) else { continue; };
+        if skill.mission_type != 4 && !chart.setup.missions.contains(&skill.mission_type) { continue; }
+        let mut rows: Vec<_> = skill.effects.iter().filter(|row| row.level == level && row.kind == 4004
+            && static_condition(master, row.condition_group, actor) == Some(true)).collect();
+        rows.sort_by_key(|row| row.id);
+        program.extend(rows.into_iter().map(|row| (source, row.id, row.value, row.seconds.to_bits(), skill.mission_type)));
+    }
+    program
 }
 
 impl Prepared {
@@ -590,6 +617,8 @@ impl Prepared {
                     })
             })
             .collect();
+        let programs = members.iter().flat_map(|member| snaps.iter().map(Some).chain(std::iter::once(None))
+            .map(move |snap| window_program(master, chart, &Performer::from_member(master, member, snap)))).collect();
         let mut spans=Vec::new();
         if policy.partial {
             let basis=coverage::basis(master,chart,members,snaps,&profiles)?;
@@ -626,8 +655,9 @@ impl Prepared {
             }
             phases = distinct;
         }
+        let sustained_only = profiles.iter().all(|profile| profile.timed == [0; 4]);
         let dominance_safe = profiles.iter().all(|profile| !profile.dynamic)
-            && phases.iter().all(|phase| {
+            && (sustained_only || phases.iter().all(|phase| {
                 let maximum = profiles
                     .iter()
                     .map(|row| {
@@ -645,7 +675,7 @@ impl Prepared {
                             && phase.before as i64 + extra <= phase.cap_before as i64
                             && phase.after as i64 + extra <= phase.cap_after as i64
                     })
-            });
+            }));
         let phase_values: Vec<Vec<f64>> = phases
             .iter()
             .map(|phase| {
@@ -672,6 +702,7 @@ impl Prepared {
             members: Arc::new(members.to_vec()),
             snaps: Arc::new(snaps.to_vec()),
             profiles,
+            programs,
             probes,
             phases,
             phase_values,
@@ -704,9 +735,6 @@ impl Prepared {
         if better == worse || !self.active() {
             return true;
         }
-        if !self.dominance_safe {
-            return false;
-        }
         let column = |snap: i32| {
             member * self.width
                 + if snap < 0 {
@@ -715,6 +743,11 @@ impl Prepared {
                     snap as usize
                 }
         };
+        if !self.dominance_safe {
+            let (better, worse) = (column(better), column(worse));
+            return !self.profiles[better].dynamic && !self.profiles[worse].dynamic
+                && self.programs[better] == self.programs[worse];
+        }
         self.phase_values
             .iter()
             .all(|values| values[column(better)] >= values[column(worse)])
@@ -726,11 +759,16 @@ impl Prepared {
         if better == worse || !self.active() {
             return true;
         }
-        if !self.dominance_safe
-            || (self.members[better].card.gekiso_skill_id == 0)
+        if (self.members[better].card.gekiso_skill_id == 0)
                 != (self.members[worse].card.gekiso_skill_id == 0)
         {
             return false;
+        }
+        if !self.dominance_safe {
+            return (0..self.width).all(|column| {
+                let (a, b) = (better * self.width + column, worse * self.width + column);
+                !self.profiles[a].dynamic && !self.profiles[b].dynamic && self.programs[a] == self.programs[b]
+            });
         }
         self.phase_values.iter().all(|values| {
             (0..self.width).all(|column| {
@@ -739,7 +777,8 @@ impl Prepared {
         })
     }
     pub(crate) fn pricing_constraints(&self) -> Option<Vec<(f64, &[f64])>> {
-        if self.policy.partial || !self.dominance_safe || !self.active() {
+        // Unclipped sums remain upper bounds when the cap changes expiration amounts.
+        if self.policy.partial || self.profiles.iter().any(|profile| profile.dynamic) || !self.active() {
             return None;
         }
         Some(
@@ -966,7 +1005,8 @@ impl Prepared {
             random |= row.random;
             maximum_extra+=row.extra(15);
         }
-        dynamic|=master.live.just_windows.iter().any(|(kind,&(early,late))| {
+        let order_dependent = dynamic;
+        dynamic |= maximum_extra > i64::from(i32::MAX) || timed.iter().any(|&value| value != 0) && master.live.just_windows.iter().any(|(kind,&(early,late))| {
             let &(cap_early,cap_late)=master.live.miss_windows.get(kind).unwrap_or(&(0,0));
             maximum_extra>i64::from((cap_early-early).min(cap_late-late))
         });
@@ -1014,7 +1054,7 @@ impl Prepared {
             result.meets_target=self.policy.allows(&result);
             Ok(Some(result))
         } else {
-            if dynamic && self.nominal && (chart.luck || random) {
+            if order_dependent && self.nominal && (chart.luck || random) {
                 return Err("just-window-random".into());
             }
             let key = (team.members.clone(), team.snaps.clone(), power);
@@ -1038,9 +1078,9 @@ impl Prepared {
             for &seed in self
                 .seeds
                 .iter()
-                .take(if dynamic { self.seeds.len() } else { 1 })
+                .take(if order_dependent { self.seeds.len() } else { 1 })
             {
-                for order in live::orders().iter().take(if dynamic { 120 } else { 1 }) {
+                for order in live::orders().iter().take(if order_dependent { 120 } else { 1 }) {
                     let events: Vec<_> = chart
                         .full
                         .events
