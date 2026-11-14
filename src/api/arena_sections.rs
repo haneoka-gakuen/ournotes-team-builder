@@ -72,6 +72,43 @@ pub(super) struct Scene {
     targets: gekiso::sections::OpponentSamples,
 }
 impl Engine {
+    pub fn section_metrics(&mut self, input: &Value) -> Result<Value, String> {
+        if input["request"]["songRules"].is_object() {
+            let (mut scoped, scoped_input) = self.song_rule_view(input)?;
+            return scoped.section_metrics(&scoped_input);
+        }
+        if input["request"]["gekiso"]["arena"].is_object() {
+            let (mut scoped, scoped_input, _, _) = self.arena_view(input)?;
+            return scoped.section_metrics(&scoped_input);
+        }
+        let request = &input["request"];
+        validate_gekiso_counts(&request["gekiso"])?;
+        let options = &request["gekiso"];
+        let count = master::int(&options["seeds"]);
+        let seeds: Vec<_> = (0..if count > 0 { count } else { 32 }).collect();
+        let mut values = Vec::new();
+        for song in master::rows(&request["songs"]) {
+            self.load_source(input, song)?;
+            let id = master::int(&song["songId"]);
+            let difficulty = master::int(&song["difficulty"]);
+            let resolved = self.resolve_team(request, &request["team"], id)?;
+            let compiled = &self.charts[&(id, difficulty)];
+            let source = &self.sources[&(id, difficulty)];
+            let mut chart = gekiso::Chart::new(&self.master, source, compiled.difficulty.play_level,
+                compiled.song.missions.clone(), serde_json::from_value(options["accuracy"].clone()).map_err(|e| e.to_string())?, gekiso_ranks(options))?;
+            chart.music_type = resolved.music.music_type;
+            let deck: Vec<_> = resolved.members.iter().zip(&resolved.snaps)
+                .map(|(member, snap)| Performer::from_member(&self.master, member, snap.as_ref())).collect();
+            let rows = gekiso::sections::metric_samples(&self.master, &chart, &deck, &seeds)?;
+            let distributions: Vec<_> = (0..3).map(|range| {
+                let mut counts = BTreeMap::<i32, usize>::new();
+                for row in &rows { *counts.entry(row[range]).or_default() += 1; }
+                counts.into_iter().map(|(points, count)| json!({"points":points,"count":count})).collect::<Vec<_>>()
+            }).collect();
+            values.push(json!({"song":song,"missions":chart.setup.missions,"samples":rows.len(),"distributions":distributions}));
+        }
+        Ok(json!({"metrics":values,"cachedCharts":self.cached_chart_keys()}))
+    }
     pub(super) fn evaluate_section_team(
         &self,
         request: &Value,

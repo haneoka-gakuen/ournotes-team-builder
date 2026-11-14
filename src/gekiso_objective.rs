@@ -919,6 +919,7 @@ pub struct Kernel<'a> {
     support_low: HashMap<String, f64>,
     base: Option<Arc<Weights>>,
     member_bases: HashMap<(i32, [u32; 5], usize), f64>,
+    member_program_bases: HashMap<(i32, String), f64>,
     luck_bases: HashMap<Vec<u32>, (SharedBase, bool)>,
     luck_base_order: VecDeque<Vec<u32>>,
     luck_aliases: HashMap<Vec<u32>, Vec<u32>>,
@@ -1725,6 +1726,7 @@ impl<'a> Kernel<'a> {
             support_low: HashMap::default(),
             base: None,
             member_bases: HashMap::default(),
+            member_program_bases: HashMap::default(),
             luck_bases: HashMap::default(),
             luck_base_order: VecDeque::new(),
             luck_aliases: HashMap::default(),
@@ -8372,15 +8374,27 @@ impl<'k, 'a> Adapter<'k, 'a> {
             }
             let level_data = self.kernel.level(level);
             let within = &level_data.within;
-            let base = self
-                .kernel
-                .partition_weights(&bound_deck, Some(within), level)
-                .map(|(weights, _)| weights.base)
-                .unwrap_or_else(|| {
-                    self.kernel
-                        .weights_of(&bound_deck, Some(within), level)
-                        .base
-                });
+            let program = (self.kernel.healthy && self.kernel.owner_local).then(|| {
+                let active: Vec<_> = bound_deck.iter().filter(|actor| actor.gekisou_skill.is_some_and(|(id, _)| {
+                    let mission = within.gekiso_skills[&id].mission_type;
+                    mission == 4 || self.kernel.chart.setup.missions.contains(&mission)
+                }) || actor.gekisou_support_skills.iter().any(|&(id, _)| {
+                    let mission = within.gekiso_support_skills[&id].mission_type;
+                    mission == 4 || self.kernel.chart.setup.missions.contains(&mission)
+                })).cloned().collect();
+                (level, lottery_member_key(within, &active))
+            });
+            let known = program.as_ref().and_then(|key| self.kernel.member_program_bases.get(key)).copied();
+            let mut calculate = || self.kernel.partition_weights(&bound_deck, Some(within), level)
+                .map(|(weights, _)| weights.base).unwrap_or_else(|| self.kernel.weights_of(&bound_deck, Some(within), level).base);
+            let base = if let Some(base) = known {
+                #[cfg(debug_assertions)] { debug_assert_eq!(base, calculate(), "nominal member program coefficient"); }
+                base
+            } else { calculate() };
+            if let Some(program) = program {
+                if self.kernel.member_program_bases.len() >= 1024 { self.kernel.member_program_bases.clear(); }
+                self.kernel.member_program_bases.insert(program, base);
+            }
             self.kernel.member_bases.insert(key, base);
             base
         };

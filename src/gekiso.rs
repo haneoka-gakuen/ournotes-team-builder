@@ -2228,7 +2228,7 @@ pub(crate) fn replay_order_scene(master:&Master,chart:&Chart,deck:&[Performer],p
 type ReplayValue = (f64, [f64; 3]);
 type ReplayObserver<'a> = dyn Fn(f64, usize, f64) -> bool + Sync + 'a;
 type ReplayDetail<'a> = dyn Fn(&Model<'_>, &[usize]) + Sync + 'a;
-struct ReplayTree<'a,const SECTIONS:bool> {
+struct ReplayTree<'a,const SECTIONS:bool,const COUNTS:bool=false> {
     chart: &'a Chart,
     events: &'a [Vec<(usize, i32)>],
     chronological: Vec<usize>,
@@ -2239,7 +2239,7 @@ struct ReplayTree<'a,const SECTIONS:bool> {
     stopped: AtomicBool,
     detail: Option<&'a ReplayDetail<'a>>,
 }
-impl<const SECTIONS:bool> ReplayTree<'_,SECTIONS> {
+impl<const SECTIONS:bool,const COUNTS:bool> ReplayTree<'_,SECTIONS,COUNTS> {
     fn advance(&self, model: &mut Model<'_>, from: usize, to: usize) -> Result<(), String> {
         for k in from..to {
             if self.generation != crate::cancellation_generation() {
@@ -2247,7 +2247,8 @@ impl<const SECTIONS:bool> ReplayTree<'_,SECTIONS> {
             }
             let frame = &self.chart.play.frames[k];
             if SECTIONS { if let Some(trace)=&mut model.just_window {trace.record_probe(k);} }
-            model.frame(frame.time_ms, &frame.judged, self.chart.play.dt[k])?;
+            if COUNTS { model.count_frame(frame.time_ms, &frame.judged, self.chart.play.dt[k])?; }
+            else { model.frame(frame.time_ms, &frame.judged, self.chart.play.dt[k])?; }
         }
         Ok(())
     }

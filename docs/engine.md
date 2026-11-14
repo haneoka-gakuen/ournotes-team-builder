@@ -59,7 +59,11 @@ Deterministic results and manual evaluations replay all 120 skill orders. Mean s
 
 For no-damage COMBO charts, GREAT retains judgement-specific score bounds and conditional COMBO traces. Ordinary GREAT-to-PERFECT pulses are bounded by their activation windows and conversion quotas. Stable LIFE projections retain these converters; unsupported programs use the full replay path. Final scores still replay all orders. COMBO levels and conditional branches within one search share the same immutable card preparation; conversion pulses and their per-note ordinary factor envelopes are prepared once per complete skill template. Shared charts combine fixed-formation coefficients before matching physical Snapshots and cache complete-formation mean ceilings.
 
+Deferred ordinary recovery can share control traces when native prefix replay proves LIFE is already zero before the first activation and no active effect can restore it. Other controls and every score order remain in the replay. Shared-song member bounds combine each song's current roster power and skill ceilings before refining the remaining nominal LUCK programs.
+
 `goal.arena` sets the league band, music type and three mission overrides for one call. Zero keeps the song's own value.
+
+`sectionMetrics` evaluates a fixed team with the same `request` shape as `evaluateAll`. It returns `metrics`, with each song's three `missions`, total `samples` and three `distributions` of `{points, count}`. All 120 skill orders and seeds 0 through n-1 contribute; a zero or omitted seed count selects 32 samples per order. The count-only replay preserves ordinary conversion, recovery and Gekiso effects. Equivalent orders share replay only when their mission counts are identical. It does not compare opponents or settle total scores.
 
 ## Song rules
 

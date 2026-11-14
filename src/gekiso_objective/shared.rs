@@ -28,6 +28,10 @@ struct SongObjective<'k, 'a> {
     base: f64,
     slots: Arc<Vec<Vec<f64>>>,
     domain_power: Vec<f64>,
+    member_power: Vec<f64>,
+    member_skill: Vec<f64>,
+    free_power: [f64; 6],
+    free_skill: [f64; 6],
     power_choices: Arc<Vec<Vec<(i32, f64)>>>,
     skill_choices: Vec<Vec<(i32, f64)>>,
 }
@@ -187,6 +191,10 @@ impl<'k, 'a> Combined<'k, 'a> {
                     base: 0.0,
                     slots: Arc::new(Vec::new()),
                     domain_power: Vec::new(),
+                    member_power: Vec::new(),
+                    member_skill: Vec::new(),
+                    free_power: [0.0; 6],
+                    free_skill: [0.0; 6],
                     power_choices: Arc::new(Vec::new()),
                     skill_choices: Vec::new(),
                 }
@@ -705,6 +713,7 @@ impl Objective for Combined<'_, '_> {
     fn prepare_member_domains_at(&mut self, leader: usize, _power: &[f64], options: &[Vec<i32>]) {
         for song in &mut self.songs {
             let k = &song.adapter.kernel;
+            let width = k.snaps.len() + 1;
             let profile = power::leader_profile(k.master, &k.members[leader]);
             song.domain_power = k
                 .members
@@ -720,6 +729,21 @@ impl Objective for Combined<'_, '_> {
                 .collect();
             song.adapter
                 .prepare_member_domains_at(leader, &song.domain_power, options);
+            song.member_power = options.iter().enumerate().map(|(member, choices)| {
+                let best = choices.iter().map(|&snap| song.snap_power[member * width + if snap < 0 { width - 1 } else { snap as usize }])
+                    .fold(f64::NEG_INFINITY, f64::max);
+                (song.domain_power[member] + best).next_up()
+            }).collect();
+            song.member_skill = options.iter().enumerate().map(|(member, choices)| choices.iter()
+                .map(|&snap| song.weights[member * width + if snap < 0 { width - 1 } else { snap as usize }])
+                .fold(f64::NEG_INFINITY, f64::max)).collect();
+            for (values, sums) in [(&song.member_power, &mut song.free_power), (&song.member_skill, &mut song.free_skill)] {
+                let mut ranked = values.clone();
+                ranked.sort_unstable_by(|a, b| b.total_cmp(a));
+                sums.fill(f64::NEG_INFINITY);
+                sums[0] = 0.0;
+                for (index, value) in ranked.into_iter().take(5).enumerate() { sums[index + 1] = (sums[index] + value).next_up(); }
+            }
         }
     }
     fn member_bound_at(
@@ -728,27 +752,34 @@ impl Objective for Combined<'_, '_> {
         t: Totals,
         left: usize,
         from: usize,
-        _limit: f64,
+        limit: f64,
     ) -> Option<f64> {
         if self.affine.is_some() {
             return Some(self.bound(t));
         }
-        let mut upper = 0.0_f64;
-        for song in &mut self.songs {
-            let t = Totals {
-                power: song.power_cap,
-                ..t
-            };
-            let coarse = song.adapter.bound(t);
-            upper = (upper
-                + song
-                    .adapter
-                    .member_bound_at(members, t, left, from, 0.0)
-                    .unwrap_or(coarse)
-                    .min(coarse))
-            .next_up();
+        let totals: Vec<_> = self.songs.iter().map(|song| Totals {
+            power: members.iter().fold(song.free_power[left], |sum, &member| (sum + song.member_power[member]).next_up()).min(song.power_cap),
+            skill: members.iter().fold(song.free_skill[left], |sum, &member| (sum + song.member_skill[member]).next_up()).min(t.skill),
+            ..t
+        }).collect();
+        let mut bounds: Vec<_> = self.songs.iter_mut().zip(&totals).map(|(song, &t)| song.adapter.bound(t)).collect();
+        let count = bounds.len() as f64;
+        let sum = |bounds: &[f64]| bounds.iter().fold(0.0_f64, |sum, value| (sum + value).next_up());
+        let mut upper = sum(&bounds);
+        for nominal in [false, true] {
+            if (upper / count).next_up() < limit { break; }
+            for (index, song) in self.songs.iter_mut().enumerate().filter(|(_, song)| song.adapter.kernel.chart.luck == nominal) {
+                let old = bounds[index];
+                let others = if upper.is_finite() && old.is_finite() { (upper - old).next_up() }
+                    else { bounds.iter().enumerate().filter(|(at, _)| *at != index).fold(0.0_f64, |sum, (_, value)| (sum + value).next_up()) };
+                let target = if limit.is_finite() { (limit * count - others).max(0.0) } else { 0.0 };
+                if let Some(value) = song.adapter.member_bound_at(members, totals[index], left, from, target) { bounds[index] = bounds[index].min(value); }
+                upper = if upper.is_finite() && old.is_finite() && bounds[index].is_finite() { ((upper - old).next_up() + bounds[index]).next_up() }
+                    else { sum(&bounds) };
+                if (upper / count).next_up() < limit { break; }
+            }
         }
-        Some((upper / self.songs.len() as f64).next_up())
+        Some((upper / count).next_up())
     }
     fn prepare_assignment(&mut self, members: &[usize], options: &[Vec<i32>]) {
         self.joint = None;

@@ -92,6 +92,7 @@ pub(crate) fn metrics(
         (seed, false),
     )?;
     chart.fixed_life(&mut model);
+    model.score.score.record_only = true;
     let generation = crate::cancellation_generation();
     for (index, frame) in chart.play.frames.iter().enumerate() {
         if generation != crate::cancellation_generation() {
@@ -109,6 +110,47 @@ pub(crate) fn metrics(
         debug_assert_eq!(result, full.missions);
     }
     Ok(result)
+}
+
+pub(crate) fn metric_samples(master: &Master, chart: &Chart, deck: &[Performer], seeds: &[i32]) -> Result<Vec<[i32; 3]>, String> {
+    let groups = super::factored::metric_order_groups(master, chart, deck);
+    let mut aliases = vec![Vec::new(); 120];
+    let orders: Vec<_> = groups.iter().map(|group| group[0]).collect();
+    for group in groups { let first = group[0]; aliases[first] = group; }
+    let events: Vec<Vec<_>> = live::orders().iter().map(|order| chart.full.events.iter()
+        .map(|&(event, time)| (order[event], time)).collect()).collect();
+    let mut chronological: Vec<_> = (0..chart.full.events.len()).collect();
+    chronological.sort_by_key(|&index| (chart.full.events[index].1, index));
+    let mut capacity = [0; 5];
+    for &order in &orders {
+        let mut count = [0; 5];
+        for &(actor, _) in &events[order] { count[actor] += 1; }
+        for (maximum, count) in capacity.iter_mut().zip(count) { *maximum = (*maximum).max(count); }
+    }
+    let runs = if super::replay_random(master, chart, deck) { seeds.to_vec() } else { vec![seeds.first().copied().unwrap_or(0)] };
+    let batches = crate::parallel::map(&runs, |&seed| {
+        let values = Mutex::new(vec![[0; 3]; 120]);
+        let record = |model: &Model<'_>, orders: &[usize]| {
+            let g = model.gk.as_ref().unwrap();
+            let metrics = std::array::from_fn(|range| Standing::from_state(&g.controller.states[range], chart.setup.missions[range]).metric);
+            let mut values = values.lock().unwrap();
+            for &order in orders { for &alias in &aliases[order] { values[alias] = metrics; } }
+        };
+        let tree = ReplayTree::<true, true> { chart, events: &events, chronological: chronological.clone(),
+            generation: crate::cancellation_generation(), observe: None, upper: &[], multiplicities: &[],
+            stopped: AtomicBool::new(false), detail: Some(&record) };
+        let mut model = Model::with_live_capacity(master, deck, &chart.full.notes, &events[orders[0]], chart.params(), Some(&chart.setup), (seed, false, Some(&capacity)))?;
+        chart.fixed_life(&mut model);
+        model.score.score.record_only = true;
+        tree.visit(model, &orders, 0, 0, &mut vec![(0.0, [0.0; 3]); 120])?;
+        Ok::<_, String>(values.into_inner().unwrap())
+    })?;
+    let values: Vec<_> = batches.into_iter().flatten().collect();
+    #[cfg(debug_assertions)] {
+        let full = replay(master, chart, deck, seeds, 1, None, None)?;
+        debug_assert_eq!(values, full.iter().map(|row| row.sections.map(|section| section.metric)).collect::<Vec<_>>(), "section metric orders");
+    }
+    Ok(values)
 }
 
 pub(crate) fn replay(

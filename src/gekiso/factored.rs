@@ -174,12 +174,19 @@ struct Views {
     control: Arc<Master>,
     ordinary: Arc<Master>,
 }
+type DeadHealKey = (Vec<Performer>, Vec<i32>, bool);
+struct DeadHealProofs {
+    tables: [usize; 12],
+    _master: Master,
+    results: HashMap<DeadHealKey, bool>,
+}
 #[derive(Default)]
 pub(super) struct Cache {
     entries: std::collections::VecDeque<Entry>,
     bytes: usize,
     views: Option<Views>,
     just: Option<(Arc<crate::master::LiveTables>, Context)>,
+    dead_heals: Option<DeadHealProofs>,
 }
 pub(super) fn just_context(master: &Master, chart: &Chart, deck: &[Performer]) -> Option<Context> {
     if chart.setup.missions.iter().any(|&mission| mission != 3)
@@ -422,67 +429,173 @@ fn ordinary(master: &Master, actor: &Performer) -> Option<(bool, bool)> {
     }
     Some((retained, ordered))
 }
-fn healthy_controls(master: &Master, chart: &Chart, deck: &[Performer], flags: &mut [(bool, bool)]) {
-    if chart.luck { return; }
-    let mut grades = [false; 7];
-    for note in chart.play.frames.iter().flat_map(|frame| &frame.judged) {
-        grades[note.judgement as usize] = true;
-    }
-    let normal: Vec<Vec<_>> = deck.iter().map(|actor| actor.support_skills.iter()
-        .flat_map(|&(id, level)| master.support_skills[&id].iter().filter(move |row| row.level == level))
+fn ignore_dead_heal_order(master: &Master, chart: &Chart, deck: &[Performer], seeds: &[i32], flags: &mut [(bool, bool)]) -> Result<(), String> {
+    let gate = |group: i32, kinds: &[i32]| group != 0 && master.condition_sets.get(&group)
+        .is_some_and(|sets| sets.iter().all(|set| set.iter().any(|id| master.conditions[id].positive && kinds.contains(&master.conditions[id].kind))));
+    let deferred = |row: &SkillEffect| matches!(row.trigger_type, 1 | 2) && gate(row.trigger_group, &[4010, 5020]);
+    let healer = |row: &SkillEffect| row.kind == 3001 && deferred(row) && ordinary_row(master, row);
+    let normal: Vec<Vec<_>> = deck.iter().map(|actor| actor.support_skills.iter().flat_map(|&(id, level)|
+        master.support_skills[&id].iter().filter(move |row| row.level == level))
         .filter(|row| !(2000..=2005).contains(&row.kind) && row.kind != 15000).collect()).collect();
-    let rows: Vec<_> = normal.iter().flatten().copied().chain(deck.iter().flat_map(|actor| {
-        actor.gekisou_skill.into_iter().flat_map(|(id, level)| {
-            let skill = &master.gekiso_skills[&id];
-            skill.effects.iter().filter(move |row| row.level == level
-                && (skill.mission_type == 4 || chart.setup.missions.contains(&skill.mission_type)))
-        }).chain(actor.gekisou_support_skills.iter().flat_map(|&(id, level)| {
-            let skill = &master.gekiso_support_skills[&id];
-            skill.effects.iter().filter(move |row| row.level == level
-                && (skill.mission_type == 4 || chart.setup.missions.contains(&skill.mission_type)))
-        }))
-    })).collect();
-    let mut targets = HashMap::<i32, [bool; 7]>::default();
-    for row in rows.iter().filter(|row| matches!(row.kind, 12006 | 13005)) {
-        let mask = targets.entry(row.id).or_default();
-        for id in &row.targets {
-            let grade = master.targets[id].judgement;
-            if (1..=6).contains(&grade) { mask[grade as usize] = true; }
+    let candidates: Vec<_> = normal.iter().enumerate().filter(|(index, rows)| flags[*index].1 && !rows.is_empty() && rows.iter().all(|row| healer(row)))
+        .map(|(index, _)| index).collect();
+    if candidates.is_empty() || normal.iter().flatten().any(|row| matches!(row.kind, 3000..=3004) && !healer(row)) { return Ok(()); }
+    let Some(first) = chart.full.events.iter().map(|&(_, time)| time).min() else { return Ok(()); };
+    let gk: Vec<_> = deck.iter().flat_map(|actor| actor.gekisou_skill.into_iter().flat_map(|(id, level)| {
+        let skill = &master.gekiso_skills[&id];
+        skill.effects.iter().filter(move |row| row.level == level && (skill.mission_type == 4 || chart.setup.missions.contains(&skill.mission_type)))
+    }).chain(actor.gekisou_support_skills.iter().flat_map(|&(id, level)| {
+        let skill = &master.gekiso_support_skills[&id];
+        skill.effects.iter().filter(move |row| row.level == level && (skill.mission_type == 4 || chart.setup.missions.contains(&skill.mission_type)))
+    }))).collect();
+    let fast = chart.setup.fevers.iter().all(|&(start, _)| start >= first)
+        && !gk.iter().any(|row| matches!(row.kind, 3000..=3004))
+        && gk.iter().filter(|row| matches!(row.kind, 12006 | 13005))
+            .all(|row| matches!(row.trigger_type, 1 | 2) && gate(row.trigger_group, &[7010, 7013, 7020]))
+        && normal.iter().flatten().all(|row| ordinary_row(master, row)
+            && (row.cumulative_id == 0 || master.cumulative.get(&row.cumulative_id).is_some_and(|counter| !(3000..=3005).contains(&counter.kind)))
+            && [row.trigger_group, row.condition_group, row.release_group, row.reset_group].iter()
+                .flat_map(|group| master.condition_sets.get(group).into_iter().flatten().flatten())
+                .all(|id| !matches!(master.conditions[id].kind, 3000 | 3001)));
+    if !fast && gk.iter().any(|row| matches!(row.kind, 3000..=3004)) { return Ok(()); }
+    let projected: Vec<_> = if fast { deck.iter().filter_map(|actor| {
+        let mut actor = actor.clone();
+        actor.live_skill = None; actor.gekisou_skill = None; actor.gekisou_support_skills.clear();
+        actor.support_skills.retain(|&(id, level)| master.support_skills[&id].iter().any(|row|
+            row.level == level && row.kind == 12006 && !deferred(row)));
+        (!actor.support_skills.is_empty()).then_some(actor)
+    }).collect() } else { deck.to_vec() };
+    let runs = if fast || !chart.luck { vec![0] } else { seeds.to_vec() };
+    let key = (projected.clone(), if fast { Vec::new() } else { runs.clone() }, fast);
+    let identity = tables(master);
+    let known = {
+        let mut cache = chart.factored.lock().unwrap();
+        if cache.dead_heals.as_ref().is_none_or(|entry| entry.tables != identity) {
+            cache.dead_heals = Some(DeadHealProofs { tables: identity, _master: master.clone(), results: HashMap::default() });
         }
-    }
-    let reachable = |id: i32, grades: &[bool; 7]| targets[&id].iter().zip(grades)
-        .any(|(&target, &possible)| target && possible);
-    loop {
-        let before = grades;
-        for row in &rows {
-            if matches!(row.kind, 12006 | 13005)
-                && reachable(row.id, &grades) {
-                let to = if row.kind == 13005 { 6 } else { row.value };
-                if (1..=6).contains(&to) { grades[to as usize] = true; }
+        cache.dead_heals.as_ref().unwrap().results.get(&key).copied()
+    };
+    let dead = if let Some(dead) = known { dead } else {
+        let generation = crate::cancellation_generation();
+        let mut template = Model::new(master, &projected, &chart.full.notes, &[], chart.params(), (!fast).then_some(&chart.setup), (0, false))?;
+        template.score.score.record_only = true;
+        let mut dead = true;
+        for seed in runs {
+            let mut model = template.clone();model.random = Random::new(seed);
+            for (index, frame) in chart.play.frames.iter().enumerate().take_while(|(_, frame)| frame.time_ms < first) {
+                if generation != crate::cancellation_generation() { return Err("cancelled".into()); }
+                model.count_frame(frame.time_ms, &frame.judged, chart.play.dt[index])?;
+            }
+            if model.life.at(first.saturating_sub(1)) != 0 { dead = false; break; }
+        }
+        let mut cache = chart.factored.lock().unwrap();
+        if let Some(known) = &mut cache.dead_heals {
+            if known.tables == identity {
+                let values = &mut known.results;
+                if values.len() >= 256 { values.clear(); }
+                values.insert(key, dead);
             }
         }
-        if before == grades { break; }
-    }
-    if grades.iter().enumerate().any(|(grade, &possible)| possible && master.live.damage[grade] != 0.0)
-        || rows.iter().any(|row| matches!(row.kind, 3000 | 3002)
-            || matches!(row.kind, 3001 | 3004) && row.value < 0) { return; }
-    for (index, rows) in normal.iter().enumerate() {
-        let active: Vec<_> = rows.iter().filter(|row| match row.kind {
-            3001 | 3003 | 3004 => false,
-            12006 => reachable(row.id, &grades),
-            _ => true,
-        }).collect();
-        flags[index].0 = !active.is_empty();
-        flags[index].1 = active.iter().any(|row| [row.trigger_group, row.condition_group,
-            row.release_group, row.reset_group].iter().flat_map(|group| {
-                master.condition_sets.get(group).into_iter().flatten().flatten()
-            }).any(|id| matches!(master.conditions[id].kind, 4010 | 5020)));
+        dead
+    };
+    if dead { for index in candidates { flags[index].1 = false; } }
+    Ok(())
+}
+fn healthy_controls(master: &Master, chart: &Chart, deck: &[Performer], flags: &mut [(bool, bool)]) {
+    if chart.luck { return; }
+    let mut ordered = vec![true; deck.len()];
+    healthy_metric_controls(master, chart, deck, &mut ordered);
+    for (index, actor) in deck.iter().enumerate() {
+        let random = actor.support_skills.iter().flat_map(|&(id, level)| master.support_skills[&id].iter().filter(move |row| row.level == level))
+            .filter(|row| !(2000..=2005).contains(&row.kind) && row.kind != 15000)
+            .flat_map(|row| [row.trigger_group, row.condition_group, row.release_group, row.reset_group])
+            .flat_map(|group| master.condition_sets.get(&group).into_iter().flatten().flatten())
+            .any(|id| master.conditions[id].kind == 4011);
+        if !ordered[index] && !random { flags[index] = (false, false); }
     }
 }
 fn independent_row(master: &Master, row: &SkillEffect) -> bool {
     row.kind!=15000 && [row.trigger_group,row.condition_group,row.release_group,row.reset_group].iter()
         .flat_map(|group|master.condition_sets.get(group).into_iter().flatten().flatten())
         .all(|id|matches!(master.conditions[id].kind,0|1000..=1031|2000..=2004|4011|5000|7000..=7021))
+}
+pub(super) fn metric_order_groups(master: &Master, chart: &Chart, deck: &[Performer]) -> Vec<Vec<usize>> {
+    let mut ordered: Vec<_> = deck.iter().map(|actor| ordinary(master, actor).is_none_or(|flags| flags.1)).collect();
+    healthy_metric_controls(master, chart, deck, &mut ordered);
+    for actor in deck {
+        let normal = actor.live_skill.into_iter().flat_map(|(id, level)| master.live_skills[&id].iter().filter(move |row| row.level == level))
+            .chain(actor.support_skills.iter().flat_map(|&(id, level)| master.support_skills[&id].iter().filter(move |row| row.level == level)));
+        let gk: Vec<_> = actor.gekisou_skill.into_iter().flat_map(|(id, level)| {
+            let skill = &master.gekiso_skills[&id];
+            skill.effects.iter().filter(move |row| row.level == level && (skill.mission_type == 4 || chart.setup.missions.contains(&skill.mission_type)))
+        }).chain(actor.gekisou_support_skills.iter().flat_map(|&(id, level)| {
+            let skill = &master.gekiso_support_skills[&id];
+            skill.effects.iter().filter(move |row| row.level == level && (skill.mission_type == 4 || chart.setup.missions.contains(&skill.mission_type)))
+        })).collect();
+        if gk.iter().any(|row| !independent_row(master, row)) || normal.chain(gk)
+            .flat_map(|row| [row.trigger_group, row.condition_group, row.release_group, row.reset_group])
+            .flat_map(|group| master.condition_sets.get(&group).into_iter().flatten().flatten())
+            .any(|id| master.conditions[id].kind == 4011) { ordered.fill(true); break; }
+    }
+    let mut groups = Vec::<Vec<usize>>::new();
+    let mut ids = HashMap::default();
+    for (index, order) in live::orders().iter().enumerate() {
+        let key: Vec<_> = order.iter().map(|&actor| if ordered[actor] { actor } else { usize::MAX }).collect();
+        let next = groups.len();
+        let group = *ids.entry(key).or_insert(next);
+        if group == next { groups.push(Vec::new()); }
+        groups[group].push(index);
+    }
+    groups
+}
+fn healthy_metric_controls(master: &Master, chart: &Chart, deck: &[Performer], ordered: &mut [bool]) {
+    let base = master.live.life_base as i32;
+    if base <= 0 || base > i32::MAX / 2 { return; }
+    let normal: Vec<Vec<_>> = deck.iter().map(|actor| actor.live_skill.into_iter()
+        .flat_map(|(id, level)| master.live_skills[&id].iter().filter(move |row| row.level == level))
+        .chain(actor.support_skills.iter().flat_map(|&(id, level)| master.support_skills[&id].iter().filter(move |row| row.level == level))).collect()).collect();
+    let all: Vec<_> = normal.iter().flatten().copied().chain(deck.iter().flat_map(|actor| {
+        actor.gekisou_skill.into_iter().flat_map(|(id, level)| master.gekiso_skills[&id].effects.iter().filter(move |row| row.level == level))
+            .chain(actor.gekisou_support_skills.iter().flat_map(|&(id, level)| master.gekiso_support_skills[&id].effects.iter().filter(move |row| row.level == level)))
+    })).collect();
+    let mut targets = HashMap::<i32, u8>::default();
+    for row in all.iter().filter(|row| matches!(row.kind, 12006 | 13005)) {
+        for id in &row.targets { let grade = master.targets[id].judgement; if (0..8).contains(&grade) { *targets.entry(row.id).or_default() |= 1 << grade; } }
+    }
+    let mut grades = chart.play.frames.iter().flat_map(|frame| &frame.judged).fold(0_u8, |mask, note| mask | (1 << note.judgement));
+    loop {
+        let previous = grades;
+        for row in all.iter().filter(|row| matches!(row.kind, 12006 | 13005)) {
+            if targets.get(&row.id).is_some_and(|mask| mask & grades != 0) {
+                let grade = if row.kind == 13005 { 6 } else { row.value };
+                if !(0..8).contains(&grade) { return; }
+                grades |= 1 << grade;
+            }
+        }
+        if grades == previous { break; }
+    }
+    if (1..=6).any(|grade| grades & (1 << grade) != 0 && master.live.damage[grade] != 0.0) { return; }
+    for row in &all {
+        if matches!(row.kind, 3000 | 3002) || matches!(row.kind, 3001 | 3004) && row.value < 0
+            || row.cumulative_id != 0 && master.cumulative.get(&row.cumulative_id)
+            .is_none_or(|counter| matches!(counter.kind, 2000 | 2001)) { return; }
+        if row.kind == 3001 && (row.cumulative_id != 0 || row.value > i32::MAX - 2 * base) { return; }
+        for id in [row.trigger_group, row.condition_group, row.release_group, row.reset_group].iter()
+            .flat_map(|group| master.condition_sets.get(group).into_iter().flatten().flatten()) {
+            let condition = &master.conditions[id];
+            if matches!(condition.kind, 2000 | 2001) {
+                let Some(&value) = condition.values.first() else { return; };
+                let test = |life| if condition.kind == 2000 { life <= value } else { life >= value };
+                if test(base as f64) != test((2 * base) as f64) { return; }
+            } else if (2002..=2004).contains(&condition.kind) { return; }
+        }
+    }
+    for (index, rows) in normal.iter().enumerate() {
+        if rows.iter().all(|row| (2000..=2005).contains(&row.kind) || matches!(row.kind, 15000 | 3001 | 3003 | 3004)
+            || row.kind == 12006 && (0..8).contains(&row.value) && targets.get(&row.id).is_none_or(|mask| mask & grades & !(1 << row.value) == 0)) {
+            ordered[index] = false;
+        }
+    }
 }
 fn matching_missions(master: &Master, deck: &[Performer]) -> bool {
     deck.iter().all(|actor| actor.mission_only.filter(|&mission| mission != 0).is_none_or(|mission| {
@@ -1228,6 +1341,7 @@ pub(super) fn scores(
         return Ok(None);
     };
     healthy_controls(master, chart, deck, &mut ordinary);
+    ignore_dead_heal_order(master, chart, deck, seeds, &mut ordinary)?;
     let (control, ordinary_master) = views(master, chart);
     let mut groups = Vec::<Vec<usize>>::new();
     let mut ids = HashMap::default();
