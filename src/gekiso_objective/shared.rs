@@ -393,8 +393,8 @@ impl<'k, 'a> Combined<'k, 'a> {
             let mut possible = [f64::NEG_INFINITY; 6];
             possible[fixed] = (0..from).fold(0.0_f64, |sum, slot|
                 (sum + budget.values[slot][(assigned[slot] + 1) as usize]).next_up());
-            for slot in from..5 {
-                let best: [f64; 2] = std::array::from_fn(|kind| budget.choices[slot][kind].iter()
+            for choices in budget.choices.iter().skip(from) {
+                let best: [f64; 2] = std::array::from_fn(|kind| choices[kind].iter()
                     .find(|(snap, _)| *snap < 0 || !assigned[..from].contains(snap))
                     .map_or(f64::NEG_INFINITY, |(_, value)| *value));
                 possible = std::array::from_fn(|number| {
