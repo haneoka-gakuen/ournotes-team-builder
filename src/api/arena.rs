@@ -296,6 +296,7 @@ impl Engine {
             cooperative_floor: self.trusted_scores
                 && request["cooperativeFloor"] == true
                 && request["noFloor"] != true
+                && minimum_just_window.is_none_or(|policy| arena && !policy.partial)
                 && master::number(&request["k"], 1.0) == 1.0,
             floor,
             on_candidate: Some(&mut publish),

@@ -71,8 +71,6 @@ For no-damage COMBO charts, GREAT retains judgement-specific score bounds and co
 
 In Arena, `mode: "shared"` searches one leader, member set and snapshot assignment for the equal-weight average over every chart. Only this joint search proves the result; per-song optima are seeds.
 
-For shared score searches with a JUST window policy, an already qualified all-chart candidate may supply a cooperative score floor. Such a floor retains equal-scoring branches in other shards. Sustained-window assignment checks can share identical bounds across charts. Candidate details use the original per-chart window measurement.
-
 Mean-score envelopes maximize each Snapshot's complete mean contribution before combining slots. Cached means preserve directed rounding and physical Snapshot matching.
 
 ## Caches
