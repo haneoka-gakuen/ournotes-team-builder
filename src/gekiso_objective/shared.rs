@@ -35,6 +35,11 @@ struct SongObjective<'k, 'a> {
 struct PowerSeed {
     bonuses: Vec<i32>,
 }
+struct WindowBudget {
+    required: f64,
+    values: [Vec<f64>; 5],
+    choices: [[Vec<(i32, f64)>; 2]; 5],
+}
 impl Objective for PowerSeed {
     fn skill(&mut self, _member: usize, _snap: i32) -> (f64, f64) {
         (0.0, 0.0)
@@ -75,6 +80,12 @@ struct Combined<'k, 'a> {
     last_bounds: Vec<f64>,
     joint: Option<crate::rewards::FixedRegionBound>,
     joint_options: Vec<Vec<i32>>,
+    window_rows: [Option<(f64, Vec<f64>)>; 6],
+    window_bounds: [Option<crate::rewards::WindowScoreBound>; 6],
+    window_attempted: [bool; 6],
+    window_converters: Option<Vec<bool>>,
+    window_options: [bool; 5],
+    window_budgets: Vec<WindowBudget>,
 }
 
 impl<'k, 'a> Combined<'k, 'a> {
@@ -224,6 +235,15 @@ impl<'k, 'a> Combined<'k, 'a> {
                 ))
             })
             .flatten();
+        let window_converters = if equal_power && songs.iter().any(|song| song.adapter.kernel.has_team_filter()) {
+            (|| {
+                let mut mask = vec![false; songs[0].adapter.kernel.members.len() * (songs[0].adapter.kernel.snaps.len() + 1)];
+                for song in &songs {
+                    for (target, &value) in mask.iter_mut().zip(song.adapter.deterministic.as_ref()?.conversion_mask()) { *target |= value; }
+                }
+                Some(mask)
+            })()
+        } else { None };
         Self {
             songs,
             player,
@@ -240,6 +260,12 @@ impl<'k, 'a> Combined<'k, 'a> {
             last_bounds: Vec::new(),
             joint: None,
             joint_options: Vec::new(),
+            window_rows: std::array::from_fn(|_| None),
+            window_bounds: std::array::from_fn(|_| None),
+            window_attempted: [false; 6],
+            window_converters,
+            window_options: [false; 5],
+            window_budgets: Vec::new(),
         }
     }
 
@@ -356,6 +382,54 @@ impl<'k, 'a> Combined<'k, 'a> {
             .all(|song| song.adapter.kernel.meets_combo(members, self.min_combo))
     }
 
+    fn window_upper(&mut self, assigned: &[i32], from: usize) -> Option<f64> {
+        let mask = self.window_converters.as_ref()?;
+        let width = self.songs[0].adapter.kernel.snaps.len() + 1;
+        let mut count = (0..5).filter(|&slot| if slot < from {
+            mask[self.roster[slot] * width + (assigned[slot] + 1) as usize]
+        } else { self.window_options[slot] }).count();
+        let fixed = (0..from).filter(|&slot| mask[self.roster[slot] * width + (assigned[slot] + 1) as usize]).count();
+        for budget in &self.window_budgets {
+            let mut possible = [f64::NEG_INFINITY; 6];
+            possible[fixed] = (0..from).fold(0.0_f64, |sum, slot|
+                (sum + budget.values[slot][(assigned[slot] + 1) as usize]).next_up());
+            for slot in from..5 {
+                let best: [f64; 2] = std::array::from_fn(|kind| budget.choices[slot][kind].iter()
+                    .find(|(snap, _)| *snap < 0 || !assigned[..from].contains(snap))
+                    .map_or(f64::NEG_INFINITY, |(_, value)| *value));
+                possible = std::array::from_fn(|number| {
+                    let same = (possible[number] + best[0]).next_up();
+                    if number == 0 { same } else { same.max((possible[number - 1] + best[1]).next_up()) }
+                });
+            }
+            let Some(maximum) = (fixed..=count).rev().find(|&number| possible[number] >= budget.required) else {
+                return Some(f64::NEG_INFINITY);
+            };
+            count = maximum;
+        }
+        if !self.window_attempted[count] {
+            self.window_attempted[count] = true;
+            if self.window_rows[count].is_none() {
+                let songs = self.songs.len() as f64;
+                let mut base = 0.0_f64;
+                let mut rows = vec![0.0_f64; mask.len()];
+                for song in &self.songs {
+                    let (constant, coefficients) = song.adapter.deterministic.as_ref()?.normalized_window_rows(count)?;
+                    base = (base + (constant / songs).next_up()).next_up();
+                    for (row, coefficient) in rows.iter_mut().zip(coefficients) { *row = (*row + (coefficient / songs).next_up()).next_up(); }
+                }
+                self.window_rows[count] = Some((base, rows));
+            }
+            let (base, coefficients) = self.window_rows[count].as_ref().unwrap();
+            let song = self.songs.iter().find(|song| song.adapter.kernel.has_team_filter())?;
+            self.window_bounds[count] = crate::rewards::WindowScoreBound::prepare(
+                song.adapter.kernel.just_window.as_ref().unwrap(), &self.roster, &self.joint_options,
+                self.songs[0].base, crate::rewards::WindowScoreInput { base: *base, converted: 1.0, width,
+                    snapshot_power: &self.songs[0].snap_power, all_coefficients: coefficients });
+        }
+        self.window_bounds[count].as_ref().map(|bound| bound.upper(assigned, from))
+    }
+
     fn totals(
         song: &SongObjective<'_, '_>,
         members: &[usize],
@@ -446,45 +520,40 @@ impl<'k, 'a> Combined<'k, 'a> {
             })
             .collect();
         let count = bounds.len() as f64;
-        if refined {
-            for (index, song) in self.songs.iter_mut().enumerate() {
-                let others = bounds
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| *i != index)
-                    .fold(0.0_f64, |sum, (_, v)| (sum + v).next_up());
-                let target = if limit.is_finite() {
-                    (limit * count - others).max(0.0)
-                } else {
-                    0.0
-                };
-                let t = totals[index];
-                if let Some(upper) = song
-                    .adapter
-                    .assignment_order_bound(members, t, assigned, from, target)
-                {
-                    bounds[index] = bounds[index].min(upper);
-                }
-                if let Some(upper) = song.adapter.assignment_bound(members, t, assigned, from) {
-                    bounds[index] = bounds[index].min(upper);
-                }
-                if from == 5 {
-                    let team = Team {
-                        members: members.to_vec(),
-                        snaps: assigned.to_vec(),
-                    };
-                    if let Some(upper) = song.adapter.leaf_bound(&team, t) {
-                        bounds[index] = bounds[index].min(upper);
+        let sum_bounds = |values: &[f64]| values.iter().fold(0.0_f64, |sum, value| (sum + value).next_up());
+        let mut sum = sum_bounds(&bounds);
+        if refined && (sum / count).next_up() >= limit {
+            for expensive in [false, true] {
+                for (index, song) in self.songs.iter_mut().enumerate() {
+                    let previous = bounds[index];
+                    let others = if sum.is_finite() && previous.is_finite() {
+                        (sum - previous).next_up()
+                    } else { bounds.iter().enumerate().filter(|(i, _)| *i != index)
+                        .fold(0.0_f64, |sum, (_, value)| (sum + value).next_up()) };
+                    let target = if limit.is_finite() { (limit * count - others).max(0.0) } else { 0.0 };
+                    let t = totals[index];
+                    let value = if expensive {
+                        song.adapter.assignment_order_bound(members, t, assigned, from, target)
+                    } else { song.adapter.shared_joint_upper(members, assigned, from, t, target) };
+                    if let Some(upper) = value { bounds[index] = bounds[index].min(upper); }
+                    if expensive {
+                        if let Some(upper) = song.adapter.assignment_bound(members, t, assigned, from) {
+                            bounds[index] = bounds[index].min(upper);
+                        }
+                        if from == 5 {
+                            let team = Team { members: members.to_vec(), snaps: assigned.to_vec() };
+                            if let Some(upper) = song.adapter.leaf_bound(&team, t) { bounds[index] = bounds[index].min(upper); }
+                        }
                     }
+                    sum = if sum.is_finite() && previous.is_finite() && bounds[index].is_finite() {
+                        ((sum - previous).next_up() + bounds[index]).next_up()
+                    } else { sum_bounds(&bounds) };
+                    if (sum / count).next_up() < limit { break; }
                 }
-                if (bounds.iter().fold(0.0_f64, |sum, v| (sum + v).next_up()) / count).next_up()
-                    < limit
-                {
-                    break;
-                }
+                if (sum / count).next_up() < limit { break; }
             }
         }
-        let upper = (bounds.iter().fold(0.0_f64, |sum, v| (sum + v).next_up()) / count).next_up();
+        let upper = (sum / count).next_up();
         self.last_bounds = bounds;
         upper
     }
@@ -683,6 +752,29 @@ impl Objective for Combined<'_, '_> {
     }
     fn prepare_assignment(&mut self, members: &[usize], options: &[Vec<i32>]) {
         self.joint = None;
+        self.window_bounds = std::array::from_fn(|_| None);
+        self.window_attempted = [false; 6];
+        self.window_budgets.clear();
+        if let Some(mask) = &self.window_converters {
+            let width = self.songs[0].adapter.kernel.snaps.len() + 1;
+            self.window_options = std::array::from_fn(|slot| options[slot].iter().any(|&snap|
+                mask[members[slot] * width + (snap + 1) as usize]));
+            if let Some(window) = self.songs.iter().find_map(|song| song.adapter.kernel.just_window.as_ref()) {
+                for (required, values) in window.pricing_constraints().unwrap_or_default() {
+                    let rows: [Vec<f64>; 5] = std::array::from_fn(|slot| (0..width).map(|col|
+                        values[members[slot] * width + if col == 0 { width - 1 } else { col - 1 }]).collect());
+                    let choices = std::array::from_fn(|slot| std::array::from_fn(|kind| {
+                        let mut row: Vec<_> = options[slot].iter().filter(|&&snap|
+                            usize::from(mask[members[slot] * width + (snap + 1) as usize]) == kind)
+                            .map(|&snap| (snap, rows[slot][(snap + 1) as usize])).collect();
+                        row.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+                        row.truncate(6);
+                        row
+                    }));
+                    self.window_budgets.push(WindowBudget { required, values: rows, choices });
+                }
+            }
+        }
         self.joint_options = options.to_vec();
         self.roster = members.to_vec();
         let master = self.songs[0].adapter.kernel.master;
@@ -763,7 +855,10 @@ impl Objective for Combined<'_, '_> {
     ) -> Option<f64> {
         let coarse = self.bound(t);
         if coarse < limit { return Some(coarse); }
+        let window = self.window_upper(assigned, from);
+        if let Some(upper) = window.filter(|&upper| upper < limit) { return Some(coarse.min(upper)); }
         let upper = coarse.min(self.upper(members, assigned, from, true, limit));
+        let upper = window.map_or(upper, |window| upper.min(window));
         Some(if upper < limit { upper } else { self.joint_bound(assigned, from, t, limit).map_or(upper, |joint| upper.min(joint)) })
     }
     fn interval(&mut self, team: &Team, _t: Totals) -> (f64, f64) {

@@ -6746,6 +6746,10 @@ pub struct Adapter<'k, 'a> {
     reuse_assignment: bool,
 }
 impl<'k, 'a> Adapter<'k, 'a> {
+    fn shared_joint_upper(&self, members: &[usize], assigned: &[i32], from: usize, totals: Totals, cutoff: f64) -> Option<f64> {
+        Some(self.deterministic.as_ref()?.joint_score_ceiling(members, assigned, from,
+            self.base_power, (totals, cutoff), self.kernel.criterion))
+    }
     fn roster_upper(&mut self, members: &[usize], from: usize, limit: f64) -> Option<f64> {
         let mut key = [usize::MAX; 5];
         key[..members.len()].copy_from_slice(members);
@@ -10837,7 +10841,8 @@ fn replay_grade_ceiling(
     members: &[Member],
     snaps: &[Snap],
 ) -> Option<ReplayGradeCeiling> {
-    if !chart.setup.missions.iter().all(|&mission| mission == 3) {
+    let just = chart.setup.missions.iter().all(|&mission| mission == 3);
+    if !just && !chart.setup.missions.iter().all(|&mission| mission == 1) {
         return None;
     }
     let mut conversions = Vec::new();
@@ -10854,7 +10859,7 @@ fn replay_grade_ceiling(
         if let Some(skill) = master
             .gekiso_skills
             .get(&member.card.gekiso_skill_id)
-            .filter(|skill| matches!(skill.mission_type, 3 | 4))
+            .filter(|skill| skill.mission_type == 4 || chart.setup.missions.contains(&skill.mission_type))
         {
             gk.extend(
                 skill
@@ -10890,7 +10895,7 @@ fn replay_grade_ceiling(
             if let Some(skill) = master
                 .gekiso_support_skills
                 .get(&id)
-                .filter(|skill| matches!(skill.mission_type, 3 | 4))
+                .filter(|skill| skill.mission_type == 4 || chart.setup.missions.contains(&skill.mission_type))
             {
                 gk.extend(skill.effects.iter().filter(|row| row.level == level));
             }
@@ -10902,7 +10907,7 @@ fn replay_grade_ceiling(
         || gk.iter().any(|row| {
             !matches!(
                 row.kind,
-                2000 | 2001 | 3004 | 4004 | 12006 | 13000 | 13002 | 13003 | 13004 | 13005
+                2000 | 2001 | 3004 | 4004 | 12000 | 12004 | 12006 | 13000 | 13002 | 13003 | 13004 | 13005
             )
         })
     {
@@ -10928,7 +10933,19 @@ fn replay_grade_ceiling(
             }
         }
     }
-    let raw_counters = chart
+    if !just {
+        for grade in chart.judgements.iter().copied().collect::<BTreeSet<_>>() {
+            let reachable: Vec<_> = conversions.iter().filter(|&&(from, _)| from == grade)
+                .map(|&(_, to)| to).chain(std::iter::once(grade)).collect();
+            let best = *reachable.iter().max_by(|&&a, &&b| chart.judge_frac[a].total_cmp(&chart.judge_frac[b]).then(a.cmp(&b)))?;
+            for row in ordinary.iter().filter(|row| row.kind == 2004) {
+                let matches = |grade| row.targets.iter().any(|id| master.targets[id].judgement == grade as i32);
+                if row.value < 0 || row.max_value < 0
+                    || !matches(best) && reachable.iter().any(|&grade| matches(grade)) { return None; }
+            }
+        }
+    }
+    let raw_counters = just && chart
         .judge_frac
         .windows(2)
         .all(|values| values[0] <= values[1])

@@ -992,6 +992,52 @@ impl<'a> Model<'a> {
     pub fn frame(&mut self, time: i32, judged: &[JudgedNote], dt: f64) -> Result<(), String> {
         self.frame_inner::<false>(time,judged,dt)
     }
+    pub(crate) fn converted_inputs(&self) -> &[(i32, i32, i32)] { &self.judged }
+    pub(crate) fn converter_frame(&mut self, time: i32, judged: &[JudgedNote], dt: f64) -> Result<(), String> {
+        debug_assert!(self.rows.iter().all(|row| row.kind == 13005) && self.live.is_empty());
+        self.frame_time = time;
+        self.frame_rank = None;
+        let g = self.gk.as_mut().unwrap();
+        g.fever_updates = g.fever.update(time);
+        g.controller.before_update(dt, time, &g.fever_updates, 0, &mut Environment {
+            random: &mut self.random, handle: &mut self.score,
+        })?;
+        self.frame_events.clear();
+        self.judged.clear();
+        for input in judged {
+            let note = &self.notes[&input.note_id];
+            let value = self.conversion.convert(input.judgement, note.judgement_type, input.time_ms)?;
+            self.judged.push((note.id, value, note.time_ms));
+        }
+        let indices = self.condition_indices();
+        let input = FrameInput { time, music_length: self.params.music_length, finished: false };
+        let mut listed = std::mem::take(&mut self.listed);
+        let mut updated = std::mem::take(&mut self.updated);
+        for phase in 1..=2 {
+            listed.clear();
+            let mut context = Context { previous_rank: None, life: &mut self.life, random: &mut self.random,
+                time, combo: 0, judged: &self.judged, events: &[], record: false,
+                gk: self.gk.as_ref().map(|g| GkView { controller: &g.controller,
+                    previous_lots: &g.previous_lots, previous_lot_ms: g.previous_lot_ms }) };
+            for index in indices.clone() {
+                let updater = &mut self.condition[index].updater;
+                if phase == 1 { updater.begin_frame(); }
+                updated.clear();
+                updater.update(phase, &input, &mut context, &mut updated)?;
+                if let Some(schedule) = &mut self.condition_schedule { schedule.update_running(index, updater.executing()); }
+                for &item in &updated {
+                    let current = &updater.updaters[item];
+                    if self.rows[updater.effects[current.effect].row].applies(current.state.state) {
+                        listed.push(Listed::Condition(index, item));
+                    }
+                }
+            }
+            for &item in &listed { self.apply(item)?; }
+        }
+        self.listed = listed;
+        self.updated = updated;
+        Ok(())
+    }
     pub(crate) fn count_frame(&mut self,time:i32,judged:&[JudgedNote],dt:f64)->Result<(),String> {
         self.frame_inner::<true>(time,judged,dt)
     }

@@ -1014,6 +1014,64 @@ fn compact_replay(commands: Vec<ReplayCommand>) -> Vec<ReplayCommand> {
     compact.shrink_to_fit();
     compact
 }
+pub(crate) fn converter_context(master: &Master, view: &Master, chart: &Chart, deck: &[Performer]) -> Result<Option<Context>, String> {
+    if deck.is_empty() || deck.iter().any(|actor| actor.gekisou_skill.is_some())
+        || !chart.setup.missions.iter().all(|&mission| mission == 3)
+        || chart.play.frames.iter().flat_map(|frame| &frame.judged)
+            .any(|note| (1..=6).contains(&note.judgement) && master.live.damage[note.judgement as usize] != 0.0)
+        || master.live.damage[6] != 0.0 { return Ok(None); }
+    let condition = |group: i32, kinds: &[i32]| group == 0 || master.condition_sets.get(&group).is_some_and(|sets|
+        sets.iter().flatten().all(|id| kinds.contains(&master.conditions[id].kind)));
+    let end = chart.play.frames.last().map_or(0, |frame| frame.time_ms);
+    for actor in deck {
+        for &(id, level) in &actor.gekisou_support_skills {
+            for row in &view.gekiso_support_skills[&id].effects {
+                if row.level != level { continue; }
+                if row.cumulative_id != 0 || row.trigger_type != 1
+                    || crate::num::window_ms(row.seconds, 0.0) <= end
+                    || !condition(row.condition_group, &[0, 2000, 2001, 5000])
+                    || ![row.trigger_group, row.release_group, row.reset_group].iter()
+                        .all(|&group| condition(group, &[0, 1030, 7010, 7013, 7020])) { return Ok(None); }
+            }
+        }
+    }
+    let reduced: Vec<_> = deck.iter().map(Performer::gekiso_only).collect();
+    let mut model = Model::new(view, &reduced, &chart.full.notes, &[], chart.params(), Some(&chart.setup), (0, false))?;
+    chart.fixed_life(&mut model);
+    let mut boundaries = vec![false; chart.play.frames.len()];
+    for &(start, finish) in &chart.setup.fevers {
+        for time in [start, finish] {
+            let index = chart.play.frames.partition_point(|frame| frame.time_ms < time);
+            if let Some(value) = boundaries.get_mut(index) { *value = true; }
+        }
+    }
+    let mut indices = vec![usize::MAX; chart.full.notes.len() + 1];
+    for (index, note) in chart.notes.iter().enumerate() { indices[note.id as usize] = index; }
+    let mut judgement = chart.judgements.clone();
+    let whole = uses_full_replay(master, chart, &[0]);
+    let frames = if whole { 0..chart.play.frames.len() } else { chart.span.0..chart.span.1 };
+    let generation = crate::cancellation_generation();
+    let mut wake_until = frames.start;
+    for frame_index in frames {
+        let frame = &chart.play.frames[frame_index];
+        let transition = model.gk.as_ref().unwrap().controller.states.iter()
+            .any(|state| matches!(state.state, gekisou::START | gekisou::END | gekisou::DELAY | gekisou::COMPLETE));
+        if frame.judged.is_empty() && !boundaries[frame_index] && frame_index > wake_until && !transition { continue; }
+        if generation != crate::cancellation_generation() { return Err("cancelled".into()); }
+        model.converter_frame(frame.time_ms, &frame.judged, chart.play.dt[frame_index])?;
+        for &(id, value, _) in model.converted_inputs() {
+            let index = indices[id as usize];
+            if index != usize::MAX { judgement[index] = if (1..=6).contains(&value) { value as usize } else { 7 }; }
+        }
+        if !frame.judged.is_empty() { wake_until = frame_index + 2; }
+    }
+    let n = chart.notes.len();
+    Ok(Some(Context { life: whole.then(|| Arc::new(vec![master.live.life_base as i32; n])),
+        live_life: whole.then(|| Arc::new(vec![master.live.life_base as i32; chart.full.events.len()])),
+        judgement, gk: vec![1.0; n], up: vec![1.0; n], luck: vec![1.0; n], factor_commands: 0,
+        factor_peak: 0.0, rush_changes: 0, rush_trace: None, seeds: 1, draws: Vec::new(), nominal: None }))
+}
+
 fn context_fixed_observed<'a>(
     master: &'a Master,
     chart: &Chart,

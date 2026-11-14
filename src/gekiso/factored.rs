@@ -20,10 +20,12 @@ struct Entry {
 struct Scene {
     draws: Vec<Arc<ScoreTape>>,
 }
+#[derive(PartialEq, Eq, Hash)]
 struct ScoreTape {
     bytes: Vec<u8>,
     offsets: Vec<usize>,
     base: i32,
+    combos: Option<Arc<[i32]>>,
 }
 impl ScoreTape {
     fn new(trace: &[ReplayCommand], chart: &Chart, base: i32) -> Self {
@@ -32,17 +34,25 @@ impl ScoreTape {
         let mut frame = 0;
         let mut offsets = vec![usize::MAX; chart.full.events.len()];
         let mut life = [base; 4];
+        let mut combo = core::Combo::default();
+        let mut last_note = i32::MIN;
+        let mut fixed_combos = true;
         let put = |bytes: &mut Vec<u8>, value: i32| bytes.extend_from_slice(&value.to_le_bytes());
         for command in trace {
             let start = bytes.len();
             match command {
                 ReplayCommand::Input(input) => {
                     if !input.is_empty() {
+                        for (raw, converted) in chart.play.frames[frame].judged.iter().zip(input) {
+                            fixed_combos &= raw.time_ms >= last_note;
+                            combo.add(raw.time_ms, converted.judgement);
+                        }
                         bytes.push(0);
                         bytes.extend(input.iter().map(|note| note.judgement as u8));
                     }
                 }
                 ReplayCommand::Note(note) => {
+                    last_note = last_note.max(note.time);
                     bytes.push(1);
                     put(&mut bytes, note.id);
                     put(&mut bytes, note.life);
@@ -142,6 +152,8 @@ impl ScoreTape {
             bytes: packed,
             offsets,
             base,
+            combos: fixed_combos.then(|| std::iter::once(0).chain(chart.full.notes.iter()
+                .map(|note| combo.at(note.time_ms))).collect::<Arc<[i32]>>()),
         }
     }
     fn i32(&self, at: &mut usize) -> i32 {
@@ -153,6 +165,7 @@ impl ScoreTape {
         std::mem::size_of::<Self>()
             + self.bytes.capacity()
             + self.offsets.capacity() * std::mem::size_of::<usize>()
+            + self.combos.as_ref().map_or(0, |counts| counts.len() * std::mem::size_of::<i32>())
     }
 }
 struct Views {
@@ -835,6 +848,7 @@ fn context(
         vec![seeds.first().copied().unwrap_or(0)]
     };
     let mut draws = Vec::new();
+    let mut unique = HashMap::<Arc<ScoreTape>, ()>::default();
     let generation = crate::cancellation_generation();
     for seed in runs {
         let mut current = model.clone();
@@ -847,14 +861,20 @@ fn context(
             current.score.score.calculator.observations.clear();
         }
         let trace = current.score.score.replay.take().unwrap();
-        draws.push(Arc::new(ScoreTape::new(
+        let draw = Arc::new(ScoreTape::new(
             &trace,
             chart,
             control.live.life_base as i32,
-        )));
+        ));
+        if let Some((stored, _)) = unique.get_key_value(&draw) {
+            draws.push(Arc::clone(stored));
+        } else {
+            unique.insert(Arc::clone(&draw), ());
+            draws.push(draw);
+        }
     }
-    let bytes = draws
-        .iter()
+    let bytes = unique
+        .keys()
         .map(|draw| draw.retained_bytes())
         .sum::<usize>()
         + draws.capacity() * std::mem::size_of::<Arc<ScoreTape>>()
@@ -942,7 +962,7 @@ impl<'a> ScoreTree<'a> {
                     for raw in &self.chart.play.frames[state.frame].judged {
                         let judgement = i32::from(self.trace.bytes[at]);
                         at += 1;
-                        state.combo.add(raw.time_ms, judgement);
+                        if self.trace.combos.is_none() { state.combo.add(raw.time_ms, judgement); }
                         state.judged.push(crate::full::play::JudgedNote {
                             note_id: raw.note_id,
                             time_ms: raw.time_ms,
@@ -1120,13 +1140,15 @@ fn score_orders<'a>(
     program.score.score.replay = Some(Vec::new());
     program.score.score.record_only = true;
     let sparse = program.sparse_score_frames();
-    let calculator = Calculator::new(
+    let mut calculator = Calculator::new(
         &master.live,
         power,
         params.level,
         params.converted,
         params.assist,
     );
+    calculator.note_combos.clone_from(&draw.combos);
+    calculator.cache_bases();
     let state = ScoreState {
         program,
         score: Incremental::new(calculator, params.music_length),
@@ -1235,14 +1257,19 @@ pub(super) fn scores(
             &live::orders()[orders[0]],
         )?;
         let draws = &context.draws;
+        let mut scored = HashMap::<*const ScoreTape, Vec<ReplayValue>>::default();
         for draw in draws {
             if generation != crate::cancellation_generation() {
                 return Err("cancelled".into());
             }
-            let Some(result) =
-                score_orders(master, &ordinary_master, chart, deck, draw, power, &orders)?
-            else {
-                return Ok(None);
+            let result = match scored.entry(Arc::as_ptr(draw)) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let Some(result) = score_orders(master, &ordinary_master, chart, deck, draw, power, &orders)? else {
+                        return Ok(None);
+                    };
+                    entry.insert(result)
+                }
             };
             for &order in &orders {
                 values[order] += result[order].0;

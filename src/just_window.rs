@@ -781,17 +781,15 @@ impl Prepared {
         if self.policy.partial || self.profiles.iter().any(|profile| profile.dynamic) || !self.active() {
             return None;
         }
-        Some(
-            self.phases
-                .iter()
-                .zip(&self.phase_values)
-                .filter_map(|(phase, values)| {
-                    let required =
-                        (self.minimum - phase.before.min(phase.after) as f64).next_down();
-                    (required > 0.0).then_some((required, values.as_slice()))
-                })
-                .collect(),
-        )
+        let mut constraints = Vec::<(f64, &[f64])>::new();
+        for (phase, values) in self.phases.iter().zip(&self.phase_values) {
+            let required = (self.minimum - phase.before.min(phase.after) as f64).next_down();
+            if required <= 0.0 { continue; }
+            if let Some((previous, _)) = constraints.iter_mut().find(|(_, row)| *row == values.as_slice()) {
+                *previous = previous.max(required);
+            } else { constraints.push((required, values)); }
+        }
+        Some(constraints)
     }
     pub(crate) fn impossible(&self) -> bool {
         self.impossible_with(&Constraints::default())

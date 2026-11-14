@@ -8,6 +8,19 @@ use crate::{
 use rustc_hash::FxHashMap as HashMap;
 use std::sync::Arc;
 
+fn sparse_modifier(master: &Master, chart: &gekiso::Chart, actor: &Performer) -> bool {
+    let one = |group: i32, kind: i32| master.condition_sets.get(&group).is_some_and(|sets| sets.len() == 1
+        && sets[0].len() == 1 && master.conditions[&sets[0][0]].kind == kind && master.conditions[&sets[0][0]].positive);
+    actor.live_skill.is_none() && actor.support_skills.is_empty() && actor.gekisou_skill.is_none()
+        && chart.setup.missions.iter().all(|&mission| mission == 3)
+        && actor.gekisou_support_skills.iter().all(|&(id, level)| master.gekiso_support_skills[&id].effects.iter()
+            .filter(|row| row.level == level).all(|row| row.kind == 2001 && row.trigger_type == 1
+                && row.seconds == 0.0 && row.reset_group == 0 && one(row.trigger_group, 7010) && one(row.release_group, 7013)
+                && master.cumulative.get(&row.cumulative_id).is_some_and(|counter| matches!(counter.kind, 1000 | 7000 | 7001))
+                && (row.condition_group == 0 || master.condition_sets.get(&row.condition_group).is_some_and(|sets|
+                    sets.iter().flatten().all(|id| matches!(master.conditions[id].kind, 0 | 2000 | 2001 | 5000))))))
+}
+
 pub(crate) fn slot_dominates(a: &crate::live::Slot, b: &crate::live::Slot) -> bool {
     if a.effects
         .iter()
@@ -153,6 +166,8 @@ struct NumericRow {
 }
 #[derive(Default)]
 pub(crate) struct Compiler {
+    converter_master: Option<Master>,
+    converter_baseline: Option<Arc<Context>>,
     conversions: ConversionCache,
     traces: HashMap<Vec<usize>, (usize, Arc<Context>)>,
     effects: HashMap<(usize, usize), Arc<Effect>>,
@@ -440,9 +455,11 @@ impl Compiler {
             Some(&chart.setup),
             (0, false),
         )?;
+        let counts_only = better.live_skill.is_none() && better.support_skills.is_empty();
         for frame in chart.span.0..chart.span.1 {
             let input = &chart.play.frames[frame];
-            model.frame(input.time_ms, &input.judged, chart.play.dt[frame])?;
+            if counts_only { model.count_frame(input.time_ms, &input.judged, chart.play.dt[frame])?; }
+            else { model.frame(input.time_ms, &input.judged, chart.play.dt[frame])?; }
         }
         let mut commands = model.score.score.note_factor_commands();
         commands.sort_by_key(|c| c.0);
@@ -811,7 +828,34 @@ impl Compiler {
         if let Some((id, context)) = self.conversions.get(programs) {
             return Ok(Some((*id, Arc::clone(context))));
         }
-        let context = Arc::new(gekiso::context_fixed(master, chart, &deck(), &[0])?);
+        let deck = deck();
+        if self.converter_master.is_none() {
+            let mut view = master.clone();
+            view.gekiso_support_skills = Arc::new(view.gekiso_support_skills.iter().map(|(&id, skill)| {
+                let mut skill = skill.clone();
+                skill.effects.retain(|row| row.kind == 13005);
+                (id, skill)
+            }).collect());
+            self.converter_master = Some(view);
+        }
+        let view = self.converter_master.as_ref().unwrap();
+        let inert = deck.iter().all(|actor| actor.gekisou_skill.is_none() && actor.gekisou_support_skills.iter()
+            .all(|&(id, level)| !view.gekiso_support_skills[&id].effects.iter().any(|row| row.level == level)));
+        let fast = if inert {
+            if self.converter_baseline.is_none() { self.converter_baseline = Some(Arc::new(gekiso::context_fixed(master, chart, &[], &[0])?)); }
+            Some((**self.converter_baseline.as_ref().unwrap()).clone())
+        } else { gekiso::converter_context(master, view, chart, &deck)? };
+        #[cfg(debug_assertions)]
+        if let Some(fast) = &fast {
+            let original = gekiso::context_fixed(master, chart, &deck, &[0])?;
+            debug_assert_eq!(fast.judgement, original.judgement, "converter counted judgements");
+            debug_assert_eq!(fast.life, original.life, "converter counted life");
+            debug_assert_eq!(fast.live_life, original.live_life, "converter counted event life");
+            debug_assert_eq!(fast.up, original.up, "converter counted factors");
+            debug_assert_eq!(fast.gk, original.gk, "converter counted combo");
+            debug_assert_eq!(fast.luck, original.luck, "converter counted luck");
+        }
+        let context = Arc::new(if let Some(fast) = fast { fast } else { gekiso::context_fixed(master, chart, &deck, &[0])? });
         let result = if let Some((id, previous)) = self.traces.get(&context.judgement) {
             (*id, Arc::clone(previous))
         } else {
@@ -881,7 +925,19 @@ impl Compiler {
                     Some(&chart.setup),
                     (0, false),
                 )?;
-                for k in chart.span.0..chart.span.1 {
+                let counts_only = actor.live_skill.is_none() && actor.support_skills.is_empty();
+                let sparse = sparse_modifier(master, chart, actor);
+                let mut boundaries = vec![false; chart.play.frames.len()];
+                if sparse {
+                    for &(start, end) in &chart.setup.fevers { for time in [start, end] {
+                        let index = chart.play.frames.partition_point(|frame| frame.time_ms < time);
+                        if let Some(value) = boundaries.get_mut(index) { *value = true; }
+                    }}
+                }
+                let mut wake_until = chart.span.0;
+                #[cfg(debug_assertions)]
+                let mut original = counts_only.then(|| model.clone());
+                for (k, &boundary) in boundaries.iter().enumerate().take(chart.span.1).skip(chart.span.0) {
                     let frame = &chart.play.frames[k];
                     let mut judged = frame.judged.clone();
                     for note in &mut judged {
@@ -890,9 +946,21 @@ impl Compiler {
                         };
                         note.judgement = converted.judgement[i] as i32;
                     }
-                    model.frame(frame.time_ms, &judged, chart.play.dt[k])?;
+                    #[cfg(debug_assertions)]
+                    if let Some(original) = &mut original { original.frame(frame.time_ms, &judged, chart.play.dt[k])?; }
+                    let transition = sparse && model.gk.as_ref().unwrap().controller.states.iter()
+                        .any(|state| matches!(state.state, crate::full::gekisou::START | crate::full::gekisou::END
+                            | crate::full::gekisou::DELAY | crate::full::gekisou::COMPLETE));
+                    if sparse && judged.is_empty() && !boundary && k > wake_until && !transition { continue; }
+                    if counts_only { model.count_frame(frame.time_ms, &judged, chart.play.dt[k])?; }
+                    else { model.frame(frame.time_ms, &judged, chart.play.dt[k])?; }
+                    if !judged.is_empty() { wake_until = k + 2; }
                 }
                 let mut commands = model.score.score.note_factor_commands();
+                #[cfg(debug_assertions)]
+                if let Some(original) = original {
+                    debug_assert_eq!(commands, original.score.score.note_factor_commands(), "counted score commands");
+                }
                 commands.sort_by_key(|c| c.0);
                 let absolute = commands.iter().fold(0.0_f64, |sum, c| {
                     (sum + f(f(c.1 as f64) / 100000.0).abs()).next_up()

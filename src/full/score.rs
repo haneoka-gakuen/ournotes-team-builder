@@ -1,7 +1,7 @@
 //! Score-factor frame logging with native binary32 undo and replay.
 use super::core::{self, Combo};
 use crate::{master::LiveTables, num::f};
-use std::{collections::BTreeMap, rc::Rc};
+use std::{collections::BTreeMap, rc::Rc, sync::Arc};
 #[derive(Clone, Default)]
 pub struct FactorCommand {
     pub time: i32,
@@ -144,6 +144,8 @@ pub struct Calculator<'a> {
     pub factors: Factors,
     pub factors_only: bool,
     pub observations: Vec<(i32, Observation)>,
+    pub(crate) note_combos: Option<Arc<[i32]>>,
+    bases: Option<Rc<Vec<[Option<f64>; 7]>>>,
 }
 impl<'a> Calculator<'a> {
     pub fn new(
@@ -162,7 +164,25 @@ impl<'a> Calculator<'a> {
             factors: Factors::default(),
             factors_only: false,
             observations: Vec::new(),
+            note_combos: None,
+            bases: None,
         }
+    }
+    pub(crate) fn cache_bases(&mut self) {
+        let mut bases = vec![[None; 7]; 256];
+        for (&op, &note) in &self.tables.note_percent {
+            if !(0..256).contains(&op) { continue; }
+            for (&grade, &judge) in &self.tables.judge_percent {
+                if !(0..7).contains(&grade) { continue; }
+                bases[op as usize][grade as usize] = Some(self.base(note, judge));
+            }
+        }
+        self.bases = Some(Rc::new(bases));
+    }
+    fn base(&self, note: f64, judge: f64) -> f64 {
+        let t = f(f(self.tables.adjustment * f(self.power as f64)) * self.level_factor);
+        let a = f(f(f(note) / 100.0) * t);
+        f(f(f(judge) / 100.0) * a)
     }
     pub fn table(&self, kind: i32, combo: i32) -> f64 {
         let Some(rows) = self.tables.combo.get(&kind) else {
@@ -220,6 +240,9 @@ impl<'a> Calculator<'a> {
         score_up: f64,
         luck: f64,
     ) -> Result<i32, String> {
+        let cached = self.bases.as_ref().and_then(|bases| bases.get(op as usize))
+            .and_then(|row| row.get(score_type as usize)).copied().flatten();
+        let b = if let Some(base) = cached { base } else {
         let note = self
             .tables
             .note_percent
@@ -230,10 +253,9 @@ impl<'a> Calculator<'a> {
             .judge_percent
             .get(&score_type)
             .ok_or_else(|| format!("score percent missing: note {op} score {score_type}"))?;
+        self.base(*note, *judge)
+        };
         let life_factor = if life > 0 { 1.0 } else { self.tables.life_onus };
-        let t = f(f(self.tables.adjustment * f(self.power as f64)) * self.level_factor);
-        let a = f(f(f(*note) / 100.0) * t);
-        let b = f(f(f(*judge) / 100.0) * a);
         let c = f(f(b * combo_factor) * score_up);
         let d = f(luck * c);
         let x = f(d / f(self.converted as f64));
@@ -484,7 +506,9 @@ impl<'a> Incremental<'a> {
                 a += 1;
             } else {
                 let n = &mut Rc::make_mut(&mut self.notes[frame / 64])[frame % 64][note_order[b]];
-                let value = self.calculator.note_score(combo.at(n.time), n, info)?;
+                let count = self.calculator.note_combos.as_ref()
+                    .map_or_else(|| combo.at(n.time), |counts| counts[n.id as usize]);
+                let value = self.calculator.note_score(count, n, info)?;
                 n.added = value;
                 self.score = self.score.wrapping_add(value);
                 b += 1;

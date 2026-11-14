@@ -2577,15 +2577,100 @@ struct WindowPlane {
     constant: f64,
     values: [Vec<f64>; 5],
     best: [Vec<(i32, f64)>; 5],
+    prices: Vec<(i32, f64)>,
 }
-struct WindowScoreBound {
+pub(crate) struct WindowScoreBound {
     planes: Vec<WindowPlane>,
     converted: f64,
 }
+pub(crate) struct WindowScoreInput<'a> {
+    pub base: f64,
+    pub converted: f64,
+    pub width: usize,
+    pub snapshot_power: &'a [f64],
+    pub all_coefficients: &'a [f64],
+}
 impl WindowScoreBound {
-    fn upper(&self, assigned: &[i32], from: usize) -> f64 {
+    pub(crate) fn prepare(window: &crate::just_window::Prepared, members: &[usize], options: &[Vec<i32>], base_power: f64, input: WindowScoreInput<'_>) -> Option<Self> {
+        let WindowScoreInput { base, converted, width, snapshot_power, all_coefficients } = input;
+        if !base_power.is_finite() || base_power < 0.0 || snapshot_power.is_empty() { return None; }
+        let constraints = window.pricing_constraints()?;
+        if constraints.is_empty() { return None; }
+        let mut powers = std::array::from_fn::<_, 5, _>(|_| vec![f64::NEG_INFINITY; width]);
+        let mut coefficients = powers.clone();
+        let mut power_high = base_power;
+        let mut coefficient_high = base;
+        for (slot, &member) in members.iter().enumerate() {
+            for &snap in &options[slot] {
+                let col = (snap + 1) as usize;
+                let power = snapshot_power[member * width + if snap < 0 { width - 1 } else { snap as usize }];
+                let coefficient = all_coefficients[member * width + col];
+                if !power.is_finite() || power < 0.0 || !coefficient.is_finite() || coefficient < 0.0 { return None; }
+                powers[slot][col] = power; coefficients[slot][col] = coefficient;
+            }
+            power_high = add(power_high, powers[slot].iter().copied().fold(f64::NEG_INFINITY, f64::max));
+            coefficient_high = add(coefficient_high, coefficients[slot].iter().copied().fold(f64::NEG_INFINITY, f64::max));
+        }
+        if !(0.0..=i32::MAX as f64).contains(&power_high) || base < 0.0 { return None; }
+        let ratio = (coefficient_high / power_high.max(1.0)).sqrt();
+        if !ratio.is_finite() || ratio <= 0.0 { return None; }
+        let mut planes = Vec::new();
+        for scale in [1.0, 0.75, 1.5] {
+            let lambda = ratio * scale;
+            let raw: [Vec<f64>; 5] = std::array::from_fn(|slot| (0..width).map(|col| add(mul(lambda, powers[slot][col]), up(coefficients[slot][col] / lambda))).collect());
+            let spread = options.iter().enumerate().map(|(slot, choices)| {
+                let (low, high) = choices.iter().map(|snap| raw[slot][(snap + 1) as usize]).fold((f64::INFINITY, f64::NEG_INFINITY), |(low, high), value| (low.min(value), high.max(value)));
+                (high - low).max(0.0)
+            }).fold(1.0_f64, f64::max);
+            for &(required, widths) in &constraints {
+                for factor in [0.0, 0.25, 1.0, 4.0] {
+                    let mu = factor * spread / required.max(1.0);
+                    if !mu.is_finite() || mu < 0.0 { continue; }
+                    let mut values: [Vec<f64>; 5] = std::array::from_fn(|slot| {
+                        let member = members[slot];
+                        (0..width).map(|col| {
+                            let width_col = if col == 0 { width - 1 } else { col - 1 };
+                            add(raw[slot][col], mul(mu, widths[member * width + width_col]))
+                        }).collect()
+                    });
+                    let columns = width - 1 + 5;
+                    let mut matrix = vec![vec![-1e100; columns]; 5];
+                    for (slot, choices) in options.iter().enumerate() {
+                        for &snap in choices {
+                            let column = if snap < 0 { width - 1 + slot } else { snap as usize };
+                            matrix[slot][column] = values[slot][(snap + 1) as usize];
+                        }
+                    }
+                    let mut matching = crate::assignment::Scratch::default();
+                    matching.maximum(&matrix, columns, Some(&mut [0; 5]));
+                    let prices = matching.column_prices(columns);
+                    for row in &mut values {
+                        for (value, price) in row[1..].iter_mut().zip(&prices) { *value = (*value - price).next_up(); }
+                    }
+                    let mut priced: Vec<_> = prices[..width - 1].iter().enumerate()
+                        .filter(|&(_, &price)| price > 0.0).map(|(snap, &price)| (snap as i32, price)).collect();
+                    priced.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+                    let best: [Vec<(i32, f64)>; 5] = std::array::from_fn(|slot| {
+                        let mut row: Vec<_> = options[slot].iter().map(|&snap| (snap, values[slot][(snap + 1) as usize])).collect();
+                        let compare = |a: &(i32, f64), b: &(i32, f64)| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0));
+                        if row.len() > 6 { row.select_nth_unstable_by(5, compare); row.truncate(6); }
+                        row.sort_unstable_by(compare); row
+                    });
+                    let constant = (add(mul(lambda, base_power), up(base / lambda)) - (mu * required).next_down()).next_up();
+                    planes.push(WindowPlane { constant, values, best, prices: priced });
+                }
+            }
+        }
+        Some(Self { planes, converted })
+    }
+    pub(crate) fn upper(&self, assigned: &[i32], from: usize) -> f64 {
         self.planes.iter().map(|plane| {
             let mut total = plane.constant;
+            let mut free = 5 - from;
+            for &(snap, price) in &plane.prices {
+                if assigned[..from].contains(&snap) { total = add(total, price); }
+                else if free > 0 { total = add(total, price); free -= 1; }
+            }
             for slot in 0..5 {
                 let value = if slot < from { plane.values[slot][(assigned[slot] + 1) as usize] }
                     else { plane.best[slot].iter().find(|(snap, _)| *snap < 0 || !assigned[..from].contains(snap)).map_or(f64::NEG_INFINITY, |(_, value)| *value) };
@@ -5130,60 +5215,23 @@ impl DeterministicBound {
     }
     pub(crate) fn prepare_window_score(&mut self, window: &crate::just_window::Prepared, members: &[usize], options: &[Vec<i32>], base_power: f64, criterion: crate::objectives::Criterion) {
         self.window_score_bound = None;
-        if criterion != crate::objectives::Criterion::Mean || !base_power.is_finite() || base_power < 0.0 || self.snapshot_power.is_empty() { return; }
-        let Some(constraints) = window.pricing_constraints() else { return; };
-        if constraints.is_empty() { return; }
-        if self.window_coefficients().is_none() { return; }
-        let all_coefficients = self.window_coefficients.as_ref().unwrap();
-        let mut powers = std::array::from_fn::<_, 5, _>(|_| vec![f64::NEG_INFINITY; self.width]);
-        let mut coefficients = powers.clone();
-        let mut power_high = base_power;
-        let mut coefficient_high = self.base;
-        for (slot, &member) in members.iter().enumerate() {
-            for &snap in &options[slot] {
-                let col = (snap + 1) as usize;
-                let power = self.snapshot_power[member * self.width + if snap < 0 { self.width - 1 } else { snap as usize }];
-                let coefficient = all_coefficients[member * self.width + col];
-                if !power.is_finite() || power < 0.0 || !coefficient.is_finite() || coefficient < 0.0 { return; }
-                powers[slot][col] = power; coefficients[slot][col] = coefficient;
-            }
-            power_high = add(power_high, powers[slot].iter().copied().fold(f64::NEG_INFINITY, f64::max));
-            coefficient_high = add(coefficient_high, coefficients[slot].iter().copied().fold(f64::NEG_INFINITY, f64::max));
-        }
-        if !(0.0..=i32::MAX as f64).contains(&power_high) || self.base < 0.0 { return; }
-        let ratio = (coefficient_high / power_high.max(1.0)).sqrt();
-        if !ratio.is_finite() || ratio <= 0.0 { return; }
-        let mut planes = Vec::new();
-        for scale in [1.0, 0.75, 1.5] {
-            let lambda = ratio * scale;
-            let raw: [Vec<f64>; 5] = std::array::from_fn(|slot| (0..self.width).map(|col| add(mul(lambda, powers[slot][col]), up(coefficients[slot][col] / lambda))).collect());
-            let spread = options.iter().enumerate().map(|(slot, choices)| {
-                let (low, high) = choices.iter().map(|snap| raw[slot][(snap + 1) as usize]).fold((f64::INFINITY, f64::NEG_INFINITY), |(low, high), value| (low.min(value), high.max(value)));
-                (high - low).max(0.0)
-            }).fold(1.0_f64, f64::max);
-            for &(required, widths) in &constraints {
-                for factor in [0.0, 0.25, 1.0, 4.0] {
-                    let mu = factor * spread / required.max(1.0);
-                    if !mu.is_finite() || mu < 0.0 { continue; }
-                    let values: [Vec<f64>; 5] = std::array::from_fn(|slot| {
-                        let member = members[slot];
-                        (0..self.width).map(|col| {
-                            let width_col = if col == 0 { self.width - 1 } else { col - 1 };
-                            add(raw[slot][col], mul(mu, widths[member * self.width + width_col]))
-                        }).collect()
-                    });
-                    let best: [Vec<(i32, f64)>; 5] = std::array::from_fn(|slot| {
-                        let mut row: Vec<_> = options[slot].iter().map(|&snap| (snap, values[slot][(snap + 1) as usize])).collect();
-                        let compare = |a: &(i32, f64), b: &(i32, f64)| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0));
-                        if row.len() > 6 { row.select_nth_unstable_by(5, compare); row.truncate(6); }
-                        row.sort_unstable_by(compare); row
-                    });
-                    let constant = (add(mul(lambda, base_power), up(self.base / lambda)) - (mu * required).next_down()).next_up();
-                    planes.push(WindowPlane { constant, values, best });
-                }
-            }
-        }
-        self.window_score_bound = Some(WindowScoreBound { planes, converted: self.converted });
+        if criterion != crate::objectives::Criterion::Mean || self.window_coefficients().is_none() { return; }
+        self.window_score_bound = WindowScoreBound::prepare(window, members, options, base_power, WindowScoreInput {
+            base: self.base, converted: self.converted, width: self.width,
+            snapshot_power: &self.snapshot_power, all_coefficients: self.window_coefficients.as_ref().unwrap(),
+        });
+    }
+    pub(crate) fn conversion_mask(&self) -> &[bool] { &self.converters }
+    pub(crate) fn normalized_window_rows(&self, converters: usize) -> Option<(f64, Vec<f64>)> {
+        let count = converters.min(self.capacity);
+        let rows: Vec<_> = self.ids.iter().enumerate().map(|(index, ids)| {
+            let mean = ids[..=count].iter().map(|&id| self.shared_means[id as usize])
+                .fold(f64::NEG_INFINITY, f64::max);
+            let value = if count > 0 { (up(mean) - self.conversion_extras[index]).next_up().max(0.0) } else { up(mean) };
+            up(value / self.converted)
+        }).collect();
+        (self.base >= 0.0 && rows.iter().all(|value| value.is_finite() && *value >= 0.0))
+            .then(|| (up(add(self.base, if count > 0 { self.conversion_extra_cap } else { 0.0 }) / self.converted), rows))
     }
     pub(crate) fn prepare_fixed_score_assignment(
         &mut self,
