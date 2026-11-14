@@ -965,6 +965,10 @@ impl LiveCore {
             upper
         })
     }
+    pub(crate) fn uses_reachable_timing(&self) -> bool {
+        self.timing.is_some()
+    }
+
     pub fn order_bounds(&mut self, team: &Team, power: f64) -> (Vec<f64>, Vec<f64>) {
         if self.unbounded { return (vec![f64::NEG_INFINITY; 120], vec![f64::INFINITY; 120]); }
 

@@ -1365,6 +1365,65 @@ impl EventObjective {
     fn rank_bound(&self, score: f64) -> i32 {
         self.rank(score.min(self.score_cap))
     }
+
+    fn minimum_rank_score(&self, minimum: i32) -> f64 {
+        if minimum <= 2 {
+            return f64::NEG_INFINITY;
+        }
+        self.chart
+            .as_ref()
+            .expect("played event has a chart")
+            .ranks
+            .iter()
+            .filter(|rank| rank.rank >= minimum)
+            .map(|rank| rank.required as f64)
+            .fold(f64::INFINITY, f64::min)
+    }
+
+    pub(crate) fn minimum_rank_impossible(&self, minimum: i32) -> bool {
+        self.core.as_ref().is_some_and(|core| {
+            let required = self.minimum_rank_score(minimum);
+            required == f64::INFINITY || !core.uses_reachable_timing() && self.score_cap < required
+        })
+    }
+
+    pub(crate) fn meets_minimum_rank(
+        &mut self,
+        team: &Team,
+        power: f64,
+        minimum: i32,
+    ) -> Result<bool, String> {
+        if self.core.is_none() {
+            // An unplayed event does not have the per-order rank distribution.
+            return Ok(false);
+        }
+        let required = self.minimum_rank_score(minimum);
+        if required == f64::INFINITY {
+            return Ok(false);
+        }
+        let core = self.core.as_mut().unwrap();
+        let power = power as i32;
+        // Match the nominal score model used by the per-order bounds.
+        if !core.uses_reachable_timing() {
+            if self.score_cap < required {
+                return Ok(false);
+            }
+            if power > 0 && required > 0.0 {
+                let (lows, highs) = core.order_bounds(team, power as f64);
+                if highs.iter().any(|&high| high.is_finite() && high < required) {
+                    return Ok(false);
+                }
+                if lows.iter().zip(&highs).all(|(&low, &high)| {
+                    low.is_finite() && high.is_finite() && low >= required && low <= high
+                }) {
+                    return Ok(true);
+                }
+            }
+        }
+        let scores = core.evaluate(team, power)?;
+        Ok(!scores.scores.is_empty()
+            && scores.scores.iter().all(|&score| self.rank(score) >= minimum))
+    }
 }
 impl Objective for EventObjective {
     fn generic_assignment_product(&self) -> bool { self.core.is_some() }

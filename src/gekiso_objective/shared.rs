@@ -337,12 +337,7 @@ impl<'k, 'a> Combined<'k, 'a> {
                 let upper = (bounds.iter().fold(0.0_f64, |sum, v| (sum + v).next_up())
                     / bounds.len() as f64)
                     .next_up();
-                let threshold = if self.cooperative_floor {
-                    cutoff.key.max(crate::search_floor())
-                } else {
-                    cutoff.key
-                };
-                if upper < threshold || cutoff.prune_equal && upper == threshold {
+                if upper < cutoff.key || cutoff.prune_equal && upper == cutoff.key {
                     return Ok(search::Evaluation::Pruned(upper));
                 }
             }

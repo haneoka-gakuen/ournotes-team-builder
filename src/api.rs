@@ -2654,6 +2654,7 @@ impl Engine {
         let request = &input["request"];
         let kind = request["goal"]["kind"].as_str().ok_or("missing-goal")?;
         crate::progress::mode(&request["goal"]);
+        crate::progress::report_rank_checks(input["reportRankChecks"] == true);
         if !request["goal"]["rewardPlan"].is_null() && !request["rewardPhase"].is_null() { return Err("reward-plan-phase".into()); }
         let primary = kind == "event" && !request["goal"]["ranking"].is_null();
         let pt = kind == "event" && request["goal"]["ranking"] == "pt-only";
@@ -2771,6 +2772,7 @@ impl Engine {
                 )?,
                 _ => unreachable!(),
             };
+            crate::progress::flush_rank_checks();
             normalize_response_hits(&mut response);
             apply_reward_cutoff(&mut response, request, song);
             unknown = response["unknownCards"].clone();

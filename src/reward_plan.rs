@@ -912,13 +912,29 @@ impl Objective for Ranked<'_> {
     }
     fn team_filter_impossible(&self) -> bool {
         self.source.view().team_filter_impossible()
+            || matches!((&self.source, self.context.plan.minimum_rank),
+                (Source::Ordinary(source), Some(minimum)) if source.minimum_rank_impossible(minimum))
     }
     fn feasible_team(&mut self, team: &Team, power: f64) -> Result<bool, String> {
         if !self.source.objective().feasible_team(team, power)? { return Ok(false); }
         let Some(minimum) = self.context.plan.minimum_rank else { return Ok(true); };
-        let exact = self.source.objective().exact(team, power, &[])?;
-        let settlement = if matches!(self.source, Source::Gekiso(_)) { &exact.detail["settlement"] } else { &exact.detail };
-        Ok(settlement["ranks"].as_object().is_some_and(|rows| !rows.is_empty() && rows.iter().all(|(rank,count)| count.as_u64().unwrap_or(0) == 0 || rank.parse::<i32>().is_ok_and(|rank| rank >= minimum))))
+        match &mut self.source {
+            Source::Ordinary(source) => {
+                let feasible = source.meets_minimum_rank(team, power, minimum)?;
+                if self.context.route.kind == RouteKind::Live {
+                    crate::progress::checked_reward_team();
+                }
+                Ok(feasible)
+            }
+            Source::Gekiso(source) => {
+                let exact = source.exact(team, power, &[])?;
+                Ok(exact.detail["settlement"]["ranks"].as_object().is_some_and(|rows| {
+                    !rows.is_empty() && rows.iter().all(|(rank, count)| {
+                        count.as_u64().unwrap_or(0) == 0 || rank.parse::<i32>().is_ok_and(|rank| rank >= minimum)
+                    })
+                }))
+            }
+        }
     }
     fn feasible_assignment(
         &self,
