@@ -6220,12 +6220,12 @@ impl Kernel<'_> {
                         } else {
                             local.get_or_insert_with(build)
                         };
-                        for chain in 0..2 {
+                        for (chain, points) in priced.events[event].iter().enumerate() {
                             let future = chain == 1 && prefix.selected_slots & (1 << slot) == 0;
                             if future && !future_chain {
                                 continue;
                             }
-                            if let Some(point) = priced.events[event][chain].iter().find(|point| {
+                            if let Some(point) = points.iter().find(|point| {
                                 point.snap < 0
                                     || !prefix.assigned[..prefix.from].contains(&point.snap)
                             }) {
