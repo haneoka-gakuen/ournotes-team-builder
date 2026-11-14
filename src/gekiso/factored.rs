@@ -1012,9 +1012,9 @@ impl<'a> ScoreTree<'a> {
                     state.score.add_fixed(end, bonus);
                 }
                 16..=31 => {
-                    for field in 0..4 {
+                    for (field, life) in state.life.iter_mut().enumerate() {
                         if op & (1 << field) != 0 {
-                            state.life[field] = self.trace.i32(&mut at);
+                            *life = self.trace.i32(&mut at);
                         }
                     }
                     self.ordinary(state)?;

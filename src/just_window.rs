@@ -994,7 +994,11 @@ impl Prepared {
                             .max(0),
                     );
                 before=before.min(early);after=after.min(late);
-                if let Some(capture)=&mut capture {for range in 0..3 {capture.add_points(range,self.phase_notes[index][range],early,late);}}
+                if let Some(capture) = &mut capture {
+                    for (range, &notes) in self.phase_notes[index].iter().enumerate() {
+                        capture.add_points(range, notes, early, late);
+                    }
+                }
             }
             if let Some(capture)=&mut capture {
                 let &(base_before,base_after)=master.live.just_windows.get(&1).or_else(||master.live.just_windows.values().next()).unwrap();

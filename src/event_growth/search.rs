@@ -337,8 +337,8 @@ impl Tier {
             }
         } else if axis < ctx.ids.len() + ctx.bands.len() {
             let band = axis - ctx.ids.len();
-            for slot in 0..5 {
-                if reading.bands[slot] == band {
+            for (slot, &slot_band) in reading.bands.iter().enumerate() {
+                if slot_band == band {
                     let curve = self.delta_curve(observation, slot, n);
                     range.0 += curve.iter().map(|r| r.0).min().unwrap();
                     range.1 += curve.iter().map(|r| r.1).max().unwrap();
@@ -837,8 +837,7 @@ impl Tier {
         let ctx = Arc::clone(&self.problem);
         let reading = &ctx.readings[observation];
         let mut axes = Vec::new();
-        for slot in 0..5 {
-            let role = reading.characters[slot];
+        for (slot, &role) in reading.characters.iter().enumerate() {
             let mut options = vec![(0, 0, 0)];
             for n in 1..=(ctx.maximums[role] - self.minimums[role])
                 .min(super::RANK_SPAN)
@@ -862,15 +861,15 @@ impl Tier {
             options.push((n * 5, -range.1, -range.0));
         }
         axes.push(options);
-        for band in 0..ctx.bands.len() {
+        for (band, info) in ctx.bands.iter().enumerate() {
             let mut options = vec![(0, 0, 0)];
             for n in 1..=super::ITEM_SPAN
                 .min(self.budget)
-                .min(ctx.bands[band].max - ctx.bands[band].min)
+                .min(info.max - info.min)
             {
                 let mut range = (0, 0);
-                for slot in 0..5 {
-                    if reading.bands[slot] == band {
+                for (slot, &slot_band) in reading.bands.iter().enumerate() {
+                    if slot_band == band {
                         let curve = self.delta_curve(observation, slot, n);
                         range.0 += curve.iter().map(|row| row.0).min().unwrap();
                         range.1 += curve.iter().map(|row| row.1).max().unwrap();
