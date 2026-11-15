@@ -863,6 +863,7 @@ struct RushProjection {
     changes: usize,
     bytes: usize,
 }
+type SupportProgram = (Vec<(i32, i32)>, i32);
 pub struct Kernel<'a> {
     master: &'a Master,
     members: &'a [Member],
@@ -915,8 +916,8 @@ pub struct Kernel<'a> {
     seeded_context_order: VecDeque<Vec<Performer>>,
     seeded_context_bytes: usize,
     levels: HashMap<i32, Arc<Level>>,
-    support_high: HashMap<(String, i32), f64>,
-    support_low: HashMap<String, f64>,
+    support_high: HashMap<(SupportProgram, i32), f64>,
+    support_low: HashMap<SupportProgram, f64>,
     base: Option<Arc<Weights>>,
     member_bases: HashMap<(i32, [u32; 5], usize), f64>,
     member_program_bases: HashMap<(i32, String), f64>,
@@ -3803,7 +3804,7 @@ impl<'a> Kernel<'a> {
             };
             if self
                 .support_high
-                .contains_key(&(json!([p.gekisou_support_skills, p.band_id]).to_string(), at))
+                .contains_key(&((p.gekisou_support_skills.clone(), p.band_id), at))
             {
                 continue;
             }
@@ -4390,7 +4391,7 @@ impl Kernel<'_> {
     fn low_of(&mut self, m: usize, s: i32) -> f64 {
         let mut support = 0.0;
         if let Some(p) = self.support(m, s) {
-            let key = json!([p.gekisou_support_skills, p.band_id]).to_string();
+            let key = (p.gekisou_support_skills.clone(), p.band_id);
             support = if let Some(&v) = self.support_low.get(&key) {
                 v
             } else {
@@ -5293,7 +5294,7 @@ impl Kernel<'_> {
             .find(|&&g| g >= level)
             .copied()
             .unwrap_or(self.maximum_level);
-        let key = (json!([p.gekisou_support_skills, p.band_id]).to_string(), at);
+        let key = ((p.gekisou_support_skills.clone(), p.band_id), at);
         if let Some(&value) = self.support_high.get(&key) {
             return value;
         }

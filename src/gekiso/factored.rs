@@ -1,4 +1,6 @@
-//! Native score replays share the judgement, LIFE and Gekiso control stream.
+//! Native score replays share judgement, LIFE and Gekiso control streams.
+//! Lottery-independent ordinary factor commands are replayed at their delivery
+//! frame across all sampled draws, with each score and rank settled separately.
 use super::*;
 use crate::master::SkillEffect;
 
@@ -19,6 +21,7 @@ struct Entry {
 }
 struct Scene {
     draws: Vec<Arc<ScoreTape>>,
+    shared_inputs: bool,
 }
 struct FixedFrame {
     judged: Vec<crate::full::play::JudgedNote>,
@@ -976,7 +979,7 @@ fn context(
                 .flat_map(|(skill, level)| skill.effects.iter().filter(move |row| row.level == level))
                 .all(|row| (2000..=2005).contains(&row.kind)
                     || (11000..=11005).contains(&row.kind) || row.kind == 4004)
-    }) && reduced.iter().any(|actor| !actor.support_skills.is_empty());
+    });
     let sampled = if fixed_inputs {
         let mut actors = reduced.clone();
         for actor in &mut actors { actor.support_skills.clear(); }
@@ -1055,7 +1058,7 @@ fn context(
         + key.seeds.capacity() * 4
         + key.ranks.capacity() * 4
         + key.events.capacity() * std::mem::size_of::<(usize, i32)>();
-    let context = Arc::new(Scene { draws });
+    let context = Arc::new(Scene { draws, shared_inputs: fixed_inputs });
     const LIMIT: usize = 2 * 1024 * 1024;
     if bytes <= LIMIT {
         let mut cache = chart.factored.lock().unwrap();
@@ -1076,9 +1079,14 @@ fn context(
     }
     Ok(context)
 }
+type OrdinaryTape = Arc<Vec<(usize, FactorCommand)>>;
+type OrdinaryOrders = [Option<OrdinaryTape>; 120];
 #[derive(Clone)]
 struct ScoreState<'a> {
-    program: Model<'a>,
+    program: Option<Model<'a>>,
+    ordinary_record: Vec<(usize, FactorCommand)>,
+    ordinary_replay: Option<OrdinaryTape>,
+    ordinary_at: usize,
     score: Incremental<'a>,
     combo: core::Combo,
     judged: Vec<crate::full::play::JudgedNote>,
@@ -1090,13 +1098,15 @@ struct ScoreState<'a> {
     next_frame: i32,
     previous_life: [i32; 4],
 }
-struct ScoreTree<'a> {
+struct ScoreTree<'a, 'o> {
     chart: &'a Chart,
     trace: &'a ScoreTape,
     chronological: Vec<usize>,
     generation: u64,
+    ordinary: Option<&'o mut OrdinaryOrders>,
+    reuse_ordinary: bool,
 }
-impl<'a> ScoreTree<'a> {
+impl<'a> ScoreTree<'a, '_> {
     fn calculate(&self, state: &mut ScoreState<'a>, time: i32) -> Result<(), String> {
         state.last[0] = state.last[1];
         state.last[1] = state.score.calculate(time, &state.combo, None)?;
@@ -1104,23 +1114,34 @@ impl<'a> ScoreTree<'a> {
     }
     fn ordinary(&self, state: &mut ScoreState<'a>) -> Result<(), String> {
         let time = self.chart.play.frames[state.frame].time_ms;
-        if !state.sparse || !state.judged.is_empty()
-            || state.previous_life != state.life || time >= state.next_frame {
-            state.program.life.freeze_frame([
-                (state.life[0], state.life[1]), (state.life[2], state.life[3]),
-            ]);
-            state.program.count_frame(time, &state.judged, self.chart.play.dt[state.frame])?;
+        if let Some(tape) = &state.ordinary_replay {
+            while state.ordinary_at < tape.len() && tape[state.ordinary_at].0 == state.frame {
+                state.score.add_factor(tape[state.ordinary_at].1.clone());
+                state.ordinary_at += 1;
+            }
             state.previous_life = state.life;
-            state.next_frame = state.program.next_score_frame(time);
+            state.next_frame = tape.get(state.ordinary_at).map_or(i32::MAX, |&(frame, _)| self.chart.play.frames[frame].time_ms);
+        } else {
+            let program = state.program.as_mut().unwrap();
+            if !state.sparse || !state.judged.is_empty()
+                || state.previous_life != state.life || time >= state.next_frame {
+                program.life.freeze_frame([
+                    (state.life[0], state.life[1]), (state.life[2], state.life[3]),
+                ]);
+                program.count_frame(time, &state.judged, self.chart.play.dt[state.frame])?;
+                state.previous_life = state.life;
+                state.next_frame = program.next_score_frame(time);
+            }
+            for command in program.score.score.replay.as_mut().unwrap().drain(..) {
+                if let ReplayCommand::Factor(mut command) = command {
+                    command.owner *= 2;
+                    if self.ordinary.is_some() { state.ordinary_record.push((state.frame, command.clone())); }
+                    state.score.add_factor(command);
+                }
+            }
         }
         state.judged.clear();
         state.frame += 1;
-        for command in state.program.score.score.replay.as_mut().unwrap().drain(..) {
-            if let ReplayCommand::Factor(mut command) = command {
-                command.owner *= 2;
-                state.score.add_factor(command);
-            }
-        }
         Ok(())
     }
     fn advance(&self, state: &mut ScoreState<'a>, from: usize, until: usize) -> Result<(), String> {
@@ -1131,15 +1152,21 @@ impl<'a> ScoreTree<'a> {
             match op {
                 0 => {
                     state.judged.clear();
-                    for raw in &self.chart.play.frames[state.frame].judged {
-                        let judgement = i32::from(self.trace.bytes[at]);
-                        at += 1;
-                        if self.trace.combos.is_none() { state.combo.add(raw.time_ms, judgement); }
-                        state.judged.push(crate::full::play::JudgedNote {
-                            note_id: raw.note_id,
-                            time_ms: raw.time_ms,
-                            judgement,
-                        });
+                    if self.reuse_ordinary && self.trace.combos.is_some() {
+                        at += self.chart.play.frames[state.frame].judged.len();
+                    } else {
+                        for raw in &self.chart.play.frames[state.frame].judged {
+                            let judgement = i32::from(self.trace.bytes[at]);
+                            at += 1;
+                            if self.trace.combos.is_none() { state.combo.add(raw.time_ms, judgement); }
+                            if !self.reuse_ordinary {
+                                state.judged.push(crate::full::play::JudgedNote {
+                                    note_id: raw.note_id,
+                                    time_ms: raw.time_ms,
+                                    judgement,
+                                });
+                            }
+                        }
                     }
                 }
                 1 => {
@@ -1217,7 +1244,7 @@ impl<'a> ScoreTree<'a> {
         Ok(())
     }
     fn visit(
-        &self,
+        &mut self,
         mut state: ScoreState<'a>,
         orders: &[usize],
         from: usize,
@@ -1228,14 +1255,17 @@ impl<'a> ScoreTree<'a> {
             return Err("cancelled".into());
         }
         let representative = &live::orders()[orders[0]];
-        let events: Vec<_> = self
-            .chart
-            .full
-            .events
-            .iter()
-            .map(|&(event, time)| (representative[event], time))
-            .collect();
-        state.program.set_event_members(&events);
+        if let Some(program) = &mut state.program {
+            let events: Vec<_> = self.chart.full.events.iter()
+                .map(|&(event, time)| (representative[event], time)).collect();
+            program.set_event_members(&events);
+        }
+        if self.reuse_ordinary {
+            let tape = self.ordinary.as_ref().unwrap()[orders[0]].as_ref().unwrap();
+            state.ordinary_at = tape.partition_point(|&(frame, _)| frame < state.frame);
+            state.next_frame = tape.get(state.ordinary_at).map_or(i32::MAX, |&(frame, _)| self.chart.play.frames[frame].time_ms);
+            state.ordinary_replay = Some(Arc::clone(tape));
+        }
         let split = (fixed..self.chronological.len()).find(|&at| {
             let event = self.chart.full.events[self.chronological[at]].0;
             orders
@@ -1247,8 +1277,11 @@ impl<'a> ScoreTree<'a> {
         });
         self.advance(&mut state, from, until)?;
         if until == self.trace.bytes.len() {
+            let tape = (!self.reuse_ordinary && self.ordinary.is_some())
+                .then(|| Arc::new(std::mem::take(&mut state.ordinary_record)));
             for &order in orders {
                 values[order] = (state.score.score as f64, state.ranges);
+                if let Some(tape) = &tape { self.ordinary.as_mut().unwrap()[order] = Some(Arc::clone(tape)); }
             }
             return Ok(());
         }
@@ -1273,13 +1306,14 @@ impl<'a> ScoreTree<'a> {
 }
 fn score_orders<'a>(
     master: &'a Master,
-    ordinary: &'a Master,
     chart: &'a Chart,
     deck: &[Performer],
     draw: &'a ScoreTape,
     power: i32,
     orders: &[usize],
+    (ordinary, ordinary_orders): (&'a Master, Option<&mut OrdinaryOrders>),
 ) -> Result<Option<Vec<ReplayValue>>, String> {
+    let reuse_ordinary = ordinary_orders.as_ref().is_some_and(|rows| orders.iter().all(|&order| rows[order].is_some()));
     let trace = draw;
     let order = &live::orders()[orders[0]];
     let events: Vec<_> = chart
@@ -1300,18 +1334,16 @@ fn score_orders<'a>(
     }
     let capacity = [capacity.into_iter().max().unwrap_or(0); 5];
     let params = chart.params();
-    let mut program = Model::with_live_capacity(
-        ordinary,
-        deck,
-        &chart.full.notes,
-        &events,
-        params.clone(),
-        None,
-        (0, false, Some(&capacity)),
-    )?;
-    program.score.score.replay = Some(Vec::new());
-    program.score.score.record_only = true;
-    let sparse = program.sparse_score_frames();
+    let program = if reuse_ordinary { None } else {
+        let mut program = Model::with_live_capacity(
+            ordinary, deck, &chart.full.notes, &events, params.clone(), None,
+            (0, false, Some(&capacity)),
+        )?;
+        program.score.score.replay = Some(Vec::new());
+        program.score.score.record_only = true;
+        Some(program)
+    };
+    let sparse = program.as_ref().is_none_or(Model::sparse_score_frames);
     let mut calculator = Calculator::new(
         &master.live,
         power,
@@ -1323,6 +1355,9 @@ fn score_orders<'a>(
     calculator.cache_bases();
     let state = ScoreState {
         program,
+        ordinary_record: Vec::new(),
+        ordinary_replay: None,
+        ordinary_at: 0,
         score: Incremental::new(calculator, params.music_length),
         combo: core::Combo::default(),
         judged: Vec::new(),
@@ -1336,11 +1371,13 @@ fn score_orders<'a>(
     };
     let mut chronological: Vec<_> = (0..events.len()).collect();
     chronological.sort_by_key(|&event| (events[event].1, event));
-    let tree = ScoreTree {
+    let mut tree = ScoreTree {
         chart,
         trace,
         chronological,
         generation: crate::cancellation_generation(),
+        ordinary: ordinary_orders,
+        reuse_ordinary,
     };
     let mut values = vec![(0.0, [0.0; 3]); 120];
     tree.visit(state, orders, 0, 0, &mut values)?;
@@ -1431,6 +1468,9 @@ pub(super) fn scores(
         )?;
         let draws = &context.draws;
         let mut scored = HashMap::<*const ScoreTape, Vec<ReplayValue>>::default();
+        let mut ordinary_orders: OrdinaryOrders = std::array::from_fn(|_| None);
+        let reuse_ordinary = context.shared_inputs && draws.iter().skip(1)
+            .any(|draw| !Arc::ptr_eq(draw, &draws[0]));
         for draw in draws {
             if generation != crate::cancellation_generation() {
                 return Err("cancelled".into());
@@ -1438,7 +1478,8 @@ pub(super) fn scores(
             let result = match scored.entry(Arc::as_ptr(draw)) {
                 std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
                 std::collections::hash_map::Entry::Vacant(entry) => {
-                    let Some(result) = score_orders(master, &ordinary_master, chart, deck, draw, power, &orders)? else {
+                    let Some(result) = score_orders(master, chart, deck, draw, power, &orders,
+                        (&ordinary_master, reuse_ordinary.then_some(&mut ordinary_orders)))? else {
                         return Ok(None);
                     };
                     entry.insert(result)
