@@ -2239,6 +2239,12 @@ struct ReplayTree<'a,const SECTIONS:bool,const COUNTS:bool=false> {
     stopped: AtomicBool,
     detail: Option<&'a ReplayDetail<'a>>,
 }
+struct OrderSplit {
+    at: usize,
+    frame: usize,
+    end: usize,
+}
+
 impl<const SECTIONS:bool,const COUNTS:bool> ReplayTree<'_,SECTIONS,COUNTS> {
     fn advance(&self, model: &mut Model<'_>, from: usize, to: usize) -> Result<(), String> {
         for k in from..to {
@@ -2252,6 +2258,31 @@ impl<const SECTIONS:bool,const COUNTS:bool> ReplayTree<'_,SECTIONS,COUNTS> {
         }
         Ok(())
     }
+    fn order_split(&self, orders: &[usize], fixed: usize) -> Option<OrderSplit> {
+        let representative = &self.events[orders[0]];
+        let at = (fixed..self.chronological.len()).find(|&at| {
+            let event = self.chronological[at];
+            orders.iter().any(|&order| self.events[order][event].0 != representative[event].0)
+        })?;
+        let time = representative[self.chronological[at]].1;
+        let frame = self.chart.play.frames.partition_point(|frame| frame.time_ms < time);
+        let time = self.chart.play.frames.get(frame)?.time_ms;
+        let end = self.chronological.partition_point(|&event| representative[event].1 <= time);
+        Some(OrderSplit { at, frame, end })
+    }
+
+    fn order_groups(&self, orders: &[usize], split: &OrderSplit) -> impl Iterator<Item = Vec<usize>> {
+        let mut groups = std::collections::BTreeMap::<Vec<usize>, Vec<usize>>::new();
+        for &order in orders {
+            let key = self.chronological[split.at..split.end]
+                .iter()
+                .map(|&event| self.events[order][event].0)
+                .collect();
+            groups.entry(key).or_default().push(order);
+        }
+        groups.into_values()
+    }
+
     fn visit(
         &self,
         mut model: Model<'_>,
@@ -2263,22 +2294,10 @@ impl<const SECTIONS:bool,const COUNTS:bool> ReplayTree<'_,SECTIONS,COUNTS> {
         if self.stopped.load(Ordering::Relaxed) {
             return Ok(false);
         }
-        let representative = &self.events[orders[0]];
-        let split = (fixed..self.chronological.len()).find(|&at| {
-            let event = self.chronological[at];
-            orders
-                .iter()
-                .any(|&order| self.events[order][event].0 != representative[event].0)
-        });
-        let until = split.map_or(self.chart.play.frames.len(), |at| {
-            let time = representative[self.chronological[at]].1;
-            self.chart
-                .play
-                .frames
-                .partition_point(|frame| frame.time_ms < time)
-        });
+        let split = self.order_split(orders, fixed);
+        let until = split.as_ref().map_or(self.chart.play.frames.len(), |split| split.frame);
         self.advance(&mut model, from, until)?;
-        if until == self.chart.play.frames.len() {
+        let Some(split) = split else {
             if let Some(detail) = self.detail { detail(&model, orders); }
             let mut ranges = [0.0; 3];
             if let Some(g) = &model.gk {
@@ -2301,29 +2320,16 @@ impl<const SECTIONS:bool,const COUNTS:bool> ReplayTree<'_,SECTIONS,COUNTS> {
                 values[order] = (score, ranges);
             }
             return Ok(true);
-        }
-        let at = split.unwrap();
-        let time = self.chart.play.frames[until].time_ms;
-        let end = self
-            .chronological
-            .partition_point(|&event| representative[event].1 <= time);
-        let mut groups = std::collections::BTreeMap::<Vec<usize>, Vec<usize>>::new();
-        for &order in orders {
-            let key = self.chronological[at..end]
-                .iter()
-                .map(|&event| self.events[order][event].0)
-                .collect();
-            groups.entry(key).or_default().push(order);
-        }
-        let mut groups = groups.into_values().peekable();
+        };
+        let mut groups = self.order_groups(orders, &split).peekable();
         while let Some(orders) = groups.next() {
             if groups.peek().is_none() {
                 model.set_event_members(&self.events[orders[0]]);
-                return self.visit(model, &orders, until, end, values);
+                return self.visit(model, &orders, until, split.end, values);
             }
             let mut branch = model.clone();
             branch.set_event_members(&self.events[orders[0]]);
-            if !self.visit(branch, &orders, until, end, values)? {
+            if !self.visit(branch, &orders, until, split.end, values)? {
                 return Ok(false);
             }
         }
