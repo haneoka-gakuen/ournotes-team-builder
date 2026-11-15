@@ -384,10 +384,29 @@ pub struct GekisoLive {
     pub rank_bonus: Vec<RankBonus>,
     pub(crate) section_opponents: Option<Arc<Vec<[crate::gekiso::sections::Standing; 3]>>>,
 }
+enum NoteIndex {
+    Dense(Vec<LiveNote>),
+    Sparse(HashMap<i32, LiveNote>),
+}
+impl NoteIndex {
+    fn new(notes: &[LiveNote]) -> Self {
+        if notes.iter().enumerate().all(|(index, note)| note.id == index as i32 + 1) {
+            Self::Dense(notes.to_vec())
+        } else {
+            Self::Sparse(notes.iter().map(|note| (note.id, note.clone())).collect())
+        }
+    }
+    fn get(&self, id: &i32) -> Option<&LiveNote> {
+        match self {
+            Self::Dense(notes) => id.checked_sub(1).and_then(|index| notes.get(index as usize)),
+            Self::Sparse(notes) => notes.get(id),
+        }
+    }
+}
 #[derive(Clone)]
 pub struct Model<'a> {
     pub master: &'a Master,
-    notes: Rc<HashMap<i32, LiveNote>>,
+    notes: Rc<NoteIndex>,
     events: Vec<(usize, i32)>,
     by_time: Vec<usize>,
     pub random: Random,
@@ -551,7 +570,7 @@ impl<'a> Model<'a> {
         let life_length = notes.iter().map(|n| n.time_ms).max().unwrap_or(0).max(0) + 1000;
         let mut model = Self {
             master,
-            notes: Rc::new(notes.iter().map(|n| (n.id, n.clone())).collect()),
+            notes: Rc::new(NoteIndex::new(notes)),
             events: events.to_vec(),
             by_time,
             random: Random::new(seed),
@@ -966,12 +985,52 @@ impl<'a> Model<'a> {
         let live = self.enabled.iter().flat_map(|&index| &self.live[index].effects)
             .map(|effect| wake(&effect.state, effect.act, time));
         let supports = self.condition.iter().flat_map(|condition| {
-            condition.updater.updaters.iter().map(|updater| {
+            condition.updater.active_updaters().map(|updater| {
                 wake(&updater.state, condition.updater.effects[updater.effect].act, time)
             })
         });
         live.chain(supports).chain(self.by_time.get(self.fired).map(|&index| self.events[index].1))
             .min().unwrap_or(i32::MAX)
+    }
+    pub(crate) fn sparse_inputs(&self) -> bool {
+        let recorded = self.record.is_some();
+        !self.record_trace && self.just_window.is_none()
+            && self.rush_observers.is_empty() && self.combo_observer.is_none()
+            && self.live.iter().flat_map(|skill| &skill.effects).all(|effect| {
+                [&effect.condition, &effect.release].into_iter().flatten().all(|checker| checker.inputs_only(recorded))
+                    && !matches!(effect.cumulative, Some(Cumulative::Elapsed { .. }))
+            })
+            && self.condition.iter().all(|condition| condition.updater.inputs_only(recorded))
+    }
+    pub(crate) fn inputs_settled(&self) -> bool {
+        self.judged.is_empty() && self.frame_events.is_empty()
+            && self.frame_rank.is_none() && self.previous_rank.is_none()
+            && self.gk.as_ref().is_some_and(|g| g.controller.updates.is_empty()
+                && g.previous_lots.is_empty() && g.controller.states.iter().all(|state|
+                    [gekisou::WAIT, gekisou::STANDBY, gekisou::PLAYING, gekisou::FINISH].contains(&state.state)
+                        && state.luck.lots == 0))
+            && self.condition.iter().all(|condition| condition.updater.frame_settled())
+    }
+    pub(crate) fn idle_frame(&mut self, time: i32) -> Result<(), String> {
+        self.frame_time = time;
+        if let Some(record) = &mut self.record {
+            let previous = record.frames.last().unwrap();
+            record.frames.push(LuckFrame { states: Arc::clone(&previous.states), updates: Vec::new(), playing: previous.playing });
+        }
+        if self.score.score.factored_record {
+            self.score.score.calculate(time, &self.combo, None)?;
+            self.life.enter_phase(1);
+            let first = (self.life.at(time), self.life.maximum());
+            self.life.enter_phase(2);
+            let second = (self.life.at(time), self.life.maximum());
+            self.life.sync(time);
+            self.score.score.replay.as_mut().unwrap().push(score::ReplayCommand::Ordinary(time, [first, second]));
+            self.score.score.calculate(time, &self.combo, None)?;
+        } else {
+            self.life.sync(time);
+            self.score.score.calculate(time, &self.combo, self.gk.as_ref().map(|g| &g.controller as &dyn score::GekisoCombo))?;
+        }
+        Ok(())
     }
     fn condition_indices(&mut self) -> ConditionIndices {
         let mut selected = self.condition_schedule.as_ref().map(|schedule| schedule.select(
@@ -1027,7 +1086,7 @@ impl<'a> Model<'a> {
         self.frame_events.clear();
         self.judged.clear();
         for input in judged {
-            let note = &self.notes[&input.note_id];
+            let note = self.notes.get(&input.note_id).ok_or_else(|| format!("unknown note {}", input.note_id))?;
             let value = self.conversion.convert(input.judgement, note.judgement_type, input.time_ms)?;
             self.judged.push((note.id, value, note.time_ms));
         }

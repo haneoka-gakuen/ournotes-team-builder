@@ -1,6 +1,7 @@
 //! Native score replays share judgement, LIFE and Gekiso control streams.
 //! Lottery-independent ordinary factor commands are replayed at their delivery
-//! frame across all sampled draws, with each score and rank settled separately.
+//! frame across all sampled draws. Equivalent input/LIFE streams share bounded
+//! sample tapes; each of the 120 scores and ranks is settled separately.
 use super::*;
 use crate::master::SkillEffect;
 
@@ -27,6 +28,38 @@ struct FixedFrame {
     judged: Vec<crate::full::play::JudgedNote>,
     life: [(i32, i32); 2],
 }
+struct SampleEntry {
+    input: Vec<u8>,
+    draws: Vec<Arc<ScoreTape>>,
+    bytes: usize,
+}
+#[derive(Default)]
+struct SampleCache {
+    entries: std::collections::VecDeque<SampleEntry>,
+    bytes: usize,
+}
+impl SampleCache {
+    fn get(&mut self, input: &[u8]) -> Option<Vec<Arc<ScoreTape>>> {
+        let index = self.entries.iter().position(|entry| entry.input == input)?;
+        let entry = self.entries.remove(index).unwrap();
+        let draws = entry.draws.clone();
+        self.entries.push_back(entry);
+        Some(draws)
+    }
+    fn insert(&mut self, input: Vec<u8>, draws: &[Arc<ScoreTape>]) {
+        let mut unique = std::collections::HashSet::new();
+        let bytes = input.capacity() + std::mem::size_of_val(draws)
+            + draws.iter().filter(|draw| unique.insert(Arc::as_ptr(draw))).map(|draw| draw.retained_bytes()).sum::<usize>() + 128;
+        const LIMIT: usize = 4 * 1024 * 1024;
+        if bytes > LIMIT { return; }
+        while self.bytes + bytes > LIMIT {
+            if let Some(entry) = self.entries.pop_front() { self.bytes -= entry.bytes; } else { break; }
+        }
+        self.bytes += bytes;
+        self.entries.push_back(SampleEntry { input, draws: draws.to_vec(), bytes });
+    }
+}
+
 #[derive(PartialEq, Eq, Hash)]
 struct ScoreTape {
     bytes: Vec<u8>,
@@ -435,6 +468,69 @@ fn ordinary(master: &Master, actor: &Performer) -> Option<(bool, bool)> {
         }
     }
     Some((retained, ordered))
+}
+fn recovery_program(master: &Master, actor: &Performer) -> Option<Vec<i32>> {
+    let mut values = Vec::new();
+    for &(id, level) in &actor.support_skills {
+        let mut rows: Vec<_> = master.support_skills.get(&id)?.iter().filter(|row| row.level == level).collect();
+        rows.sort_unstable_by_key(|row| row.id);
+        for row in rows {
+            if (2000..=2005).contains(&row.kind) || row.kind == 15000 { continue; }
+            if row.kind != 3001 || row.value < 0 || row.seconds != 0.0 || row.trigger_type != 1
+                || row.cumulative_id != 0 || row.release_group != 0 || row.reset_group != 0 || row.execute_limit != 0 { return None; }
+            let trigger = master.condition_sets.get(&row.trigger_group)?;
+            if trigger.len() != 1 || trigger[0].len() != 1 { return None; }
+            let condition = &master.conditions[&trigger[0][0]];
+            if !condition.positive || !matches!(condition.kind, 4010 | 5020) { return None; }
+            let mut enabled = row.condition_group == 0;
+            if row.condition_group != 0 {
+                for set in master.condition_sets.get(&row.condition_group)? {
+                    let mut matched = true;
+                    for id in set {
+                        let condition = &master.conditions[id];
+                        if condition.kind != 5000 { return None; }
+                        matched &= condition.targets.iter().any(|id|
+                            crate::full::conditions::performer_matches(actor, &master.targets[id])) == condition.positive;
+                    }
+                    enabled |= matched;
+                }
+            }
+            if enabled { values.push(row.value); }
+        }
+    }
+    Some(values)
+}
+fn control_classes(master: &Master, chart: &Chart, deck: &[Performer], ordinary: &[(bool, bool)]) -> Vec<usize> {
+    let mut classes: Vec<_> = ordinary.iter().enumerate().map(|(index, flags)| if flags.1 { index + 1 } else { 0 }).collect();
+    let mut frames: Vec<_> = chart.full.events.iter().map(|&(_, time)| chart.play.frames.partition_point(|frame| frame.time_ms < time)).collect();
+    frames.sort_unstable();
+    if frames.windows(2).any(|pair| pair[0] == pair[1]) { return classes; }
+    let mut programs = Vec::new();
+    for actor in deck {
+        let program = recovery_program(master, actor);
+        for &(id, level) in &actor.support_skills {
+            for row in master.support_skills[&id].iter().filter(|row| row.level == level) {
+                if matches!(row.kind, 3000..=3004) && (row.kind != 3001 || program.is_none()) { return classes; }
+            }
+        }
+        let rows = actor.gekisou_skill.into_iter().filter_map(|(id, level)| master.gekiso_skills.get(&id).map(|skill| (skill, level)))
+            .chain(actor.gekisou_support_skills.iter().filter_map(|&(id, level)| master.gekiso_support_skills.get(&id).map(|skill| (skill, level))))
+            .filter(|(skill, _)| skill.mission_type == 4 || chart.setup.missions.contains(&skill.mission_type))
+            .flat_map(|(skill, level)| skill.effects.iter().filter(move |row| row.level == level));
+        if rows.into_iter().any(|row| matches!(row.kind, 3000..=3004)) { return classes; }
+        programs.push(program);
+    }
+    let mut ids = HashMap::default();
+    for (index, program) in programs.into_iter().enumerate() {
+        if !ordinary[index].1 { continue; }
+        if let Some(program) = program {
+            if program.is_empty() { classes[index] = 0; } else {
+                let next = deck.len() + 1 + ids.len();
+                classes[index] = *ids.entry(program).or_insert(next);
+            }
+        }
+    }
+    classes
 }
 fn ignore_dead_heal_order(master: &Master, chart: &Chart, deck: &[Performer], seeds: &[i32], flags: &mut [(bool, bool)]) -> Result<(), String> {
     let gate = |group: i32, kinds: &[i32]| group != 0 && master.condition_sets.get(&group)
@@ -906,8 +1002,8 @@ fn context(
     chart: &Chart,
     deck: &[Performer],
     seeds: &[i32],
-    ordinary: &[(bool, bool)],
-    order: &[usize; 5],
+    (ordinary, order): (&[(bool, bool)], &[usize; 5]),
+    samples: &mut SampleCache,
 ) -> Result<Arc<Scene>, String> {
     let mut reduced: Vec<_> = deck.iter().map(Performer::gekiso_only).collect();
     for (i, actor) in reduced.iter_mut().enumerate() {
@@ -978,7 +1074,8 @@ fn context(
                 .filter(|(skill, _)| skill.mission_type == 4 || chart.setup.missions.contains(&skill.mission_type))
                 .flat_map(|(skill, level)| skill.effects.iter().filter(move |row| row.level == level))
                 .all(|row| (2000..=2005).contains(&row.kind)
-                    || (11000..=11005).contains(&row.kind) || row.kind == 4004)
+                    || (11000..=11005).contains(&row.kind)
+                    || matches!(row.kind, 4004 | 12000 | 12002 | 12003 | 12004 | 13000 | 13002 | 13003 | 13004))
     });
     let sampled = if fixed_inputs {
         let mut actors = reduced.clone();
@@ -994,26 +1091,41 @@ fn context(
     let lottery_record = chart.setup.missions.iter().all(|&mission| mission == 2)
         && sampled.as_ref().is_some_and(Model::can_record_lottery);
     let mut prepared: Option<Vec<FixedFrame>> = None;
+    let mut prepared_next = Vec::new();
     let mut note_life = if fixed_inputs { vec![0; chart.full.notes.len() + 1] } else { Vec::new() };
     let mut draws = Vec::new();
     let mut unique = HashMap::<Arc<ScoreTape>, ()>::default();
+    let mut sample_input = None;
     let generation = crate::cancellation_generation();
     for (run, seed) in runs.iter().copied().enumerate() {
         let mut current = if run > 0 { sampled.as_ref().unwrap_or(&model) } else { &model }.clone();
         current.random = Random::new(seed);
+        let sparse = current.sparse_inputs();
+        let next = sparse.then(|| if run > 0 && fixed_inputs { prepared_next.as_slice() } else { chart.sparse_inputs() });
+        let (mut until, mut quiet) = (0, 0);
         for (index, frame) in chart.play.frames.iter().enumerate() {
             if index % 64 == 0 && generation != crate::cancellation_generation() {
                 return Err("cancelled".into());
             }
-            if let Some(prepared) = prepared.as_ref().filter(|_| run > 0) {
-                current.life.freeze_frame(prepared[index].life);
-                if lottery_record {
-                    current.record_lottery_frame(frame.time_ms, &prepared[index].judged, chart.play.dt[index])?;
-                } else {
-                    current.frame(frame.time_ms, &prepared[index].judged, chart.play.dt[index])?;
-                }
+            let fixed = prepared.as_ref().filter(|_| run > 0);
+            if let Some(prepared) = fixed { current.life.freeze_frame(prepared[index].life); }
+            if index < until {
+                current.idle_frame(frame.time_ms)?;
             } else {
-                current.frame(frame.time_ms, &frame.judged, chart.play.dt[index])?;
+                if let Some(prepared) = fixed {
+                    if lottery_record {
+                        current.record_lottery_frame(frame.time_ms, &prepared[index].judged, chart.play.dt[index])?;
+                    } else {
+                        current.frame(frame.time_ms, &prepared[index].judged, chart.play.dt[index])?;
+                    }
+                } else {
+                    current.frame(frame.time_ms, &frame.judged, chart.play.dt[index])?;
+                }
+                quiet = if sparse && current.inputs_settled() { quiet + 1 } else { 0 };
+                if quiet >= 2 {
+                    let wake = current.next_score_frame(frame.time_ms);
+                    until = chart.before_wake(next.unwrap()[index + 1], wake);
+                }
             }
             current.score.score.calculator.observations.clear();
         }
@@ -1030,6 +1142,13 @@ fn context(
                 }
             }
             debug_assert_eq!(inputs.len(), chart.play.frames.len());
+            let base = chart.sparse_inputs();
+            prepared_next = vec![chart.play.frames.len(); base.len()];
+            let mut after = chart.play.frames.len();
+            for index in (0..inputs.len()).rev() {
+                if base[index] == index || index == 0 || inputs[index].life != inputs[index - 1].life { after = index; }
+                prepared_next[index] = after;
+            }
             prepared = Some(inputs);
         } else if fixed_inputs {
             for command in &mut trace {
@@ -1047,7 +1166,27 @@ fn context(
             unique.insert(Arc::clone(&draw), ());
             draws.push(draw);
         }
+        if run == 0 && fixed_inputs {
+            let mut input = Vec::with_capacity(chart.play.frames.len() * 16 + chart.full.notes.len() * 5);
+            for frame in prepared.as_ref().unwrap() {
+                for &(life, maximum) in &frame.life {
+                    input.extend_from_slice(&life.to_le_bytes());
+                    input.extend_from_slice(&maximum.to_le_bytes());
+                }
+                input.extend(frame.judged.iter().map(|note| note.judgement as u8));
+            }
+            for life in &note_life { input.extend_from_slice(&life.to_le_bytes()); }
+            if let Some(cached) = samples.get(&input) {
+                for draw in cached {
+                    if let Some((stored, _)) = unique.get_key_value(&draw) { draws.push(Arc::clone(stored)); }
+                    else { unique.insert(Arc::clone(&draw), ()); draws.push(draw); }
+                }
+                break;
+            }
+            sample_input = Some(input);
+        }
     }
+    if let Some(input) = sample_input { samples.insert(input, &draws[1..]); }
     let bytes = unique
         .keys()
         .map(|draw| draw.retained_bytes())
@@ -1311,7 +1450,7 @@ fn score_orders<'a>(
     draw: &'a ScoreTape,
     power: i32,
     orders: &[usize],
-    (ordinary, ordinary_orders): (&'a Master, Option<&mut OrdinaryOrders>),
+    (ordinary, ordinary_orders, note_memo): (&'a Master, Option<&mut OrdinaryOrders>, &mut Option<std::rc::Rc<crate::full::score::NoteMemo>>),
 ) -> Result<Option<Vec<ReplayValue>>, String> {
     let reuse_ordinary = ordinary_orders.as_ref().is_some_and(|rows| orders.iter().all(|&order| rows[order].is_some()));
     let trace = draw;
@@ -1352,7 +1491,7 @@ fn score_orders<'a>(
         params.assist,
     );
     calculator.note_combos.clone_from(&draw.combos);
-    calculator.cache_bases();
+    calculator.share_note_memo(note_memo, chart.full.notes.len());
     let state = ScoreState {
         program,
         ordinary_record: Vec::new(),
@@ -1439,12 +1578,13 @@ pub(super) fn scores(
     healthy_controls(master, chart, deck, &mut ordinary);
     ignore_dead_heal_order(master, chart, deck, seeds, &mut ordinary)?;
     let (control, ordinary_master) = views(master, chart);
+    let classes = control_classes(master, chart, deck, &ordinary);
     let mut groups = Vec::<Vec<usize>>::new();
     let mut ids = HashMap::default();
     for (index, order) in live::orders().iter().enumerate() {
         let key: Vec<_> = order
             .iter()
-            .map(|&actor| if ordinary[actor].1 { actor } else { usize::MAX })
+            .map(|&actor| classes[actor])
             .collect();
         let next = groups.len();
         let group = *ids.entry(key).or_insert(next);
@@ -1456,6 +1596,8 @@ pub(super) fn scores(
     let generation = crate::cancellation_generation();
     let mut values = vec![0.0; 120];
     let mut range_values = [[0.0; 3]; 120];
+    let mut note_memo = None;
+    let mut sample_cache = SampleCache::default();
     for orders in groups {
         let context = context(
             master,
@@ -1463,8 +1605,8 @@ pub(super) fn scores(
             chart,
             deck,
             seeds,
-            &ordinary,
-            &live::orders()[orders[0]],
+            (&ordinary, &live::orders()[orders[0]]),
+            &mut sample_cache,
         )?;
         let draws = &context.draws;
         let mut scored = HashMap::<*const ScoreTape, Vec<ReplayValue>>::default();
@@ -1479,7 +1621,7 @@ pub(super) fn scores(
                 std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     let Some(result) = score_orders(master, chart, deck, draw, power, &orders,
-                        (&ordinary_master, reuse_ordinary.then_some(&mut ordinary_orders)))? else {
+                        (&ordinary_master, reuse_ordinary.then_some(&mut ordinary_orders), &mut note_memo))? else {
                         return Ok(None);
                     };
                     entry.insert(result)

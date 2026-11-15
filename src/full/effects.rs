@@ -455,6 +455,20 @@ impl ConditionUpdater {
     pub(super) fn executing(&self) -> bool {
         !self.executing.is_empty()
     }
+    pub(crate) fn inputs_only(&self, recorded: bool) -> bool {
+        self.effects.iter().all(|effect| {
+            [&effect.trigger, &effect.condition, &effect.release, &effect.reset].into_iter().flatten().all(|checker| checker.inputs_only(recorded))
+                && !matches!(effect.cumulative, Some(Cumulative::Elapsed { .. }))
+        })
+    }
+    pub(crate) fn active_updaters(&self) -> impl Iterator<Item = &Updater> {
+        self.executing.iter().copied().chain(self.sustained.iter().flatten().flat_map(|state|
+            state.current.into_iter().chain(state.executing.iter().copied())))
+            .map(|index| &self.updaters[index])
+    }
+    pub(crate) fn frame_settled(&self) -> bool {
+        self.active_updaters().all(|updater| matches!(updater.state.state, STAY | EXECUTING))
+    }
     pub(crate) fn can_pause_lottery(&self) -> bool {
         self.lottery_pause && self.updaters.iter().all(|updater| matches!(updater.state.state, STAY | EXECUTING))
     }

@@ -863,7 +863,7 @@ struct RushProjection {
     changes: usize,
     bytes: usize,
 }
-type SupportProgram = (Vec<(i32, i32)>, i32);
+type SupportValues = HashMap<Vec<(i32, i32)>, f64>;
 pub struct Kernel<'a> {
     master: &'a Master,
     members: &'a [Member],
@@ -916,8 +916,8 @@ pub struct Kernel<'a> {
     seeded_context_order: VecDeque<Vec<Performer>>,
     seeded_context_bytes: usize,
     levels: HashMap<i32, Arc<Level>>,
-    support_high: HashMap<(SupportProgram, i32), f64>,
-    support_low: HashMap<SupportProgram, f64>,
+    support_high: HashMap<(i32, i32), SupportValues>,
+    support_low: HashMap<i32, SupportValues>,
     base: Option<Arc<Weights>>,
     member_bases: HashMap<(i32, [u32; 5], usize), f64>,
     member_program_bases: HashMap<(i32, String), f64>,
@@ -3192,12 +3192,11 @@ impl<'a> Kernel<'a> {
     fn slot(&self, m: usize, s: i32) -> &Slot {
         &self.slots[self.slot_index(m, s)]
     }
+    fn support_ref(&self, m: usize, s: i32) -> Option<&Performer> {
+        (s >= 0).then(|| self.support[m * self.snaps.len() + s as usize].as_ref()).flatten()
+    }
     fn support(&self, m: usize, s: i32) -> Option<Performer> {
-        if s < 0 {
-            None
-        } else {
-            self.support[m * self.snaps.len() + s as usize].clone()
-        }
+        self.support_ref(m, s).cloned()
     }
     fn performer_key(&mut self, p: &Performer) -> u32 {
         if let Some(&id) = self.performer_key_cache.get(p) {
@@ -3650,11 +3649,12 @@ impl<'a> Kernel<'a> {
     }
     /// The sorted deck and its cache key.
     fn deck_key(&mut self, deck: &[Performer], tag: i32) -> (Vec<Performer>, (i32, Vec<u32>)) {
+        let normalize = tag == 0 || (self.owner_local && tag > 0 && tag <= self.maximum_level && self.template.is_some());
         let mut keyed: Vec<_> = deck
             .iter()
             .map(|p| {
                 let raw = self.performer_key(p);
-                if tag == 0 && self.owner_local {
+                if normalize && self.owner_local {
                     if let Some((normalized, id)) = self.normalized_performers.get(&raw) {
                         return (normalized.clone(), raw, Some(*id));
                     }
@@ -3665,7 +3665,7 @@ impl<'a> Kernel<'a> {
         keyed.sort_by(|a, b| {
             self.chart.performer_json[a.1 as usize].cmp(&self.chart.performer_json[b.1 as usize])
         });
-        if tag == 0 {
+        if normalize {
             for (p, _, cached) in &mut keyed {
                 if cached.is_some() {
                     continue;
@@ -3799,15 +3799,10 @@ impl<'a> Kernel<'a> {
         let mut seen = HashSet::default();
         let mut jobs = Vec::new();
         for &(m, s) in pairs {
-            let Some(p) = self.support(m, s) else {
-                continue;
-            };
-            if self
-                .support_high
-                .contains_key(&((p.gekisou_support_skills.clone(), p.band_id), at))
-            {
-                continue;
-            }
+            let Some(p) = self.support_ref(m, s) else { continue; };
+            if self.support_high.get(&(at, p.band_id))
+                .is_some_and(|values| values.contains_key(p.gekisou_support_skills.as_slice())) { continue; }
+            let p = p.clone();
             let combined: Vec<Performer> = data
                 .deck
                 .iter()
@@ -4389,17 +4384,16 @@ impl Kernel<'_> {
         }
     }
     fn low_of(&mut self, m: usize, s: i32) -> f64 {
-        let mut support = 0.0;
-        if let Some(p) = self.support(m, s) {
-            let key = (p.gekisou_support_skills.clone(), p.band_id);
-            support = if let Some(&v) = self.support_low.get(&key) {
-                v
-            } else {
-                let value = self.gain(&[p], &[], None, 0).max(0.0);
-                self.support_low.insert(key, value);
+        let support = if let Some(p) = self.support_ref(m, s) {
+            if let Some(&value) = self.support_low.get(&p.band_id).and_then(|values| values.get(p.gekisou_support_skills.as_slice())) {
                 value
-            };
-        }
+            } else {
+                let p = p.clone();
+                let value = self.gain(std::slice::from_ref(&p), &[], None, 0).max(0.0);
+                self.support_low.entry(p.band_id).or_default().insert(p.gekisou_support_skills, value);
+                value
+            }
+        } else { 0.0 };
         let base = if let Some(base) = &self.base {
             Arc::clone(base)
         } else {
@@ -5285,22 +5279,17 @@ impl Kernel<'_> {
         data
     }
     fn support_high(&mut self, m: usize, s: i32, level: i32) -> f64 {
-        let Some(p) = self.support(m, s) else {
-            return 0.0;
-        };
-        let at = self
-            .grid
-            .iter()
-            .find(|&&g| g >= level)
-            .copied()
-            .unwrap_or(self.maximum_level);
-        let key = ((p.gekisou_support_skills.clone(), p.band_id), at);
-        if let Some(&value) = self.support_high.get(&key) {
+        let Some(p) = self.support_ref(m, s) else { return 0.0; };
+        let at = self.grid.iter().find(|&&g| g >= level).copied().unwrap_or(self.maximum_level);
+        if let Some(&value) = self.support_high.get(&(at, p.band_id)).and_then(|values| values.get(p.gekisou_support_skills.as_slice())) {
             return value;
         }
+        let p = p.clone();
+        let band = p.band_id;
+        let skills = p.gekisou_support_skills.clone();
         let data = self.level(at);
         let value = self.gain(&[p], &data.deck, Some(&data.within), at).max(0.0);
-        self.support_high.insert(key, value);
+        self.support_high.entry((at, band)).or_default().insert(skills, value);
         value
     }
     fn strongest(&mut self, variants: Vec<Performer>) -> Vec<Performer> {
@@ -10857,7 +10846,7 @@ fn replay_grade_ceiling(
     snaps: &[Snap],
 ) -> Option<ReplayGradeCeiling> {
     let just = chart.setup.missions.iter().all(|&mission| mission == 3);
-    if !just && !chart.setup.missions.iter().all(|&mission| mission == 1) {
+    if !just && !chart.luck && !chart.setup.missions.iter().all(|&mission| mission == 1) {
         return None;
     }
     let mut conversions = Vec::new();
@@ -10923,7 +10912,7 @@ fn replay_grade_ceiling(
             !matches!(
                 row.kind,
                 2000 | 2001 | 3004 | 4004 | 12000 | 12004 | 12006 | 13000 | 13002 | 13003 | 13004 | 13005
-            )
+            ) && !(chart.luck && (11000..=11005).contains(&row.kind))
         })
     {
         return None;
@@ -11264,7 +11253,8 @@ fn replay_bound(
                     .then(a.cmp(&b))
             })
             .unwrap();
-        optimistic.judgements.fill(best);
+        if let Some(ceiling) = replay_grade_ceiling(master, chart, members, snaps) { optimistic.judgements = ceiling.grades; }
+        else { optimistic.judgements.fill(best); }
         for frame in &mut optimistic.play.frames {
             for note in &mut frame.judged {
                 note.judgement = 6;

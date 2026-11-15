@@ -1,4 +1,6 @@
 //! Mission ranges, combo/Just replay, luck lotteries and native stopwatches.
+//! Append-only count replay resumes each range with its consumed protections;
+//! changed skill commands invalidate all count checkpoints.
 use super::{
     core::{self, Random, STREAM_LUCK},
     score::GekisoCombo,
@@ -420,6 +422,7 @@ struct Resume {
     just_bonus: f64,
     i_cb: usize,
     i_jb: usize,
+    i_pr: usize,
     i_just: usize,
     i_combo: usize,
 }
@@ -479,6 +482,8 @@ pub struct Controller {
     history: Vec<Vec<(i32, i32, i32)>>,
     snapshot: Vec<Vec<i32>>,
     resume: Vec<Resume>,
+    resumed_unlimited: Vec<Vec<(i32, i32)>>,
+    resumed_limited: Vec<Vec<(i32, i32, i32)>>,
     combo_stack: Vec<(i32, f64, i32)>,
     just_stack: Vec<(i32, f64, i32)>,
     add_just_stack: Vec<(i32, f64, i32)>,
@@ -555,6 +560,8 @@ impl Controller {
             history: vec![Vec::new(); n],
             snapshot: vec![Vec::new(); n],
             resume: vec![Resume::default(); n],
+            resumed_unlimited: vec![Vec::new(); n],
+            resumed_limited: vec![Vec::new(); n],
             combo_stack: Vec::new(),
             just_stack: Vec::new(),
             add_just_stack: Vec::new(),
@@ -737,7 +744,6 @@ impl Controller {
             let r = self.resume[index];
             let (mut cb, mut jb, mut i_cb, mut i_jb, mut i_pr, mut k, mut i_just, mut i_combo);
             if !self.full_recalculation
-                && self.protection.is_empty()
                 && r.processed >= 1
                 && r.processed <= self.history[index].len()
             {
@@ -751,7 +757,11 @@ impl Controller {
                 jb = r.just_bonus;
                 i_cb = r.i_cb;
                 i_jb = r.i_jb;
-                i_pr = 0;
+                i_pr = r.i_pr;
+                if !self.protection.is_empty() {
+                    self.unlimited.clone_from(&self.resumed_unlimited[index]);
+                    self.limited.clone_from(&self.resumed_limited[index]);
+                }
                 k = r.processed;
                 i_just = r.i_just;
                 i_combo = r.i_combo;
@@ -839,9 +849,14 @@ impl Controller {
                 just_bonus: jb,
                 i_cb,
                 i_jb,
+                i_pr,
                 i_just,
                 i_combo,
             };
+            if !self.protection.is_empty() {
+                self.resumed_unlimited[index].clone_from(&self.unlimited);
+                self.resumed_limited[index].clone_from(&self.limited);
+            }
             for i in i_just..self.add_just_stack.len() {
                 let (_, delta, range) = self.add_just_stack[i];
                 self.fixed_count(index, delta, range, true);

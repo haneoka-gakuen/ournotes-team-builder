@@ -188,7 +188,8 @@ impl Combo {
         if judgement == 0 || judgement == 7 {
             return;
         }
-        let at = self.times.partition_point(|&t| t <= time);
+        let at = if self.times.last().is_none_or(|&last| last <= time) { self.times.len() }
+            else { self.times.partition_point(|&t| t <= time) };
         self.times.insert(at, time);
         self.judgements.insert(at, judgement);
         self.combos.insert(at, 0);
@@ -203,6 +204,7 @@ impl Combo {
         }
     }
     pub fn at(&self, time: i32) -> i32 {
+        if self.times.last().is_some_and(|&last| last < time) { return *self.combos.last().unwrap(); }
         let at = self.times.partition_point(|&t| t < time);
         if at == 0 {
             0

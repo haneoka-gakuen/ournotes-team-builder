@@ -2439,10 +2439,16 @@ impl CumulativeWindows {
         let mut out = [0usize; 6];
         for &[value, maximum, n, kind, mission] in rows {
             let cap = (maximum as usize).div_ceil(value as usize);
+            let mut rush_counted = false;
             for &(range, just, extras, combo) in &self.limits {
                 if mission != 4 && mission != range {
                     continue;
                 }
+                let rush_changes = if n < 0 {
+                    let changes = if rush_counted { 0 } else { self.rush_commands };
+                    rush_counted = true;
+                    changes
+                } else { 0 };
                 for (c, count) in out.iter_mut().enumerate() {
                     let raw = if kind == 7001 {
                         combo
@@ -2452,11 +2458,11 @@ impl CumulativeWindows {
                     let changes = if n > 0 {
                         (raw / n as f64).ceil().min(cap as f64) as usize
                     } else if n < 0 {
-                        self.rush_commands
+                        rush_changes
                     } else {
                         cap
                     };
-                    if changes > 0 {
+                    if changes > 0 || n < 0 {
                         *count = count.saturating_add(changes.saturating_mul(2).saturating_add(4));
                     }
                 }

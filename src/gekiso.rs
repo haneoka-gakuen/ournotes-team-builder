@@ -57,6 +57,7 @@ pub struct Chart {
     pub(crate) delivery_radius_ms: i32,
     pub(crate) deterministic_ranges: OnceLock<Option<Vec<(i32, i32)>>>,
     pub(crate) factor_operations: OnceLock<usize>,
+    sparse_inputs: OnceLock<Vec<usize>>,
     curves: HashMap<Vec<u64>, Arc<Recorded>>,
     curve_bytes: usize,
     /// Lottery frame streams by their recorded range states: decks almost always share one.
@@ -167,6 +168,33 @@ pub(crate) fn combo_factors(master: &Master, times: &[i32], judgements: &[usize]
 }
 
 impl Chart {
+    pub(crate) fn before_wake(&self, next: usize, wake: i32) -> usize {
+        if next == 0 || self.play.frames[next - 1].time_ms < wake { next }
+        else { self.play.frames[..next].partition_point(|frame| frame.time_ms < wake) }
+    }
+    pub(crate) fn sparse_inputs(&self) -> &[usize] {
+        self.sparse_inputs.get_or_init(|| {
+            let mut required: Vec<_> = self.play.frames.iter().map(|frame| !frame.judged.is_empty()).chain(std::iter::once(true)).collect();
+            for time in self.full.events.iter().map(|event| event.1).chain(self.setup.fevers.iter()
+                .flat_map(|&(start, end)| [start.saturating_sub(4000), start, end]))
+                .chain(std::iter::once(self.music_length))
+                .chain(self.play.frames.iter().flat_map(|frame| &frame.judged)
+                    .flat_map(|note| {
+                        let time = self.full.notes[(note.note_id - 1) as usize].time_ms;
+                        [time, time.saturating_add(1)]
+                    })) {
+                let index = self.play.frames.partition_point(|frame| frame.time_ms < time);
+                required[index] = true;
+            }
+            let mut next = vec![self.play.frames.len(); required.len()];
+            let mut after = self.play.frames.len();
+            for index in (0..self.play.frames.len()).rev() {
+                if required[index] { after = index; }
+                next[index] = after;
+            }
+            next
+        })
+    }
     pub(crate) fn fixed_life(&self, model: &mut Model<'_>) {
         if self
             .play
@@ -337,6 +365,7 @@ impl Chart {
             delivery_radius_ms,
             deterministic_ranges: OnceLock::new(),
             factor_operations: OnceLock::new(),
+            sparse_inputs: OnceLock::new(),
             curves: HashMap::default(),
             curve_bytes: 0,
             frame_streams: HashMap::default(),
@@ -388,6 +417,7 @@ impl Chart {
             delivery_radius_ms: self.delivery_radius_ms,
             deterministic_ranges: self.deterministic_ranges.clone(),
             factor_operations: self.factor_operations.clone(),
+            sparse_inputs: self.sparse_inputs.clone(),
             curves: HashMap::default(),
             curve_bytes: 0,
             frame_streams: HashMap::default(),
@@ -1142,9 +1172,21 @@ fn context_fixed_observed<'a>(
         };
         model.score.score.calculator.factors_only = true;
         model.live_life=whole.then(Vec::new);
+        let sparse = model.sparse_inputs();
+        let next = sparse.then(|| chart.sparse_inputs());
+        let (mut until, mut quiet) = (0, 0);
         for k in if whole {0..chart.play.frames.len()}else{chart.span.0..chart.span.1} {
             let frame = &chart.play.frames[k];
+            if k < until {
+                model.idle_frame(frame.time_ms)?;
+                continue;
+            }
             model.frame(frame.time_ms, &frame.judged, chart.play.dt[k])?;
+            quiet = if sparse && model.inputs_settled() { quiet + 1 } else { 0 };
+            if quiet >= 2 {
+                let wake = model.next_score_frame(frame.time_ms);
+                until = chart.before_wake(next.unwrap()[k + 1], wake);
+            }
         }
         if let Some(lives)=&mut live_life {
             for (event,&(_,at)) in chart.full.events.iter().enumerate() {
@@ -1239,13 +1281,23 @@ fn expected(master: &Master, chart: &mut Chart, deck: &[Performer]) -> Result<Co
         (0, true),
     )?;
     model.score.score.calculator.factors_only = true;
+    chart.fixed_life(&mut model);
+    let sparse = model.sparse_inputs();
+    let next = sparse.then(|| chart.sparse_inputs());
     let simulated = &chart.play.frames[chart.span.0..chart.span.1];
-    for (k, frame) in simulated.iter().enumerate() {
-        model.frame(
-            frame.time_ms,
-            &frame.judged,
-            chart.play.dt[chart.span.0 + k],
-        )?;
+    let (mut until, mut quiet) = (0, 0);
+    for (offset, frame) in simulated.iter().enumerate() {
+        let k = chart.span.0 + offset;
+        if k < until {
+            model.idle_frame(frame.time_ms)?;
+            continue;
+        }
+        model.frame(frame.time_ms, &frame.judged, chart.play.dt[k])?;
+        quiet = if sparse && model.inputs_settled() { quiet + 1 } else { 0 };
+        if quiet >= 2 {
+            let wake = model.next_score_frame(frame.time_ms);
+            until = chart.before_wake(next.unwrap()[k + 1], wake);
+        }
     }
     for (id, o) in &model.score.score.calculator.observations {
         if let Some(&i) = index.get(id) {
@@ -1420,7 +1472,7 @@ fn rank_remainder(
     input: &mut luck::Input,
     range: usize,
     outcomes: &[f64],
-    cache: &mut HashMap<Vec<i32>, f64>,
+    cache: &mut HashMap<Vec<i32>, Vec<f64>>,
     index: &HashMap<i32, usize>,
 ) -> Result<f64, String> {
     let percent = chart.range_percent[range];
@@ -1431,66 +1483,62 @@ fn rank_remainder(
         numerator = next;
     }
     let modulus = (100 / divisor) as usize;
-    if modulus == 1 {
-        return Ok(0.0);
-    }
-    let first = input
-        .frames
-        .iter()
-        .position(|frame| frame.states[range] == 3)
+    if modulus == 1 { return Ok(0.0); }
+    let first = input.frames.iter().position(|frame| frame.states[range] == 3)
         .ok_or("luck range without start")?;
-    let last = input
-        .frames
-        .iter()
-        .enumerate()
-        .skip(first + 1)
-        .find(|(_, frame)| frame.states[range] == 8)
-        .map(|(i, _)| i)
+    let last = input.frames.iter().enumerate().skip(first + 1)
+        .find(|(_, frame)| frame.states[range] == 8).map(|(i, _)| i)
         .unwrap_or(input.frames.len() - 1);
-    let observed: HashSet<_> = input.frames[first..=last]
-        .iter()
-        .flat_map(|frame| frame.judged.iter().map(|note| note.id))
-        .collect();
+    let observed: HashSet<_> = input.frames[first..=last].iter()
+        .flat_map(|frame| frame.judged.iter().map(|note| note.id)).collect();
+    let normalized = chart.notes.iter().enumerate().filter(|(i, _)| chart.range_of[*i] == range as i32)
+        .all(|(i, _)| outcomes[4 * i..4 * i + 4].iter().all(|&score| score >= 0.0));
     let mut initial = 0;
-    let mut signature = vec![range as i32];
+    let mut signature = vec![range as i32, i32::from(normalized)];
     for (i, note) in chart.notes.iter().enumerate() {
-        if chart.range_of[i] != range as i32 {
-            continue;
-        }
-        if !observed.contains(&note.id) {
+        if chart.range_of[i] != range as i32 { continue; }
+        if normalized || !observed.contains(&note.id) {
             initial = (initial + outcomes[4 * i] as usize) % modulus;
         }
-        for mask in 0..4 {
-            signature.push((outcomes[4 * i + mask] as i32) % (modulus as i32));
+        if normalized {
+            if observed.contains(&note.id) {
+                for mask in 1..4 {
+                    signature.push(((outcomes[4 * i + mask] as i32) - (outcomes[4 * i] as i32)).rem_euclid(modulus as i32));
+                }
+            }
+        } else {
+            for mask in 0..4 { signature.push((outcomes[4 * i + mask] as i32) % modulus as i32); }
         }
     }
-    if let Some(&value) = cache.get(&signature) {
-        return Ok(value);
-    }
-    input.ranges.clear();
-    input.ranges.push(range);
-    input.modulus = modulus;
-    input.initial = initial;
-    for frame in Arc::make_mut(&mut input.frames) {
-        for note in &mut frame.judged {
-            note.scores = if let Some(&i) = index
-                .get(&note.id)
-                .filter(|&&i| chart.range_of[i] == range as i32)
-            {
-                std::array::from_fn(|mask| outcomes[4 * i + mask] as i32)
-            } else {
-                [0; 4]
-            };
+    if !cache.contains_key(&signature) {
+        input.ranges.clear();
+        input.ranges.push(range);
+        input.modulus = modulus;
+        input.initial = if normalized { 0 } else { initial };
+        for frame in Arc::make_mut(&mut input.frames) {
+            for note in &mut frame.judged {
+                note.scores = if let Some(&i) = index.get(&note.id)
+                    .filter(|&&i| chart.range_of[i] == range as i32) {
+                    std::array::from_fn(|mask| if normalized {
+                        ((outcomes[4 * i + mask] as i32) - (outcomes[4 * i] as i32)).rem_euclid(modulus as i32)
+                    } else { outcomes[4 * i + mask] as i32 })
+                } else { [0; 4] };
+            }
         }
+        cache.insert(signature.clone(), luck::run(input)?.residues);
     }
-    let result = luck::run(input)?;
+    let residues = &cache[&signature];
+    let shift = if normalized { initial } else { 0 };
     let mut value = 0.0;
-    for (residue, &probability) in result.residues.iter().enumerate() {
-        value += probability * ((residue as i32 * percent) % 100) as f64 / 100.0;
+    // Translate the deterministic score after the distribution; visit actual
+    // residues in their original order to retain binary64 settlement.
+    for residue in 0..modulus {
+        value += residues[(residue + modulus - shift) % modulus]
+            * ((residue as i32 * percent) % 100) as f64 / 100.0;
     }
-    cache.insert(signature, value);
     Ok(value)
 }
+
 struct Active {
     end: i32,
     channel: usize,
@@ -2258,17 +2306,28 @@ struct OrderSplit {
 
 impl<const SECTIONS:bool,const COUNTS:bool> ReplayTree<'_,SECTIONS,COUNTS> {
     fn advance(&self, model: &mut Model<'_>, from: usize, to: usize) -> Result<bool, String> {
-        for k in from..to {
+        let sparse = !SECTIONS && !COUNTS && model.sparse_inputs();
+        let next = sparse.then(|| self.chart.sparse_inputs());
+        let (mut k, mut quiet, mut visited) = (from, 0, 0usize);
+        while k < to {
             if self.generation != crate::cancellation_generation() {
                 return Err("cancelled".into());
             }
-            if k & 63 == 0 && crate::clock::deadline_expired(self.deadline) {
+            if visited & 63 == 0 && crate::clock::deadline_expired(self.deadline) {
                 return Ok(false);
             }
+            visited += 1;
             let frame = &self.chart.play.frames[k];
             if SECTIONS { if let Some(trace)=&mut model.just_window {trace.record_probe(k);} }
             if COUNTS { model.count_frame(frame.time_ms, &frame.judged, self.chart.play.dt[k])?; }
             else { model.frame(frame.time_ms, &frame.judged, self.chart.play.dt[k])?; }
+            quiet = if sparse && model.inputs_settled() { quiet + 1 } else { 0 };
+            let until = if quiet >= 2 {
+                let wake = model.next_score_frame(frame.time_ms);
+                self.chart.before_wake(next.unwrap()[k + 1].min(to), wake).max(k + 1)
+            } else { k + 1 };
+            if until > k + 1 { model.idle_frame(self.chart.play.frames[until - 1].time_ms)?; }
+            k = until;
         }
         Ok(true)
     }

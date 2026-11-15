@@ -1,7 +1,8 @@
 //! Score-factor frame logging with native binary32 undo and replay.
 use super::core::{self, Combo};
 use crate::{master::LiveTables, num::f};
-use std::{collections::BTreeMap, rc::Rc, sync::Arc};
+use std::{cell::RefCell, collections::BTreeMap, rc::Rc, sync::Arc};
+use rustc_hash::FxHashMap;
 #[derive(Clone, Default)]
 pub struct FactorCommand {
     pub time: i32,
@@ -134,6 +135,57 @@ pub struct Observation {
     pub luck: f64,
     pub judge: f64,
 }
+type NoteCells = Rc<RefCell<Vec<Option<i32>>>>;
+pub(crate) struct NoteMemo {
+    bases: Rc<Vec<[Option<f64>; 7]>>,
+    base_ids: Vec<[u16; 7]>,
+    combo_ids: Vec<usize>,
+    combos: Vec<f64>,
+    cells: usize,
+    lucks: Vec<i32>,
+    states: RefCell<FxHashMap<[u64; 2], NoteCells>>,
+}
+impl NoteMemo {
+    fn new(calculator: &Calculator<'_>, maximum: usize) -> Self {
+        let bases = Rc::clone(calculator.bases.as_ref().unwrap());
+        let mut base_ids = vec![[0; 7]; bases.len()];
+        let mut ids = FxHashMap::default();
+        for (op, row) in bases.iter().enumerate() {
+            for (grade, base) in row.iter().enumerate() {
+                if let Some(base) = base {
+                    let next = ids.len() as u16 + 1;
+                    base_ids[op][grade] = *ids.entry(base.to_bits()).or_insert(next);
+                }
+            }
+        }
+        let base_count = ids.len();
+        let mut combo_ids = Vec::with_capacity(maximum + 1);
+        let mut combos = Vec::new();
+        let mut ids = FxHashMap::default();
+        for count in 0..=maximum {
+            let value = f(core::min_nan(calculator.table(0, count as i32), 1.0) + 1.0);
+            let next = combos.len();
+            let id = *ids.entry(value.to_bits()).or_insert_with(|| { combos.push(value); next });
+            combo_ids.push(id);
+        }
+        let mut lucks = vec![100];
+        let rush = calculator.tables.gekiso.rush_percent.wrapping_add(100).min(200);
+        if rush != 100 { lucks.push(rush); }
+        let cells = base_count.checked_mul(combos.len()).and_then(|n| n.checked_mul(2))
+            .and_then(|n| n.checked_mul(lucks.len())).unwrap_or(usize::MAX);
+        Self { bases, base_ids, combo_ids, combos, cells, lucks, states: RefCell::new(FxHashMap::default()) }
+    }
+    fn state(&self, combo: f64, up: f64) -> Option<NoteCells> {
+        let key = [combo.to_bits(), up.to_bits()];
+        let mut states = self.states.borrow_mut();
+        if let Some(row) = states.get(&key) { return Some(Rc::clone(row)); }
+        let limit = 4 * 1024 * 1024 / std::mem::size_of::<Option<i32>>();
+        if self.cells == 0 || self.cells > limit / (states.len() + 1) { return None; }
+        let row = Rc::new(RefCell::new(vec![None; self.cells]));
+        states.insert(key, Rc::clone(&row));
+        Some(row)
+    }
+}
 #[derive(Clone)]
 pub struct Calculator<'a> {
     pub tables: &'a LiveTables,
@@ -146,6 +198,10 @@ pub struct Calculator<'a> {
     pub observations: Vec<(i32, Observation)>,
     pub(crate) note_combos: Option<Arc<[i32]>>,
     bases: Option<Rc<Vec<[Option<f64>; 7]>>>,
+    memo: Option<Rc<NoteMemo>>,
+    memo_rows: [Option<NoteCells>; 7],
+    memo_ups: [f64; 7],
+    memo_dirty: bool,
 }
 impl<'a> Calculator<'a> {
     pub fn new(
@@ -166,7 +222,50 @@ impl<'a> Calculator<'a> {
             observations: Vec::new(),
             note_combos: None,
             bases: None,
+            memo: None,
+            memo_rows: std::array::from_fn(|_| None),
+            memo_ups: [0.0; 7],
+            memo_dirty: true,
         }
+    }
+    pub(crate) fn share_note_memo(&mut self, shared: &mut Option<Rc<NoteMemo>>, maximum: usize) {
+        if shared.is_none() {
+            self.cache_bases();
+            *shared = Some(Rc::new(NoteMemo::new(self, maximum)));
+        }
+        let memo = Rc::clone(shared.as_ref().unwrap());
+        self.bases = Some(Rc::clone(&memo.bases));
+        self.memo = Some(memo);
+        self.memo_rows = std::array::from_fn(|_| None);
+        self.memo_dirty = true;
+    }
+    fn memo_score(&mut self, life: i32, op: i32, grade: i32, combo: i32) -> Result<Option<i32>, String> {
+        let memo = self.memo.as_ref().unwrap();
+        if self.memo_dirty {
+            for grade in 0..7 {
+                let up = f(self.factors.note + self.factors.judgement(grade as i32));
+                self.memo_ups[grade] = up;
+                self.memo_rows[grade] = if let Some(previous) = (0..grade).find(|&index| self.memo_ups[index].to_bits() == up.to_bits()) {
+                    self.memo_rows[previous].clone()
+                } else { memo.state(self.factors.combo, up) };
+            }
+            self.memo_dirty = false;
+        }
+        let Some(row) = self.memo_rows.get(grade as usize).and_then(Option::as_ref) else { return Ok(None); };
+        let Some(&base) = memo.base_ids.get(op as usize).and_then(|row| row.get(grade as usize)) else { return Ok(None); };
+        if base == 0 { return Ok(None); }
+        let Some(&bucket) = memo.combo_ids.get(combo as usize) else { return Ok(None); };
+        let percent = self.factors.luck.wrapping_add(100).min(200);
+        let Some(luck) = memo.lucks.iter().position(|&value| value == percent) else { return Ok(None); };
+        let index = (((base as usize - 1) * memo.combos.len() + bucket) * 2 + usize::from(life <= 0)) * memo.lucks.len() + luck;
+        let cached = row.borrow()[index];
+        if let Some(value) = cached { return Ok(Some(value)); }
+        let combo_factor = f(1.0 * f(self.factors.combo + memo.combos[bucket]));
+        let score_up = self.memo_ups[grade as usize];
+        let luck = f(f(percent as f64) / 100.0);
+        let value = self.core(life, op, grade, combo_factor, score_up, luck)?;
+        row.borrow_mut()[index] = Some(value);
+        Ok(Some(value))
     }
     pub(crate) fn cache_bases(&mut self) {
         let mut bases = vec![[None; 7]; 256];
@@ -208,6 +307,9 @@ impl<'a> Calculator<'a> {
     ) -> Result<i32, String> {
         let (life, time, op, score_type, note_id) =
             (note.life, note.time, note.op, note.score_type, note.id);
+        if self.memo.is_some() && info.is_none() && !self.factors_only {
+            if let Some(value) = self.memo_score(life, op, score_type, combo)? { return Ok(value); }
+        }
         let gk = self.gekiso_factor(info, time);
         let judge = self.factors.judgement(score_type);
         let luck_percent = self.factors.luck.wrapping_add(100).min(200);
@@ -459,6 +561,7 @@ impl<'a> Incremental<'a> {
         }
         if !self.factors[frame / 64][frame % 64].is_empty() {
             Rc::make_mut(&mut self.diffs[frame / 64])[frame % 64].undo(&mut self.calculator.factors);
+            self.calculator.memo_dirty = true;
         }
     }
     fn execute(
@@ -502,6 +605,7 @@ impl<'a> Incremental<'a> {
             {
                 let c = &self.factors[frame / 64][frame % 64][factor_order[a]];
                 self.calculator.factors.apply(c);
+                if c.note != 0 || c.combo != 0 || c.judgement != 0 { self.calculator.memo_dirty = true; }
                 Rc::make_mut(&mut self.diffs[frame / 64])[frame % 64].add(c);
                 a += 1;
             } else {

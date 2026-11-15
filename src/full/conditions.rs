@@ -217,6 +217,15 @@ impl Checker {
                 | Test::JudgementCount { .. }
         )
     }
+    pub(crate) fn inputs_only(&self, recorded: bool) -> bool {
+        match &self.test {
+            Test::Elapsed { .. } => false,
+            Test::Probability(_) => recorded,
+            Test::And(items) | Test::Or(items) => items.iter().all(|item| item.inputs_only(recorded)),
+            Test::Not(inner) => inner.inputs_only(recorded),
+            _ => true,
+        }
+    }
     pub(crate) fn range_stable(&self) -> bool {
         match &self.test {
             Test::Fixed(_) | Test::SameMember(_) | Test::RangePlaying { .. } | Test::RangeStart { .. } | Test::RangeComplete | Test::Rush(_) => true,
