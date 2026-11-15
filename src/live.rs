@@ -446,10 +446,11 @@ pub(crate) fn effect_end(input: &Input, slot: &Slot, effect: &Effect, start: i32
         let frame = input.frame_time(input.times[first]);
         if frame > deadline { break; }
         let after = input.times.partition_point(|&time| input.frame_time(time) <= frame);
-        if let Some(index) = (first..after).rfind(|&index| {
+        if (first..after).any(|index| {
             effect.release_judgements.contains(&judgements.map_or(5, |grades| grades[index]))
         }) {
-            return end.min(input.times[index]);
+            // The judgement is delivered at the frame boundary. Scheduled expiry may be earlier.
+            return end.min(frame);
         }
         first = after;
     }

@@ -133,13 +133,11 @@ fn release_end(
         }
         let after = first
             + input.times[first..].partition_point(|&time| input.clock.frame_time(time) <= frame);
-        let mut last = None;
         let mut unavoidable = false;
         for (i, &grade) in grades.iter().enumerate().take(after).skip(first) {
             if mask & (1 << grade) == 0 {
                 continue;
             }
-            last = Some(i);
             if budget > 0.0
                 && input.times[i] > from
                 && input.times[i] <= until
@@ -151,7 +149,7 @@ fn release_end(
             }
         }
         if unavoidable {
-            return relaxed(end.min(input.times[last.unwrap()]));
+            return relaxed(end.min(frame));
         }
         first = after;
     }

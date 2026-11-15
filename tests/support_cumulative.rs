@@ -362,7 +362,7 @@ fn low_judgement_releases_extra_score_after_conversion() {
 }
 
 #[test]
-fn release_uses_the_last_matching_judgement_time_of_its_first_frame() {
+fn release_keeps_all_notes_before_the_first_matching_delivery_frame() {
     let mut skill = slot(Vec::new());
     skill.effects.push(Effect {
         kind: 2000, delta: 10000, seconds: 5.0,
@@ -372,10 +372,26 @@ fn release_uses_the_last_matching_judgement_time_of_its_first_frame() {
     let mut played = input(vec![skill], Some(vec![PERFECT, 3, 3, PERFECT]), 4);
     played.times = vec![100, 201, 202, 300];
     played.judge_frac[3] = 0.5;
-    assert_eq!(live::score(&played).unwrap().scores[0], 3150.0);
+    // Both matching notes arrive at 216 ms and retain the bonus before that boundary.
+    assert_eq!(live::score(&played).unwrap().scores[0], 3200.0);
     let mut bounds = model::PlayBounds::new(&played, played.judgements.as_ref().unwrap());
     assert_eq!(bounds.order(&played, played.judgements.as_ref().unwrap(), &played.slots,
         &[0], &[0, 1, 2, 3, 4], 1000.0), (f64::NEG_INFINITY, f64::INFINITY));
+    for (hz, seconds, expected) in [
+        (30_u16, 5.0, 4950.0), (60, 5.0, 4850.0),
+        (90, 5.0, 4750.0), (120, 5.0, 4750.0), (60, 1.206, 4650.0),
+    ] {
+        let mut timed = played.clone();
+        timed.clock = live::FrameClock::from(hz);
+        timed.times = vec![100, 1205, 1206, 1212, 1216];
+        timed.note_frac = vec![1.0; 5];
+        timed.ap_combo = vec![1.0; 5];
+        timed.judgements = Some(vec![PERFECT, GREAT, PERFECT, PERFECT, PERFECT]);
+        timed.judge_frac[GREAT] = 0.5;
+        timed.slots[0].effects[0].release_judgements = vec![GREAT];
+        timed.slots[0].effects[0].seconds = seconds;
+        assert_eq!(live::score(&timed).unwrap().scores[0], expected, "{hz} Hz, {seconds}s");
+    }
 }
 
 #[test]
