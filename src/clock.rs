@@ -7,7 +7,10 @@ pub(crate) fn enter_preparation_deadline(deadline:f64)->PreparationDeadline{
     PreparationDeadline(PREPARATION_DEADLINE.with(|value|value.replace(value.get().min(deadline))))
 }
 pub(crate) fn preparation_expired_at(now:f64)->bool{now>=preparation_deadline()}
-pub(crate) fn preparation_expired()->bool{let deadline=preparation_deadline();deadline.is_finite()&&milliseconds()>=deadline}
+pub(crate) fn preparation_expired()->bool{deadline_expired(preparation_deadline())}
+pub(crate) fn deadline_expired(deadline: f64) -> bool {
+    deadline.is_finite() && milliseconds() >= deadline
+}
 #[cfg(not(target_arch = "wasm32"))]
 pub fn milliseconds() -> f64 {
     use std::{

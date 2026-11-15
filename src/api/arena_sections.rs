@@ -25,7 +25,7 @@ pub(super) struct Cache {
 pub(super) struct Multiple {
     key: Value,
     sources: Vec<Source>,
-    completed: BTreeMap<String, Value>,
+    results: BTreeMap<String, Value>,
 }
 fn task_key(request: &Value) -> Value {
     let mut key = request.clone();
@@ -195,8 +195,21 @@ impl Engine {
         id: i32,
         seeds: &[i32],
     ) -> Result<Option<gekiso::sections::OpponentSamples>, String> {
+        self.section_opponents_until(options, chart, source, id, seeds, f64::INFINITY)
+            .map(|value| value.expect("unlimited opponent replay"))
+    }
+
+    fn section_opponents_until(
+        &self,
+        options: &Value,
+        chart: &gekiso::Chart,
+        source: &Source,
+        id: i32,
+        seeds: &[i32],
+        deadline: f64,
+    ) -> Result<Option<Option<gekiso::sections::OpponentSamples>>, String> {
         if master::rows(&options["opponents"]).is_empty() {
-            return Ok(None);
+            return Ok(Some(None));
         }
         let key = json!([
             id,
@@ -216,13 +229,16 @@ impl Engine {
             .iter()
             .find(|entry| entry.key == key && &entry.source == source)
         {
-            return Ok(Some(found.targets.clone()));
+            return Ok(Some(Some(found.targets.clone())));
         }
         let samples = seeds.len();
         let mut scenarios = vec![Vec::new(); samples];
         for (opponent_index, opponent) in
             master::rows(&options["opponents"]).into_iter().enumerate()
         {
+            if crate::clock::deadline_expired(deadline) {
+                return Ok(None);
+            }
             let resolved = self.resolve_team(opponent, &opponent["team"], id)?;
             if resolved
                 .members
@@ -259,6 +275,9 @@ impl Engine {
             let deterministic = !gekiso::replay_random(&self.master, &opponent_chart, &deck);
             let mut orders = [None; 120];
             for (sample, into) in scenarios.iter_mut().enumerate() {
+                if crate::clock::deadline_expired(deadline) {
+                    return Ok(None);
+                }
                 let mut random = crate::full::core::Random::new(
                     (sample as i32).wrapping_mul(17).wrapping_add(salt),
                 );
@@ -266,14 +285,17 @@ impl Engine {
                 let standing = if let Some(value) = orders[order].filter(|_| deterministic) {
                     value
                 } else {
-                    let value = gekiso::replay_order_mode(
+                    let Some(value) = gekiso::replay_order_until(
                         &self.master,
                         &opponent_chart,
                         &deck,
                         resolved.power.total as i32,
                         order,
                         (independent[sample], false),
-                    )?;
+                        (None, deadline),
+                    )? else {
+                        return Ok(None);
+                    };
                     let standing = std::array::from_fn(|range| gekiso::sections::Standing {
                         metric: value.missions[range],
                         score: value.ranges[range] as i32,
@@ -290,7 +312,7 @@ impl Engine {
         let scenarios = Arc::new(scenarios);
         let mut cache = self.section_scenes.lock().unwrap();
         if samples > 4096 {
-            return Ok(Some(scenarios));
+            return Ok(Some(Some(scenarios)));
         }
         if cache.len() >= 32 {
             cache.pop_front();
@@ -300,7 +322,7 @@ impl Engine {
             source: source.clone(),
             targets: scenarios.clone(),
         });
-        Ok(Some(scenarios))
+        Ok(Some(Some(scenarios)))
     }
 }
 
@@ -319,6 +341,11 @@ impl Engine {
         if master::rows(&options["opponents"]).len() > 4 {
             return Err("section-opponents-limit".into());
         }
+        let deadline = input["request"]["deadline"].as_f64().unwrap_or_else(|| {
+            input["request"]["timeLimitMs"]
+                .as_f64()
+                .map_or(f64::INFINITY, |ms| started + ms)
+        });
         let (mut scoped, mut scoped_input, songs, sources) =
             if input["request"]["songRules"].is_object() {
                 let (mut view, projected) = self.song_rule_view(input)?;
@@ -335,30 +362,32 @@ impl Engine {
                 .unwrap_or_else(|| Multiple {
                     key,
                     sources: sources.clone(),
-                    completed: BTreeMap::new(),
+                    results: BTreeMap::new(),
                 });
             let response = (|| -> Result<Value, String> {
                 let mut results = Vec::new();
                 for song in &songs {
                     let key = song.to_string();
-                    if let Some(completed) = multiple.completed.get(&key) {
-                        results.extend(master::rows(&completed["results"]).into_iter().cloned());
-                        continue;
+                    let expired = now() >= deadline;
+                    if let Some(cached) = multiple.results.get(&key) {
+                        let complete = cached["stopReason"] == "complete";
+                        if complete || expired {
+                            results.extend(master::rows(&cached["results"]).into_iter().cloned());
+                        }
+                        if complete {
+                            continue;
+                        }
                     }
-                    if now()
-                        >= input["request"]["deadline"]
-                            .as_f64()
-                            .unwrap_or(f64::INFINITY)
-                    {
+                    if expired {
                         break;
                     }
                     let mut single = input.clone();
                     single["request"]["goal"]["songs"] = json!([song]);
                     let response = self.run_arena_sections(&single, started, now)?;
                     results.extend(master::rows(&response["results"]).into_iter().cloned());
-                    if response["stopReason"] == "complete" {
-                        multiple.completed.insert(key, response);
-                    } else {
+                    let complete = response["stopReason"] == "complete";
+                    multiple.results.insert(key, response);
+                    if !complete {
                         break;
                     }
                 }
@@ -426,11 +455,7 @@ impl Engine {
             ] {
                 scoped_input["request"][key] = Value::Null;
             }
-            let deadline = input["request"]["deadline"].as_f64().unwrap_or_else(|| {
-                input["request"]["timeLimitMs"]
-                    .as_f64()
-                    .map_or(f64::INFINITY, |ms| started + ms)
-            });
+            let replay_deadline = crate::clock::preparation_deadline();
             let mut charts = Vec::new();
             let mut compiled = Vec::new();
             let mut music = Vec::new();
@@ -513,7 +538,7 @@ impl Engine {
             if reference.is_null() {
                 return Ok(baseline);
             }
-            if baseline["stopReason"] != "complete" || now() >= deadline {
+            if baseline["stopReason"] != "complete" || (cache.plan.is_none() && now() >= deadline) {
                 return Ok(pending_reference(baseline, now() - started));
             }
             let reference_team = json!({"members":reference["members"],"snaps":reference["snaps"],"leader":reference["members"][0]});
@@ -543,8 +568,11 @@ impl Engine {
                     })
                     .transpose()?;
                 let id = master::int(&songs[index]["songId"]);
-                let opponents =
-                    scoped.section_opponents(options, chart, &sources[index], id, &seeds)?;
+                let Some(opponents) = scoped.section_opponents_until(
+                    options, chart, &sources[index], id, &seeds, replay_deadline,
+                )? else {
+                    return Ok(pending_reference(baseline, now() - started));
+                };
                 let resolved =
                     scoped.resolve_team(&scoped_input["request"], &reference_team, id)?;
                 let deck: Vec<_> = resolved
@@ -553,15 +581,20 @@ impl Engine {
                     .zip(&resolved.snaps)
                     .map(|(m, s)| Performer::from_member(&scoped.master, m, s.as_ref()))
                     .collect();
-                let rows = gekiso::sections::replay(
+                let Some(rows) = gekiso::sections::replay_until(
                     &scoped.master,
                     chart,
                     &deck,
                     &seeds,
-                    resolved.power.total as i32,
-                    opponents.as_ref(),
-                    trace.as_ref(),
-                )?;
+                    gekiso::sections::ReplayOptions {
+                        power: resolved.power.total as i32,
+                        opponents: opponents.as_ref(),
+                        window: trace.as_ref(),
+                        deadline: replay_deadline,
+                    },
+                )? else {
+                    return Ok(pending_reference(baseline, now() - started));
+                };
                 references.push(Summary::of(
                     &rows,
                     versus,

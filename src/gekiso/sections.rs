@@ -141,7 +141,7 @@ pub(crate) fn metric_samples(master: &Master, chart: &Chart, deck: &[Performer],
             for &order in orders { for &alias in &aliases[order] { values[alias] = metrics; } }
         };
         let tree = ReplayTree::<true, true> { chart, events: &events, chronological: chronological.clone(),
-            generation: crate::cancellation_generation(), observe: None, upper: &[], multiplicities: &[],
+            generation: crate::cancellation_generation(), deadline: f64::INFINITY, observe: None, upper: &[], multiplicities: &[],
             stopped: AtomicBool::new(false), detail: Some(&record) };
         let mut model = Model::with_live_capacity(master, deck, &chart.full.notes, &events[orders[0]], chart.params(), Some(&chart.setup), (seed, false, Some(&capacity)))?;
         chart.fixed_life(&mut model);
@@ -171,12 +171,21 @@ impl ReplayTree<'_, true> {
         fixed: usize,
         samples: &[usize],
         replay: &mut ScenarioReplay<'_>,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
+        if self.generation != crate::cancellation_generation() {
+            return Err("cancelled".into());
+        }
+        if crate::clock::deadline_expired(self.deadline) {
+            return Ok(false);
+        }
         let split = self.order_split(orders, fixed);
         let until = split.as_ref().map_or(self.chart.play.frames.len(), |split| split.frame);
         for index in from..until {
             if self.generation != crate::cancellation_generation() {
                 return Err("cancelled".into());
+            }
+            if index & 63 == 0 && crate::clock::deadline_expired(self.deadline) {
+                return Ok(false);
             }
             if let Some(trace) = &mut model.just_window {
                 trace.record_probe(index);
@@ -209,7 +218,9 @@ impl ReplayTree<'_, true> {
                 }
                 let mut branch = model.clone();
                 branch.finish_section_frame(range, rank);
-                self.visit_scenarios(branch, orders, index + 1, fixed, &samples, replay)?;
+                if !self.visit_scenarios(branch, orders, index + 1, fixed, &samples, replay)? {
+                    return Ok(false);
+                }
             }
         }
         if let Some(split) = split {
@@ -221,7 +232,9 @@ impl ReplayTree<'_, true> {
                 }
                 let mut branch = model.clone();
                 branch.set_event_members(&self.events[orders[0]]);
-                self.visit_scenarios(branch, &orders, until, split.end, samples, replay)?;
+                if !self.visit_scenarios(branch, &orders, until, split.end, samples, replay)? {
+                    return Ok(false);
+                }
             }
         } else {
             let row = Observation::from_model(&model);
@@ -231,7 +244,7 @@ impl ReplayTree<'_, true> {
                 }
             }
         }
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -244,6 +257,26 @@ pub(crate) fn replay(
     opponents: Option<&OpponentSamples>,
     window: Option<&crate::just_window::Trace>,
 ) -> Result<Vec<Observation>, String> {
+    replay_until(master, chart, deck, seeds, ReplayOptions {
+        power, opponents, window, deadline: f64::INFINITY,
+    }).map(|value| value.expect("unlimited section replay"))
+}
+
+pub(crate) struct ReplayOptions<'a> {
+    pub power: i32,
+    pub opponents: Option<&'a OpponentSamples>,
+    pub window: Option<&'a crate::just_window::Trace>,
+    pub deadline: f64,
+}
+
+pub(crate) fn replay_until(
+    master: &Master,
+    chart: &Chart,
+    deck: &[Performer],
+    seeds: &[i32],
+    options: ReplayOptions<'_>,
+) -> Result<Option<Vec<Observation>>, String> {
+    let ReplayOptions { power, opponents, window, deadline } = options;
     let random = crate::gekiso::replay_random(master, chart, deck);
     let runs = if random || opponents.is_some() {
         seeds.to_vec()
@@ -252,6 +285,9 @@ pub(crate) fn replay(
     };
     if runs.is_empty() {
         return Err("section-luck-samples-required".into());
+    }
+    if crate::clock::deadline_expired(deadline) {
+        return Ok(None);
     }
     let events: Vec<Vec<_>> = live::orders()
         .iter()
@@ -305,16 +341,24 @@ pub(crate) fn replay(
             events: &events,
             chronological,
             generation: crate::cancellation_generation(),
+            deadline,
             observe: None,
             upper: &[],
             multiplicities: &[],
             stopped: AtomicBool::new(false),
             detail: None,
         };
-        tree.visit_scenarios(make_model(runs[0])?, &orders, 0, 0, &samples, &mut replay)?;
-        return Ok(replay.observations);
+        return Ok(tree.visit_scenarios(make_model(runs[0])?, &orders, 0, 0, &samples, &mut replay)?
+            .then_some(replay.observations));
     }
-    let batches = crate::parallel::map(&runs, |&seed| {
+    let generation = crate::cancellation_generation();
+    let batches = crate::parallel::map(&runs, |&seed| -> Result<_, String> {
+        if generation != crate::cancellation_generation() {
+            return Err("cancelled".into());
+        }
+        if crate::clock::deadline_expired(deadline) {
+            return Ok(None);
+        }
         let observations = Mutex::new(vec![Observation::default(); 120]);
         let record = |model: &Model<'_>, orders: &[usize]| {
             let observation = Observation::from_model(model);
@@ -327,7 +371,8 @@ pub(crate) fn replay(
             chart,
             events: &events,
             chronological: chronological.clone(),
-            generation: crate::cancellation_generation(),
+            generation,
+            deadline,
             observe: None,
             upper: &[],
             multiplicities: &[],
@@ -340,8 +385,10 @@ pub(crate) fn replay(
                 Some(Arc::new(samples[seed as usize % samples.len()].clone()));
         }
         let mut unused = vec![(0.0, [0.0; 3]); 120];
-        tree.visit(model, &orders, 0, 0, &mut unused)?;
-        Ok::<_, String>(observations.into_inner().unwrap())
+        Ok(tree.visit(model, &orders, 0, 0, &mut unused)?.then(|| observations.into_inner().unwrap()))
     })?;
-    Ok(batches.into_iter().flatten().collect())
+    if batches.iter().any(Option::is_none) {
+        return Ok(None);
+    }
+    Ok(Some(batches.into_iter().flatten().flatten().collect()))
 }

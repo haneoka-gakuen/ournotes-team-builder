@@ -319,6 +319,10 @@ pub trait Objective {
     fn domain_rank_upper(&mut self) -> Option<[f64;3]> {None}
     fn interval(&mut self, team: &Team, totals: Totals) -> (f64, f64);
     fn exact(&mut self, team: &Team, power: f64, slot_powers: &[f64]) -> Result<Exact, String>;
+    /// A missing value stops the search and leaves this team unexplored.
+    fn try_exact(&mut self, team: &Team, power: f64, slot_powers: &[f64]) -> Result<Option<Exact>, String> {
+        self.exact(team, power, slot_powers).map(Some)
+    }
     fn exact_value(&mut self, team: &Team, power: f64, slot_powers: &[f64]) -> Result<f64, String> {
         self.exact(team, power, slot_powers).map(|value| value.key)
     }
@@ -330,6 +334,11 @@ pub trait Objective {
         _cutoff: Cutoff,
     ) -> Result<Evaluation, String> {
         self.exact(team, power, slot_powers).map(Evaluation::Exact)
+    }
+    fn try_evaluate(
+        &mut self, team: &Team, power: f64, slot_powers: &[f64], cutoff: Cutoff,
+    ) -> Result<Option<Evaluation>, String> {
+        self.evaluate(team, power, slot_powers, cutoff).map(Some)
     }
 }
 #[derive(Clone)]
@@ -1029,6 +1038,17 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         self.generation != crate::cancellation_generation()
             || self.input.deadline != f64::INFINITY && (self.input.now)() > self.input.deadline
     }
+    fn interrupt_evaluation(&mut self) {
+        self.timed_out = true;
+        self.unexplored = f64::INFINITY;
+    }
+    fn try_exact(&mut self, team: &Team, power: f64, slots: &[f64]) -> Result<Option<Exact>, String> {
+        let exact = self.input.objective.try_exact(team, power, slots)?;
+        if exact.is_none() {
+            self.interrupt_evaluation();
+        }
+        Ok(exact)
+    }
     fn visit_expired(&mut self) -> bool {
         self.visit_polls = self.visit_polls.wrapping_add(1);
         self.timed_out || self.visit_polls & 63 == 0 && self.expired()
@@ -1180,12 +1200,16 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         let exact = if let Some(exact) = evaluated {
             Evaluation::Exact(exact)
         } else {
-            self.input.objective.evaluate(
+            let Some(exact) = self.input.objective.try_evaluate(
                 &candidate.team,
                 candidate.power,
                 &candidate.slot_powers,
                 cutoff,
-            )?
+            )? else {
+                self.interrupt_evaluation();
+                return Ok(());
+            };
+            exact
         };
         let exact = match exact {
             Evaluation::Exact(exact) => exact,
@@ -1351,7 +1375,9 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         if self.team_filter && !self.feasible_team(&seed, power)? {
             return Ok(false);
         }
-        let exact = self.input.objective.exact(&seed, power, &powers)?;
+        let Some(exact) = self.try_exact(&seed, power, &powers)? else {
+            return Ok(false);
+        };
         self.stats.exact += 1;
         let set_key = self.set_key(&seed.members);
         self.frontier.offer(&set_key, exact.key);
@@ -1502,10 +1528,9 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                     && alternate
                 {
                     let (totals, powers) = self.seed_values(&hit.team);
-                    let exact = self
-                        .input
-                        .objective
-                        .exact(&hit.team, totals.power, &powers)?;
+                    let Some(exact) = self.try_exact(&hit.team, totals.power, &powers)? else {
+                        return Ok(());
+                    };
                     self.stats.exact += 1;
                     let rank = [
                         exact.detail["directMean"].as_f64().unwrap_or(0.0),
@@ -1573,11 +1598,13 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                 if self.team_filter && !self.feasible_team(&origin, totals.power)? {
                     continue;
                 }
-                let initial = self.input.objective.exact(&origin, totals.power, &powers)?;
+                let Some(initial) = self.try_exact(&origin, totals.power, &powers)? else {
+                    return Ok(());
+                };
                 self.stats.exact += 1;
                 let mut team = origin;
                 let mut value = rating(&initial);
-                while !self.expired() && (direct || value.0 < self.input.objective.seed_ceiling()) {
+                while !self.timed_out && !self.expired() && (direct || value.0 < self.input.objective.seed_ceiling()) {
                     let mut next_value = value;
                     let (current_totals, _) = self.seed_values(&team);
                     let lambda = ((self.input.objective.product_base().unwrap_or(0.0)
@@ -1678,7 +1705,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                         }
                     }
                     let mut best = None;
-                    for rematch in [false, true] {
+                    'neighbors: for rematch in [false, true] {
                         if rematch {
                             let mut sets = vec![team.snaps.clone()];
                             for slot in 0..5 {
@@ -1750,7 +1777,9 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                             {
                                 continue;
                             }
-                            let exact = self.input.objective.exact(&next, totals.power, &powers)?;
+                            let Some(exact) = self.try_exact(&next, totals.power, &powers)? else {
+                                break 'neighbors;
+                            };
                             self.stats.exact += 1;
                             let candidate = rating(&exact);
                             if candidate > next_value {
@@ -3642,7 +3671,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         }
         let mut seen = HashSet::default();
         for seed in self.input.seeds.clone() {
-            if self.expired() {
+            if self.timed_out || self.expired() {
                 break;
             }
             if self.seed_valid(&seed) {
@@ -3657,7 +3686,9 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             .shard
             .filter(|(_, count)| *count > 1)
             .map(|_| leaders.as_slice());
-        self.warm_seed(owned_leaders)?;
+        if !self.timed_out {
+            self.warm_seed(owned_leaders)?;
+        }
         for (position, &leader) in leaders.iter().enumerate() {
             if let Some(callback) = self.input.progress.as_deref_mut() {
                 callback(position, leaders.len());
@@ -3994,11 +4025,10 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                 }) {
                     continue;
                 }
+                let Some(exact) = self.try_exact(&c.team, c.power, &c.slot_powers)? else {
+                    break;
+                };
                 self.stats.exact += 1;
-                let exact = self
-                    .input
-                    .objective
-                    .exact(&c.team, c.power, &c.slot_powers)?;
                 if known.get(&c.set_key).is_some_and(|&v| {
                     v > exact.key || !self.input.objective.score_ties() && v == exact.key
                 }) {

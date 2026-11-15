@@ -2142,6 +2142,13 @@ pub(crate) fn replay_order_mode(
 }
 pub(crate) fn replay_order_scene(master:&Master,chart:&Chart,deck:&[Performer],power:i32,order_index:usize,
     mode:(i32,bool),scene:Option<&sections::ReplayScene<'_>>)->Result<ReplayedOrder,String> {
+    replay_order_until(master, chart, deck, power, order_index, mode, (scene, f64::INFINITY))
+        .map(|value| value.expect("unlimited replay"))
+}
+
+pub(crate) fn replay_order_until(master:&Master,chart:&Chart,deck:&[Performer],power:i32,order_index:usize,
+    mode:(i32,bool), limit:(Option<&sections::ReplayScene<'_>>,f64))->Result<Option<ReplayedOrder>,String> {
+    let (scene, deadline) = limit;
     let (seed, trace_combo) = mode;
     let order = &live::orders()[order_index];
     let events = chart
@@ -2179,7 +2186,7 @@ pub(crate) fn replay_order_scene(master:&Master,chart:&Chart,deck:&[Performer],p
                 let original=chart.play.frames.partition_point(|frame|frame.time_ms<note.time_ms);
                 let Some(&target)=inputs.get(&note.id).filter(|&&target|target!=chart.play.frames[original].time_ms) else{continue;};
                 if !chart.setup.fevers.iter().zip(&chart.setup.missions).any(|(&(start,end),&mission)|mission==3 && start<=target && target<end) {
-                    return Ok(ReplayedOrder {valid:false,ranks:[1;3],score:0.0,base_score:0.0,ranges:[0.0;3],combos:[0;3],perfects:[0;3],missions:[0;3],combo_frames:Vec::new()});
+                    return Ok(Some(ReplayedOrder {valid:false,ranks:[1;3],score:0.0,base_score:0.0,ranges:[0.0;3],combos:[0;3],perfects:[0;3],missions:[0;3],combo_frames:Vec::new()}));
                 }
                 let delivered=chart.play.frames.partition_point(|frame|frame.time_ms<target);
                 let before=if delivered==0 {0}else{chart.play.frames[delivered-1].time_ms+1};
@@ -2194,13 +2201,16 @@ pub(crate) fn replay_order_scene(master:&Master,chart:&Chart,deck:&[Performer],p
         if generation != crate::cancellation_generation() {
             return Err("cancelled".into());
         }
+        if k & 63 == 0 && crate::clock::deadline_expired(deadline) {
+            return Ok(None);
+        }
         let count = if trace_combo { model.gk.as_ref().map_or(0, |g| g.controller.combo_bonus_count()) } else { 0 };
         let reachable=|model:&Model<'_>|frame.judged.iter().filter_map(|note|displaced.get(&note.note_id)).all(|&(kind,note,first,last)|
             model.just_window.as_ref().and_then(|trace|trace.current.get(&kind)).is_some_and(|&(before,after)|first.max(note-before)<=last.min(note+after)));
-        if !displaced.is_empty() && !reachable(&model) {return Ok(ReplayedOrder {valid:false,ranks:[1;3],score:0.0,base_score:0.0,ranges:[0.0;3],combos:[0;3],perfects:[0;3],missions:[0;3],combo_frames:Vec::new()});}
+        if !displaced.is_empty() && !reachable(&model) {return Ok(Some(ReplayedOrder {valid:false,ranks:[1;3],score:0.0,base_score:0.0,ranges:[0.0;3],combos:[0;3],perfects:[0;3],missions:[0;3],combo_frames:Vec::new()}));}
         if scene.is_some_and(|scene|scene.window.is_some()) {if let Some(trace)=&mut model.just_window {trace.record_probe(k);}}
         model.frame(frame.time_ms, &frame.judged, chart.play.dt[k])?;
-        if !displaced.is_empty() && !reachable(&model) {return Ok(ReplayedOrder {valid:false,ranks:[1;3],score:0.0,base_score:0.0,ranges:[0.0;3],combos:[0;3],perfects:[0;3],missions:[0;3],combo_frames:Vec::new()});}
+        if !displaced.is_empty() && !reachable(&model) {return Ok(Some(ReplayedOrder {valid:false,ranks:[1;3],score:0.0,base_score:0.0,ranges:[0.0;3],combos:[0;3],perfects:[0;3],missions:[0;3],combo_frames:Vec::new()}));}
         if let Some(g) = model.gk.as_ref().filter(|_| trace_combo) {
             combo_frames.extend(g.controller.combo_bonus_times(count).map(|time| live::FrameClock::default().frame_time(time)));
         }
@@ -2223,7 +2233,7 @@ pub(crate) fn replay_order_scene(master:&Master,chart:&Chart,deck:&[Performer],p
     }
     let valid=scene.and_then(|scene|scene.minimum).is_none_or(|policy|model.just_window.as_ref().and_then(|trace|trace.window(policy)).is_none_or(|window|window.meets_target));
     let bonus=model.gk.as_ref().map_or(0,|g|g.rank_bonus.iter().fold(0_i32,|sum,row|sum.wrapping_add(row.bonus)));
-    Ok(ReplayedOrder { valid,ranks,score: model.score.score.score as f64,base_score:model.score.score.score.wrapping_sub(bonus) as f64, ranges, combos,perfects, missions, combo_frames })
+    Ok(Some(ReplayedOrder { valid,ranks,score: model.score.score.score as f64,base_score:model.score.score.score.wrapping_sub(bonus) as f64, ranges, combos,perfects, missions, combo_frames }))
 }
 type ReplayValue = (f64, [f64; 3]);
 type ReplayObserver<'a> = dyn Fn(f64, usize, f64) -> bool + Sync + 'a;
@@ -2233,6 +2243,7 @@ struct ReplayTree<'a,const SECTIONS:bool,const COUNTS:bool=false> {
     events: &'a [Vec<(usize, i32)>],
     chronological: Vec<usize>,
     generation: u64,
+    deadline: f64,
     observe: Option<&'a ReplayObserver<'a>>,
     upper: &'a [f64],
     multiplicities: &'a [usize],
@@ -2246,17 +2257,20 @@ struct OrderSplit {
 }
 
 impl<const SECTIONS:bool,const COUNTS:bool> ReplayTree<'_,SECTIONS,COUNTS> {
-    fn advance(&self, model: &mut Model<'_>, from: usize, to: usize) -> Result<(), String> {
+    fn advance(&self, model: &mut Model<'_>, from: usize, to: usize) -> Result<bool, String> {
         for k in from..to {
             if self.generation != crate::cancellation_generation() {
                 return Err("cancelled".into());
+            }
+            if k & 63 == 0 && crate::clock::deadline_expired(self.deadline) {
+                return Ok(false);
             }
             let frame = &self.chart.play.frames[k];
             if SECTIONS { if let Some(trace)=&mut model.just_window {trace.record_probe(k);} }
             if COUNTS { model.count_frame(frame.time_ms, &frame.judged, self.chart.play.dt[k])?; }
             else { model.frame(frame.time_ms, &frame.judged, self.chart.play.dt[k])?; }
         }
-        Ok(())
+        Ok(true)
     }
     fn order_split(&self, orders: &[usize], fixed: usize) -> Option<OrderSplit> {
         let representative = &self.events[orders[0]];
@@ -2294,9 +2308,19 @@ impl<const SECTIONS:bool,const COUNTS:bool> ReplayTree<'_,SECTIONS,COUNTS> {
         if self.stopped.load(Ordering::Relaxed) {
             return Ok(false);
         }
+        if self.deadline.is_finite() {
+            if self.generation != crate::cancellation_generation() {
+                return Err("cancelled".into());
+            }
+            if crate::clock::deadline_expired(self.deadline) {
+                return Ok(false);
+            }
+        }
         let split = self.order_split(orders, fixed);
         let until = split.as_ref().map_or(self.chart.play.frames.len(), |split| split.frame);
-        self.advance(&mut model, from, until)?;
+        if !self.advance(&mut model, from, until)? {
+            return Ok(false);
+        }
         let Some(split) = split else {
             if let Some(detail) = self.detail { detail(&model, orders); }
             let mut ranges = [0.0; 3];
@@ -2559,6 +2583,7 @@ fn replay_selected_orders(
         multiplicities[index] += 1;
     }
     let tree = ReplayTree::<false> {
+        deadline: f64::INFINITY,
         chart,
         events: &event_orders,
         chronological,

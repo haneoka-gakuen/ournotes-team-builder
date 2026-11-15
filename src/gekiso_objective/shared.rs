@@ -1071,8 +1071,15 @@ pub(crate) fn search_shared(input: SharedInput<'_>) -> Result<search::Output, St
             if let (Some(hit), Some(callback)) = (&early, on_candidate.as_deref_mut()) { callback(std::slice::from_ref(hit)); }
         }
     }
+    let mut hits = Vec::new();
+    if let Some(hit) = early { offer(&mut hits, env.members, hit); }
+    if let Some(plan) = sections {
+        for hit in plan.incumbents.borrow().iter().chain(plan.reference_hit.iter()) {
+            offer(&mut hits, env.members, hit.clone());
+        }
+    }
     if (env.now)() >= deadline {
-        return Ok(search::Output { hits: early.into_iter().collect(), proven: false, bound: None, stats: search::Stats { elapsed_ms: (env.now)()-started, ..Default::default() } });
+        return Ok(search::Output { hits: ranked(&hits, k), proven: false, bound: None, stats: search::Stats { elapsed_ms: (env.now)()-started, ..Default::default() } });
     }
     let section_charts = sections.map(|_| charts.iter().map(|chart| chart.converted_judgements(&chart.judgements).unwrap()).collect::<Vec<_>>());
     let mut windows = Vec::with_capacity(charts.len());
@@ -1155,9 +1162,6 @@ pub(crate) fn search_shared(input: SharedInput<'_>) -> Result<search::Output, St
             levels.sort_by_key(|&level| (level != preferred, std::cmp::Reverse(level)));
         }
     }
-    let mut hits=Vec::new();
-    if let Some(hit) = early { offer(&mut hits, env.members, hit); }
-    if let Some(plan)=sections {for hit in plan.incumbents.borrow().iter().chain(plan.reference_hit.iter()) {offer(&mut hits,env.members,hit.clone());}}
     if let Some(callback)=on_candidate.as_deref_mut().filter(|_|!hits.is_empty()) {callback(&ranked(&hits,k));}
     let mut stats = search::Stats::default();
     if !seeded && (initial.is_empty() || levels.len() > 1 && kernels.iter().any(|kernel| kernel.chart.luck)) {
