@@ -26,6 +26,10 @@ impl Standing {
     pub fn beats(&self, other: &Self) -> bool {
         (self.metric, self.score, self.perfect) > (other.metric, other.score, other.perfect)
     }
+
+    pub(crate) fn rank_against(&self, range: usize, opponents: &[[Standing; 3]]) -> i32 {
+        1 + opponents.iter().filter(|other| other[range].beats(self)).count().min(4) as i32
+    }
 }
 
 #[derive(Clone, Copy, Default, Serialize, Deserialize)]
@@ -153,6 +157,84 @@ pub(crate) fn metric_samples(master: &Master, chart: &Chart, deck: &[Performer],
     Ok(values)
 }
 
+struct ScenarioReplay<'a> {
+    opponents: Vec<&'a [[Standing; 3]]>,
+    observations: Vec<Observation>,
+}
+
+impl ReplayTree<'_, true> {
+    fn visit_scenarios(
+        &self,
+        mut model: Model<'_>,
+        orders: &[usize],
+        from: usize,
+        fixed: usize,
+        samples: &[usize],
+        replay: &mut ScenarioReplay<'_>,
+    ) -> Result<(), String> {
+        let split = self.order_split(orders, fixed);
+        let until = split.as_ref().map_or(self.chart.play.frames.len(), |split| split.frame);
+        for index in from..until {
+            if self.generation != crate::cancellation_generation() {
+                return Err("cancelled".into());
+            }
+            if let Some(trace) = &mut model.just_window {
+                trace.record_probe(index);
+            }
+            let frame = &self.chart.play.frames[index];
+            let Some((range, own)) = model.frame_to_section_rank(
+                frame.time_ms,
+                &frame.judged,
+                self.chart.play.dt[index],
+            )? else {
+                continue;
+            };
+            let rank = |sample: usize| own.rank_against(range, replay.opponents[sample]);
+            let first = rank(samples[0]);
+            if samples[1..].iter().all(|&sample| rank(sample) == first) {
+                model.finish_section_frame(range, first);
+                continue;
+            }
+            // A different rank changes the fixed bonus and becomes skill input on the next frame.
+            let mut by_rank = [const { Vec::new() }; 5];
+            for &sample in samples {
+                by_rank[rank(sample) as usize - 1].push(sample);
+            }
+            let mut branches = by_rank.into_iter().enumerate().filter(|(_, samples)| !samples.is_empty()).peekable();
+            while let Some((rank, samples)) = branches.next() {
+                let rank = rank as i32 + 1;
+                if branches.peek().is_none() {
+                    model.finish_section_frame(range, rank);
+                    return self.visit_scenarios(model, orders, index + 1, fixed, &samples, replay);
+                }
+                let mut branch = model.clone();
+                branch.finish_section_frame(range, rank);
+                self.visit_scenarios(branch, orders, index + 1, fixed, &samples, replay)?;
+            }
+        }
+        if let Some(split) = split {
+            let mut groups = self.order_groups(orders, &split).peekable();
+            while let Some(orders) = groups.next() {
+                if groups.peek().is_none() {
+                    model.set_event_members(&self.events[orders[0]]);
+                    return self.visit_scenarios(model, &orders, until, split.end, samples, replay);
+                }
+                let mut branch = model.clone();
+                branch.set_event_members(&self.events[orders[0]]);
+                self.visit_scenarios(branch, &orders, until, split.end, samples, replay)?;
+            }
+        } else {
+            let row = Observation::from_model(&model);
+            for &sample in samples {
+                for &order in orders {
+                    replay.observations[sample * 120 + order] = row;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 pub(crate) fn replay(
     master: &Master,
     chart: &Chart,
@@ -162,7 +244,8 @@ pub(crate) fn replay(
     opponents: Option<&OpponentSamples>,
     window: Option<&crate::just_window::Trace>,
 ) -> Result<Vec<Observation>, String> {
-    let runs = if crate::gekiso::replay_random(master, chart, deck) || opponents.is_some() {
+    let random = crate::gekiso::replay_random(master, chart, deck);
+    let runs = if random || opponents.is_some() {
         seeds.to_vec()
     } else {
         vec![seeds.first().copied().unwrap_or(0)]
@@ -194,6 +277,43 @@ pub(crate) fn replay(
         }
     }
     let orders: Vec<_> = (0..120).collect();
+    let make_model = |seed| {
+        let mut params = chart.params();
+        params.power = power;
+        params.music_type = chart.music_type;
+        let mut model = Model::with_live_capacity(
+            master,
+            deck,
+            &chart.full.notes,
+            &events[0],
+            params,
+            Some(&chart.setup),
+            (seed, false, Some(&capacity)),
+        )?;
+        chart.fixed_life(&mut model);
+        model.just_window = window.cloned();
+        Ok::<_, String>(model)
+    };
+    if let Some(opponents) = opponents.filter(|_| !random && runs.len() > 1) {
+        let mut replay = ScenarioReplay {
+            opponents: runs.iter().map(|&seed| opponents[seed as usize % opponents.len()].as_slice()).collect(),
+            observations: vec![Observation::default(); 120 * runs.len()],
+        };
+        let samples: Vec<_> = (0..runs.len()).collect();
+        let tree = ReplayTree::<true> {
+            chart,
+            events: &events,
+            chronological,
+            generation: crate::cancellation_generation(),
+            observe: None,
+            upper: &[],
+            multiplicities: &[],
+            stopped: AtomicBool::new(false),
+            detail: None,
+        };
+        tree.visit_scenarios(make_model(runs[0])?, &orders, 0, 0, &samples, &mut replay)?;
+        return Ok(replay.observations);
+    }
     let batches = crate::parallel::map(&runs, |&seed| {
         let observations = Mutex::new(vec![Observation::default(); 120]);
         let record = |model: &Model<'_>, orders: &[usize]| {
@@ -214,20 +334,7 @@ pub(crate) fn replay(
             stopped: AtomicBool::new(false),
             detail: Some(&record),
         };
-        let mut params = chart.params();
-        params.power = power;
-        params.music_type = chart.music_type;
-        let mut model = Model::with_live_capacity(
-            master,
-            deck,
-            &chart.full.notes,
-            &events[0],
-            params,
-            Some(&chart.setup),
-            (seed, false, Some(&capacity)),
-        )?;
-        chart.fixed_life(&mut model);
-        model.just_window = window.cloned();
+        let mut model = make_model(seed)?;
         if let Some(samples) = opponents {
             model.gk.as_mut().unwrap().section_opponents =
                 Some(Arc::new(samples[seed as usize % samples.len()].clone()));

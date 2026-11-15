@@ -990,7 +990,21 @@ impl<'a> Model<'a> {
         ConditionIndices { selected, all: 0..self.condition.len() }
     }
     pub fn frame(&mut self, time: i32, judged: &[JudgedNote], dt: f64) -> Result<(), String> {
-        self.frame_inner::<false>(time,judged,dt)
+        self.frame_inner::<false, false>(time, judged, dt).map(|_| ())
+    }
+
+    pub(crate) fn frame_to_section_rank(
+        &mut self,
+        time: i32,
+        judged: &[JudgedNote],
+        dt: f64,
+    ) -> Result<Option<(usize, crate::gekiso::sections::Standing)>, String> {
+        self.frame_inner::<false, true>(time, judged, dt)
+    }
+
+    pub(crate) fn finish_section_frame(&mut self, index: usize, rank: i32) {
+        self.apply_section_rank(index, rank);
+        self.record_frame();
     }
     pub(crate) fn converted_inputs(&self) -> &[(i32, i32, i32)] { &self.judged }
     pub(crate) fn converter_frame(&mut self, time: i32, judged: &[JudgedNote], dt: f64) -> Result<(), String> {
@@ -1039,9 +1053,14 @@ impl<'a> Model<'a> {
         Ok(())
     }
     pub(crate) fn count_frame(&mut self,time:i32,judged:&[JudgedNote],dt:f64)->Result<(),String> {
-        self.frame_inner::<true>(time,judged,dt)
+        self.frame_inner::<true, false>(time, judged, dt).map(|_| ())
     }
-    fn frame_inner<const COUNTS_ONLY:bool>(&mut self, time: i32, judged: &[JudgedNote], dt: f64) -> Result<(), String> {
+    fn frame_inner<const COUNTS_ONLY: bool, const DEFER_RANK: bool>(
+        &mut self,
+        time: i32,
+        judged: &[JudgedNote],
+        dt: f64,
+    ) -> Result<Option<(usize, crate::gekiso::sections::Standing)>, String> {
         self.frame_time = time;
         self.frame_rank = self.previous_rank.take();
         if let Some(g) = &mut self.gk {
@@ -1350,14 +1369,30 @@ impl<'a> Model<'a> {
                 .map(|g| &g.controller as &dyn score::GekisoCombo),
         )?;}
         if self.gk.is_some() {
-            self.after::<COUNTS_ONLY>(time)?;
+            if let Some(index) = self.after::<COUNTS_ONLY>(time)? {
+                let g = self.gk.as_ref().unwrap();
+                let standing = || crate::gekiso::sections::Standing::from_state(
+                    &g.controller.states[index], g.controller.ranges[index].mission,
+                );
+                if DEFER_RANK {
+                    return Ok(Some((index, standing())));
+                }
+                let rank = g.section_opponents.as_ref().map_or_else(
+                    || g.ranks.get(index).copied().unwrap_or(1),
+                    |opponents| standing().rank_against(index, opponents),
+                );
+                self.apply_section_rank(index, rank);
+            }
         }
-        if self.record_trace {
-            self.trace.push((time, self.score.score.score));
-        }
-        Ok(())
+        self.record_frame();
+        Ok(None)
     }
-    fn after<const COUNTS_ONLY:bool>(&mut self, time: i32) -> Result<(), String> {
+    fn record_frame(&mut self) {
+        if self.record_trace {
+            self.trace.push((self.frame_time, self.score.score.score));
+        }
+    }
+    fn after<const COUNTS_ONLY:bool>(&mut self, time: i32) -> Result<Option<usize>, String> {
         let g = self.gk.as_mut().unwrap();
         self.gk_judged.clear();
         self.gk_judged.extend(
@@ -1402,7 +1437,7 @@ impl<'a> Model<'a> {
             .find(|&&i| g.controller.states[i].state == gekisou::COMPLETE)
             .copied()
         else {
-            return Ok(());
+            return Ok(None);
         };
         let range = &g.controller.ranges[index];
         let s0 = if COUNTS_ONLY {0}else{self
@@ -1415,28 +1450,21 @@ impl<'a> Model<'a> {
             .calculate(range.end, &self.combo, Some(&g.controller))?};
         g.controller.states[index].start_score = s0;
         g.controller.states[index].end_score = s1;
-        if index < g.factors.len() {
-            let own = g.controller.states[index].score();
-            let rank = if let Some(opponents) = &g.section_opponents {
-                let own = crate::gekiso::sections::Standing::from_state(
-                    &g.controller.states[index], g.controller.ranges[index].mission,
-                );
-                1 + opponents.iter().filter(|opponent| opponent[index].beats(&own)).count().min(4) as i32
-            } else { g.ranks.get(index).copied().unwrap_or(1) };
-            let percent = g.factors[index][rank as usize - 1];
-            let product = own as i64 * percent as i64;
-            let bonus = crate::num::i32((product as f64 / 100.0).trunc());
-            self.score.score.add_fixed(range.end, bonus);
-            if self.score.score.factored_record { self.score.score.replay.as_mut().unwrap().push(score::ReplayCommand::Rank(index, range.end, percent)); }
-            g.rank_bonus.push(RankBonus {
-                range: index,
-                rank,
-                bonus,
-                percent,
-            });
-            self.previous_rank = Some(rank);
+        Ok((index < g.factors.len()).then_some(index))
+    }
+    fn apply_section_rank(&mut self, index: usize, rank: i32) {
+        let g = self.gk.as_mut().unwrap();
+        let end = g.controller.ranges[index].end;
+        let own = g.controller.states[index].score();
+        let percent = g.factors[index][rank as usize - 1];
+        let product = own as i64 * percent as i64;
+        let bonus = crate::num::i32((product as f64 / 100.0).trunc());
+        self.score.score.add_fixed(end, bonus);
+        if self.score.score.factored_record {
+            self.score.score.replay.as_mut().unwrap().push(score::ReplayCommand::Rank(index, end, percent));
         }
-        Ok(())
+        g.rank_bonus.push(RankBonus { range: index, rank, bonus, percent });
+        self.previous_rank = Some(rank);
     }
     fn state(&self, item: Listed) -> &State {
         match item {
