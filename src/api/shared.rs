@@ -8,6 +8,9 @@ use crate::{
     search::{self, Exact, Objective, Team, Totals},
 };
 
+// Five slots of three integer components each sum exactly in binary64 at this magnitude.
+const EXACT_POWER_COMPONENT: u64 = 1 << 49;
+
 struct SongObjective<'a> {
     objective: Box<dyn Objective + 'a>,
     music: power::Music,
@@ -76,6 +79,7 @@ struct Combined<'a> {
     songs: Vec<SongObjective<'a>>,
     linear_groups: Vec<LinearGroup>,
     power_groups: Vec<usize>,
+    prepared_rank_members: Option<Vec<usize>>,
     program_groups: Vec<usize>,
     leader_profiles: Vec<power::LeaderProfile>,
     options: Vec<Vec<i32>>,
@@ -427,6 +431,18 @@ impl Objective for Combined<'_> {
         self.songs.iter().all(|song| song.objective.feasible_assignment(members, assigned, from, options))
     }
     fn feasible_team(&mut self, team: &Team, _power: f64) -> Result<bool, String> {
+        if team.members.len() == 5 && team.snaps.len() == 5
+            && self.prepared_rank_members.as_deref() == Some(team.members.as_slice())
+        {
+            let empty = self.snaps.len();
+            for song in &mut self.songs {
+                let power = song.slots.iter().zip(&team.snaps).map(|(row, &snap)| {
+                    row[if snap < 0 { empty } else { snap as usize }]
+                }).sum::<f64>();
+                if !song.objective.feasible_team(team, power)? { return Ok(false); }
+            }
+            return Ok(true);
+        }
         let members: Vec<_> = team.members.iter().map(|&index| self.members[index].clone()).collect();
         let snaps: Vec<_> = team.snaps.iter().map(|&index| (index >= 0).then(|| self.snaps[index as usize].clone())).collect();
         for song in &mut self.songs {
@@ -776,6 +792,10 @@ impl Objective for Combined<'_> {
     }
     fn prepare_assignment(&mut self, members: &[usize], options: &[Vec<i32>]) {
         self.options = options.to_vec();
+        let mut rank_power_exact = self.prepared_rank_members.is_some();
+        if let Some(prepared) = &mut self.prepared_rank_members {
+            prepared.clear();
+        }
         let roster: Vec<_> = members.iter().map(|&m| self.members[m].clone()).collect();
         let profile = &self.leader_profiles[members[0]];
         let width = self.snaps.len() + 1;
@@ -792,9 +812,12 @@ impl Objective for Combined<'_> {
                     .iter()
                     .enumerate()
                     .map(|(slot, &m)| {
-                        (song.bases[m].fixed_points
-                            + power::leader_points(&song.bases[m], &percents[slot]))
-                            as f64
+                        let base = song.bases[m].fixed_points;
+                        let leader = power::leader_points(&song.bases[m], &percents[slot]);
+                        rank_power_exact = rank_power_exact
+                            && base.unsigned_abs() <= EXACT_POWER_COMPONENT
+                            && leader.unsigned_abs() <= EXACT_POWER_COMPONENT;
+                        (base + leader) as f64
                     })
                     .collect();
                 song.base_power = bases.iter().sum();
@@ -813,6 +836,9 @@ impl Objective for Combined<'_> {
                 .prepare_power(Arc::clone(&song.snap_power), width);
             song.objective.prepare_assignment_power(song.base_power);
             song.objective.prepare_assignment(members, options);
+        }
+        if rank_power_exact {
+            self.prepared_rank_members.as_mut().unwrap().extend_from_slice(members);
         }
         self.joint_slots.clear();
         if self.joint_linear() {
@@ -1520,6 +1546,12 @@ impl Engine {
                 plan.criterion == crate::reward_plan::Aggregation::Mean
                     && matches!(plan.levels[0].as_slice(), [term] if term.metric == Metric::Points)
             });
+        // The rank gate calls team_power with no event effects. The assignment tables
+        // only match that call when they were built for each song without effects.
+        let reuse_rank_power = event && !battle && route_kind == RouteKind::Live && effects.is_empty()
+            && plan.as_ref().is_some_and(|plan| plan.minimum_rank == Some(7))
+            && power_groups.iter().copied().eq(0..objectives.len())
+            && objectives.iter().all(|song| song.snap_power.iter().all(|value| value.abs() <= EXACT_POWER_COMPONENT as f64));
         let mut combined = Combined {
             master: &self.master,
             player: &player,
@@ -1529,6 +1561,7 @@ impl Engine {
             songs: objectives,
             linear_groups,
             power_groups,
+            prepared_rank_members: reuse_rank_power.then(|| Vec::with_capacity(5)),
             program_groups,
             leader_profiles: profiles,
             options: Vec::new(),
