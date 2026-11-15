@@ -20,6 +20,10 @@ struct Entry {
 struct Scene {
     draws: Vec<Arc<ScoreTape>>,
 }
+struct FixedFrame {
+    judged: Vec<crate::full::play::JudgedNote>,
+    life: [(i32, i32); 2],
+}
 #[derive(PartialEq, Eq, Hash)]
 struct ScoreTape {
     bytes: Vec<u8>,
@@ -960,20 +964,69 @@ fn context(
     } else {
         vec![seeds.first().copied().unwrap_or(0)]
     };
+    let fixed_inputs = runs.len() > 1 && reduced.iter().all(|actor| {
+        actor.support_skills.iter().all(|&(id, level)| control.support_skills[&id]
+            .iter().filter(|row| row.level == level).all(|row|
+                (matches!(row.kind, 3000..=3004 | 12006 | 15000)) && ordinary_row(control, row)))
+            && actor.gekisou_skill.into_iter().filter_map(|(id, level)|
+                control.gekiso_skills.get(&id).map(|skill| (skill, level)))
+                .chain(actor.gekisou_support_skills.iter().filter_map(|&(id, level)|
+                    control.gekiso_support_skills.get(&id).map(|skill| (skill, level))))
+                .filter(|(skill, _)| skill.mission_type == 4 || chart.setup.missions.contains(&skill.mission_type))
+                .flat_map(|(skill, level)| skill.effects.iter().filter(move |row| row.level == level))
+                .all(|row| (2000..=2005).contains(&row.kind)
+                    || (11000..=11005).contains(&row.kind) || row.kind == 4004)
+    }) && reduced.iter().any(|actor| !actor.support_skills.is_empty());
+    let sampled = if fixed_inputs {
+        let mut actors = reduced.clone();
+        for actor in &mut actors { actor.support_skills.clear(); }
+        let mut model = Model::new(control, &actors, &chart.full.notes, &key.events,
+            chart.params(), Some(&chart.setup), (runs[0], false))?;
+        model.score.score.replay = Some(Vec::new());
+        model.score.score.factored_record = true;
+        model.score.score.record_only = true;
+        model.score.score.calculator.factors_only = true;
+        Some(model)
+    } else { None };
+    let mut prepared: Option<Vec<FixedFrame>> = None;
+    let mut note_life = if fixed_inputs { vec![0; chart.full.notes.len() + 1] } else { Vec::new() };
     let mut draws = Vec::new();
     let mut unique = HashMap::<Arc<ScoreTape>, ()>::default();
     let generation = crate::cancellation_generation();
-    for seed in runs {
-        let mut current = model.clone();
+    for (run, seed) in runs.iter().copied().enumerate() {
+        let mut current = if run > 0 { sampled.as_ref().unwrap_or(&model) } else { &model }.clone();
         current.random = Random::new(seed);
         for (index, frame) in chart.play.frames.iter().enumerate() {
             if index % 64 == 0 && generation != crate::cancellation_generation() {
                 return Err("cancelled".into());
             }
-            current.frame(frame.time_ms, &frame.judged, chart.play.dt[index])?;
+            if let Some(prepared) = prepared.as_ref().filter(|_| run > 0) {
+                current.life.freeze_frame(prepared[index].life);
+                current.frame(frame.time_ms, &prepared[index].judged, chart.play.dt[index])?;
+            } else {
+                current.frame(frame.time_ms, &frame.judged, chart.play.dt[index])?;
+            }
             current.score.score.calculator.observations.clear();
         }
-        let trace = current.score.score.replay.take().unwrap();
+        let mut trace = current.score.score.replay.take().unwrap();
+        if run == 0 && fixed_inputs {
+            let mut inputs = Vec::with_capacity(chart.play.frames.len());
+            let mut judged = Vec::new();
+            for command in &trace {
+                match command {
+                    ReplayCommand::Input(notes) => judged = notes.clone(),
+                    ReplayCommand::Ordinary(_, life) => inputs.push(FixedFrame { judged: std::mem::take(&mut judged), life: *life }),
+                    ReplayCommand::Note(note) => note_life[note.id as usize] = note.life,
+                    _ => {}
+                }
+            }
+            debug_assert_eq!(inputs.len(), chart.play.frames.len());
+            prepared = Some(inputs);
+        } else if fixed_inputs {
+            for command in &mut trace {
+                if let ReplayCommand::Note(note) = command { note.life = note_life[note.id as usize]; }
+            }
+        }
         let draw = Arc::new(ScoreTape::new(
             &trace,
             chart,
