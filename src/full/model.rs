@@ -992,6 +992,14 @@ impl<'a> Model<'a> {
     pub fn frame(&mut self, time: i32, judged: &[JudgedNote], dt: f64) -> Result<(), String> {
         self.frame_inner::<false, false>(time, judged, dt).map(|_| ())
     }
+    pub(crate) fn can_record_lottery(&self) -> bool {
+        self.live.is_empty() && self.rows.iter().all(|row|
+            (11000..=11005).contains(&row.kind) || matches!(row.kind, 2000 | 2002 | 2004 | 2005 | 4004))
+    }
+    pub(crate) fn record_lottery_frame(&mut self, time: i32, judged: &[JudgedNote], dt: f64) -> Result<(), String> {
+        debug_assert!(self.score.score.record_only && self.score.score.factored_record);
+        lottery::record_frame(self, time, judged, dt)
+    }
 
     pub(crate) fn frame_to_section_rank(
         &mut self,

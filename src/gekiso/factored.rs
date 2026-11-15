@@ -988,6 +988,8 @@ fn context(
         model.score.score.calculator.factors_only = true;
         Some(model)
     } else { None };
+    let lottery_record = chart.setup.missions.iter().all(|&mission| mission == 2)
+        && sampled.as_ref().is_some_and(Model::can_record_lottery);
     let mut prepared: Option<Vec<FixedFrame>> = None;
     let mut note_life = if fixed_inputs { vec![0; chart.full.notes.len() + 1] } else { Vec::new() };
     let mut draws = Vec::new();
@@ -1002,7 +1004,11 @@ fn context(
             }
             if let Some(prepared) = prepared.as_ref().filter(|_| run > 0) {
                 current.life.freeze_frame(prepared[index].life);
-                current.frame(frame.time_ms, &prepared[index].judged, chart.play.dt[index])?;
+                if lottery_record {
+                    current.record_lottery_frame(frame.time_ms, &prepared[index].judged, chart.play.dt[index])?;
+                } else {
+                    current.frame(frame.time_ms, &prepared[index].judged, chart.play.dt[index])?;
+                }
             } else {
                 current.frame(frame.time_ms, &frame.judged, chart.play.dt[index])?;
             }

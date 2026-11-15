@@ -180,7 +180,7 @@ pub(crate) fn rush_windows(
             }
             visited += 1;
             let input = &chart.play.frames[k];
-            frame(
+            frame::<false>(
                 &mut model,
                 input.time_ms,
                 &input.judged,
@@ -217,7 +217,15 @@ pub(crate) fn rush_windows(
     Ok(Some(traces))
 }
 
-fn frame(
+pub(super) fn record_frame(model: &mut Model<'_>, time: i32, input: &[JudgedNote], dt: f64) -> Result<(), String> {
+    let mut judged = std::mem::take(&mut model.gk_judged);
+    let mut due = Vec::new();
+    let result = frame::<true>(model, time, input, dt, &mut judged, &mut due);
+    model.gk_judged = judged;
+    result
+}
+
+fn frame<const FACTORED: bool>(
     model: &mut Model<'_>,
     time: i32,
     input: &[JudgedNote],
@@ -257,24 +265,40 @@ fn frame(
             .notes
             .get(&j.note_id)
             .ok_or_else(|| format!("unknown note {}", j.note_id))?;
-        let converted = model
-            .conversion
-            .convert(j.judgement, n.judgement_type, j.time_ms)?;
-        model.combo.add(n.time_ms, converted);
+        let converted = if FACTORED { j.judgement } else {
+            model.conversion.convert(j.judgement, n.judgement_type, j.time_ms)?
+        };
+        if !FACTORED { model.combo.add(n.time_ms, converted); }
         model.judged.push((n.id, converted, n.time_ms));
         judged.push((n.id, n.op, n.time_ms, converted));
         broken |= converted == 1 || converted == 2;
     }
-    let combo = model.combo.at(time);
-    let added = (combo - model.previous_combo).max(0);
-    model.previous_combo = combo;
-    if broken {
-        model.current_combo = 0;
+    if !FACTORED {
+        let combo = model.combo.at(time);
+        let added = (combo - model.previous_combo).max(0);
+        model.previous_combo = combo;
+        if broken { model.current_combo = 0; }
+        model.current_combo = model.current_combo.wrapping_add(added);
     }
-    model.current_combo = model.current_combo.wrapping_add(added);
-    for &(_, _, note_time, converted) in judged.iter() {
-        model.life.note_damage(note_time, converted as usize);
-        model.life.at(note_time);
+    if FACTORED {
+        model.score.score.replay.as_mut().unwrap().push(score::ReplayCommand::Input(
+            model.judged.iter().map(|&(note_id, judgement, time_ms)| JudgedNote { note_id, judgement, time_ms }).collect()));
+    }
+    if !FACTORED {
+        for &(_, _, note_time, converted) in judged.iter() {
+            model.life.note_damage(note_time, converted as usize);
+            model.life.at(note_time);
+        }
+    }
+    if FACTORED {
+        for &(id, op, time, converted) in judged.iter() {
+            if model.master.live.note_percent.contains_key(&op) {
+                let j = converted + 1;
+                let score_type = if (0..9).contains(&j) { [0, 0, 6, 5, 4, 3, 2, 1, 0][j as usize] } else { 0 };
+                model.score.score.add_note(time, model.life.at(time), id, op, score_type);
+            }
+        }
+        model.score.score.calculate(time, &model.combo, None)?;
     }
     let indices = model.condition_indices();
     let mut listed = std::mem::take(&mut model.listed);
@@ -284,7 +308,12 @@ fn frame(
         music_length: model.params.music_length,
         finished: false,
     };
+    let mut phase_life = [(0, 0); 2];
     for phase in 1..=2 {
+        if FACTORED {
+            model.life.enter_phase(phase as usize);
+            phase_life[phase as usize - 1] = (model.life.at(time), model.life.maximum());
+        }
         listed.clear();
         let mut ctx = Context {
             previous_rank: model.frame_rank,
@@ -324,6 +353,10 @@ fn frame(
     model.listed = listed;
     model.updated = updated;
     model.life.sync(time);
+    if FACTORED {
+        model.score.score.replay.as_mut().unwrap().push(score::ReplayCommand::Ordinary(time, phase_life));
+        model.score.score.calculate(time, &model.combo, None)?;
+    }
     let g = model.gk.as_mut().unwrap();
     g.controller.update(
         time,
@@ -344,7 +377,16 @@ fn frame(
         .find(|&&i| g.controller.states[i].state == gekisou::COMPLETE)
     {
         if i < g.factors.len() {
-            model.previous_rank = Some(g.ranks.get(i).copied().unwrap_or(1));
+            let rank = g.ranks.get(i).copied().unwrap_or(1);
+            if FACTORED {
+                let range = &g.controller.ranges[i];
+                let (start, end) = (range.start, range.end);
+                model.score.score.calculate(start, &model.combo, None)?;
+                model.score.score.calculate(end, &model.combo, None)?;
+                model.apply_section_rank(i, rank);
+            } else {
+                model.previous_rank = Some(rank);
+            }
         }
     }
     Ok(())
