@@ -1,6 +1,6 @@
 //! Section-first ranking keeps a base-score floor and complete physical formations.
 use super::*;
-use crate::gekiso::sections::{Observation, OpponentSamples};
+use crate::gekiso::sections::{Observation, OpponentSamples, ReplayOptions};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 
@@ -878,9 +878,24 @@ impl Objective for Wrapper<'_, '_> {
         ])
     }
     fn exact(&mut self, team: &Team, _power: f64, _slots: &[f64]) -> Result<Exact, String> {
+        self.score_team(team, f64::INFINITY)
+            .map(|score| score.expect("unlimited section scoring"))
+    }
+    fn try_exact(&mut self, team: &Team, _power: f64, _slots: &[f64]) -> Result<Option<Exact>, String> {
+        self.score_team(team, crate::clock::preparation_deadline())
+    }
+    fn try_evaluate(
+        &mut self, team: &Team, power: f64, slots: &[f64], _cutoff: search::Cutoff,
+    ) -> Result<Option<search::Evaluation>, String> {
+        self.try_exact(team, power, slots).map(|score| score.map(search::Evaluation::Exact))
+    }
+}
+
+impl Wrapper<'_, '_> {
+    fn score_team(&mut self, team: &Team, deadline: f64) -> Result<Option<Exact>, String> {
         let key = (team.members.clone(), team.snaps.clone());
         if let Some(known) = self.scores.get(&key) {
-            return Ok(known.clone());
+            return Ok(Some(known.clone()));
         }
         if let Some(hit) = self
             .plan
@@ -888,10 +903,10 @@ impl Objective for Wrapper<'_, '_> {
             .as_ref()
             .filter(|hit| hit.team.members == team.members && hit.team.snaps == team.snaps)
         {
-            return Ok(Exact {
+            return Ok(Some(Exact {
                 key: hit.key,
                 detail: hit.detail.clone(),
-            });
+            }));
         }
         let members: Vec<_> = team
             .members
@@ -911,6 +926,9 @@ impl Objective for Wrapper<'_, '_> {
         let mut details = Vec::new();
         let mut summaries = Vec::new();
         for (index, (chart, music)) in self.charts.iter().zip(self.music).enumerate() {
+            if crate::clock::deadline_expired(deadline) {
+                return Ok(None);
+            }
             let power = power::team_power(
                 self.env.master,
                 self.env.player,
@@ -920,15 +938,20 @@ impl Objective for Wrapper<'_, '_> {
                 Some(music),
                 &[],
             )?;
-            let rows = crate::gekiso::sections::replay(
+            let Some(rows) = crate::gekiso::sections::replay_until(
                 &self.plan.full_master,
                 chart,
                 &deck,
                 &self.plan.seeds,
-                power.total as i32,
-                self.plan.opponents[index].as_ref(),
-                self.plan.window_traces[index].as_ref(),
-            )?;
+                ReplayOptions {
+                    power: power.total as i32,
+                    opponents: self.plan.opponents[index].as_ref(),
+                    window: self.plan.window_traces[index].as_ref(),
+                    deadline,
+                },
+            )? else {
+                return Ok(None);
+            };
             let summary = Summary::of(
                 &rows,
                 self.plan.opponents[index].is_some(),
@@ -954,7 +977,7 @@ impl Objective for Wrapper<'_, '_> {
             self.scores.remove(&first);
         }
         self.scores.insert(key, exact.clone());
-        Ok(exact)
+        Ok(Some(exact))
     }
 }
 impl Drop for Wrapper<'_, '_> {
