@@ -4345,9 +4345,9 @@ impl Engine {
         }).collect();
         if input.slots.iter().all(|slot| slot.cumulative.is_empty()) { return Ok(Value::Null); }
         let timing_inputs = crate::input_timing::InputTiming::new(&self.master, chart, input.judgements.as_deref(), input.clock)?;
-        let Some(timing) = live::timing_with_inputs(&input, index, &before_ms, Some(&timing_inputs)) else { return Ok(Value::Null) };
-        let mut output = json!(timing);
         let phases = live::PhaseTiming::from_timing(timing_inputs);
+        let Some(timing) = phases.guide(&input, index, &before_ms)? else { return Ok(Value::Null) };
+        let mut output = json!(timing);
         output["worst"] = json!(phases.order(&input, false, index)?);
         output["optimal"] = json!(phases.order(&input, true, index)?);
         Ok(output)

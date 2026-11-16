@@ -287,6 +287,10 @@ impl FrameClock {
         (frame * 1000 / hz - i64::from(self.phase)).min(i64::from(i32::MAX)) as i32
     }
 
+    pub(crate) fn origin_ms(self) -> f64 {
+        f64::from((-self.phase * i32::from(self.hz)).rem_euclid(1000)) / f64::from(self.hz)
+    }
+
     pub fn advance_ms(self) -> i32 { (1000 + i32::from(self.hz) - 1) / i32::from(self.hz) }
 
     pub(crate) fn with_phase(self, phase: i32) -> Self { Self { phase, ..self } }
@@ -2380,6 +2384,8 @@ pub struct TimingWindow {
 #[serde(rename_all = "camelCase")]
 pub struct Timing {
     pub score: f64,
+    pub plan_base_score: f64,
+    pub frame_origin_ms: f64,
     pub best: f64,
     pub guide_available: bool,
     pub advance_ms: i32,
@@ -2468,7 +2474,7 @@ pub fn timing_with_inputs(input: &Input, order_index: usize, before_ms: &[i32], 
     let score = evaluate(&offsets, false)?;
     if evaluate(&offsets, true).is_none() {
         for window in &mut windows { window.steps.clear(); }
-        return Some(Timing { score, best: score, guide_available: false, advance_ms, windows });
+        return Some(Timing { score, plan_base_score: score, frame_origin_ms: input.clock.origin_ms(), best: score, guide_available: false, advance_ms, windows });
     }
     let mut best = score;
     for (window, step, chord) in groups {
@@ -2493,7 +2499,7 @@ pub fn timing_with_inputs(input: &Input, order_index: usize, before_ms: &[i32], 
         window.steps.retain(|step| step.gain > 0.0);
     }
     if let Some(inputs) = inputs { let _ = inputs.conflict(&Delivery::new(input, &offsets).selected()); }
-    Some(Timing { score, best, guide_available: true, advance_ms, windows })
+    Some(Timing { score, plan_base_score: score, frame_origin_ms: input.clock.origin_ms(), best, guide_available: true, advance_ms, windows })
 }
 #[cfg(test)]
 mod delivery_extremes_tests {

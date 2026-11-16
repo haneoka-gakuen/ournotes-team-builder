@@ -71,6 +71,26 @@ impl PhaseTiming {
         })
     }
 
+    pub(crate) fn guide(&self, input: &Input, order: usize, before_ms: &[i32]) -> Result<Option<super::Timing>, String> {
+        let Some(nominal) = super::timing_with_inputs(input, order, before_ms, Some(&self.base)) else { return Ok(None); };
+        if nominal.guide_available && nominal.best > nominal.plan_base_score
+            || before_ms.iter().all(|&early| early < input.clock.advance_ms()) { return Ok(Some(nominal)); }
+        let mut shifted = input.clone();
+        let generation = crate::cancellation_generation();
+        for phase in 1..input.clock.phase_count() {
+            crate::input_timing::poll(generation)?;
+            shifted.clock = input.clock.with_phase(phase);
+            let inputs = self.timing(shifted.clock, phase)?;
+            if let Some(mut plan) = super::timing_with_inputs(&shifted, order, before_ms, Some(&inputs)) {
+                if plan.guide_available && plan.best > plan.plan_base_score && plan.best > nominal.score {
+                    plan.score = nominal.score;
+                    return Ok(Some(plan));
+                }
+            }
+        }
+        Ok(Some(nominal))
+    }
+
     pub fn scores(&self, input: &Input, best: bool) -> Result<Scores, String> {
         Ok(summarize(input.power, self.extremes(input, best, None)?))
     }
