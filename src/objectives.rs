@@ -1089,13 +1089,20 @@ impl LiveCore {
         if self.broad_play {
             if self.program_ids[better] != self.program_ids[worse] { return false; }
         } else if a.recovery != b.recovery || a.conversion_signature() != b.conversion_signature() { return false; }
+        let ap = self.input.judgements.is_none();
+        let ap_value = |effect: &live::Effect| i64::from(effect.delta) * if effect.kind == 2000 { 1 }
+            else { effect.judgements.iter().filter(|&&grade| grade == 5).count() as i64 };
         let mut used = vec![false; a.effects.len()];
         for effect in &b.effects {
-            let candidate = a.effects.iter().enumerate().filter(|&(index, row)| !used[index]
-                && row.delta >= effect.delta && row.kind == effect.kind && row.gate == effect.gate
-                && row.judgements == effect.judgements && row.release_judgements == effect.release_judgements
-                && window_ms(row.seconds, a.extension_ms) == window_ms(effect.seconds, b.extension_ms))
-                .min_by_key(|(_, row)| row.delta).map(|(index, _)| index);
+            if ap && ap_value(effect) == 0 { continue; }
+            let candidate = a.effects.iter().enumerate().filter(|&(index, row)| {
+                if used[index] || row.gate != effect.gate { return false; }
+                let (a_duration, b_duration) = (window_ms(row.seconds, a.extension_ms), window_ms(effect.seconds, b.extension_ms));
+                if ap { ap_value(row) >= ap_value(effect) && a_duration >= b_duration
+                    && row.release_judgements.contains(&5) == effect.release_judgements.contains(&5) }
+                else { row.delta >= effect.delta && row.kind == effect.kind && row.judgements == effect.judgements
+                    && row.release_judgements == effect.release_judgements && a_duration == b_duration }
+            }).min_by_key(|(_, row)| row.delta).map(|(index, _)| index);
             let Some(index) = candidate else { return false; };
             used[index] = true;
         }
