@@ -857,8 +857,7 @@ impl Search {
         let mut cursor = 0;
         while cursor < programs.len() {
             if cursor.is_multiple_of(1024) {
-                crate::clock::milliseconds();
-                if crate::cancellation_generation() != self.generation { return Err("cancelled".into()); }
+                super::poll(self.generation)?;
             }
             let (key, _, _, depth) = programs[cursor];
             let signature = (0..indices.len()).fold(0u64, |signature, position| signature
@@ -977,8 +976,7 @@ impl Search {
         let mut cursor = 0;
         while cursor < programs.len() {
             if cursor % 1024 == 0 {
-                crate::clock::milliseconds();
-                if crate::cancellation_generation() != self.generation { return Err("cancelled".into()); }
+                super::poll(self.generation)?;
             }
             let (state, _, _, depth) = programs[cursor];
             let mut mask = 0u16;
@@ -1121,10 +1119,7 @@ impl Search {
         while let Some((_, _, _, word)) = self.queue.pop() {
             self.iterations += 1;
             if self.iterations.is_multiple_of(1024) {
-                crate::clock::milliseconds();
-                if crate::cancellation_generation() != self.generation {
-                    return Err("cancelled".into());
-                }
+                super::poll(self.generation)?;
             }
             self.inputs.clear();
             if !word.is_empty() {

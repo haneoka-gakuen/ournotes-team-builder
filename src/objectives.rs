@@ -1807,6 +1807,28 @@ pub struct LiveObjective {
     pub target: Option<Target>,
 }
 impl LiveObjective {
+    pub(crate) fn uses_timing_deadline(&self) -> bool {
+        self.criterion == Criterion::Max
+            && self.target.is_none()
+            && self.core.uses_reachable_timing()
+    }
+
+    pub(crate) fn search_at(
+        input: crate::search::Input<'_, Self>,
+        generation: u64,
+    ) -> Result<crate::search::Output, String> {
+        let _deadline = (input.deadline.is_finite() && input.objective.uses_timing_deadline()).then(|| {
+            // The Worker supplies its runtime clock. Native callers may inject
+            // a different clock origin, so translate the remaining duration.
+            #[cfg(target_arch = "wasm32")]
+            let deadline = input.deadline;
+            #[cfg(not(target_arch = "wasm32"))]
+            let deadline = crate::clock::milliseconds() + (input.deadline - (input.now)()).max(0.0);
+            crate::clock::enter_timing_deadline(deadline)
+        });
+        crate::search::search_at(input, generation)
+    }
+
     fn max_bounds(&self) -> bool {
         self.criterion == Criterion::Max && self.target.is_none()
             || self
@@ -2289,6 +2311,20 @@ impl Objective for LiveObjective {
             detail: json!({"scores":&*scores}),
         })
     }
+    fn try_exact(&mut self, team: &Team, power: f64, slots: &[f64]) -> Result<Option<Exact>, String> {
+        match self.exact(team, power, slots) {
+            Err(error) if error == crate::input_timing::DEADLINE_REACHED => Ok(None),
+            result => result.map(Some),
+        }
+    }
+
+    fn try_evaluate(
+        &mut self, team: &Team, power: f64, slots: &[f64], _cutoff: crate::search::Cutoff,
+    ) -> Result<Option<crate::search::Evaluation>, String> {
+        self.try_exact(team, power, slots)
+            .map(|exact| exact.map(crate::search::Evaluation::Exact))
+    }
+
     fn exact_value(&mut self, team: &Team, power: f64, _slots: &[f64]) -> Result<f64, String> {
         let scores = self.core.evaluate(team, power as i32)?;
         Ok(self.target.map_or_else(|| self.criterion.key(&scores), |target| target.value(&scores.scores)))

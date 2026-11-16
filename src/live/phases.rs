@@ -120,10 +120,7 @@ impl PhaseTiming {
         let mut programs = HashMap::<(usize, Vec<i64>), Vec<f64>>::new();
         let mut phases = Vec::new();
         for phase in 0..input.clock.phase_count() {
-            crate::clock::milliseconds();
-            if generation != crate::cancellation_generation() {
-                return Err("cancelled".into());
-            }
+            crate::input_timing::poll(generation)?;
             shifted.clock = input.clock.with_phase(phase);
             let shapes = relaxed_programs(&shifted, &self.base, &landmarks, best);
             let mut bounds = vec![0.0; 120];
@@ -200,6 +197,7 @@ impl PhaseTiming {
             if !only.map_or_else(|| (0..120).any(improves), improves) {
                 continue;
             }
+            crate::input_timing::check_deadline()?;
             shifted.clock = input.clock.with_phase(*phase);
             let timing = self.timing(shifted.clock, *phase)?;
             let scores = timed_scores(

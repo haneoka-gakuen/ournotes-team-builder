@@ -9,6 +9,31 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+pub(crate) const DEADLINE_REACHED: &str = "native timing deadline reached";
+
+pub(crate) fn check_deadline() -> Result<(), String> {
+    if crate::clock::deadline_expired(crate::clock::timing_deadline()) {
+        return Err(DEADLINE_REACHED.into());
+    }
+    Ok(())
+}
+
+pub(crate) fn poll(generation: u64) -> Result<(), String> {
+    let now = crate::clock::milliseconds();
+    if generation != crate::cancellation_generation() {
+        return Err("cancelled".into());
+    }
+    let deadline = crate::clock::timing_deadline();
+    if deadline.is_finite() && now >= deadline {
+        return Err(DEADLINE_REACHED.into());
+    }
+    Ok(())
+}
+
+pub(crate) fn interrupted(error: &str) -> bool {
+    matches!(error, DEADLINE_REACHED | "cancelled")
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Action {
     Enter,
@@ -497,6 +522,7 @@ impl InputTiming {
     pub(crate) fn ordering_pairs(&self) -> &[(usize, usize)] { &self.orderings }
 
     fn check_inputs(&self, selected: &[i32]) -> Result<Option<Conflict>, String> {
+        check_deadline()?;
         for &(first, second) in &self.orderings {
             if selected[first] > selected[second] {
                 return Ok(Some(Conflict { notes: vec![first, second], interval: None }));
@@ -511,6 +537,7 @@ impl InputTiming {
             }
         }
         for i in 0..self.components.len() {
+            if i != 0 && i.is_multiple_of(16) { check_deadline()?; }
             if let Some(conflict) = self.component_conflict(i, selected)? { return Ok(Some(conflict)); }
         }
         let mut frames = BTreeSet::new();
@@ -519,7 +546,8 @@ impl InputTiming {
             let component = self.components.partition_point(|component| component.end < at);
             if self.components.get(component).is_none_or(|component| component.start > at) { frames.insert(at); }
         }
-        for at in frames {
+        for (index, at) in frames.into_iter().enumerate() {
+            if index != 0 && index.is_multiple_of(64) { check_deadline()?; }
             if let Some(conflict) = self.local_conflict(selected, at, at)? {
                 return Ok(Some(conflict));
             }
@@ -541,7 +569,7 @@ impl InputTiming {
             let start = self.clock.frame_time(at.saturating_sub(self.clock.advance_ms()));
             match self.local_conflict(selected,start,at) {
                 Ok(Some(conflict)) => return Ok(Some(conflict)),
-                Err(error) if error == "cancelled" => return Err(error),
+                Err(error) if interrupted(&error) => return Err(error),
                 _ => {}
             }
         }
@@ -565,14 +593,16 @@ impl InputTiming {
         let checked = replay(self.clock, &notes, &frames.into_iter().collect::<Vec<_>>(), &targets, &initial, &self.atoms, None);
         let mut tightened = None;
         if !matches!(checked, Ok(None)) {
-            if matches!(&checked, Err(error) if error == "cancelled") { return Err("cancelled".into()); }
+            if let Err(error) = &checked {
+                if interrupted(error) { return Err(error.clone()); }
+            }
             let mut ends: Vec<_> = targets.iter().copied().filter(|&at| component.start <= at && at <= component.end).collect();
             ends.sort_unstable(); ends.dedup();
             for at in ends.into_iter().rev() {
                 let start = self.clock.frame_time(at.saturating_sub(self.clock.advance_ms()));
                 match self.local_conflict(selected,start,at) {
                     Ok(Some(conflict)) => { tightened = Some(conflict); break; },
-                    Err(error) if error == "cancelled" => return Err(error),
+                    Err(error) if interrupted(&error) => return Err(error),
                     _ => {}
                 }
             }
@@ -707,19 +737,21 @@ impl InputTiming {
             frames: &[i32],
             selected: &[i32],
             choices: &[(usize, Vec<Option<ReservedFlick>>)],
-            state: &mut State,
+            (state, attempts): (&mut State, &mut usize),
             atoms: &Arc<Mutex<search::AtomCache>>,
         ) -> Result<bool, String> {
             let Some(((index, options), rest)) = choices.split_first() else {
+                *attempts += 1;
+                if attempts.is_multiple_of(64) { check_deadline()?; }
                 return replay(clock, notes, frames, selected, state, atoms, None).map(|conflict| conflict.is_none());
             };
             let mut unresolved = None;
             for &option in options {
                 state.flicks[*index] = option;
-                match possible(clock, notes, frames, selected, rest, state, atoms) {
+                match possible(clock, notes, frames, selected, rest, (state, attempts), atoms) {
                     Ok(true) => return Ok(true),
                     Ok(false) => {}
-                    Err(error) if error == "cancelled" => return Err(error),
+                    Err(error) if interrupted(&error) => return Err(error),
                     Err(error) => unresolved = Some(error),
                 }
             }
@@ -739,7 +771,7 @@ impl InputTiming {
             &frames,
             &selected,
             &choices,
-            &mut initial.clone(),
+            (&mut initial.clone(), &mut 0),
             &self.atoms,
         )?;
         let mut cache = self.local_checked.lock().unwrap();
@@ -802,10 +834,7 @@ fn replay(
     loop {
         iterations += 1;
         if iterations.is_multiple_of(128) {
-            crate::clock::milliseconds();
-            if generation != crate::cancellation_generation() {
-                return Err("cancelled".into());
-            }
+            poll(generation)?;
         }
         if let Some(index) = step.take() {
             if index == frames.len() {
