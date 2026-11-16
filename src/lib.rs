@@ -280,7 +280,7 @@ pub unsafe extern "C" fn haneoka_context_json(input: *const c_char) -> *mut c_ch
             .to_str()
             .map_err(|e| e.to_string())?;
         let input: serde_json::Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
-        session::execute(&input).map(|v| v.to_string())
+        session::execute_owned(input).map(|v| v.to_string())
     });
     let text = match result {
         Ok(Ok(text)) => text,

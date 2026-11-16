@@ -2,6 +2,7 @@
 use crate::num::f;
 use serde_json::{Map, Value};
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
 };
@@ -40,7 +41,9 @@ pub fn rows(v: &Value) -> Vec<&Value> {
         Vec::new()
     }
 }
-pub fn native(v: &Value) -> Value {
+pub fn native(v: &Value) -> Value { native_view(v).into_owned() }
+fn native_view(v: &Value) -> Cow<'_, Value> {
+    if v.is_object() && v.get("raw").is_none() { return Cow::Borrowed(v); }
     let mut row = Map::new();
     if let Some(raw) = v["raw"].as_object() {
         for (k, v) in raw {
@@ -54,7 +57,7 @@ pub fn native(v: &Value) -> Value {
             }
         }
     }
-    Value::Object(row)
+    Cow::Owned(Value::Object(row))
 }
 fn field<'a>(row: &'a Value, a: &str, b: &str) -> &'a Value {
     if row[a].is_null() {
@@ -69,7 +72,7 @@ fn stat(row: &Value, keys: [&str; 3]) -> Stat3 {
 fn nested<T>(rows: Vec<&Value>, outer: &str, inner: &str, parse: impl Fn(&Value) -> T) -> Table<T> {
     let mut out: BTreeMap<i32, BTreeMap<i32, T>> = BTreeMap::new();
     for r in rows {
-        let r = native(r);
+        let r = native_view(r);
         out.entry(int(&r[outer]))
             .or_default()
             .insert(int(&r[inner]), parse(&r));
@@ -509,7 +512,7 @@ fn skill_map(v: &Value) -> BTreeMap<i32, Vec<SkillEffect>> {
                     id,
                     rows(&v["effects"])
                         .iter()
-                        .map(|r| SkillEffect::from(&native(r)))
+                        .map(|r| SkillEffect::from(native_view(r).as_ref()))
                         .collect(),
                 )
             })
@@ -528,7 +531,7 @@ fn gekiso_map(v: &Value) -> BTreeMap<i32, GekisoSkill> {
                         mission_type: int(&v["gekisouMissionType"]),
                         effects: rows(&v["effects"])
                             .iter()
-                            .map(|r| SkillEffect::from(&native(r)))
+                            .map(|r| SkillEffect::from(native_view(r).as_ref()))
                             .collect(),
                     },
                 )
@@ -547,7 +550,7 @@ fn boosts(v: &Value, key: &str) -> Vec<Boost> {
     let mut out: Vec<_> = rows(v)
         .iter()
         .map(|r| {
-            let r = native(r);
+            let r = native_view(r);
             Boost {
                 consumed: int(&r[key]),
                 event_point_rate: number(&r["eventPointRate"], 0.0),
@@ -599,7 +602,7 @@ pub fn compile(data: &Value) -> Result<Master, String> {
     let mut judge = BTreeMap::new();
     let mut damage = [0.0; 7];
     for r in rows(&tools["judgementParameters"]) {
-        let r = native(r);
+        let r = native_view(r);
         let j = number(&r["noteSimulateJudgement"], -1.0) as i32;
         if (1..=6).contains(&j) {
             judge.insert(7 - j, number(&r["scorePercent"], 0.0));
@@ -608,11 +611,11 @@ pub fn compile(data: &Value) -> Result<Master, String> {
     }
     let mut combo_rows: BTreeMap<i32, Vec<Value>> = BTreeMap::new();
     for r in rows(&tools["comboScoreBonuses"]) {
-        let r = native(r);
+        let r = native_view(r);
         combo_rows
             .entry(int(&r["comboBonusType"]))
             .or_default()
-            .push(r);
+            .push(r.into_owned());
     }
     let combo = combo_rows
         .into_iter()
@@ -716,7 +719,7 @@ pub fn compile(data: &Value) -> Result<Master, String> {
         .collect();
     let mut condition_sets: BTreeMap<i32, Vec<Vec<i32>>> = BTreeMap::new();
     for r in rows(&reference["conditionSets"]) {
-        let r = native(r);
+        let r = native_view(r);
         condition_sets
             .entry(int(&r["group"]))
             .or_default()
@@ -724,7 +727,7 @@ pub fn compile(data: &Value) -> Result<Master, String> {
     }
     let mut score_ranks: BTreeMap<i32, Vec<ScoreRank>> = BTreeMap::new();
     for r in rows(&tools["scoreRanks"]) {
-        let r = native(r);
+        let r = native_view(r);
         score_ranks
             .entry(int(&r["group"]))
             .or_default()
@@ -849,7 +852,7 @@ pub fn compile(data: &Value) -> Result<Master, String> {
     let mut character_rank_bonus: Vec<_> = rows(&progression["characterRanks"])
         .iter()
         .map(|r| {
-            let r = native(r);
+            let r = native_view(r);
             (int(&r["rank"]), int(&r["bonus"]))
         })
         .collect();
@@ -857,7 +860,7 @@ pub fn compile(data: &Value) -> Result<Master, String> {
     let mut total_rank_bonus: Vec<_> = rows(&progression["characterTotalRanks"])
         .iter()
         .map(|r| {
-            let r = native(r);
+            let r = native_view(r);
             (int(&r["totalRank"]), int(&r["bonus"]))
         })
         .collect();
@@ -866,7 +869,7 @@ pub fn compile(data: &Value) -> Result<Master, String> {
     for r in rows(&data["bandItems"]) {
         let mut levels: BTreeMap<i32, Vec<SkillEffect>> = BTreeMap::new();
         for effect in rows(&r["effects"]) {
-            let e = SkillEffect::from(&native(effect));
+            let e = SkillEffect::from(&native_view(effect));
             levels.entry(e.level).or_default().push(e);
         }
         band_items.insert(
@@ -914,7 +917,7 @@ pub fn compile(data: &Value) -> Result<Master, String> {
             note_percent: rows(&tools["noteParameters"])
                 .iter()
                 .map(|r| {
-                    let r = native(r);
+                    let r = native_view(r);
                     (int(&r["noteOperateType"]), number(&r["scorePercent"], 0.0))
                 })
                 .collect(),
@@ -978,7 +981,7 @@ pub fn compile(data: &Value) -> Result<Master, String> {
             phases: rows(&reference["effectSettings"])
                 .iter()
                 .map(|r| {
-                    let r = native(r);
+                    let r = native_view(r);
                     (int(&r["skillEffectType"]), number(&r["phase"], 1.0) as i32)
                 })
                 .collect(),
@@ -986,7 +989,7 @@ pub fn compile(data: &Value) -> Result<Master, String> {
                 base: rows(&tools["gekisouLuckBasePoints"])
                     .iter()
                     .map(|r| {
-                        let r = native(r);
+                        let r = native_view(r);
                         [
                             int(&r["noteCategory"]),
                             int(&r["noteSimulateJudgement"]),
@@ -998,7 +1001,7 @@ pub fn compile(data: &Value) -> Result<Master, String> {
                 lots: rows(&tools["gekisouLuckBonusLots"])
                     .iter()
                     .map(|r| {
-                        let r = native(r);
+                        let r = native_view(r);
                         [
                             int(&r["chanceLotType"]),
                             int(&r["lotResult"]),
@@ -1009,7 +1012,7 @@ pub fn compile(data: &Value) -> Result<Master, String> {
                 ranks: rows(&tools["gekisouRankingScoreBonuses"])
                     .iter()
                     .map(|r| {
-                        let r = native(r);
+                        let r = native_view(r);
                         [
                             int(&r["missionPattern"]),
                             int(&r["count"]),
@@ -1052,7 +1055,7 @@ pub fn compile(data: &Value) -> Result<Master, String> {
         member_level_limits: rows(&progression["memberCardLevelLimits"])
             .iter()
             .map(|r| {
-                let r = native(r);
+                let r = native_view(r);
                 (
                     (int(&r["rarity"]), int(&r["awakeCount"])),
                     int(&r["limitLevel"]),
@@ -1094,14 +1097,14 @@ pub fn compile(data: &Value) -> Result<Master, String> {
         targets: rows(&reference["targets"])
             .iter()
             .map(|r| {
-                let t = Target::from(&native(r));
+                let t = Target::from(&native_view(r));
                 (t.id, t)
             })
             .collect(),
         conditions: rows(&reference["conditions"])
             .iter()
             .map(|r| {
-                let r = native(r);
+                let r = native_view(r);
                 let id = int(&r["id"]);
                 (
                     id,
@@ -1119,7 +1122,7 @@ pub fn compile(data: &Value) -> Result<Master, String> {
         cumulative: rows(&reference["cumulativeConditions"])
             .iter()
             .map(|r| {
-                let r = native(r);
+                let r = native_view(r);
                 let id = int(&r["id"]);
                 (
                     id,

@@ -2,6 +2,7 @@
 use crate::{api::Engine, clock, master};
 use serde_json::{json, Value};
 use std::{
+    borrow::Cow,
     collections::HashMap,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -37,59 +38,7 @@ fn get(handle: u64) -> Result<Arc<Session>, String> {
 pub fn execute(input: &Value) -> Result<Value, String> {
     let op = input["op"].as_str().ok_or("missing-context-operation")?;
     if op == "create" {
-        // Compare the complete release document, including cross-server data.
-        // Worker contexts then share immutable tables rather than duplicating
-        // the card/skill database for every CPU worker.
-        let engine = {
-            let mut cache = MASTER
-                .get_or_init(|| Mutex::new(None))
-                .lock()
-                .map_err(|_| "master-cache-poisoned")?;
-            if cache
-                .as_ref()
-                .is_none_or(|entry| entry.data.as_ref() != &input["data"])
-            {
-                *cache = Some(MasterEntry {
-                    data: Arc::new(input["data"].clone()),
-                    master: master::compile(&input["data"])?,
-                    scores: crate::api::SharedScores::default(),
-                    #[cfg(not(target_arch = "wasm32"))]
-                    floors: crate::api::SharedFloors::default(),
-                });
-            }
-            let entry = cache.as_ref().unwrap();
-            let mut engine = Engine::from_master(entry.master.clone());
-            engine.growth_source = Some(Arc::clone(&entry.data));
-            engine.scored_seeds = entry.scores.clone();
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                engine.shared_floors = entry.floors.clone();
-            }
-            engine.trusted_scores = input["trustedScores"] == true;
-            #[cfg(not(target_arch = "wasm32"))]
-            if engine.trusted_scores {
-                engine.worker_budget = input["workers"]
-                    .as_u64()
-                    .map(|value| value.clamp(1, 8) as usize);
-            }
-            engine
-        };
-        let id = NEXT.fetch_add(1, Ordering::Relaxed);
-        sessions()
-            .lock()
-            .map_err(|_| "session-registry-poisoned")?
-            .insert(
-                id,
-                Arc::new(Session {
-                    engine: Mutex::new(engine),
-                    generation: Arc::new(AtomicU64::new(0)),
-                }),
-            );
-        let mut response = json!({"handle":id,"chartCacheLimit":crate::api::CHART_CACHE_LIMIT});
-        if input["trustedScores"] == true {
-            response["cooperativeFloor"] = json!(cfg!(not(target_arch = "wasm32")));
-        }
-        return Ok(response);
+        return create(Cow::Borrowed(&input["data"]), input["trustedScores"] == true, input["workers"].as_u64());
     }
     let handle = input["handle"].as_u64().ok_or("invalid-engine-context")?;
     if op == "dispose" {
@@ -172,4 +121,70 @@ pub fn execute(input: &Value) -> Result<Value, String> {
             _ => Err(format!("unknown-context-operation:{op}")),
         }
     })
+}
+
+pub(crate) fn execute_owned(mut input: Value) -> Result<Value, String> {
+    if input["op"] == "create" {
+        let data = input["data"].take();
+        return create(Cow::Owned(data), input["trustedScores"] == true, input["workers"].as_u64());
+    }
+    execute(&input)
+}
+fn create(data: Cow<'_, Value>, trusted: bool, workers: Option<u64>) -> Result<Value, String> {
+    #[cfg(target_arch = "wasm32")]
+    let _ = workers;
+    // Compare the complete release document, including cross-server data.
+    // Worker contexts then share immutable tables rather than duplicating
+    // the card/skill database for every CPU worker.
+    let engine = {
+        let mut cache = MASTER
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .map_err(|_| "master-cache-poisoned")?;
+        if cache
+            .as_ref()
+            .is_none_or(|entry| entry.data.as_ref() != data.as_ref())
+        {
+            let master = master::compile(data.as_ref())?;
+            *cache = Some(MasterEntry {
+                data: Arc::new(data.into_owned()),
+                master,
+                scores: crate::api::SharedScores::default(),
+                #[cfg(not(target_arch = "wasm32"))]
+                floors: crate::api::SharedFloors::default(),
+            });
+        }
+        let entry = cache.as_ref().unwrap();
+        let mut engine = Engine::from_master(entry.master.clone());
+        engine.growth_source = Some(Arc::clone(&entry.data));
+        engine.scored_seeds = entry.scores.clone();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            engine.shared_floors = entry.floors.clone();
+        }
+        engine.trusted_scores = trusted;
+        #[cfg(not(target_arch = "wasm32"))]
+        if engine.trusted_scores {
+            engine.worker_budget = workers
+                .map(|value| value.clamp(1, 8) as usize);
+        }
+        engine
+    };
+    let id = NEXT.fetch_add(1, Ordering::Relaxed);
+    sessions()
+        .lock()
+        .map_err(|_| "session-registry-poisoned")?
+        .insert(
+            id,
+            Arc::new(Session {
+                engine: Mutex::new(engine),
+                generation: Arc::new(AtomicU64::new(0)),
+            }),
+        );
+    let mut response = json!({"handle":id,"chartCacheLimit":crate::api::CHART_CACHE_LIMIT});
+    if trusted {
+        response["cooperativeFloor"] = json!(cfg!(not(target_arch = "wasm32")));
+    }
+    Ok(response)
+
 }
