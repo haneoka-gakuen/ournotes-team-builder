@@ -20,7 +20,6 @@ struct Ledger<'a> {
     commands: Vec<Command>,
     factor: Cumulative,
     owner: usize,
-    start: i32,
     activation: i32,
     end: i32,
     limit: i32,
@@ -67,7 +66,7 @@ impl FrameObjective for Ledger<'_> {
         State { general: f(1.0), perfect: f(0.0), count: 0, applied: 0, ended: false, note: 0, command: 0, score: 0.0 }
     }
 
-    fn span(&self) -> (i32, i32) { (self.start, self.end) }
+    fn span(&self) -> (i32, i32) { (self.activation, self.end) }
 
     fn advance(&mut self, previous: &State, time: i32, judged: &[usize]) -> State {
         let mut state = previous.clone();
@@ -75,7 +74,7 @@ impl FrameObjective for Ledger<'_> {
             state.count = (state.count + judged.len() as i32).min(self.limit);
             let next = self.factor.mill(state.count);
             if next != state.applied {
-                self.counter(&mut state, if time == self.activation { self.start } else { time }, Some(next));
+                self.counter(&mut state, time, Some(next));
             }
         }
         if !state.ended && time >= self.end {
@@ -111,8 +110,7 @@ pub(super) fn score(input: &Input, timing: &InputTiming, order_index: usize, bes
     if !factor.judgements.contains(&5) { return Ok(None); }
     let order = &orders()[order_index];
     let Some(owner) = order.iter().position(|&position| position == slot).filter(|&event| event < input.skill_times.len()) else { return Ok(None); };
-    let start = input.skill_times[owner];
-    let Some(end) = start.checked_add(factor.duration_ms()) else { return Ok(None); };
+    let (activation, end) = factor.window(input.clock, input.skill_times[owner]);
     let mut plain = input.clone();
     plain.slots[slot].cumulative.clear();
     let commands = commands(&plain, order, None);
@@ -122,7 +120,7 @@ pub(super) fn score(input: &Input, timing: &InputTiming, order_index: usize, bes
     let magnitude = 2.0 * (1.0 + (commands.iter().map(|command| (command.delta as f64).abs()).sum::<f64>()
         + (2.0 * limit as f64 + 1.0) * cumulative) / 100000.0);
     if !magnitude.is_finite() || scorer.integer_bound(magnitude) >= (1u64 << 50) as f64 { return Ok(None); }
-    let mut ledger = Ledger { input, scorer, commands, factor: factor.clone(), owner, start, activation: input.frame_time(start), end, limit };
+    let mut ledger = Ledger { input, scorer, commands, factor: factor.clone(), owner, activation, end, limit };
     let Some((value, frames)) = timing.optimize(&mut ledger, best)? else { return Ok(None); };
     if timing.conflict(&frames)?.is_some() { return Err("native frame optimization input mismatch".into()); }
     if ApScorer::new(input).order(order, Some(&Delivery::from_frames(&frames))) != value {

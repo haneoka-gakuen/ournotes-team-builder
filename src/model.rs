@@ -440,12 +440,11 @@ pub(crate) fn cumulative_upper(
     if factor.judgements.is_empty() {
         return 0.0;
     }
-    let end = start.saturating_add(factor.bound_duration_ms());
-    let activation = input.clock.frame_time(start);
+    let (activation, end) = factor.window(input.clock, start);
     let mut first = input
         .times
         .partition_point(|&time| input.clock.frame_time(time) < activation);
-    let mut cursor = input.times.partition_point(|&time| time < start);
+    let mut cursor = input.times.partition_point(|&time| time < activation);
     let finish = input.times.partition_point(|&time| time < end);
     let (mut count, mut applied, mut total) = (0, 0, 0.0);
     while first < input.times.len() {
@@ -460,7 +459,7 @@ pub(crate) fn cumulative_upper(
             .count() as i32;
         let mill = factor.mill(count);
         if mill != applied {
-            let time = if frame == activation { start } else { frame };
+            let time = frame;
             let next = input.times.partition_point(|&note| note < time).min(finish);
             total += f(applied as f64 / 100000.0) * (prefix[next] - prefix[cursor]);
             cursor = next;
@@ -568,7 +567,7 @@ pub fn skill_weights(
                 } else if model.ignore_gates {
                     cumulative_upper(&model.prefix, input, factor, start, None)
                 } else {
-                    delta * window_weight(&model.prefix, input, start, length)
+                    delta * window_weight(&model.prefix, input, input.clock.frame_time(start), length)
                 };
             }
         }
@@ -790,8 +789,7 @@ impl PlayBounds {
                     }
                     for factor in &slot.cumulative {
                         let end = input.times.partition_point(|&t| {
-                            t < input.skill_times[event]
-                                + factor.bound_duration_ms()
+                            t < factor.window(input.clock, input.skill_times[event]).1
                         });
                         let delta = f(factor.at_cap() as f64 / 100000.0);
                         if end > start {

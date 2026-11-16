@@ -109,6 +109,11 @@ impl Cumulative {
     pub(crate) fn bound_duration_ms(&self) -> i32 {
         self.duration_ms()
     }
+
+    pub(crate) fn window(&self, clock: FrameClock, trigger: i32) -> (i32, i32) {
+        let start = clock.frame_time(trigger);
+        (start, start + self.duration_ms())
+    }
 }
 #[derive(Clone, Deserialize, Serialize, PartialEq)]
 pub struct Slot {
@@ -426,11 +431,11 @@ fn combo(table: &[(usize, f64)], count: usize) -> f64 {
     f(value.min(1.0) + 1.0)
 }
 #[derive(Clone)]
-struct Command {
-    time: i32,
+pub(crate) struct Command {
+    pub(crate) time: i32,
     owner: usize,
     channel: usize,
-    delta: i32,
+    pub(crate) delta: i32,
 }
 pub(crate) fn effect_end(input: &Input, slot: &Slot, effect: &Effect, start: i32, judgements: Option<&[usize]>) -> i32 {
     let end = start + window_ms(effect.seconds, slot.extension_ms);
@@ -554,9 +559,9 @@ fn timed_scores(input: &Input, frames: &[Vec<i32>], best: bool, timing: Option<&
                 let values: Vec<_> = (0..=n).map(|count| factor.mill(count as i32)).collect();
                 let trend = if values.windows(2).all(|w| w[0] <= w[1]) { 1 }
                     else if values.windows(2).all(|w| w[0] >= w[1]) { -1 } else { 0 };
-                let activation = input.frame_time(start);
+                let (activation,end) = factor.window(input.clock,start);
                 let mask = factor.judgements.iter().fold(0, |mask, &g| mask | (1u64 << g));
-                windows.push((activation, start + factor.duration_ms(), mask, trend));
+                windows.push((activation, end, mask, trend));
             }
         }
         windows.sort_unstable();
@@ -658,7 +663,7 @@ fn reachable_extreme<E: FnMut(&Delivery) -> f64>(
     let (bound, delivery, order_index) = initial;
     let windows: Vec<_> = input.skill_times.iter().take(5).enumerate().flat_map(|(event, &start)| {
         input.slots[orders()[order_index][event]].cumulative.iter().filter(|factor| !factor.judgements.is_empty() && factor.value != 0)
-            .map(move |factor| (input.frame_time(start), start + factor.duration_ms()))
+            .map(move |factor| factor.window(input.clock, start))
     }).collect();
     let nominal: Vec<_> = input.times.iter().map(|&time| input.frame_time(time)).collect();
     let mut preferred = nominal.clone();
@@ -833,8 +838,7 @@ fn slot_cumulative_commands(
     let note_at = |k: usize| delivery.map_or(k, |d| d.notes[k]);
     let mut commands = Vec::new();
     for factor in &slot.cumulative {
-        let activation = input.frame_time(start);
-        let end = start + factor.duration_ms();
+        let (activation, end) = factor.window(input.clock, start);
         let (mut count, mut applied) = (0, 0);
         let mut first = partition(n, |k| frame_at(k) < activation);
         while first < n {
@@ -852,7 +856,7 @@ fn slot_cumulative_commands(
                 .count() as i32;
             let mill = factor.mill(count);
             if mill != applied {
-                let time = if frame == activation { start } else { frame };
+                let time = frame;
                 commands.push(Command {
                     time,
                     owner: event,
@@ -896,6 +900,10 @@ fn cumulative_commands(
     }
     commands.sort_by_key(|command| (command.time, command.owner));
     commands
+}
+
+pub(crate) fn cumulative_note_commands(input: &Input, order: &[usize; 5], grades: &[usize]) -> Vec<Command> {
+    cumulative_commands(input, order, Some(grades), None)
 }
 
 fn commands(input: &Input, order: &[usize; 5], delivery: Option<&Delivery>) -> Vec<Command> {
@@ -2194,8 +2202,8 @@ pub struct Timing {
 pub const TIMING_ADVANCE_MS: i32 = 17;
 
 /// Cumulative snapshots count judgements in the frame that delivers them.
-/// The first frame's factor starts at the skill event's chart time; later
-/// changes start at their delivery frame. Notes score at their chart time.
+/// Activation and duration follow the member event's delivery frame. Later
+/// changes follow their judgement delivery frame; notes score at chart time.
 /// Moving a completing note one frame early can put its score after the change;
 /// moving the window's first notes early can drop them before activation.
 /// `before_ms` follows `input.times` and allows only inputs retaining their base judgement.
@@ -2218,8 +2226,7 @@ pub fn timing_with_inputs(input: &Input, order_index: usize, before_ms: &[i32], 
     for (event, &start) in input.skill_times.iter().take(5).enumerate() {
         let Some(slot) = input.slots.get(order[event]) else { continue };
         for factor in slot.cumulative.iter().filter(|factor| !factor.judgements.is_empty()) {
-            let activation = input.frame_time(start);
-            let end = start + factor.duration_ms();
+            let (activation, end) = factor.window(input.clock, start);
             let mut window = TimingWindow { event, start_ms: activation, end_ms: end, unit: factor.unit, notes: Vec::new(), steps: Vec::new() };
             let (mut count, mut applied) = (0, 0);
             let mut first = input.times.partition_point(|&time| input.frame_time(time) < activation);

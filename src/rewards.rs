@@ -436,7 +436,7 @@ pub fn score_coefficient(
                 }
                 for factor in &slot.cumulative {
                     let diff = f(factor.at_cap().abs() as f64 / 100000.0);
-                    let duration = factor.bound_duration_ms();
+                    let duration = factor.bound_duration_ms().saturating_add(live::FrameClock::default().advance_ms());
                     if !diff.is_finite() {
                         return None;
                     }
@@ -1654,7 +1654,7 @@ fn cumulative_windows(
     if cap > 256 || i64::from(factor.value) * i64::from(cap) > i64::from(i32::MAX / 10) {
         return None;
     }
-    let duration = factor.bound_duration_ms();
+    let duration = factor.bound_duration_ms().saturating_add(live::FrameClock::default().advance_ms());
     let padding = chart.delivery_radius_ms.saturating_add(40);
     let mut previous = 0.0_f64;
     let mut windows = Vec::new();
@@ -1677,7 +1677,7 @@ fn cumulative_windows(
                     .saturating_sub(1);
                 let end = chart
                     .times
-                    .partition_point(|&time| time < at.saturating_add(duration));
+                    .partition_point(|&time| time < factor.window(live::FrameClock::default(), at).1);
                 let first = times
                     .get(threshold)
                     .map(|&time| time.saturating_sub(padding).max(at));
@@ -1971,14 +1971,15 @@ impl BoundPreparation {
                 for factor in &slot.cumulative {
                     let delta = f(factor.at_cap() as f64 / 100000.0);
                     let duration = factor.bound_duration_ms();
-                    shape.push((duration, delta));
+                    shape.push((duration.saturating_add(live::FrameClock::default().advance_ms()), delta));
                     let key=(factor.unit,factor.value,factor.maximum,factor.cap,duration);
                     let windows = cumulative_cache.entry(key).or_insert_with(|| cumulative_windows(factor,chart,&count_times));
                     if let Some(windows) = windows {
                         normal_windows.extend(windows.iter().cloned());
                     } else {
                         let intervals = chart.full.events.iter().take(5).map(|&(_,time)| {
-                            (chart.times.partition_point(|&t|t<time),chart.times.partition_point(|&t|t<time.saturating_add(duration)))
+                            let (start,end)=factor.window(live::FrameClock::default(),time);
+                            (chart.times.partition_point(|&t|t<start),chart.times.partition_point(|&t|t<end))
                         }).collect();
                         normal_windows.push(PreparedWindow { delta, mask: 0, duration, intervals });
                     }
@@ -11906,10 +11907,10 @@ pub(crate) fn order_score_coefficients_with_base(
         }
         for factor in &slot.cumulative {
             let diff = f(factor.at_cap() as f64 / 100000.0);
-            let duration = factor.bound_duration_ms();
             for (event, &(_, time)) in chart.full.events.iter().take(5).enumerate() {
-                let start = chart.times.partition_point(|&t| t < time);
-                let end = chart.times.partition_point(|&t| t < time + duration);
+                let (from,until)=factor.window(live::FrameClock::default(),time);
+                let start = chart.times.partition_point(|&t| t < from);
+                let end = chart.times.partition_point(|&t| t < until);
                 events[slot_index][event] +=
                     diff * (weights.general[end] - weights.general[start]);
             }

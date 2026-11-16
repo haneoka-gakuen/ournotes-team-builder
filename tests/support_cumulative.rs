@@ -136,12 +136,12 @@ fn cumulative_changes_wait_for_the_judgement_frame() {
 }
 
 #[test]
-fn activation_frame_uses_its_complete_judgement_batch() {
+fn activation_batch_does_not_backdate_its_bonus() {
     let mut all = input(vec![slot(vec![climbing(6, 5.0)])], None, 3);
     all.skill_times = vec![1];
     all.times = vec![2, 10, 120];
     let scores = live::score(&all).unwrap();
-    assert_eq!(scores.scores[0], 3600.0);
+    assert_eq!(scores.scores[0], 3200.0);
     all.judgements = Some(vec![PERFECT; 3]);
     assert_eq!(scores.scores, live::score(&all).unwrap().scores);
 }
@@ -172,7 +172,7 @@ fn cumulative_expiry_does_not_count_a_later_delivery_frame() {
 }
 
 #[test]
-fn search_bounds_end_at_the_nominal_support_expiry() {
+fn search_bounds_cover_the_delivered_support_expiry() {
     let factor = Cumulative {
         unit: 1,
         cap: 1,
@@ -184,7 +184,7 @@ fn search_bounds_end_at_the_nominal_support_expiry() {
     all.times = vec![20, 111];
     all.note_frac = vec![0.0, 1.0];
     let exact = live::score(&all).unwrap().scores[0];
-    assert_eq!(exact, 1000.0);
+    assert_eq!(exact, 1200.0);
     let upper = model::skill_weights(&model::linear(&all), &all, &all.slots[0], true);
     assert!(1000.0 + 1000.0 * upper.per_event[0] >= exact);
     let mut bounds = model::PlayBounds::new(&all, &[PERFECT; 2]);

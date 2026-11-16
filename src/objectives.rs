@@ -320,7 +320,7 @@ impl LiveCore {
                 longest = longest.max(window_ms(effect.seconds, slot.extension_ms));
             }
             for factor in &slot.cumulative {
-                longest = longest.max(factor.bound_duration_ms());
+                longest = longest.max(factor.bound_duration_ms().saturating_add(input.clock.advance_ms()));
             }
         }
         let mut overlap = 1;

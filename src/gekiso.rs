@@ -1544,16 +1544,9 @@ struct Active {
     channel: usize,
     delta: i32,
 }
-struct Climbing {
-    end: i32,
-    factor: live::Cumulative,
-    count: i32,
-    applied: i32,
-}
 struct Factors {
     channel: [f64; 7],
     active: Vec<Active>,
-    climbing: Vec<Climbing>,
     factor: f64,
     convert_end: Option<i32>,
     convert_judgements: Vec<usize>,
@@ -1576,15 +1569,6 @@ impl Factors {
                 }
             }
         }
-        let mut index = 0;
-        while index < self.climbing.len() {
-            if self.climbing[index].end as i64 > time {
-                index += 1;
-                continue;
-            }
-            let run = self.climbing.remove(index);
-            self.factor = f(self.factor - f(run.applied as f64 / 100000.0));
-        }
         if self.convert_end.is_some_and(|end| end as i64 <= time) {
             self.convert_end = None;
         }
@@ -1592,7 +1576,6 @@ impl Factors {
             .active
             .iter()
             .map(|active| active.end)
-            .chain(self.climbing.iter().map(|run| run.end))
             .chain(self.convert_end)
             .min()
             .map_or(i64::MAX, i64::from);
@@ -1630,7 +1613,6 @@ impl NoteScorePlan {
             let mut factors = Factors {
                 channel: [0.0; 7],
                 active: Vec::new(),
-                climbing: Vec::new(),
                 factor: f(0.0),
                 convert_end: None,
                 convert_judgements: Vec::new(),
@@ -1914,6 +1896,14 @@ fn score_orders_selected(
             .flat_map(|s| &s.effects)
             .any(|e| e.gate.kind != 0));
     let mut life_cache = HashMap::<[i32; 5], (Vec<i32>, Vec<i32>)>::default();
+    let ordinary = slots.iter().any(|slot| !slot.cumulative.is_empty()).then(|| live::Input {
+        clock: live::FrameClock::default(), times: chart.times.clone(), note_frac: chart.note_frac.clone(),
+        ap_combo: normal_combo.to_vec(), combo_table: master.live.combo.get(&0).cloned().unwrap_or_default(),
+        judge_frac: chart.judge_frac, converted_count: chart.full.converted as usize,
+        difficulty_factor: chart.difficulty_factor, adjustment: master.live.adjustment,
+        skill_times: event_times.clone(), life_base: master.live.life_base, life_onus: master.live.life_onus,
+        damage: *damage, power, slots: slots.to_vec(), judgements: Some(ctx.judgement.clone()), assist: 1.0, luck_percent: 100.0,
+    });
     for &order_index in &plan.representatives {
         if selected.is_some_and(|orders| !orders.iter().any(|&order|plan.sources[order]==order_index)) {
             continue;
@@ -1963,14 +1953,16 @@ fn score_orders_selected(
         let mut factors = Factors {
             channel: [0.0; 7],
             active: Vec::new(),
-            climbing: Vec::new(),
             factor: if native_life {f(1.0)}else{f(0.0)},
             convert_end: None,
             convert_judgements: Vec::new(),
             convert_left: 0.0,
             next_expiry: i64::MAX,
         };
-        let mut converted = ctx.judgement.clone();
+        let mut converted = ordinary.as_ref().map_or_else(|| ctx.judgement.clone(), |input|
+            live::converted_judgements(input, order, &ctx.judgement));
+        let mut cumulative = ordinary.as_ref().map_or_else(Vec::new, |input|
+            live::cumulative_note_commands(input, order, &converted)).into_iter().peekable();
         let mut prepared = 0;
         let mut cursor = 0;
         let mut score = 0.0;
@@ -1984,6 +1976,10 @@ fn score_orders_selected(
             while cursor < firing.len() && event_times[firing[cursor]] as i64 <= time {
                 let event = firing[cursor];
                 let start = event_times[event];
+                while cumulative.peek().is_some_and(|command| command.time <= start) {
+                    let command = cumulative.next().unwrap();
+                    factors.factor = f(factors.factor + f(command.delta as f64 / 100000.0));
+                }
                 factors.expire(start as i64);
                 if let Some(slot) = slots.get(order[event]) {
                     for effect in &slot.effects {
@@ -2014,17 +2010,6 @@ fn score_orders_selected(
                             factors.next_expiry = factors.next_expiry.min(end as i64);
                         }
                     }
-                    for factor in &slot.cumulative {
-                        factors.climbing.push(Climbing {
-                            end: start + factor.duration_ms(),
-                            factor: factor.clone(),
-                            count: 0,
-                            applied: 0,
-                        });
-                        factors.next_expiry = factors
-                            .next_expiry
-                            .min((start + factor.duration_ms()) as i64);
-                    }
                     if let Some(convert) = &slot.convert {
                         factors.convert_end = Some(
                             start
@@ -2046,30 +2031,22 @@ fn score_orders_selected(
                 break;
             }
             factors.expire(time);
+            while cumulative.peek().is_some_and(|command| command.time as i64 <= time) {
+                let command = cumulative.next().unwrap();
+                factors.factor = f(factors.factor + f(command.delta as f64 / 100000.0));
+            }
             if prepared <= i {
                 let mut end = i + 1;
                 while end < n && chart.times[end] as i64 == time {
                     end += 1;
                 }
                 for judgement in &mut converted[i..end] {
-                    if factors.convert_end.is_some()
+                    if ordinary.is_none() && factors.convert_end.is_some()
                         && factors.convert_left > 0.0
                         && factors.convert_judgements.contains(judgement)
                     {
                         *judgement = 5;
                         factors.convert_left -= 1.0;
-                    }
-                }
-                for run in &mut factors.climbing {
-                    run.count += converted[i..end]
-                        .iter()
-                        .filter(|j| run.factor.judgements.contains(j))
-                        .count() as i32;
-                    let mill = run.factor.mill(run.count);
-                    if mill != run.applied {
-                        factors.factor = f(factors.factor - f(run.applied as f64 / 100000.0));
-                        factors.factor = f(factors.factor + f(mill as f64 / 100000.0));
-                        run.applied = mill;
                     }
                 }
                 prepared = end;
