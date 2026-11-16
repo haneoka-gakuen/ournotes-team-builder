@@ -515,6 +515,14 @@ extern "C" {
     /// Receives each progress notification (a NUL-terminated JSON string, valid during the call).
     fn haneoka_progress(value: *const c_char);
 }
+/// Opt into cooperative clock polls through `env.haneoka_progress(0)`.
+/// Other progress pointers remain NUL-terminated JSON notifications.
+#[cfg(target_arch = "wasm32")]
+#[no_mangle]
+pub extern "C" fn haneoka_cooperative_clock(enabled: u32) { clock::cooperative(enabled != 0); }
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn yield_for_clock() { unsafe { haneoka_progress(std::ptr::null()) } }
+
 #[cfg(target_arch = "wasm32")]
 extern "C" fn forward_progress(value: *const c_char) {
     unsafe { haneoka_progress(value) }

@@ -36,6 +36,11 @@ extern "C" {
     fn haneoka_now_ms() -> f64;
 }
 #[cfg(target_arch = "wasm32")]
+thread_local! { static COOPERATIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn cooperative(enabled: bool) { COOPERATIVE.with(|value| value.set(enabled)); }
+#[cfg(target_arch = "wasm32")]
 pub fn milliseconds() -> f64 {
+    if COOPERATIVE.with(std::cell::Cell::get) { crate::yield_for_clock(); }
     unsafe { haneoka_now_ms() }
 }

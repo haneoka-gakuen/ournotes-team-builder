@@ -55,3 +55,7 @@ Timing search shares immutable frame domains and propagates watched conflicts. A
 ## Artifact identity
 
 These addresses refer to original `libil2cpp.so` SHA-256 `119a19de9dfae037e75b4443769247ac38df4f1e60e61031363aa1227be48d4e`. The native execution checks restore the original client's readonly constants as well as its executable instructions.
+
+## WASM host clock
+
+`env.haneoka_now_ms` stays synchronous. Hosts may opt into cooperative polling with `haneoka_cooperative_clock(1)`; a null pointer passed to `env.haneoka_progress` then requests a yield. Other progress pointers remain JSON strings. Hosts that never enable this export keep the existing imports and synchronous behavior. The browser wraps progress in JSPI and uses `WebAssembly.promising` for calls because even ordinary searches publish progress; the high-frequency clock import itself needs no JSPI wrapper.
