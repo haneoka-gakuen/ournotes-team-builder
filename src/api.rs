@@ -476,7 +476,7 @@ impl Engine {
             );
             input.clock = live::FrameClock::for_play(play);
             match chart::timing_mode(play) {
-                Some(best) if input.slots.iter().any(|slot| !slot.cumulative.is_empty()) => live::score_reachable(&input, &crate::input_timing::InputTiming::new(&self.master, chart, input.judgements.as_deref(), input.clock)?, best)?,
+                Some(best) if input.slots.iter().any(|slot| !slot.cumulative.is_empty()) => live::PhaseTiming::new(&self.master, chart, input.judgements.as_deref(), input.clock)?.scores(&input, best)?,
                 _ => live::score(&input)?,
             }
         };
@@ -4332,8 +4332,9 @@ impl Engine {
         let timing_inputs = crate::input_timing::InputTiming::new(&self.master, chart, input.judgements.as_deref(), input.clock)?;
         let Some(timing) = live::timing_with_inputs(&input, index, &before_ms, Some(&timing_inputs)) else { return Ok(Value::Null) };
         let mut output = json!(timing);
-        output["worst"] = json!(live::score_reachable_order(&input, &timing_inputs, false, index)?);
-        output["optimal"] = json!(live::score_reachable_order(&input, &timing_inputs, true, index)?);
+        let phases = live::PhaseTiming::from_timing(timing_inputs);
+        output["worst"] = json!(phases.order(&input, false, index)?);
+        output["optimal"] = json!(phases.order(&input, true, index)?);
         Ok(output)
     }
 }

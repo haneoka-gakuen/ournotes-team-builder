@@ -4,7 +4,7 @@
 
 Score requests can set `goal.play.cumulativeTiming` to `"best"` or `"worst"` with `criterion: "max"`; evaluation reads `request.play.cumulativeTiming`. Each of the 120 skill orders gets its own timing optimum and the best order sets the team's score. Without the option, scoring is nominal.
 
-`play.frameRate` is 30, 60, 90 or 120 (default 60). The release document supplies `liveTools.judgementAreaOffsets`. Numeric card dominance is off in these modes, and a selected optimum must pass whole-frame input replay.
+`play.frameRate` is 30, 60, 90 or 120 (default 60). The release document supplies `liveTools.judgementAreaOffsets`. AP numeric dominance requires identical cumulative and conversion programs, pointwise ordinary-skill dominance and a power difference covering the full floating-point error budget. Selected optima pass whole-frame input replay. Timing bounds cover the earliest possible counter climb and latest possible expiry over every origin.
 
 A `timeline` request with a `timing` context returns `worst` and `optimal` next to the nominal `score` and the input-checked guide's `best`. Guide steps advance one frame rounded up to whole milliseconds (34, 17, 12 or 9 ms) and address notes by `noteIndices` in the judged-note stream. Timeline bounds cover only the selected skill order; full evaluation returns all 120.
 
@@ -18,7 +18,7 @@ For song 100001 EXPERT, member 74's LIFE-gated COMBO skill makes a 7.578-second 
 
 ## Original-client paths
 
-The ordinary cumulative scorer separates judgement delivery from the score ledger. `play.frameRate` selects 30, 60, 90 or 120 evenly spaced updates per second, with 60 as the default. The first update has music time 0.
+The ordinary cumulative scorer separates judgement delivery from the score ledger. `play.frameRate` selects 30, 60, 90 or 120 evenly spaced updates per second, with 60 as the default. Nominal scoring and the one-frame-early guide use music time 0 for the first update. Best/worst scoring covers every distinct render-grid origin: 100 integer-millisecond grids at 30 or 90 Hz, 50 at 60 Hz and 25 at 120 Hz. Integer timestamp observations repeat after `1000 / gcd(1000, Hz)` whole-millisecond translations, which also cover the fractional origins between those translations. Each order retains its own extremum across that complete set. Relaxed per-origin input bounds prune origins before whole-frame replay; geometry, phase-independent ordinary commands and integer score prefixes are shared.
 
 The original `FrameRateHelper.ToFrameRateValue` (`0x6653030`) maps the four setting modes to these rates. `LiveManager.OnUpdate` (`0x5ad24c4`) forwards `AppTimeManager.GetGameDeltaTime` into the live entry point on each update; the music clock supplies judgement time.
 
@@ -32,7 +32,7 @@ The original 1.1.0 Android ARM64 client records note score commands at the note'
 
 ## Cumulative activation and expiry
 
-`LiveSkillExecuteTrigger.Update` (`0x55e8ac4`) preserves the skill event's timestamp in its trigger result. `SkillEffectUpdater.UpdateStay` (`0x55eb374`) copies it to `ExecuteTimeMs` and updates the cumulative counter for the current frame.
+`LiveSkillExecuteTrigger.Update` (`0x55e8ac4`) preserves the member skill event's timestamp. The snapshot condition `SameMemberLiveSkillActivated` observes that member activation during the render update, so its own `ExecuteTimeMs` is the delivery frame. `SkillEffectUpdater.UpdateStay` (`0x55eb374`) starts the snapshot counter in that frame; its duration ends relative to that actual activation.
 
 `NoteCumulativeScoreUpApplier.Update` (`0x55d6720`) handles three states:
 
@@ -50,7 +50,7 @@ Direct execution of the original function with `ExecuteTimeMs = 1001` and a five
 
 Flick reservations are the input state carried between updates. The engine caches independent flick intervals and checks other judgement frames separately. Spatial candidates include exterior cells beyond widened hit areas. Input words share their observable selection state and complete finite input languages. Frames without flick judgements factor flick reservations from Enter inputs. Every retained outcome is checked by the whole-frame selector.
 
-Timing search shares immutable frame domains and propagates watched conflicts. Late Perfect flicks that require a saved input first check the preceding update. Failed flick components also check two-update windows for smaller certified conflicts. A single-counter AP fallback advances legal frame states together with the original binary32 factor ledger. A relaxed-window optimum requires a full input certificate; a complete frame search retains its actual touches for replay. `guideAvailable: false` identifies an unavailable fixed early-input plan while preserving the numeric `best` field and the separate `worst` and `optimal` results.
+Timing search shares immutable frame domains and propagates watched conflicts. AP origins with identical score-ledger positions and ordinary-command interleavings share their exact relaxed score vectors; input feasibility remains separate for every origin. Saturated counters stop producing new increments, and input tie resolution only reevaluates notes that can still affect a counter. Whole-frame replay indexes eligible notes by delivery interval instead of rescanning the whole component at every update. Late Perfect flicks that require a saved input first check the preceding update. Failed flick components also check two-update windows for smaller certified conflicts. A single-counter AP fallback advances legal frame states together with the original binary32 factor ledger. A relaxed-window optimum requires a full input certificate; a complete frame search retains its actual touches for replay. `guideAvailable: false` identifies an unavailable fixed early-input plan while preserving the numeric `best` field and the separate `worst` and `optimal` results.
 
 ## Artifact identity
 

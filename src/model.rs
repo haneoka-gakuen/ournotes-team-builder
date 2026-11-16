@@ -13,6 +13,7 @@ pub struct Linear {
     pub life_at: HashMap<usize, f64>,
     pub absolute_error: f64,
     pub ignore_gates: bool,
+    pub ignore_releases: bool,
     pub nominal_cumulative: bool,
     pub conversion_combo: Vec<f64>,
     pub release_windows: Vec<ReleaseWindow>,
@@ -182,11 +183,23 @@ pub fn linear(input: &Input) -> Linear {
             .collect(),
         absolute_error: input.times.len() as f64 + 1.0,
         ignore_gates: false,
+        ignore_releases: false,
         nominal_cumulative: false,
         conversion_combo: Vec::new(),
         release_windows: Vec::new(),
     }
 }
+pub(crate) fn timing_play_upper(input: &Input) -> Linear {
+    let mut optimistic = input.clone();
+    optimistic.ap_combo.fill(2.0);
+    optimistic.judge_frac[5] = input.judge_frac.iter().copied().fold(0.0, f64::max);
+    let mut model = linear(&optimistic);
+    model.ignore_gates = true;
+    model.ignore_releases = true;
+    for life in model.life_at.values_mut() { *life = input.life_base * 2.0; }
+    model
+}
+
 pub fn linear_play(
     input: &Input,
     judgements: &[usize],
@@ -248,6 +261,7 @@ pub fn linear_play(
         life_at,
         absolute_error: n as f64 + 1.0,
         ignore_gates: false,
+        ignore_releases: false,
         nominal_cumulative: false,
         conversion_combo: Vec::new(),
         release_windows: Vec::new(),
@@ -420,6 +434,7 @@ pub(crate) fn relaxed_play_limits(
         life_at,
         absolute_error: n as f64 + 1.0,
         ignore_gates: true,
+        ignore_releases: false,
         nominal_cumulative: false,
         conversion_combo,
         release_windows: Vec::new(),
@@ -513,7 +528,7 @@ pub fn skill_weights(
             {
                 continue;
             }
-            let length = if model.ignore_gates {
+            let length = if model.ignore_gates && !model.ignore_releases {
                 release_end(model, input, skill, effect, event, start, length) - start
             } else {
                 length
@@ -918,6 +933,7 @@ pub(crate) fn played_linear(input: &Input, grades: &[usize], life: &live::LifeSu
             .collect(),
         absolute_error: n as f64 + 1.0,
         ignore_gates: false,
+        ignore_releases: false,
         nominal_cumulative: false,
         conversion_combo: Vec::new(),
         release_windows: Vec::new(),

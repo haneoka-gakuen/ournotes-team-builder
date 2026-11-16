@@ -149,7 +149,7 @@ impl Objective for AccuracySeed {
 }
 pub struct LiveCore {
     pub input: Input,
-    timing: Option<(bool, Result<crate::input_timing::InputTiming, String>)>,
+    timing: Option<(bool, Result<live::PhaseTiming, String>)>,
     pub high: Linear,
     pub low: Linear,
     pub factor_cap: f64,
@@ -273,7 +273,7 @@ impl LiveCore {
         let timing = chart::timing_mode(play).map(|best| {
             (
                 best,
-                crate::input_timing::InputTiming::new(
+                live::PhaseTiming::new(
                     master,
                     chart,
                     input.judgements.as_deref(),
@@ -533,8 +533,16 @@ impl LiveCore {
             [false; 5]
         };
 
+        let phase_play = timing.is_some() && input.judgements.is_some() && !unbounded_cumulative
+            && input.life_base.is_finite() && input.life_base > 0.0 && (0.0..=1.0).contains(&input.life_onus)
+            && input.damage.iter().chain(&input.note_frac).chain(&input.judge_frac).all(|value| value.is_finite() && *value >= 0.0)
+            && input.combo_table.iter().all(|(_, value)| value.is_finite() && *value >= 0.0)
+            && input.adjustment.is_finite() && input.adjustment >= 0.0
+            && input.difficulty_factor.is_finite() && input.difficulty_factor >= 0.0
+            && slots.iter().all(|slot| slot.effects.iter().all(|effect| effect.delta >= 0));
         let mut factor_cap = 1.0 + overlap as f64 * raise;
-        let mut high = if broad_play {
+        let mut high = if phase_play { model::timing_play_upper(&input) }
+        else if broad_play {
             model::relaxed_play(&input, input.judgements.as_ref().unwrap(), &slots, width)
         } else if let Some(j) = &input.judgements {
             model::linear_play(&input, j, true, 0, 1.0, recovery)
@@ -546,16 +554,16 @@ impl LiveCore {
         } else {
             high.clone()
         };
-        let tight_ap = input.judgements.is_none()
-            && timing.is_none()
+        let ap_rounding = input.judgements.is_none()
             && !unbounded_cumulative
             && slots.iter().any(|slot| !slot.cumulative.is_empty())
             && slots
                 .iter()
                 .all(|slot| slot.effects.iter().all(|effect| effect.delta >= 0));
+        let tight_ap = ap_rounding && timing.is_none();
         high.nominal_cumulative = tight_ap;
         let mut perfect_cap = None;
-        if played_envelope || tight_ap {
+        if played_envelope || ap_rounding || phase_play {
             let base: Vec<_> = slots
                 .iter()
                 .step_by(width)
@@ -610,17 +618,17 @@ impl LiveCore {
                     }
                 }
             }
-            let error_base = input
+            let error_base = if phase_play { *high.prefix.last().unwrap() } else { input
                 .note_frac
                 .iter()
                 .zip(&input.ap_combo)
                 .map(|(&note, &combo)| {
                     input.adjustment * input.difficulty_factor * note * combo * judge
                 })
-                .sum::<f64>();
+                .sum::<f64>() };
             if error_base != 0.0 {
                 high.total = (high.total + (error_base * error).next_up()).next_up();
-                if tight_ap {
+                if ap_rounding {
                     low.total = (low.total - (error_base * error).next_up())
                         .next_down()
                         .max(0.0);
@@ -643,14 +651,18 @@ impl LiveCore {
                 low.perfect_prefix.fill(0.0);
             }
         }
+        if phase_play {
+            low.total = 0.0; low.prefix.fill(0.0); low.perfect_prefix.fill(0.0);
+        }
         let unbounded = unbounded_cumulative
+            || timing.is_some() && input.judgements.is_some() && !phase_play
             || (input.judgements.is_some()
-                && !played_envelope
+                && !played_envelope && !phase_play
                 && slots.iter().any(Slot::changes_play_timeline));
         let play_bounds = input
             .judgements
             .as_ref()
-            .filter(|_| !played_envelope)
+            .filter(|_| !played_envelope && !phase_play)
             .map(|j| PlayBounds::new(&input, j));
         let drains = input.judgements.as_ref().is_some_and(|grades| {
             grades.iter().map(|&grade| input.damage[grade]).sum::<f64>() >= input.life_base
@@ -767,9 +779,28 @@ impl LiveCore {
         }
         let pair = {
             let skill = &self.slots[index];
-            let mut upper = model::skill_weights(&self.high, &self.input, skill, true);
+            let mut upper = model::skill_weights(&self.high, &self.input, skill, self.timing.is_none());
+            if self.timing.is_some() {
+                for factor in &skill.cumulative {
+                    let weights = self.timing.as_ref().and_then(|(_, timing)| timing.as_ref().ok())
+                        .filter(|_| self.input.judgements.is_none() && !factor.requires_unbounded_bounds(self.input.times.len()))
+                        .map(|timing| timing.cumulative_weights(&self.high.prefix, &self.input, factor));
+                    if let Some(weights) = weights {
+                        for (upper, weight) in upper.per_event.iter_mut().zip(weights) { *upper += weight; }
+                    } else {
+                        let delta = crate::num::f(factor.at_cap() as f64 / 100000.0);
+                        let length = factor.bound_duration_ms().saturating_add(self.input.clock.advance_ms());
+                        for (event, &start) in self.input.skill_times.iter().take(5).enumerate() {
+                            upper.per_event[event] += delta * model::window_weight(&self.high.prefix, &self.input, start, length);
+                        }
+                    }
+                }
+                upper.mean = upper.per_event.iter().sum::<f64>() / 5.0;
+                upper.best = upper.per_event.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                upper.worst = upper.per_event.iter().copied().fold(f64::INFINITY, f64::min);
+            }
             if let Some(j) = &self.input.judgements {
-                if skill.convert.is_some() {
+                if skill.convert.is_some() && !self.high.ignore_releases {
                     let extra = model::conversion_weights(
                         &self.input,
                         j,
@@ -879,11 +910,7 @@ impl LiveCore {
                     .any(|slot| !slot.cumulative.is_empty()) =>
             {
                 (
-                    live::score_reachable(
-                        &self.input,
-                        timing.as_ref().map_err(Clone::clone)?,
-                        *best,
-                    )?,
+                    timing.as_ref().map_err(Clone::clone)?.scores(&self.input, *best)?,
                     None,
                 )
             }
@@ -1022,9 +1049,7 @@ impl LiveCore {
         (lows, highs)
     }
     pub(crate) fn prepare_dominance(&mut self, power_cap: f64) {
-        if self.unbounded || self.timing.is_some() {
-            return;
-        }
+        if self.unbounded { return; }
 
         if self.broad_play && self.input.damage[3..=5].iter().all(|&damage| damage == 0.0)
             && self.slots.iter().all(|slot| slot.effects.iter().all(|effect| effect.delta >= 0)
@@ -1060,7 +1085,10 @@ impl LiveCore {
     }
     fn program_dominates(&self, better: usize, worse: usize) -> bool {
         let (a, b) = (&self.slots[better], &self.slots[worse]);
-        if self.program_ids[better] != self.program_ids[worse] || a.cumulative != b.cumulative { return false; }
+        if a.cumulative != b.cumulative { return false; }
+        if self.broad_play {
+            if self.program_ids[better] != self.program_ids[worse] { return false; }
+        } else if a.recovery != b.recovery || a.conversion_signature() != b.conversion_signature() { return false; }
         let mut used = vec![false; a.effects.len()];
         for effect in &b.effects {
             let candidate = a.effects.iter().enumerate().filter(|&(index, row)| !used[index]
@@ -1085,7 +1113,7 @@ impl LiveCore {
         if let Some(&answer) = self.member_dominance.get(&(better, worse)) {
             return answer;
         }
-        if self.broad_play {
+        if self.broad_play || self.timing.is_some() {
             let answer = (0..self.width).all(|column| self.program_dominates(better * self.width + column, worse * self.width + column));
             self.member_dominance.insert((better, worse), answer);
             return answer;
@@ -1108,7 +1136,7 @@ impl LiveCore {
         if power_delta <= self.dominance_margin {
             return false;
         }
-        if self.broad_play { return self.program_dominates(self.at(member, better), self.at(member, worse)); }
+        if self.broad_play || self.timing.is_some() { return self.program_dominates(self.at(member, better), self.at(member, worse)); }
         let a = self.weight(member, better).low.per_event;
         let b = self.weight(member, worse).high.per_event;
         a.iter().zip(b).all(|(&a, b)| a >= b)
@@ -1707,6 +1735,7 @@ impl LiveCore {
         if self.unbounded {
             return f64::INFINITY;
         }
+        if self.high.ignore_releases { return self.score_high(t); }
         if self.played_envelope {
             return self
                 .power_upper(team, t.power, Criterion::Max)

@@ -33,6 +33,7 @@ struct Note {
     last_phase: i32,
     auto_frame: i32,
     forced_frame: i32,
+    forced_time: i32,
 }
 impl Note {
     #[inline]
@@ -98,6 +99,52 @@ impl Note {
         }
         (action == Action::Enter).then(|| self.grade_at(time))
     }
+    fn with_clock(&self, clock: live::FrameClock) -> Self {
+        let mut note = self.clone();
+        let max_after = note.after.iter().copied().max().unwrap_or(0).max(0);
+        note.first = clock.frame_time(note.input_first.max(0) as i32);
+        note.last_phase = clock.frame_time(note.time.saturating_add(max_after).saturating_add(1));
+        note.auto_frame = clock.frame_time(note.last_phase.saturating_add(1));
+        note.forced_frame = if note.forced_time == i32::MAX { i32::MAX } else { clock.frame_time(note.forced_time) };
+        note
+    }
+
+    fn frames(&self, clock: live::FrameClock) -> Vec<i32> {
+        let mut allowed = BTreeSet::new();
+        if self.grade == 5 {
+            let first = self.time.saturating_sub(self.before[5]).max(0).max(self.input_first.max(0) as i32);
+            let last = self.time.saturating_add(self.after[5]).min(self.last);
+            if first <= last {
+                let mut at = clock.frame_time(first);
+                let end = clock.frame_time(last);
+                while at <= end {
+                    let time = first.max(*input_times(clock, at).start());
+                    if time <= last && self.actions().iter().any(|&action| self.hit(at, time, action) == Some(5)) {
+                        allowed.insert(at);
+                    }
+                    at = clock.frame_time(at.saturating_add(1));
+                }
+            }
+            if self.trace() || self.tail() {
+                let mut at = clock.frame_time(self.time.max(0));
+                let end = clock.frame_time(self.last);
+                while at <= end {
+                    if self.hit(at, at, Action::Hold) == Some(5) { allowed.insert(at); }
+                    at = clock.frame_time(at.saturating_add(1));
+                }
+            }
+        } else {
+            for time in self.input_first.max(0) as i32..=self.last {
+                let frame = clock.frame_time(time);
+                if self.actions().iter().any(|&action| self.hit(frame, time, action) == Some(self.grade)) {
+                    allowed.insert(frame);
+                }
+            }
+            if self.grade == 1 { allowed.insert(self.auto_frame.min(self.forced_frame)); }
+        }
+        allowed.into_iter().collect()
+    }
+
     fn actions(&self) -> &'static [Action] {
         if self.trace() || self.tail() || self.flick() {
             &[Action::Hold, Action::Exit]
@@ -115,12 +162,13 @@ pub struct InputTiming {
     checked: Arc<Mutex<InputChecks>>,
     local_checked: Arc<Mutex<LocalChecks>>,
     atoms: Arc<Mutex<search::AtomCache>>,
-    witnesses: Arc<Mutex<Vec<Vec<i32>>>>,
+    witnesses: Arc<Mutex<Vec<Arc<[i32]>>>>,
     orderings: Vec<(usize, usize)>,
     contexts: Arc<HashMap<i32, Arc<Vec<usize>>>>,
     components: Arc<Vec<FlickComponent>>,
     component_checked: Arc<Mutex<ComponentChecks>>,
 }
+
 struct FlickComponent {
     start: i32,
     end: i32,
@@ -151,7 +199,7 @@ fn input_times(clock: live::FrameClock, frame: i32) -> std::ops::RangeInclusive<
 impl InputTiming {
     pub fn new(master: &Master, chart: &Chart, grades: Option<&[usize]>, clock: live::FrameClock) -> Result<Self, String> {
         let mut notes = Vec::with_capacity(chart.times.len());
-        let mut frames: Vec<Vec<i32>> = Vec::with_capacity(chart.times.len());
+
         let mut line_ends = HashMap::new();
         for source in &chart.notes {
             if !matches!(source.operate_type, 22 | 42 | 62 | 82 | 103 | 105) {
@@ -216,11 +264,11 @@ impl InputTiming {
             let last_phase =
                 clock.frame_time(source.time_ms.saturating_add(max_after).saturating_add(1));
             let auto_frame = clock.frame_time(last_phase.saturating_add(1));
-            let mut forced_frame = i32::MAX;
+            let mut forced_time = i32::MAX;
             if matches!(source.operate_type, 20 | 41 | 61 | 101 | 102 | 104) {
                 for line in &geometry.lines {
                     if let Some(&end) = line_ends.get(line) {
-                        forced_frame = forced_frame.min(clock.frame_time(end.saturating_add(1)));
+                        forced_time = forced_time.min(end.saturating_add(1));
                     }
                 }
             }
@@ -239,35 +287,87 @@ impl InputTiming {
                 last: source.time_ms.saturating_add(max_after),
                 last_phase,
                 auto_frame,
-                forced_frame,
+                forced_frame: if forced_time == i32::MAX { i32::MAX } else { clock.frame_time(forced_time) },
+                forced_time,
             };
-            let mut allowed = BTreeSet::new();
-            for time in source.time_ms.saturating_sub(max_before).max(0)..=note.last {
-                let frame = clock.frame_time(time);
-                if note
-                    .actions()
-                    .iter()
-                    .any(|&action| note.hit(frame, time, action) == Some(note.grade))
-                {
-                    allowed.insert(frame);
-                }
-            }
-            if (note.trace() || note.tail()) && note.grade == 5 {
-                for time in source.time_ms.max(0)..=note.last {
-                    let frame = clock.frame_time(time);
-                    if note.hit(frame, time, Action::Hold) == Some(5) {
-                        allowed.insert(frame);
-                    }
-                }
-            }
-            if note.grade == 1 {
-                allowed.insert(note.auto_frame.min(note.forced_frame));
-            }
-            if allowed.is_empty() {
-                return Err(format!("unreachable native judgement at note {i}"));
-            }
-            frames.push(allowed.into_iter().collect());
             notes.push(note);
+        }
+        Self::from_notes(notes, clock)
+    }
+
+    fn phase_notes(&self, clock: live::FrameClock) -> Vec<Note> {
+        self.notes.iter().map(|note| note.with_clock(clock)).collect()
+    }
+
+    pub(crate) fn with_clock(&self, clock: live::FrameClock) -> Result<Self, String> {
+        let mut timing = Self::from_notes(self.phase_notes(clock), clock)?;
+        timing.atoms = Arc::clone(&self.atoms);
+        Ok(timing)
+    }
+
+    pub(crate) fn relaxed_counter_frames(&self, clock: live::FrameClock, start: i32, end: i32, best: bool) -> Vec<i32> {
+        self.notes.iter().filter(|note| note.last.saturating_add(clock.advance_ms() * 2) >= start && note.input_first <= i64::from(end)).filter_map(|source| {
+            let note = source.with_clock(clock);
+            let mut frames = note.frames(clock);
+            if note.flick() {
+                let reserved: Vec<_> = frames.iter().map(|&at| clock.frame_time(at.saturating_add(1))).collect();
+                frames.extend(reserved);
+            }
+            if best { frames.iter().copied().filter(|&at| start <= at && at <= end).min() }
+            else if frames.iter().all(|&at| start <= at && at <= end) { frames.iter().copied().max() }
+            else { None }
+        }).collect()
+    }
+
+    pub(crate) fn cumulative_upper(&self, prefix: &[f64], input: &live::Input, factor: &live::Cumulative, start: i32) -> f64 {
+        if !factor.judgements.contains(&5) { return 0.0; }
+        let padding = input.clock.advance_ms();
+        let end = start.saturating_add(factor.duration_ms()).saturating_add(padding);
+        let mut deliveries: Vec<_> = self.notes.iter().filter(|note| note.last.saturating_add(padding * 2) >= start)
+            .map(|note| note.time.saturating_sub(note.before[5].max(0)).max(start)).filter(|&at| at < end).collect();
+        deliveries.sort_unstable();
+        let finish = input.times.partition_point(|&at| at < end);
+        let mut cursor = input.times.partition_point(|&at| at < start);
+        let (mut count, mut applied, mut weight) = (0, 0, 0.0);
+        let mut first = 0;
+        while first < deliveries.len() {
+            let at = deliveries[first];
+            let after = first + deliveries[first..].partition_point(|&time| time == at);
+            count += (after - first) as i32;
+            let mill = factor.mill(count);
+            if mill != applied {
+                let next = input.times.partition_point(|&time| time < at).min(finish);
+                weight += f(applied as f64 / 100000.0) * (prefix[next] - prefix[cursor]);
+                cursor = next;
+                applied = mill;
+            }
+            first = after;
+        }
+        weight + f(applied as f64 / 100000.0) * (prefix[finish] - prefix[cursor])
+    }
+
+    pub(crate) fn relaxed_frames(&self, clock: live::FrameClock, spans: &[(i32, i32)]) -> Vec<Vec<i32>> {
+        self.phase_notes(clock).iter().map(|note| {
+            if !spans.iter().any(|&(start, end)| note.last.saturating_add(clock.advance_ms() * 2) >= start && note.input_first <= i64::from(end)) {
+                return vec![clock.frame_time(note.time)];
+            }
+            let mut allowed = note.frames(clock);
+            if note.flick() {
+                let reserved: Vec<_> = allowed.iter().map(|&at| clock.frame_time(at.saturating_add(1))).collect();
+                allowed.extend(reserved);
+                allowed.sort_unstable();
+                allowed.dedup();
+            }
+            allowed
+        }).collect()
+    }
+
+    fn from_notes(notes: Vec<Note>, clock: live::FrameClock) -> Result<Self, String> {
+        let mut frames = Vec::with_capacity(notes.len());
+        for (i, note) in notes.iter().enumerate() {
+            let allowed = note.frames(clock);
+            if allowed.is_empty() { return Err(format!("unreachable native judgement at note {i}")); }
+            frames.push(allowed);
         }
         for (i, note) in notes.iter().enumerate().filter(|(_, note)| note.flick()) {
             let mut allowed: BTreeSet<_> = frames[i].iter().copied().collect();
@@ -379,14 +479,18 @@ impl InputTiming {
         }
         drop(checked);
         let mut witnesses = self.witnesses.lock().unwrap();
-        if !witnesses.iter().any(|known| known == selected) {
+        if !witnesses.iter().any(|known| known.as_ref() == selected) {
             if witnesses.len() == 8 { witnesses.remove(0); }
-            witnesses.push(selected.to_vec());
+            witnesses.push(Arc::from(selected));
         }
         Ok(())
     }
 
     pub fn witnesses(&self) -> Vec<Vec<i32>> {
+        self.witnesses_shared().iter().map(|frames| frames.to_vec()).collect()
+    }
+
+    pub(crate) fn witnesses_shared(&self) -> Vec<Arc<[i32]>> {
         self.witnesses.lock().unwrap().clone()
     }
 
@@ -675,6 +779,12 @@ fn replay(
             if let Some(search) = &mut self.search { search.next() } else { Ok(self.forced.take()) }
         }
     }
+    let mut eligible = vec![Vec::new(); frames.len()];
+    for (i, note) in notes.iter().enumerate().filter(|(i, _)| !initial.done[*i]) {
+        let first = frames.partition_point(|&at| at < note.first);
+        let after = frames.partition_point(|&at| at <= selected[i]);
+        if first < after { for row in &mut eligible[first..after] { row.push(i); } }
+    }
     let mut saved: Saved = initial
         .flicks
         .iter()
@@ -703,12 +813,7 @@ fn replay(
             }
             let at = frames[index];
             block_end = block_end.max(at);
-            let indices: Vec<_> = notes
-                .iter()
-                .enumerate()
-                .filter(|(i, note)| !initial.done[*i] && selected[*i] >= at && note.first <= at)
-                .map(|(i, _)| i)
-                .collect();
+            let indices = &eligible[index];
             if indices.iter().any(|&i| notes[i].flick() && selected[i] > at) {
                 block_end = block_end.max(frames.get(index + 1).copied().unwrap_or(at));
             }
@@ -750,7 +855,7 @@ fn replay(
                 };
                 stack.push(Step {
                     index,
-                    notes: indices,
+                    notes: indices.clone(),
                     incoming: saved.clone(),
                     key,
                     search: choices,

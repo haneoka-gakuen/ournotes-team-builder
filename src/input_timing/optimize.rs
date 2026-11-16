@@ -85,7 +85,7 @@ impl InputTiming {
     }
 
     fn optimize_mode<O: FrameObjective>(&self, objective: &mut O, best: bool, relaxed: bool) -> Result<Option<(f64, Vec<i32>)>, String> {
-        let baseline = self.witnesses().pop();
+        let baseline = self.witnesses_shared().pop();
         let mut region: Vec<_> = (0..self.notes.len()).collect();
         let (window_start, window_end) = objective.span();
         let padding = self.notes.iter().enumerate().map(|(i, note)| self.frames[i].last().unwrap().saturating_sub(note.first)).max().unwrap_or(0);
@@ -113,7 +113,7 @@ impl InputTiming {
             }
         }
         region.sort_unstable();
-        let selected_base = baseline.unwrap_or_else(|| self.notes.iter().map(|note| self.clock.frame_time(note.time)).collect::<Vec<_>>());
+        let selected_base = baseline.map(|frames| frames.to_vec()).unwrap_or_else(|| self.notes.iter().map(|note| self.clock.frame_time(note.time)).collect::<Vec<_>>());
         if region.is_empty() {
             let value = objective.advance(&objective.initial(), i32::MAX, &[]);
             return Ok(Some((objective.score(&value), selected_base)));
