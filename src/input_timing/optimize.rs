@@ -35,13 +35,15 @@ impl InputTiming {
         let last = *frames.last().unwrap();
         let mut chosen = Vec::new();
         let mut extreme = if best { f64::NEG_INFINITY } else { f64::INFINITY };
-        for node in states.values().flatten() {
+        for (index, node) in states.values().flatten().enumerate() {
+            if index.is_multiple_of(256) { super::check_deadline()?; }
             let value = objective.advance(&node.value, i32::MAX, &[]);
             let score = objective.score(&value);
             if if best { score > extreme } else { score < extreme } { extreme = score; chosen.clear(); }
             if score == extreme && chosen.len() < 8 { chosen.push(node.history.clone()); }
         }
         for mut history in chosen {
+            super::check_deadline()?;
             let mut selected = baseline.to_vec();
             let mut assigned = vec![false; selected.len()];
             let mut inputs = BTreeMap::<i32, Vec<frame::Touch>>::new();
@@ -53,7 +55,8 @@ impl InputTiming {
             if constructed {
                 let notes: Vec<_> = region.iter().map(|&i| self.notes[i].clone()).collect();
                 let mut state = frame::State { done: vec![false; notes.len()], flicks: vec![None; notes.len()] };
-                for &at in frames {
+                for (index, &at) in frames.iter().enumerate() {
+                    if index.is_multiple_of(64) { super::check_deadline()?; }
                     let judged = frame::run(&notes, at, inputs.get(&at).map_or(&[], Vec::as_slice), &mut state);
                     if judged.iter().any(|j| j.grade != notes[j.note].grade || selected[region[j.note]] != at) {
                         return Err("native frame optimization replay mismatch".into());
@@ -73,7 +76,7 @@ impl InputTiming {
             if !possible { continue; }
             match self.verify_program(&selected, &inputs) {
                 Ok(true) => return Ok(Some((extreme, selected))),
-                Err(error) if error == "cancelled" => return Err(error),
+                Err(error) if super::interrupted(&error) => return Err(error),
                 _ => continue,
             }
         }
@@ -85,6 +88,7 @@ impl InputTiming {
     }
 
     fn optimize_mode<O: FrameObjective>(&self, objective: &mut O, best: bool, relaxed: bool) -> Result<Option<(f64, Vec<i32>)>, String> {
+        super::check_deadline()?;
         let baseline = self.witnesses_shared().pop();
         let mut region: Vec<_> = (0..self.notes.len()).collect();
         let (window_start, window_end) = objective.span();
@@ -139,6 +143,7 @@ impl InputTiming {
         let mut previous = if relaxed { region.iter().copied().filter(|&i| self.notes[i].first <= cut && cut <= *self.frames[i].last().unwrap()).collect() } else { Vec::<usize>::new() };
         let mut roots = vec![initial];
         for &i in &previous {
+            super::check_deadline()?;
             let note = &self.notes[i];
             let mut options = vec![(false, None)];
             if note.flick() {
@@ -172,8 +177,7 @@ impl InputTiming {
         let generation = crate::cancellation_generation();
         let mut tried_settled = false;
         for (step, &at) in frames.iter().enumerate() {
-            crate::clock::milliseconds();
-            if generation != crate::cancellation_generation() { return Err("cancelled".into()); }
+            super::poll(generation)?;
             let indices: Vec<_> = region.iter().copied().filter(|&i| self.notes[i].first <= at && at <= *self.frames[i].last().unwrap()).collect();
             if indices.len() > 32 { return Ok(None); }
             for (position, &i) in previous.iter().enumerate() { old_positions[i] = position; }
@@ -181,6 +185,7 @@ impl InputTiming {
             let required: Vec<_> = indices.iter().map(|&i| self.frames[i].last() == Some(&at)).collect();
             let mut next = HashMap::default();
             let mut next_count = 0usize;
+            let mut scored = 0usize;
             let mut physical_groups = HashMap::<u128, Vec<Node<O::State>>>::default();
             for ((physical, _), nodes) in states.drain() { physical_groups.entry(physical).or_default().extend(nodes); }
             for nodes in physical_groups.into_values() {
@@ -195,7 +200,6 @@ impl InputTiming {
                     let outcome = match search.next() {
                         Ok(Some(outcome)) => outcome,
                         Ok(None) => break,
-                        Err(error) if error == "cancelled" => return Err(error),
                         Err(error) if error.starts_with("native input word search budget exceeded") => return Ok(None),
                         Err(error) => return Err(error),
                     };
@@ -205,6 +209,8 @@ impl InputTiming {
                     let input = Arc::new(outcome.state);
                     let inputs: Arc<[frame::Touch]> = outcome.inputs.into();
                     for node in &nodes {
+                        scored += 1;
+                        if scored.is_multiple_of(256) { super::check_deadline()?; }
                         let value = objective.advance(&node.value, at, &judged);
                         let key = (physical, objective.key(&value));
                         let group = next.entry(key).or_insert_with(Vec::<Node<O::State>>::new);

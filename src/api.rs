@@ -1139,8 +1139,9 @@ impl Engine {
                     )?;
                     seeds.extend(probe.hits.into_iter().map(|hit| hit.team));
                 }
+                let mut timed_probe = None;
                 if shard.is_some_and(|(_, count)| count > 1) {
-                    let probe = search::search_at(
+                    let probe = LiveObjective::search_at(
                         search::Input {
                             master: &self.master,
                             player: &player,
@@ -1167,9 +1168,14 @@ impl Engine {
                         },
                         generation,
                     )?;
-                    seeds.extend(probe.hits.into_iter().map(|hit| hit.team));
+                    if objective.uses_timing_deadline() {
+                        seeds.extend(probe.hits.iter().map(|hit| hit.team.clone()));
+                        timed_probe = Some(probe);
+                    } else {
+                        seeds.extend(probe.hits.into_iter().map(|hit| hit.team));
+                    }
                 }
-                search::search_at(
+                let mut output = LiveObjective::search_at(
                     search::Input {
                         master: &self.master,
                         player: &player,
@@ -1195,7 +1201,16 @@ impl Engine {
                         progress: None,
                     },
                     generation,
-                )?
+                )?;
+                // The probe used the same candidate constraints. Its exact hits
+                // can survive expiry before the shard has evaluated its seeds.
+                if !output.proven && output.hits.is_empty() && generation == crate::cancellation_generation() {
+                    if let Some(probe) = timed_probe {
+                        output.hits = probe.hits;
+                        output.stats.add(&probe.stats);
+                    }
+                }
+                output
             };
             output.stats.add(&cap_stats);
             let hits:Vec<_>=output.hits.iter().map(|hit|{
