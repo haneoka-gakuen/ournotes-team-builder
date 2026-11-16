@@ -9,6 +9,11 @@ pub struct PhaseTiming {
     cached: RefCell<Vec<(i32, Arc<InputTiming>)>>,
     weights: RefCell<HashMap<FactorKey, [f64; 5]>>,
 }
+struct FramePlan {
+    clock: FrameClock,
+    timing: Arc<InputTiming>,
+    frames: Arc<[i32]>,
+}
 impl PhaseTiming {
     pub fn new(
         master: &Master,
@@ -71,35 +76,24 @@ impl PhaseTiming {
         })
     }
 
-    pub(crate) fn guide(&self, input: &Input, order: usize, before_ms: &[i32]) -> Result<Option<super::Timing>, String> {
-        let Some(nominal) = super::timing_with_inputs(input, order, before_ms, Some(&self.base)) else { return Ok(None); };
-        if nominal.guide_available && nominal.best > nominal.plan_base_score
-            || before_ms.iter().all(|&early| early < input.clock.advance_ms()) { return Ok(Some(nominal)); }
+    pub(crate) fn guide(&self, input: &Input, order: usize) -> Result<super::Timing, String> {
+        let mut plan = None;
+        let scores = self.extremes(input, true, Some(order), Some(&mut plan))?;
+        let plan = plan.ok_or("missing optimal timing inputs")?;
         let mut shifted = input.clone();
-        let generation = crate::cancellation_generation();
-        for phase in 1..input.clock.phase_count() {
-            crate::input_timing::poll(generation)?;
-            shifted.clock = input.clock.with_phase(phase);
-            let inputs = self.timing(shifted.clock, phase)?;
-            if let Some(mut plan) = super::timing_with_inputs(&shifted, order, before_ms, Some(&inputs)) {
-                if plan.guide_available && plan.best > plan.plan_base_score && plan.best > nominal.score {
-                    plan.score = nominal.score;
-                    return Ok(Some(plan));
-                }
-            }
-        }
-        Ok(Some(nominal))
+        shifted.clock = plan.clock;
+        super::optimal_timing(&shifted, order, &plan.timing, &plan.frames, scores[order], score(input)?.scores[order])
     }
 
     pub fn scores(&self, input: &Input, best: bool) -> Result<Scores, String> {
-        Ok(summarize(input.power, self.extremes(input, best, None)?))
+        Ok(summarize(input.power, self.extremes(input, best, None, None)?))
     }
 
     pub(crate) fn order(&self, input: &Input, best: bool, index: usize) -> Result<f64, String> {
-        Ok(self.extremes(input, best, Some(index))?[index])
+        Ok(self.extremes(input, best, Some(index), None)?[index])
     }
 
-    fn extremes(&self, input: &Input, best: bool, only: Option<usize>) -> Result<Vec<f64>, String> {
+    fn extremes(&self, input: &Input, best: bool, only: Option<usize>, mut plan: Option<&mut Option<FramePlan>>) -> Result<Vec<f64>, String> {
         super::validate(input)?;
         if input.slots.iter().all(|slot| slot.cumulative.is_empty()) {
             return Ok(score(input)?.scores);
@@ -229,6 +223,12 @@ impl PhaseTiming {
                 Some((&values, bounds)),
                 ap.as_mut(),
             )?;
+            if let (Some(index), Some(plan)) = (only, plan.as_deref_mut()) {
+                if if best { scores[index] > values[index] } else { scores[index] < values[index] } {
+                    let frames = super::timing_witness(&shifted, index, &timing, scores[index])?;
+                    *plan = Some(FramePlan { clock: shifted.clock, timing, frames });
+                }
+            }
             for (value, score) in values.iter_mut().zip(scores) {
                 *value = if best {
                     value.max(score)

@@ -4333,23 +4333,13 @@ impl Engine {
         let judgements = live::judgements_for_types(&chart.judgement_types, &context["play"]);
         let mut input = chart::prepare(&self.master, chart, resolved.power.total as i32, resolved.slots, judgements, 1.0, 100.0);
         input.clock = live::FrameClock::for_play(&context["play"]);
-        let advance_ms = input.clock.advance_ms();
-        let before_ms: Vec<_> = chart.judgement_types.iter().enumerate().map(|(i, &kind)| {
-            // This guide uses taps, flicks and tail releases, rather than early Trace contacts.
-            if !matches!(kind, 1 | 2 | 5 | 10 | 11 | 12 | 15) { return 0; }
-            let grade = input.judgements.as_ref().map_or(5, |grades| grades[i]) as i32;
-            let early_grade = (1..=5).rev().find(|&candidate| {
-                self.master.live.judgement_before_ms.get(&(kind, candidate)).copied().unwrap_or(0) >= advance_ms
-            });
-            if early_grade == Some(grade) { advance_ms } else { 0 }
-        }).collect();
         if input.slots.iter().all(|slot| slot.cumulative.is_empty()) { return Ok(Value::Null); }
         let timing_inputs = crate::input_timing::InputTiming::new(&self.master, chart, input.judgements.as_deref(), input.clock)?;
         let phases = live::PhaseTiming::from_timing(timing_inputs);
-        let Some(timing) = phases.guide(&input, index, &before_ms)? else { return Ok(Value::Null) };
+        let timing = phases.guide(&input, index)?;
         let mut output = json!(timing);
         output["worst"] = json!(phases.order(&input, false, index)?);
-        output["optimal"] = json!(phases.order(&input, true, index)?);
+        output["optimal"] = output["best"].clone();
         Ok(output)
     }
 }

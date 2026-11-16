@@ -2367,6 +2367,10 @@ pub struct TimingStep {
     pub note_indices: Vec<usize>,
     pub note_times_ms: Vec<i32>,
     pub input_times_ms: Vec<i32>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub input_kinds: Vec<crate::input_timing::InputKind>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub delivery_times_ms: Vec<i32>,
     pub gain: f64,
 }
 /// A cumulative snapshot's counting window: its counted notes and steps.
@@ -2388,6 +2392,7 @@ pub struct Timing {
     pub frame_origin_ms: f64,
     pub best: f64,
     pub guide_available: bool,
+    pub plan_is_optimal: bool,
     pub advance_ms: i32,
     pub windows: Vec<TimingWindow>,
 }
@@ -2441,7 +2446,7 @@ pub fn timing_with_inputs(input: &Input, order_index: usize, before_ms: &[i32], 
                     window.steps.push(TimingStep { step: (count / factor.unit).min(factor.cap), time_ms: last, notes: chord.len(),
                         note_times_ms: chord.iter().map(|&i| input.times[i]).collect(),
                         input_times_ms: chord.iter().map(|&i| input.frame_time(input.times[i] - advance_ms)).collect(),
-                        note_indices: chord, gain: 0.0 });
+                        note_indices: chord, input_kinds: Vec::new(), delivery_times_ms: Vec::new(), gain: 0.0 });
                 }
                 applied = mill;
                 first = after;
@@ -2474,7 +2479,7 @@ pub fn timing_with_inputs(input: &Input, order_index: usize, before_ms: &[i32], 
     let score = evaluate(&offsets, false)?;
     if evaluate(&offsets, true).is_none() {
         for window in &mut windows { window.steps.clear(); }
-        return Some(Timing { score, plan_base_score: score, frame_origin_ms: input.clock.origin_ms(), best: score, guide_available: false, advance_ms, windows });
+        return Some(Timing { score, plan_base_score: score, frame_origin_ms: input.clock.origin_ms(), best: score, guide_available: false, plan_is_optimal: false, advance_ms, windows });
     }
     let mut best = score;
     for (window, step, chord) in groups {
@@ -2499,7 +2504,81 @@ pub fn timing_with_inputs(input: &Input, order_index: usize, before_ms: &[i32], 
         window.steps.retain(|step| step.gain > 0.0);
     }
     if let Some(inputs) = inputs { let _ = inputs.conflict(&Delivery::new(input, &offsets).selected()); }
-    Some(Timing { score, plan_base_score: score, frame_origin_ms: input.clock.origin_ms(), best, guide_available: true, advance_ms, windows })
+    Some(Timing { score, plan_base_score: score, frame_origin_ms: input.clock.origin_ms(), best, guide_available: true, plan_is_optimal: false, advance_ms, windows })
+}
+
+fn selected_score(input: &Input, order: usize, frames: &[i32]) -> f64 {
+    let delivery = Delivery::from_frames(frames);
+    match &input.judgements {
+        Some(grades) => PlayScorer::new(input, grades).order(&orders()[order], Some(&delivery)),
+        None => ApScorer::new(input).order(&orders()[order], Some(&delivery)),
+    }
+}
+
+fn timing_witness(input: &Input, order: usize, timing: &crate::input_timing::InputTiming, value: f64) -> Result<Arc<[i32]>, String> {
+    timing.witnesses_shared().into_iter().filter(|frames| selected_score(input, order, frames) == value)
+        .min_by_key(|frames| frames.iter().zip(&input.times).filter(|&(frame, time)| *frame != input.frame_time(*time)).count())
+        .ok_or_else(|| "missing optimal timing witness".into())
+}
+
+fn optimal_timing(input: &Input, order: usize, timing: &crate::input_timing::InputTiming, frames: &[i32], best: f64, score: f64) -> Result<Timing, String> {
+    let mut frames = frames.to_vec();
+    let mut delivery = Delivery::from_frames(&frames);
+    let mut positions = vec![0; frames.len()];
+    for (position, &note) in delivery.notes.iter().enumerate() { positions[note] = position; }
+    let mut ap = input.judgements.is_none().then(|| ApScorer::new(input));
+    let mut played = input.judgements.as_ref().map(|grades| PlayScorer::new(input, grades));
+    for note in 0..frames.len() {
+        let nominal = input.frame_time(input.times[note]);
+        let previous = frames[note];
+        if nominal == previous { continue; }
+        crate::input_timing::check_deadline()?;
+        let distance = |at: i32| (i64::from(at) - i64::from(nominal)).abs();
+        let mut nearer: Vec<_> = timing.frames[note].iter().copied().filter(|&at| distance(at) < distance(previous)).collect();
+        nearer.sort_by_key(|&at| (distance(at), at));
+        for at in nearer {
+            delivery.move_note(note, at, &mut positions);
+            let value = match (&mut ap, &mut played) {
+                (Some(scorer), _) => scorer.order(&orders()[order], Some(&delivery)),
+                (_, Some(scorer)) => scorer.order(&orders()[order], Some(&delivery)),
+                _ => unreachable!(),
+            };
+            if value == best {
+                let mut candidate = frames.clone(); candidate[note] = at;
+                match timing.conflict(&candidate) {
+                    Ok(None) => { frames = candidate; break; }
+                    Err(error) if crate::input_timing::interrupted(&error) => return Err(error),
+                    _ => {}
+                }
+            }
+            delivery.move_note(note, previous, &mut positions);
+        }
+    }
+    let frames = frames.as_slice();
+    let played = timing.plan(frames)?;
+    if selected_score(input, order, frames) != best { return Err("optimal timing score mismatch".into()); }
+    let plan_base_score = self::score(input)?.scores[order];
+    let mut windows = Vec::new();
+    for (event, &start) in input.skill_times.iter().take(5).enumerate() {
+        for factor in &input.slots[orders()[order][event]].cumulative {
+            let (start_ms, end_ms) = factor.window(input.clock, start);
+            windows.push(TimingWindow { event, start_ms, end_ms, unit: factor.unit,
+                notes: input.times.iter().zip(frames).filter(|(_, frame)| start_ms <= **frame && **frame <= end_ms)
+                    .map(|(&time, _)| time).collect(), steps: Vec::new() });
+        }
+    }
+    for (note, hit) in played.into_iter().enumerate() {
+        if hit.time == input.times[note] && frames[note] == input.frame_time(input.times[note]) { continue; }
+        let window = windows.iter_mut().min_by_key(|window| {
+            if window.start_ms <= frames[note] && frames[note] <= window.end_ms { 0 }
+            else { (i64::from(frames[note]) - i64::from(window.start_ms)).abs().min((i64::from(frames[note]) - i64::from(window.end_ms)).abs()) }
+        }).ok_or("missing cumulative timing window")?;
+        window.steps.push(TimingStep { step: window.steps.len() as i32 + 1, time_ms: input.times[note], notes: 1,
+            note_indices: vec![note], note_times_ms: vec![input.times[note]], input_times_ms: vec![hit.time],
+            input_kinds: vec![hit.kind], delivery_times_ms: vec![frames[note]], gain: 0.0 });
+    }
+    Ok(Timing { score, plan_base_score, frame_origin_ms: input.clock.origin_ms(), best, guide_available: true,
+        plan_is_optimal: true, advance_ms: input.clock.advance_ms(), windows })
 }
 #[cfg(test)]
 mod delivery_extremes_tests {

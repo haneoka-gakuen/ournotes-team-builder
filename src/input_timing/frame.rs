@@ -42,6 +42,15 @@ pub(super) struct Judgement {
     pub note: usize,
     pub grade: usize,
 }
+#[derive(Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum InputKind { Hit, Hold, Release, Flick, Miss }
+
+#[derive(Clone, Copy)]
+pub(crate) struct PlayedInput {
+    pub time: i32,
+    pub kind: InputKind,
+}
 
 #[derive(Clone, Copy)]
 struct Candidate {
@@ -188,14 +197,18 @@ pub(super) fn run(
 pub(super) fn run_cached<'a>(
     notes: &[Note], frame: i32, inputs: &[Touch], state: &mut State, scratch: &'a mut Scratch,
 ) -> &'a [Judgement] {
-    run_selection(notes, frame, inputs, None, state, scratch)
+    run_selection(notes, frame, inputs, None, state, scratch, None)
 }
 
 pub(super) fn run_selected<'a>(notes: &[Note], frame: i32, inputs: &[Touch], selected: &[Option<usize>], state: &mut State, scratch: &'a mut Scratch) -> &'a [Judgement] {
-    run_selection(notes, frame, inputs, Some(selected), state, scratch)
+    run_selection(notes, frame, inputs, Some(selected), state, scratch, None)
 }
 
-fn run_selection<'a>(notes: &[Note], frame: i32, inputs: &[Touch], selected: Option<&[Option<usize>]>, state: &mut State, scratch: &'a mut Scratch) -> &'a [Judgement] {
+pub(super) fn run_plan<'a>(notes: &[Note], frame: i32, inputs: &[Touch], state: &mut State, scratch: &'a mut Scratch, plan: &mut [PlayedInput]) -> &'a [Judgement] {
+    run_selection(notes, frame, inputs, None, state, scratch, Some(plan))
+}
+
+fn run_selection<'a>(notes: &[Note], frame: i32, inputs: &[Touch], selected: Option<&[Option<usize>]>, state: &mut State, scratch: &'a mut Scratch, mut plan: Option<&mut [PlayedInput]>) -> &'a [Judgement] {
     let Scratch { results, synchronous, asynchronous, claims, claimed } = scratch;
     results.clear();
     if synchronous.len() < inputs.len() { synchronous.resize_with(inputs.len(), Vec::new); }
@@ -209,6 +222,7 @@ fn run_selection<'a>(notes: &[Note], frame: i32, inputs: &[Touch], selected: Opt
             continue;
         }
         if frame >= note.auto_frame {
+            if let Some(plan) = &mut plan { plan[index] = PlayedInput { time: frame, kind: InputKind::Miss }; }
             state.done[index] = true;
             results.push(Judgement {
                 note: index,
@@ -218,6 +232,7 @@ fn run_selection<'a>(notes: &[Note], frame: i32, inputs: &[Touch], selected: Opt
         }
         if frame >= note.time {
             if let Some(saved) = state.flicks[index].filter(|saved| in_area(note, saved.begin)) {
+                if let Some(plan) = &mut plan { plan[index] = PlayedInput { time: saved.time, kind: InputKind::Flick }; }
                 state.done[index] = true;
                 results.push(Judgement {
                     note: index,
@@ -227,6 +242,7 @@ fn run_selection<'a>(notes: &[Note], frame: i32, inputs: &[Touch], selected: Opt
             }
         }
         if frame >= note.forced_frame {
+            if let Some(plan) = &mut plan { plan[index] = PlayedInput { time: frame, kind: InputKind::Miss }; }
             state.done[index] = true;
             results.push(Judgement {
                 note: index,
@@ -300,6 +316,13 @@ fn run_selection<'a>(notes: &[Note], frame: i32, inputs: &[Touch], selected: Opt
         }
         for candidate in winner.iter().chain(asynchronous[unit].iter()) {
             if !state.done[candidate.note] {
+                if let Some(plan) = &mut plan {
+                    let note = &notes[candidate.note];
+                    let kind = if note.flick() { InputKind::Flick }
+                        else if !note.asynchronous() { InputKind::Hit }
+                        else if input.state == TouchState::Exit { InputKind::Release } else { InputKind::Hold };
+                    plan[candidate.note] = PlayedInput { time: if note.flick() { candidate.time } else { input.time }, kind };
+                }
                 state.done[candidate.note] = true;
                 results.push(Judgement {
                     note: candidate.note,

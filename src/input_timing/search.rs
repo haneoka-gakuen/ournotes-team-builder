@@ -314,6 +314,27 @@ fn atoms(notes: &[Note], at: i32, clock: crate::live::FrameClock, flicks_only: b
     out
 }
 
+pub(super) fn nominal_inputs(notes: &[Note], due: &[bool], at: i32, clock: crate::live::FrameClock, inputs: &mut [Touch]) {
+    for input in inputs {
+        let key = atom_key(notes, *input, at);
+        let wanted = notes.iter().enumerate().filter(|(_, note)| frame::in_area(note, input.lane)
+            && (input.flick_begin.is_none() || note.flick()))
+            .min_by_key(|&(i, note)| (!due[i], (i64::from(note.time) - i64::from(at)).abs()))
+            .map_or(input.time, |(_, note)| note.time);
+        if let Some(time) = input_times(clock, at).filter(|&time| atom_key(notes, Touch { time, ..*input }, at) == key)
+            .min_by_key(|&time| ((i64::from(time) - i64::from(wanted)).abs(), time)) { input.time = time; }
+    }
+}
+
+pub(super) fn nominal_word(notes: &[Note], at: i32, clock: crate::live::FrameClock, targets: &[i32]) -> Vec<Touch> {
+    notes.iter().zip(targets).filter(|(_, target)| **target == at).map(|(note, _)| {
+        let state = if note.asynchronous() && note.grade == 5 && at >= note.time { TouchState::Hold }
+            else if note.asynchronous() || note.flick() { TouchState::Exit } else { TouchState::Enter };
+        Touch { state, lane: (note.body_left + note.body_right) / 2.0,
+            time: note.time.clamp(*input_times(clock, at).start(), at), flick_begin: note.flick().then_some((note.body_left + note.body_right) / 2.0) }
+    }).collect()
+}
+
 #[derive(Default)]
 struct WordScratch {
     inputs: Vec<Touch>,

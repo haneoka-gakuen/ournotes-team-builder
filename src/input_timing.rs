@@ -3,6 +3,8 @@ mod frame;
 mod optimize;
 mod search;
 pub(crate) use optimize::FrameObjective;
+pub use frame::InputKind;
+pub(crate) use frame::PlayedInput;
 use crate::{chart::Chart, live, master::Master, num::f};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
@@ -519,6 +521,33 @@ impl InputTiming {
         self.witnesses.lock().unwrap().clone()
     }
 
+    pub(crate) fn plan(&self, selected: &[i32]) -> Result<Vec<PlayedInput>, String> {
+        let frames: Vec<_> = self.replay_frames(selected).into_iter().collect();
+        let initial = frame::State { done: vec![false; self.notes.len()], flicks: vec![None; self.notes.len()] };
+        let mut program = Vec::new();
+        if replay(self.clock, &self.notes, &frames, selected, &initial, &self.atoms, (None, Some(&mut program)))?.is_some() {
+            return Err("optimal timing input replay failed".into());
+        }
+        let mut state = initial;
+        let mut scratch = frame::Scratch::default();
+        let mut plan = vec![PlayedInput { time: 0, kind: InputKind::Miss }; self.notes.len()];
+        for (index, (at, mut inputs)) in program.into_iter().enumerate() {
+            if index.is_multiple_of(64) { check_deadline()?; }
+            let indices: Vec<_> = self.notes.iter().enumerate().filter(|&(i, note)| note.first <= at && at <= selected[i])
+                .map(|(i, _)| i).collect();
+            let notes: Vec<_> = indices.iter().map(|&i| self.notes[i].clone()).collect();
+            let due: Vec<_> = indices.iter().map(|&i| selected[i] == at).collect();
+            search::nominal_inputs(&notes, &due, at, self.clock, &mut inputs);
+            for judged in frame::run_plan(&self.notes, at, &inputs, &mut state, &mut scratch, &mut plan) {
+                if selected[judged.note] != at || judged.grade != self.notes[judged.note].grade {
+                    return Err("optimal timing input replay mismatch".into());
+                }
+            }
+        }
+        if state.done.iter().any(|&done| !done) { return Err("optimal timing input replay incomplete".into()); }
+        Ok(plan)
+    }
+
     pub(crate) fn ordering_pairs(&self) -> &[(usize, usize)] { &self.orderings }
 
     fn check_inputs(&self, selected: &[i32]) -> Result<Option<Conflict>, String> {
@@ -590,7 +619,7 @@ impl InputTiming {
                 }
             }
         }
-        let checked = replay(self.clock, &notes, &frames.into_iter().collect::<Vec<_>>(), &targets, &initial, &self.atoms, None);
+        let checked = replay(self.clock, &notes, &frames.into_iter().collect::<Vec<_>>(), &targets, &initial, &self.atoms, (None, None));
         let mut tightened = None;
         if !matches!(checked, Ok(None)) {
             if let Err(error) = &checked {
@@ -643,7 +672,7 @@ impl InputTiming {
         let mut frames = self.replay_frames(selected);
         frames.extend(inputs.keys().copied());
         let initial = frame::State { done: vec![false; self.notes.len()], flicks: vec![None; self.notes.len()] };
-        if replay(self.clock, &self.notes, &frames.into_iter().collect::<Vec<_>>(), selected, &initial, &self.atoms, Some(inputs))?.is_none() {
+        if replay(self.clock, &self.notes, &frames.into_iter().collect::<Vec<_>>(), selected, &initial, &self.atoms, (Some(inputs), None))?.is_none() {
             self.remember_verified(selected)?;
             Ok(true)
         } else { Ok(false) }
@@ -743,7 +772,7 @@ impl InputTiming {
             let Some(((index, options), rest)) = choices.split_first() else {
                 *attempts += 1;
                 if attempts.is_multiple_of(64) { check_deadline()?; }
-                return replay(clock, notes, frames, selected, state, atoms, None).map(|conflict| conflict.is_none());
+                return replay(clock, notes, frames, selected, state, atoms, (None, None)).map(|conflict| conflict.is_none());
             };
             let mut unresolved = None;
             for &option in options {
@@ -783,6 +812,7 @@ impl InputTiming {
     }
 }
 
+type InputProgram = Vec<(i32, Vec<frame::Touch>)>;
 fn replay(
     clock: live::FrameClock,
     notes: &[Note],
@@ -790,8 +820,9 @@ fn replay(
     selected: &[i32],
     initial: &frame::State,
     atoms: &Arc<Mutex<search::AtomCache>>,
-    inputs: Option<&BTreeMap<i32, Vec<frame::Touch>>>,
+    program: (Option<&BTreeMap<i32, Vec<frame::Touch>>>, Option<&mut InputProgram>),
 ) -> Result<Option<(i32, i32)>, String> {
+    let (inputs, mut output) = program;
     use frame::ReservedFlick;
     type Saved = Vec<(usize, ReservedFlick)>;
     struct Step {
@@ -808,7 +839,8 @@ fn replay(
     }
     impl Choices {
         fn next(&mut self) -> Result<Option<search::Outcome>, String> {
-            if let Some(search) = &mut self.search { search.next() } else { Ok(self.forced.take()) }
+            if let Some(forced) = self.forced.take() { Ok(Some(forced)) }
+            else if let Some(search) = &mut self.search { search.next() } else { Ok(None) }
         }
     }
     let mut eligible = vec![Vec::new(); frames.len()];
@@ -827,6 +859,7 @@ fn replay(
     let mut failed = HashSet::<(usize, Vec<u8>)>::new();
     let mut step = Some(0usize);
     let mut witness = Vec::<(i32, Vec<frame::Touch>)>::new();
+    let mut witness_start = 0;
     let generation = crate::cancellation_generation();
     let mut iterations = 0usize;
     let mut block_start = frames.first().copied().unwrap_or(0);
@@ -838,6 +871,7 @@ fn replay(
         }
         if let Some(index) = step.take() {
             if index == frames.len() {
+                if let Some(output) = &mut output { output.append(&mut witness); }
                 return Ok(None);
             }
             let at = frames[index];
@@ -880,7 +914,15 @@ fn replay(
                         && judged.iter().all(|j| targets[j.note] == at && j.grade == local_notes[j.note].grade);
                     Choices { search: None, forced: valid.then(|| search::Outcome { state, inputs: inputs.clone() }) }
                 } else {
-                    Choices { search: Some(search::Search::new(local_notes, at, targets, local, clock, Arc::clone(atoms), frames.get(index + 1).copied())), forced: None }
+                    let forced = output.is_some().then(|| {
+                        let inputs = search::nominal_word(&local_notes, at, clock, &targets);
+                        let mut state = local.clone();
+                        let judged = frame::run(&local_notes, at, &inputs, &mut state);
+                        let valid = judged.len() == targets.iter().filter(|&&target| target == at).count()
+                            && judged.iter().all(|j| targets[j.note] == at && j.grade == local_notes[j.note].grade);
+                        valid.then_some(search::Outcome { state, inputs })
+                    }).flatten();
+                    Choices { search: Some(search::Search::new(local_notes, at, targets, local, clock, Arc::clone(atoms), frames.get(index + 1).copied())), forced }
                 };
                 stack.push(Step {
                     index,
@@ -906,12 +948,14 @@ fn replay(
                     }
                 }
             }
-            witness.truncate(index);
+            witness.truncate(index - witness_start);
             witness.push((frames[index], outcome.inputs));
             if current.complete {
                 stack.clear();
                 failed.clear();
+                if let Some(output) = &mut output { output.append(&mut witness); }
                 witness.clear();
+                witness_start = index + 1;
                 block_start = frames.get(index + 1).copied().unwrap_or(frames[index]);
                 block_end = block_start;
             }
