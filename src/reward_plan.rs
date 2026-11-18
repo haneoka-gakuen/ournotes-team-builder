@@ -63,6 +63,8 @@ pub(crate) struct Plan {
     pub criterion: Aggregation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub minimum_rank: Option<i32>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub maximize_bonus: bool,
     pub levels: Vec<Vec<Term>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tie_break: Option<TieBreak>,
@@ -100,6 +102,13 @@ impl Plan {
         }
         if plan.levels[0][0].weight != plan.unit as u64 {
             return Err("reward-plan-unit".into());
+        }
+        if plan.maximize_bonus
+            && (plan.unit != 1 || plan.minimum_rank.is_none() || plan.levels.len() != 1
+                || plan.levels[0].len() != 1 || plan.levels[0][0].metric == Metric::ChallengePoints
+                || plan.criterion != Aggregation::Mean || plan.auto_cp.is_some())
+        {
+            return Err("reward-plan-bonus".into());
         }
         if let Some(auto) = &plan.auto_cp {
             if auto.songs.is_empty()
@@ -145,6 +154,9 @@ impl Plan {
                 }))
             })
             .collect()
+    }
+    pub(crate) fn primary_display(&self, value: &Fraction) -> f64 {
+        value.divided(if self.maximize_bonus { 100 } else { self.unit }).value()
     }
     pub(crate) fn upper(&self, rewards: [f64; 3]) -> [f64; 3] {
         std::array::from_fn(|index| {
@@ -388,7 +400,11 @@ impl<'a> Ranked<'a> {
             }
         }
         let caps = units.map(|value| Fraction::new(value, 10_000));
-        let cap_levels = context.plan.rank(&caps);
+        let cap_levels = if context.plan.maximize_bonus {
+            vec![Fraction::new(bonus_max[anchor] as i128, 1)]
+        } else {
+            context.plan.rank(&caps)
+        };
         let own = context.plan.levels[0]
             .iter()
             .find(|term| term.metric == anchor_metric);
@@ -451,7 +467,7 @@ impl<'a> Ranked<'a> {
                     <= (1u64 << 52) as f64
             })
             && (!prefix_items || !context.route.fractional_items());
-        let source_lex = context.plan.criterion == Aggregation::Mean
+        let source_lex = !context.plan.maximize_bonus && context.plan.criterion == Aggregation::Mean
             && matches!(source, Source::Gekiso(_))
             && lex_precision
             && secondary_matches
@@ -560,6 +576,14 @@ impl<'a> Ranked<'a> {
         }
         let rank = self.rank_cap(self.source.score_upper(totals).min(score_cap));
         let mut result = [0.0_f64; 3];
+        if self.context.plan.maximize_bonus {
+            result[self.anchor_metric.index()] = if self.context.plan.minimum_rank.is_some_and(|minimum| rank < minimum) {
+                f64::NEG_INFINITY
+            } else {
+                bonuses[self.anchor].floor()
+            };
+            return result;
+        }
         for (kind, &bonus) in bonuses.iter().enumerate() {
             if self.payout_cache[kind].len() >= 4096 {
                 self.payout_cache[kind].clear();
@@ -648,7 +672,7 @@ impl<'a> Ranked<'a> {
         values[0]
     }
     fn primary_floor(&self, value: f64) -> f64 {
-        if self.context.plan.criterion != Aggregation::Mean || !value.is_finite() {
+        if self.context.plan.maximize_bonus || self.context.plan.criterion != Aggregation::Mean || !value.is_finite() {
             return f64::NEG_INFINITY;
         }
         let Some(value) = Fraction::from_value(value.next_down()) else {
@@ -678,7 +702,7 @@ impl<'a> Ranked<'a> {
         Fraction((value.0 - others) / BigInt::from(own.weight)).lower() - self.rounding
     }
     fn update_floor(&mut self) {
-        if self.context.plan.criterion != Aggregation::Mean { return; }
+        if self.context.plan.maximize_bonus || self.context.plan.criterion != Aggregation::Mean { return; }
         self.raw_floor = self.primary_floor(self.context.floor);
         let Some(incumbent) = &self.incumbent else {
             return;
@@ -809,7 +833,11 @@ impl<'a> Ranked<'a> {
                 .collect::<Result<Vec<_>, _>>()?;
             rows.try_into().unwrap()
         };
-        let mut ranked = self.context.plan.rank(&rewards);
+        let mut ranked = if self.context.plan.maximize_bonus {
+            vec![Fraction::new(bonuses[self.anchor] as i128, 1)]
+        } else {
+            self.context.plan.rank(&rewards)
+        };
         if self.context.plan.score_tie() {
             ranked.push(Fraction::from_value(exact.detail["scores"]["mean"].as_f64().unwrap_or(0.0))
                 .ok_or("reward-plan-score")?);
@@ -824,7 +852,7 @@ impl<'a> Ranked<'a> {
             "points":rewards[0].json(), "challenge-points":rewards[1].json(), "items":rewards[2].json()
         });
         exact.detail["rewardPlan"] = json!(self.context.plan);
-        exact.detail["planMean"] = json!(ranked[0].divided(self.context.plan.unit).value());
+        exact.detail["planMean"] = json!(self.context.plan.primary_display(&ranked[0]));
         Ok(exact)
     }
     fn cp_members(&mut self, rewards: &mut [f64; 3], members: &[usize], from: usize, power: f64) {
@@ -964,7 +992,7 @@ impl Objective for Ranked<'_> {
         compare(&a.detail["rewardRanking"], &b.detail["rewardRanking"])
     }
     fn observe_hits(&mut self, hits: &[Hit]) {
-        if let Some(hit) = hits.first() {
+        if let Some(hit) = hits.first().filter(|_| !self.context.plan.maximize_bonus) {
             let mut source_hit = hit.clone();
             source_hit.key = hit.detail["settlement"]["mean"].as_f64().unwrap_or(hit.key);
             self.source.objective().observe_hit(&source_hit);

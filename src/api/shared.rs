@@ -1181,7 +1181,7 @@ impl Combined<'_> {
             key = ranks[0].lower();
             detail["rewardRanking"] = json!(ranks.iter().map(Fraction::json).collect::<Vec<_>>());
             detail["rewardPlan"] = json!(plan);
-            detail["planMean"] = json!(ranks[0].divided(plan.unit).value());
+            detail["planMean"] = json!(plan.primary_display(&ranks[0]));
             detail["rewardValues"] = json!({});
             for metric in ["points", "challenge-points", "items"] {
                 detail["rewardValues"][metric] = Fraction::mean(

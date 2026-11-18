@@ -943,7 +943,7 @@ impl Engine {
             let mut objective = LiveObjective {
                 core,
                 criterion: Criterion::from_value(&goal["criterion"]),
-                target: crate::objectives::Target::from_value(&goal["target"]),
+                target: crate::objectives::Target::from_value(&goal["target"], chart)?,
             };
             let song_deadline =
                 (now() + (deadline - now()).max(0.0) / (songs.len() - index) as f64).min(deadline);
@@ -2061,6 +2061,9 @@ impl Engine {
                 return Err("event-reward-phase".into());
             }
             let mut objective: Box<dyn Objective> = if let Some(plan) = &plan {
+                if kind == RouteKind::Skip && plan.maximize_bonus {
+                    return Err("reward-plan-bonus".into());
+                }
                 use crate::reward_plan::{Context, Metric, Ranked, Source};
                 let mut event = EventObjective::new(
                     &self.master, &cards.members, &cards.snaps, chart, route.clone(),

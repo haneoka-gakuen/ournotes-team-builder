@@ -2509,9 +2509,16 @@ pub struct Target {
 }
 const TIE: f64 = 1e-12;
 impl Target {
-    pub fn from_value(v: &Value) -> Option<Self> {
-        let score = v["score"].as_f64().filter(|s| s.is_finite() && *s > 0.0)?;
-        match v["kind"].as_str() {
+    pub fn from_value(v: &Value, chart: &crate::chart::Chart) -> Result<Option<Self>, String> {
+        let score = if v["kind"] == "at-least" && !v["rank"].is_null() {
+            let rank = v["rank"].as_i64().filter(|rank| (3..=7).contains(rank)).ok_or("score-target-rank")?;
+            Some(chart.ranks.iter().filter(|row| i64::from(row.rank) >= rank)
+                .map(|row| row.required).min().ok_or("score-target-rank-unavailable")? as f64)
+        } else {
+            v["score"].as_f64().filter(|s| s.is_finite() && *s > 0.0)
+        };
+        let Some(score) = score else { return Ok(None); };
+        Ok(match v["kind"].as_str() {
             Some("at-least") => Some(Self {
                 score,
                 capped: false,
@@ -2523,7 +2530,7 @@ impl Target {
                 peak: (0..120).fold(0.0, |sum, _| sum + score) / 120.0,
             }),
             _ => None,
-        }
+        })
     }
     fn value(self, scores: &[f64]) -> f64 {
         let n = scores.len().max(1) as f64;
