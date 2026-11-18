@@ -141,6 +141,9 @@ fn rank_bound_order(
 }
 
 impl Combined<'_> {
+    fn bonus_without_ties(&self) -> bool {
+        self.plan.as_ref().is_some_and(|plan| plan.maximize_bonus && !plan.power_tie())
+    }
     fn joint_linear(&self) -> bool {
         !self.event
             && self.songs.iter().all(|song| {
@@ -353,6 +356,10 @@ impl Combined<'_> {
             }
         }
         let bound = joint.min((sum / self.songs.len() as f64).next_up());
+        // Event bonus uses the same integer basis points on every chart of this event.
+        if self.bonus_without_ties() {
+            return bound.floor();
+        }
         if let (Some(mut sums), Some(cutoff)) = (rank_sums, &self.reward_cutoff) {
             sums[0] = sum;
             let rewards = self.plan.as_ref().unwrap().levels.len();
@@ -511,7 +518,7 @@ impl Objective for Combined<'_> {
         values
     }
     fn score_ties(&self) -> bool {
-        self.event
+        self.event && !self.bonus_without_ties()
     }
     fn tie_rank(&self, hit: &search::Hit) -> [f64; 2] {
         [
@@ -577,7 +584,8 @@ impl Objective for Combined<'_> {
             }))
             .next_up()
         });
-        (sum / self.songs.len() as f64).next_up()
+        let upper = (sum / self.songs.len() as f64).next_up();
+        if self.bonus_without_ties() { upper.floor() } else { upper }
     }
     fn prepare_members(&mut self, groups: &[Vec<usize>]) {
         for song in &mut self.songs {

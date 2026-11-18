@@ -974,7 +974,7 @@ impl Objective for Ranked<'_> {
         self.source.view().feasible_assignment(members, assigned, from, options)
     }
     fn score_ties(&self) -> bool {
-        true
+        !self.context.plan.maximize_bonus || self.context.plan.power_tie()
     }
     fn seed_objective(&self) -> Option<Box<dyn Objective>> {
         self.source.view().seed_objective().or_else(|| {
