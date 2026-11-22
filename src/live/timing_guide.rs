@@ -73,27 +73,32 @@ fn contributing_windows(
             owners.push(i);
         }
     }
+    let replay = |use_after: &dyn Fn(usize) -> bool| {
+        let commands = windows
+            .iter()
+            .enumerate()
+            .flat_map(|(j, w)| {
+                if use_after(w.event) {
+                    &after[j]
+                } else {
+                    &before[j]
+                }
+            })
+            .cloned()
+            .collect();
+        score_with_counters(input, order, commands)
+    };
     let mut previous = previous_score;
     let mut contributors = Vec::new();
     for (position, &i) in owners.iter().enumerate() {
+        let event = windows[i].event;
         let value = if position + 1 == owners.len() {
             score
         } else {
-            let commands = windows
-                .iter()
-                .enumerate()
-                .flat_map(|(j, w)| {
-                    if w.event <= windows[i].event {
-                        &after[j]
-                    } else {
-                        &before[j]
-                    }
-                })
-                .cloned()
-                .collect();
-            score_with_counters(input, order, commands)
+            replay(&|e| e <= event)
         };
-        if value > previous {
+        // Rounding can make an earlier owner necessary only once the others are active.
+        if value > previous || (position + 1 < owners.len() && replay(&|e| e != event) < score) {
             contributors.push(i);
         }
         previous = value;
