@@ -42,11 +42,11 @@ pub(super) struct Judgement {
     pub note: usize,
     pub grade: usize,
 }
-#[derive(Clone, Copy, serde::Serialize)]
+#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum InputKind { Hit, Hold, Release, Flick, Miss }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PlayedInput {
     pub time: i32,
     pub kind: InputKind,

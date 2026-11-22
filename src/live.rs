@@ -5,6 +5,7 @@ mod frame_optimization;
 mod phases;
 pub use phases::PhaseTiming;
 mod timing_constraints;
+mod timing_guide;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BinaryHeap, HashMap},
@@ -962,7 +963,7 @@ fn partition(len: usize, mut below: impl FnMut(usize) -> bool) -> usize {
 }
 fn slot_cumulative_commands(
     input: &Input,
-    slot: &Slot,
+    factors: &[Cumulative],
     event: usize,
     judgements: Option<&[usize]>,
     delivery: Option<&Delivery>,
@@ -973,7 +974,7 @@ fn slot_cumulative_commands(
         |k: usize| delivery.map_or_else(|| input.frame_time(input.times[k]), |d| d.frames[k]);
     let note_at = |k: usize| delivery.map_or(k, |d| d.notes[k]);
     let mut commands = Vec::new();
-    for factor in &slot.cumulative {
+    for factor in factors {
         let (activation, end) = factor.window(input.clock, start);
         let (mut count, mut applied) = (0, 0);
         let mut first = partition(n, |k| frame_at(k) < activation);
@@ -1053,7 +1054,7 @@ fn cumulative_commands(
     for (event, &position) in order.iter().enumerate().take(input.skill_times.len()) {
         if let Some(slot) = input.slots.get(position) {
             commands.extend(slot_cumulative_commands(
-                input, slot, event, judgements, delivery,
+                input, &slot.cumulative, event, judgements, delivery,
             ));
         }
     }
@@ -1283,10 +1284,6 @@ impl<'a> ApScorer<'a> {
         self.order_input(self.input, order, delivery)
     }
     fn order_input(&mut self, input: &Input, order: &[usize; 5], delivery: Option<&Delivery>) -> f64 {
-        let n = input.times.len();
-        let (mut general, mut perfect_up) = (f(1.0), f(0.0));
-        let mut at = 0;
-        let mut score = 0.0;
         let commands = if delivery.is_some() && input.slots.iter().all(|slot| slot.effects.iter().all(|effect| !effect.release_judgements.contains(&5))) {
             let table = self.timed_commands.get_or_insert_with(|| {
                 input.skill_times.iter().take(5).enumerate().map(|(event, _)| {
@@ -1328,6 +1325,14 @@ impl<'a> ApScorer<'a> {
             combined.sort_by_key(|command| (command.time, command.owner));
             combined
         };
+        self.score_commands(input, commands)
+    }
+
+    fn score_commands(&mut self, input: &Input, commands: Vec<Command>) -> f64 {
+        let n = input.times.len();
+        let (mut general, mut perfect_up) = (f(1.0), f(0.0));
+        let mut at = 0;
+        let mut score = 0.0;
         for command in commands {
             let end = input.times.partition_point(|&time| time < command.time);
             if end > at {
@@ -1975,6 +1980,9 @@ impl<'a> PlayScorer<'a> {
         index
     }
     fn order(&mut self, order: &[usize; 5], delivery: Option<&Delivery>) -> f64 {
+        self.order_with_counters(order, delivery, None)
+    }
+    fn order_with_counters(&mut self, order: &[usize; 5], delivery: Option<&Delivery>, counters: Option<Vec<Command>>) -> f64 {
         let mut curve = self.curve_enabled.then_some(0.0_f64);
         let trajectory = self.trajectory(order);
         let (input, firing, note) = (self.input, &self.firing, &self.note);
@@ -2005,7 +2013,7 @@ impl<'a> PlayScorer<'a> {
             active: Vec::new(),
         };
         let mut cursor = 0;
-        let cumulative = if delivery.is_none() {
+        let cumulative = if let Some(commands) = counters { commands } else if delivery.is_none() {
             let mut commands = Vec::new();
             for (event, &position) in order.iter().enumerate().take(input.skill_times.len()) {
                 let Some(slot) = input
@@ -2022,7 +2030,7 @@ impl<'a> PlayScorer<'a> {
                     self.cumulative_cache
                         .entry((trajectory, event, position))
                         .or_insert_with(|| {
-                            slot_cumulative_commands(input, slot, event, Some(converted), None)
+                            slot_cumulative_commands(input, &slot.cumulative, event, Some(converted), None)
                         }),
                 );
             }
@@ -2362,6 +2370,8 @@ fn judgement_pattern(count: usize, play: &serde_json::Value, kinds: Option<&[i32
 #[serde(rename_all = "camelCase")]
 pub struct TimingStep {
     pub step: i32,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<usize>,
     pub time_ms: i32,
     pub notes: usize,
     pub note_indices: Vec<usize>,
@@ -2443,7 +2453,7 @@ pub fn timing_with_inputs(input: &Input, order_index: usize, before_ms: &[i32], 
                 if mill != applied && !chord.is_empty() {
                     let last = input.times[*chord.last().unwrap()];
                     groups.push((windows.len(), window.steps.len(), chord.clone()));
-                    window.steps.push(TimingStep { step: (count / factor.unit).min(factor.cap), time_ms: last, notes: chord.len(),
+                    window.steps.push(TimingStep { events: Vec::new(), step: (count / factor.unit).min(factor.cap), time_ms: last, notes: chord.len(),
                         note_times_ms: chord.iter().map(|&i| input.times[i]).collect(),
                         input_times_ms: chord.iter().map(|&i| input.frame_time(input.times[i] - advance_ms)).collect(),
                         note_indices: chord, input_kinds: Vec::new(), delivery_times_ms: Vec::new(), gain: 0.0 });
@@ -2554,31 +2564,7 @@ fn optimal_timing(input: &Input, order: usize, timing: &crate::input_timing::Inp
             delivery.move_note(note, previous, &mut positions);
         }
     }
-    let frames = frames.as_slice();
-    let played = timing.plan(frames)?;
-    if selected_score(input, order, frames) != best { return Err("optimal timing score mismatch".into()); }
-    let plan_base_score = self::score(input)?.scores[order];
-    let mut windows = Vec::new();
-    for (event, &start) in input.skill_times.iter().take(5).enumerate() {
-        for factor in &input.slots[orders()[order][event]].cumulative {
-            let (start_ms, end_ms) = factor.window(input.clock, start);
-            windows.push(TimingWindow { event, start_ms, end_ms, unit: factor.unit,
-                notes: input.times.iter().zip(frames).filter(|(_, frame)| start_ms <= **frame && **frame <= end_ms)
-                    .map(|(&time, _)| time).collect(), steps: Vec::new() });
-        }
-    }
-    for (note, hit) in played.into_iter().enumerate() {
-        if hit.time == input.times[note] && frames[note] == input.frame_time(input.times[note]) { continue; }
-        let window = windows.iter_mut().min_by_key(|window| {
-            if window.start_ms <= frames[note] && frames[note] <= window.end_ms { 0 }
-            else { (i64::from(frames[note]) - i64::from(window.start_ms)).abs().min((i64::from(frames[note]) - i64::from(window.end_ms)).abs()) }
-        }).ok_or("missing cumulative timing window")?;
-        window.steps.push(TimingStep { step: window.steps.len() as i32 + 1, time_ms: input.times[note], notes: 1,
-            note_indices: vec![note], note_times_ms: vec![input.times[note]], input_times_ms: vec![hit.time],
-            input_kinds: vec![hit.kind], delivery_times_ms: vec![frames[note]], gain: 0.0 });
-    }
-    Ok(Timing { score, plan_base_score, frame_origin_ms: input.clock.origin_ms(), best, guide_available: true,
-        plan_is_optimal: true, advance_ms: input.clock.advance_ms(), windows })
+    timing_guide::build(input, order, timing, &frames, best, score)
 }
 #[cfg(test)]
 mod delivery_extremes_tests {

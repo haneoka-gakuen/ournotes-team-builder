@@ -317,8 +317,10 @@ fn atoms(notes: &[Note], at: i32, clock: crate::live::FrameClock, flicks_only: b
 pub(super) fn nominal_inputs(notes: &[Note], due: &[bool], at: i32, clock: crate::live::FrameClock, inputs: &mut [Touch]) {
     for input in inputs {
         let key = atom_key(notes, *input, at);
-        let wanted = notes.iter().enumerate().filter(|(_, note)| frame::in_area(note, input.lane)
-            && (input.flick_begin.is_none() || note.flick()))
+        let wanted = notes.iter().enumerate().filter(|(_, note)| match input.flick_begin {
+            Some(begin) => note.flick() && frame::in_area(note, begin),
+            None => frame::in_area(note, input.lane),
+        })
             .min_by_key(|&(i, note)| (!due[i], (i64::from(note.time) - i64::from(at)).abs()))
             .map_or(input.time, |(_, note)| note.time);
         if let Some(time) = input_times(clock, at).filter(|&time| atom_key(notes, Touch { time, ..*input }, at) == key)
