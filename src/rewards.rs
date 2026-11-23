@@ -234,6 +234,7 @@ fn range_delta(master: &Master, row: &SkillEffect) -> Option<f64> {
 #[derive(Clone, Copy, Default)]
 struct Budget {
     positive: f64,
+    sustained: f64,
     commands: usize,
 }
 fn admitted(master: &Master, rows: Option<&Vec<SkillEffect>>, level: i32) -> Option<Budget> {
@@ -264,7 +265,13 @@ fn admitted(master: &Master, rows: Option<&Vec<SkillEffect>>, level: i32) -> Opt
         {
             continue;
         }
-        budget.positive = add(budget.positive, mul(3.0, range_delta(master, row)?));
+        let delta = range_delta(master, row)?;
+        budget.positive = add(budget.positive, mul(3.0, delta));
+        // An untimed Rush effect uses one sustained updater for this row.
+        // Its previous activation ends before another can be registered.
+        let occurrences = if row.trigger_type == 2 && row.seconds == 0.0
+            && row.release_group == 0 { 1.0 } else { 3.0 };
+        budget.sustained = add(budget.sustained, mul(occurrences, delta));
         budget.commands += 6;
     }
     Some(budget)
@@ -326,13 +333,14 @@ fn snap_budget(master: &Master, chart: &gekiso::Chart, snap: &Snap) -> Option<Bu
             continue;
         }
         total.budget.positive = add(total.budget.positive, part.budget.positive);
+        total.budget.sustained = add(total.budget.sustained, part.budget.sustained);
         total.budget.commands += part.budget.commands;
         total.raises |= part.raises;
     }
     Some(total)
 }
-fn largest(budgets: &[Budget]) -> f64 {
-    let mut rows: Vec<_> = budgets.iter().map(|b| b.positive).collect();
+fn largest(budgets: &[Budget], value: impl Fn(&Budget) -> f64) -> f64 {
+    let mut rows: Vec<_> = budgets.iter().map(value).collect();
     rows.sort_by(|a, b| b.total_cmp(a));
     rows.into_iter().take(5).fold(0.0, add)
 }
@@ -349,6 +357,24 @@ pub fn score_coefficient(
     members: &[Member],
     snaps: &[Snap],
     bindings: Option<&[Option<Snap>]>,
+) -> f64 {
+    score_coefficient_with_weights(master, chart, members, snaps, bindings, None)
+}
+
+pub(crate) struct ReplayScoreWeights<'a> {
+    pub(crate) grades: [f64; 7],
+    pub(crate) promotions: [usize; 7],
+    pub(crate) combo: &'a [f64],
+    pub(crate) dead_after: Option<i32>,
+}
+
+pub(crate) fn score_coefficient_with_weights(
+    master: &Master,
+    chart: &gekiso::Chart,
+    members: &[Member],
+    snaps: &[Snap],
+    bindings: Option<&[Option<Snap>]>,
+    weights: Option<ReplayScoreWeights<'_>>,
 ) -> f64 {
     let make = || -> Option<f64> {
         if bindings.is_some_and(|b| b.len() != members.len() || members.len() > 5) {
@@ -375,7 +401,10 @@ pub fn score_coefficient(
             sb.push(info.budget);
             fixed_judgements &= !info.raises;
         }
-        let positive = add(largest(&mb), largest(&sb));
+        let positive = add(largest(&mb, |budget| budget.positive), largest(&sb, |budget| budget.positive));
+        let peak = if weights.is_some() {
+            add(largest(&mb, |budget| budget.sustained), largest(&sb, |budget| budget.sustained))
+        } else { positive };
         let note_commands = commands(&mb) + commands(&sb);
         let live = &master.live;
         if !(0.0..=1.0).contains(&live.life_onus)
@@ -492,7 +521,7 @@ pub fn score_coefficient(
         } else {
             0.0
         };
-        let note_multiplier = add(add(1.0, positive), error);
+        let note_multiplier = add(add(1.0, peak), error);
         let operations = (10 * max_actions + 1) as f64;
         if operations * u > 0.25 {
             return None;
@@ -519,6 +548,11 @@ pub fn score_coefficient(
             return None;
         }
         let mut coefficient = 0.0;
+        let grade_counts = weights.as_ref().map(|_| chart.judgements.iter().fold([0usize; 7], |mut counts, &grade| {
+            counts[grade] += 1;
+            counts
+        }));
+        let mut promoted: [Vec<f64>; 7] = std::array::from_fn(|_| Vec::new());
         let luck_ranges = (chart.luck && live.gekiso.rush_percent == 100
             && chart.play.frames.windows(2).all(|frames| {
                 (10..=40).contains(&(frames[1].time_ms - frames[0].time_ms))
@@ -530,7 +564,9 @@ pub fn score_coefficient(
             .filter(|ranges| ranges.windows(2).all(|pair| pair[0].1 < pair[1].0));
         for (i, note) in chart.notes.iter().enumerate() {
             let frac = chart.note_frac[i];
-            let combo = if chart.accuracy.miss_every > 0 {
+            let combo = if let Some(weights) = &weights {
+                weights.combo[i]
+            } else if chart.accuracy.miss_every > 0 {
                 2.0
             } else {
                 chart.combo_factor[i]
@@ -574,13 +610,10 @@ pub fn score_coefficient(
                     chart.setup.missions[range] == 2 && start <= note.time_ms && note.time_ms <= end
                 })) { 1.0 } else { 2.0 };
             let mut c = mul(live.adjustment, chart.difficulty_factor);
+            let grade = chart.judgements[i];
+            let cap = weights.as_ref().filter(|weights| weights.promotions[grade] < grade_counts.unwrap()[grade]);
             for term in [
                 frac,
-                if fixed_judgements {
-                    chart.judge_frac[chart.judgements[i]]
-                } else {
-                    fraction
-                },
                 combo,
                 gk,
                 luck,
@@ -588,6 +621,9 @@ pub fn score_coefficient(
                 round_factor,
             ] {
                 c = mul(c, term);
+            }
+            if weights.as_ref().and_then(|weights| weights.dead_after).is_some_and(|at| note.time_ms > at) {
+                c = mul(c, live.life_onus);
             }
             c = up(c / chart.full.converted as f64);
             let range = chart.range_of[i];
@@ -597,7 +633,26 @@ pub fn score_coefficient(
                     add(1.0, up(chart.range_percent[range as usize] as f64 / 100.0)),
                 );
             }
-            coefficient = add(coefficient, c);
+            let raw = chart.judge_frac[grade];
+            if let Some(weights) = cap {
+                coefficient = add(coefficient, mul(c, raw));
+                if weights.promotions[grade] > 0 {
+                    promoted[grade].push(mul(c, (weights.grades[grade] - raw).next_up()));
+                }
+            } else {
+                let judgement = weights.as_ref().map_or(if fixed_judgements { raw } else { fraction }, |weights| weights.grades[grade]);
+                coefficient = add(coefficient, mul(c, judgement));
+            }
+        }
+        if let Some(weights) = &weights {
+            for (values, count) in promoted.iter_mut().zip(weights.promotions) {
+                if values.len() > count {
+                    values.select_nth_unstable_by(count, |a, b| b.total_cmp(a));
+                }
+                for &value in values.iter().take(count) {
+                    coefficient = add(coefficient, value);
+                }
+            }
         }
         Some(coefficient)
     };

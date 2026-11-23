@@ -11213,6 +11213,8 @@ fn replay_bound(
     chart: &Chart,
     members: &[Member],
     snaps: &[Snap],
+    combo: &[f64],
+    dead_after: Option<i32>,
 ) -> Result<Option<crate::rewards::DeterministicBound>, String> {
     if !(0.0..=1.0).contains(&master.live.life_onus) {
         return Ok(None);
@@ -11244,7 +11246,14 @@ fn replay_bound(
             .collect(),
     );
     let mut optimistic = chart.all_just(&relaxed)?;
-    optimistic.combo_factor = replay_combo_ceiling(master, chart, members, snaps);
+    optimistic.combo_factor = combo.to_vec();
+    if let Some(dead_after) = dead_after {
+        for (note, fraction) in optimistic.notes.iter().zip(&mut optimistic.note_frac) {
+            if note.time_ms > dead_after {
+                *fraction = (*fraction * master.live.life_onus).next_up();
+            }
+        }
+    }
     if chart.luck {
         let best = (1..=6)
             .max_by(|&a, &b| {
@@ -11288,6 +11297,135 @@ fn replay_bound(
         snaps,
     ))
 }
+
+struct ReplayLimits {
+    grades: [f64; 7],
+    promotions: [usize; 7],
+    dead_after: Option<i32>,
+}
+
+fn replay_limits(master: &Master, chart: &Chart, members: &[Member], snaps: &[Snap]) -> ReplayLimits {
+    let first_skill = chart.full.events.iter().map(|event| event.1).min().unwrap_or(i32::MAX);
+    let first_range = chart.setup.fevers.iter().map(|range| range.0).min().unwrap_or(i32::MAX);
+    let gate = |group: i32| {
+        let sets = master.condition_sets.get(&group)?;
+        let mut kinds = sets.iter().map(|set| {
+            let [id] = set.as_slice() else { return None; };
+            master.conditions.get(id).filter(|condition| condition.positive).map(|c| c.kind)
+        });
+        let kind = kinds.next()??;
+        kinds.all(|other| other == Some(kind)).then_some(kind)
+    };
+    let trigger = |row: &SkillEffect| gate(row.trigger_group);
+    let onset = |row: &SkillEffect, ordinary: bool| {
+        if ordinary { return first_skill; }
+        if !matches!(row.trigger_type, 1 | 2) { return i32::MIN; }
+        match trigger(row) {
+            Some(4010 | 5020) => first_skill,
+            Some(7010 | 7013 | 7020 | 7021 | 5021) => first_range,
+            _ => i32::MIN,
+        }
+    };
+    let mut grades = chart.judge_frac;
+    let mut promotions = [0usize; 7];
+    let mut first_protection = i32::MAX;
+    let mut converters = Vec::new();
+    let mut visit = |row: &SkillEffect, limit: usize, ordinary: bool| {
+        let start = onset(row, ordinary);
+        if matches!(row.kind, 3001 | 3003 | 3004) {
+            first_protection = first_protection.min(start);
+        }
+        let to = match row.kind {
+            12006 if (1..=6).contains(&row.value) => row.value as usize,
+            13005 => 6,
+            _ => return,
+        };
+        let mut saved = 0.0_f64;
+        let mut counted = [false; 7];
+        for target in row.targets.iter().filter_map(|id| master.targets.get(id)) {
+            if let Ok(from) = usize::try_from(target.judgement) {
+                if from < grades.len() {
+                    grades[from] = grades[from].max(chart.judge_frac[to]);
+                    if !counted[from] && chart.judge_frac[to] > chart.judge_frac[from] {
+                        promotions[from] = promotions[from].saturating_add(limit);
+                        counted[from] = true;
+                    }
+                    saved = saved.max(master.live.damage[from] - master.live.damage[to]);
+                }
+            }
+        }
+        if saved > 0.0 { converters.push((start, limit, saved.ceil() as i64)); }
+    };
+    let quota = |row: &SkillEffect| {
+        if row.limit_count > 0 && row.trigger_type == 1 && row.execute_limit > 0 && row.reset_group == 0 {
+            (row.limit_count as usize).saturating_mul(row.execute_limit as usize)
+        } else { usize::MAX }
+    };
+    let live_events = chart.full.events.len();
+    for member in members {
+        for row in master.live_skills.get(&member.card.live_skill_id).into_iter().flatten()
+            .filter(|row| row.level == member.growth.live_skill_level)
+        {
+            let count = if row.limit_count > 0 {
+                (row.limit_count as usize).saturating_mul(live_events)
+            } else { usize::MAX };
+            visit(row, count, true);
+        }
+        if let Some(skill) = master.gekiso_skills.get(&member.card.gekiso_skill_id)
+            .filter(|skill| skill.mission_type == 4 || chart.setup.missions.contains(&skill.mission_type))
+        {
+            for row in skill.effects.iter().filter(|row| row.level == member.growth.gekiso_skill_level) {
+                visit(row, quota(row), false);
+            }
+        }
+    }
+    for snap in snaps {
+        for (id, level) in snap.card.support_skills.into_iter().zip(snap.skill_levels) {
+            for row in master.support_skills.get(&id).into_iter().flatten().filter(|row| row.level == level) {
+                visit(row, quota(row), false);
+            }
+        }
+        for (id, level) in snap.card.gekiso_support_skills.into_iter().zip(snap.gekiso_skill_levels) {
+            if let Some(skill) = master.gekiso_support_skills.get(&id)
+                .filter(|skill| skill.mission_type == 4 || chart.setup.missions.contains(&skill.mission_type))
+            {
+                for row in skill.effects.iter().filter(|row| row.level == level) {
+                    visit(row, quota(row), false);
+                }
+            }
+        }
+    }
+
+    // Recovery has no effect at zero LIFE. Count the most damage every
+    // conversion in the inventory could prevent before the first protection.
+    let dead_after = (|| -> Option<i32> {
+        if !(1.0..=1_000_000.0).contains(&master.live.life_base)
+            || master.live.damage.iter().any(|&value| !(0.0..=1_000_000.0).contains(&value) || value.fract() != 0.0)
+        { return None; }
+        let life = master.live.life_base as i64;
+        let times: HashMap<_, _> = chart.full.notes.iter().map(|note| (note.id, note.time_ms)).collect();
+        let mut damage = 0i64;
+        let mut last = i32::MIN;
+        for frame in &chart.play.frames {
+            if frame.time_ms >= first_protection { break; }
+            for note in &frame.judged {
+                let at = *times.get(&note.note_id)?;
+                if at >= first_protection { return None; }
+                last = last.max(at);
+                damage = damage.saturating_add(master.live.damage[note.judgement as usize] as i64);
+            }
+            if damage < life { continue; }
+            let saved = converters.iter().filter(|&&(start, _, _)| start <= frame.time_ms)
+                .fold(0i64, |sum, &(_, count, saved)| {
+                    sum.saturating_add(i64::try_from(count).unwrap_or(i64::MAX).saturating_mul(saved))
+                });
+            if damage.saturating_sub(saved) >= life { return Some(last); }
+        }
+        None
+    })();
+    ReplayLimits { grades, promotions, dead_after }
+}
+
 fn replay_support_key(master: &Master, actor: &Performer, global_converters: &HashSet<i32>) -> Option<Vec<u64>> {
     if actor.support_skills.len() > 1 {
         return None;
@@ -11413,6 +11551,7 @@ struct ReplayObjective<'a> {
     alias_allowed: bool,
     base_power: f64,
     just_window: Option<crate::just_window::Prepared>,
+    scores: HashMap<([u32; 5], i32, i32), Exact>,
 }
 impl ReplayObjective<'_> {
     fn shape_id(&mut self, member: usize, snap: i32) -> u32 {
@@ -11472,17 +11611,15 @@ impl Objective for ReplayObjective<'_> {
         self.shape_id(member, a) == self.shape_id(member, b)
     }
     fn bound(&mut self, totals: Totals) -> f64 {
-        self.bound.as_ref().map_or_else(
-            || (totals.power * self.coefficient).next_up(),
-            |b| b.score(totals),
-        )
+        let coefficient = (totals.power * self.coefficient).next_up();
+        self.bound.as_ref().map_or(coefficient, |bound| coefficient.min(bound.score(totals)))
     }
     fn interval(&mut self, team: &Team, totals: Totals) -> (f64, f64) {
         let upper = self
             .bound
             .as_mut()
             .map(|b| b.score_ceiling(&team.members, &team.snaps, 5, totals.power, self.criterion));
-        (0.0, upper.unwrap_or_else(|| self.bound(totals)))
+        (0.0, upper.unwrap_or(f64::INFINITY).min(self.bound(totals)))
     }
     fn prepare_members(&mut self, characters: &[Vec<usize>]) {
         if let Some(b) = &mut self.bound {
@@ -11532,6 +11669,13 @@ impl Objective for ReplayObjective<'_> {
         })
     }
     fn exact(&mut self, team: &Team, power: f64, _slots: &[f64]) -> Result<Exact, String> {
+        let bonus = team.members.iter().map(|&i| self.bonuses[i]).sum::<i32>();
+        let cache_key = self.just_window.is_none().then(|| {
+            (std::array::from_fn(|slot| self.shape_id(team.members[slot], team.snaps[slot])), power as i32, bonus)
+        });
+        if let Some(known) = cache_key.as_ref().and_then(|key| self.scores.get(key)) {
+            return Ok(known.clone());
+        }
         let deck: Vec<_> = team
             .members
             .iter()
@@ -11552,15 +11696,21 @@ impl Objective for ReplayObjective<'_> {
             gekiso::replay_orders(self.master, self.chart, &deck, self.seeds, power as i32)?;
         let mut result = Exact {
             key: self.criterion.key(&scores.scores),
-            detail: json!({"scores":scores,"seeds":self.seeds.len().max(1),"comboBonus":if self.chart.setup.missions.iter().any(|m| *m == 1 || *m == 4) { Some(1 + team.members.iter().map(|&i| self.bonuses[i]).sum::<i32>()) } else { None }}),
+            detail: json!({"scores":scores,"seeds":self.seeds.len().max(1),"comboBonus":if self.chart.setup.missions.iter().any(|m| *m == 1 || *m == 4) { Some(1 + bonus) } else { None }}),
         };
         if let Some(window) = &mut self.just_window {
             if let Some(value) = window.measure(self.master, self.chart, team, power as i32)? { result.detail["justWindow"] = json!(value); }
         }
+        debug_assert!(power < 0.0 || !self.coefficient.is_finite()
+            || result.key <= (power * self.coefficient).next_up(), "full replay coefficient");
         #[cfg(debug_assertions)]
         if let Some(bound) = &mut self.bound {
             let upper=bound.fixed_score_ceiling(&team.members,&team.snaps,power,self.criterion);
             debug_assert!(result.key<=upper,"replay score {} exceeds certificate {}",result.key,upper);
+        }
+        if let Some(key) = cache_key {
+            if self.scores.len() >= 512 { self.scores.clear(); }
+            self.scores.insert(key, result.clone());
         }
         Ok(result)
     }
@@ -11976,6 +12126,15 @@ fn search_levels(
                 maximum,
             });
         }
+        let combo = replay_combo_ceiling(env.master, chart, env.members, env.snaps);
+        let limits = replay_limits(env.master, chart, env.members, env.snaps);
+        let coefficient = crate::rewards::score_coefficient_with_weights(
+            env.master, chart, env.members, env.snaps, None,
+            Some(crate::rewards::ReplayScoreWeights {
+                grades: limits.grades, promotions: limits.promotions, combo: &combo, dead_after: limits.dead_after,
+            }),
+        );
+        let bound = replay_bound(env.master, chart, env.members, env.snaps, &combo, limits.dead_after)?;
         let mut objective = ReplayObjective {
             master: env.master,
             members: env.members,
@@ -11984,14 +12143,8 @@ fn search_levels(
             seeds: &seeds,
             criterion,
             bonuses,
-            coefficient: crate::rewards::score_coefficient(
-                env.master,
-                chart,
-                env.members,
-                env.snaps,
-                None,
-            ),
-            bound: replay_bound(env.master, chart, env.members, env.snaps)?,
+            coefficient,
+            bound,
             conversion_rows: env.master.live_skills.values().flatten().chain(env.master.gekiso_skills.values().flat_map(|skill|&skill.effects))
                 .chain(env.master.gekiso_support_skills.values().flat_map(|skill|&skill.effects)).filter(|row|matches!(row.kind,12006|13005)).map(|row|row.id).collect(),
             shapes: HashMap::default(),
@@ -11999,6 +12152,7 @@ fn search_levels(
             alias_allowed: false,
             base_power: 0.0,
             just_window,
+            scores: HashMap::default(),
         };
         let mut candidate = |hits: &[Hit]| {
             if let Some(callback) = on_candidate.as_deref_mut() {
