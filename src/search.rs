@@ -886,9 +886,8 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             }
             input.objective.prepare_dominance(5.0 * maximum);
         }
-        let conditional_dominance = input.objective.conditional_snap_dominance()
-            && !input.disable_snap_dominance
-            && !input.objective.preserve_snap_options();
+        let preserve_options = input.disable_snap_dominance || input.objective.preserve_snap_options();
+        let conditional_dominance = input.objective.conditional_snap_dominance() && !preserve_options;
         let mut dominators = vec![vec![Vec::new(); width]; n];
         let options = (0..n)
             .map(|i| {
@@ -900,64 +899,65 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                     };
                 }
                 let list = &raw_options[i];
-                let values: Vec<Vec<f64>> = list
-                    .iter()
-                    .map(|&j| {
-                        let col = if j < 0 { s } else { j as usize };
-                        let mut value = vec![
-                            snap_power[i * width + col],
-                            skill[i * width + col],
-                            skill_low[i * width + col],
-                            if j < 0 { 0.0 } else { snap_bonus[j as usize] },
-                        ];
-                        value.extend(input.objective.snap_dominance(i, j));
-                        value
-                    })
-                    .collect();
-                let mut kept: Vec<_> = list
-                    .iter()
-                    .enumerate()
-                    .filter(|&(a, &j)| {
-                        if input.disable_snap_dominance
-                            || input.objective.preserve_snap_options()
-                            || (j >= 0 && required_snaps.contains(&(j as usize)))
-                        {
-                            return true;
-                        }
-                        let mut dominated = 0;
-                        for (b, &other) in list.iter().enumerate() {
-                            if b == a || other < 0 {
-                                continue;
+                let mut kept = if preserve_options {
+                    list.clone()
+                } else {
+                    let values: Vec<Vec<f64>> = list
+                        .iter()
+                        .map(|&j| {
+                            let col = if j < 0 { s } else { j as usize };
+                            let mut value = vec![
+                                snap_power[i * width + col],
+                                skill[i * width + col],
+                                skill_low[i * width + col],
+                                if j < 0 { 0.0 } else { snap_bonus[j as usize] },
+                            ];
+                            value.extend(input.objective.snap_dominance(i, j));
+                            value
+                        })
+                        .collect();
+                    list
+                        .iter()
+                        .enumerate()
+                        .filter(|&(a, &j)| {
+                            if j >= 0 && required_snaps.contains(&(j as usize)) {
+                                return true;
                             }
-                            let (x, y) = (&values[a], &values[b]);
-                            if (input.constraints.max_bonus.is_none() || y[3] == x[3])
-                                && input.objective.filter_snap_dominates(i, other, j)
-                                && input.constraints.skill_roles.as_ref().is_none_or(|roles| roles.mask(i, other) == roles.mask(i, j))
-                                && y[..4].iter().zip(&x[..4]).all(|(y, x)| y >= x)
-                                && (y[4..].iter().zip(&x[4..]).all(|(y, x)| y >= x)
-                                    || input.objective.numeric_snap_dominance(
-                                        i,
-                                        other,
-                                        j,
-                                        y[0] - x[0],
-                                    ))
-                            {
-                                let equal = y == x && input.objective.filter_snap_dominates(i, j, other);
-                                if !equal || b < a {
-                                    if conditional_dominance && j >= 0 {
-                                        dominators[i][j as usize].push(other as usize);
-                                    }
-                                    dominated += 1;
-                                    if dominated >= 5 {
-                                        break;
+                            let mut dominated = 0;
+                            for (b, &other) in list.iter().enumerate() {
+                                if b == a || other < 0 {
+                                    continue;
+                                }
+                                let (x, y) = (&values[a], &values[b]);
+                                if (input.constraints.max_bonus.is_none() || y[3] == x[3])
+                                    && input.objective.filter_snap_dominates(i, other, j)
+                                    && input.constraints.skill_roles.as_ref().is_none_or(|roles| roles.mask(i, other) == roles.mask(i, j))
+                                    && y[..4].iter().zip(&x[..4]).all(|(y, x)| y >= x)
+                                    && (y[4..].iter().zip(&x[4..]).all(|(y, x)| y >= x)
+                                        || input.objective.numeric_snap_dominance(
+                                            i,
+                                            other,
+                                            j,
+                                            y[0] - x[0],
+                                        ))
+                                {
+                                    let equal = y == x && input.objective.filter_snap_dominates(i, j, other);
+                                    if !equal || b < a {
+                                        if conditional_dominance && j >= 0 {
+                                            dominators[i][j as usize].push(other as usize);
+                                        }
+                                        dominated += 1;
+                                        if dominated >= 5 {
+                                            break;
+                                        }
                                     }
                                 }
                             }
-                        }
-                        dominated < 5
-                    })
-                    .map(|(_, &j)| j)
-                    .collect();
+                            dominated < 5
+                        })
+                        .map(|(_, &j)| j)
+                        .collect()
+                };
                 if conditional_dominance {
                     for &snap in &kept {
                         if snap >= 0 {

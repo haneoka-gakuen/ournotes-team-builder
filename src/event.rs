@@ -1865,38 +1865,46 @@ impl Objective for EventObjective {
             scores.as_ref().unwrap().scores.iter().map(|&score| self.rank(score)).collect()
         });
         let mut per_order = Vec::with_capacity(order_ranks.len());
-        let mut ranks = BTreeMap::<i32, i32>::new();
+        let mut payouts = BTreeMap::new();
         let (mut total, mut cp, mut reward_sum, mut direct_min, mut direct_max, mut other_sum) =
             (0.0, 0.0, 0.0, f64::INFINITY, f64::NEG_INFINITY, 0.0);
+        let mut other_min = f64::INFINITY;
+        let mut other_max = f64::NEG_INFINITY;
+        let mut key_min = f64::INFINITY;
+        let mut key_max = f64::NEG_INFINITY;
+        // The payout is constant for a rank within this team. Accumulate in
+        // order so weighted non-integer rewards keep the original rounding.
         for &rank in &order_ranks {
-            *ranks.entry(rank).or_default() += 1;
-            let value = self.value(bonus, rank);
+            let entry = payouts.entry(rank).or_insert_with(|| {
+                (
+                    0,
+                    self.value(bonus, rank),
+                    self.route.cp(rank),
+                    self.direct(bonus, rank),
+                    self.other(other, rank),
+                )
+            });
+            entry.0 += 1;
+            let (_, value, challenge, reward, other) = *entry;
             per_order.push(value);
             total += value;
-            cp += self.route.cp(rank);
-            let reward = self.direct(bonus, rank);
+            cp += challenge;
             reward_sum += reward;
             direct_min = direct_min.min(reward);
             direct_max = direct_max.max(reward);
-            other_sum += self.other(other, rank);
+            other_sum += other;
+            other_min = other_min.min(other);
+            other_max = other_max.max(other);
+            let key = value + self.tie * other;
+            key_min = key_min.min(key);
+            key_max = key_max.max(key);
         }
+        let ranks: BTreeMap<_, _> = payouts.into_iter().map(|(rank, payout)| (rank, payout.0)).collect();
         let count = order_ranks.len() as f64;
         let mean = (total / count).clamp(
             per_order.iter().copied().fold(f64::INFINITY, f64::min),
             per_order.iter().copied().fold(f64::NEG_INFINITY, f64::max),
         );
-        let mut other_min = f64::INFINITY;
-        let mut other_max = f64::NEG_INFINITY;
-        let mut key_min = f64::INFINITY;
-        let mut key_max = f64::NEG_INFINITY;
-        for &rank in &order_ranks {
-            let other = self.other(other, rank);
-            other_min = other_min.min(other);
-            other_max = other_max.max(other);
-            let key = self.value(bonus, rank) + self.tie * other;
-            key_min = key_min.min(key);
-            key_max = key_max.max(key);
-        }
         let other_mean = (other_sum / count).clamp(other_min, other_max);
         let mut detail = json!({"scores":scores.as_deref(),"perOrder":per_order,"mean":mean,"bonus":bonus,"ranks":ranks,"rewardSum":reward_sum,"comparisonSum":total,"directMin":direct_min,"directMax":direct_max,"directMean":reward_sum/count,"otherMean":other_mean,"challengePoints":cp/count});
         if let Some((_, low, high)) = certificate {

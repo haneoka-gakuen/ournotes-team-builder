@@ -2099,10 +2099,20 @@ impl Engine {
                     master::int(&request["shard"]["count"]) as usize,
                 ))
             };
+            // The catalog threshold is in the primary objective's units. Tie
+            // searches have their own secondary thresholds.
+            let catalog_cutoff = if pt && kind == RouteKind::Live && plan.is_none() && phase.is_none() {
+                request["cutoff"]["key"]
+                    .as_f64()
+                    .map(|key| (key, request["cutoff"]["comparison"] == "gt"))
+            } else {
+                None
+            };
             let run = |objective: &mut dyn Objective,
                        search_k,
                        seeds,
                        floor,
+                       floor_exclusive,
                        reward_group: Option<(&[search::Hit], f64)>,
                        notify: bool| {
                 let mut publish = |hits: &[search::Hit]| {
@@ -2129,7 +2139,7 @@ impl Engine {
                     shard,
                     owns: None,
                     floor,
-                    floor_exclusive: false,
+                    floor_exclusive,
 
                     streaming: true,
                     disable_snap_dominance: false,
@@ -2177,6 +2187,7 @@ impl Engine {
                     1,
                     seeds,
                     master::number(&request["rewardPhase"]["floor"], f64::NEG_INFINITY),
+                    false,
                     Some((&[], target)),
                     true,
                 )?;
@@ -2187,18 +2198,29 @@ impl Engine {
                 output.bound = (!output.proven).then_some(target);
                 output
             } else {
-                let floor = if phase == Some("primary") {
-                    request["floors"][format!(
+                if let Some((floor, exclusive)) = catalog_cutoff {
+                    let upper = objective.seed_ceiling();
+                    if upper < floor || exclusive && upper == floor {
+                        results.push(json!({"song":song,"hits":[],"proven":true,"bound":null,"stats":cap_stats}));
+                        continue;
+                    }
+                }
+                // On an inclusive payout plateau, raising the search floor
+                // can prevent its normal incumbent from tightening tie bounds.
+                let (floor, exclusive) = if let Some(cutoff) = catalog_cutoff.filter(|(_, exclusive)| *exclusive) {
+                    cutoff
+                } else if phase == Some("primary") {
+                    (request["floors"][format!(
                         "{}:{}",
                         master::int(&song["songId"]),
                         master::int(&song["difficulty"])
                     )]
                     .as_f64()
-                    .unwrap_or(f64::NEG_INFINITY)
+                    .unwrap_or(f64::NEG_INFINITY), false)
                 } else {
-                    f64::NEG_INFINITY
+                    (f64::NEG_INFINITY, false)
                 };
-                run(objective.as_mut(), k, seeds, floor, None, true)?
+                run(objective.as_mut(), k, seeds, floor, exclusive, None, true)?
             };
             output.stats.add(&cap_stats);
             if let Some(tie_chart) = chart.filter(|_| {
@@ -2243,6 +2265,7 @@ impl Engine {
                         k - ordered.len(),
                         seeds,
                         f64::NEG_INFINITY,
+                        false,
                         Some((&baseline, key)),
                         true,
                     )?;
@@ -2276,6 +2299,7 @@ impl Engine {
                             k - ordered.len(),
                             group.iter().map(|h| h.team.clone()).collect(),
                             0.0,
+                            false,
                             Some((&baseline, key)),
                             true,
                         )?;
@@ -2318,6 +2342,7 @@ impl Engine {
                             .map(|h| h.team.clone())
                             .collect(),
                         f64::NEG_INFINITY,
+                        false,
                         Some((&baseline, key)),
                         true,
                     )?;

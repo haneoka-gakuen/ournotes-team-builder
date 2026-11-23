@@ -79,7 +79,8 @@ struct Combined<'a> {
     songs: Vec<SongObjective<'a>>,
     linear_groups: Vec<LinearGroup>,
     power_groups: Vec<usize>,
-    prepared_rank_members: Option<Vec<usize>>,
+    prepared_power_members: Option<Vec<usize>>,
+    reuse_rank_power: bool,
     program_groups: Vec<usize>,
     leader_profiles: Vec<power::LeaderProfile>,
     options: Vec<Vec<i32>>,
@@ -439,7 +440,8 @@ impl Objective for Combined<'_> {
     }
     fn feasible_team(&mut self, team: &Team, _power: f64) -> Result<bool, String> {
         if team.members.len() == 5 && team.snaps.len() == 5
-            && self.prepared_rank_members.as_deref() == Some(team.members.as_slice())
+            && self.reuse_rank_power
+            && self.prepared_power_members.as_deref() == Some(team.members.as_slice())
         {
             let empty = self.snaps.len();
             for song in &mut self.songs {
@@ -491,6 +493,15 @@ impl Objective for Combined<'_> {
         });
     }
     fn seed_objective(&self) -> Option<Box<dyn Objective>> {
+        if self.prune_chart_replay && !self.has_team_filter() {
+            // A power-only seed can miss the activity's bonus cards. Search
+            // the same legal deck domain for a high-bonus witness first.
+            return Some(Box::new(crate::event::BonusSurrogate {
+                members: (0..self.members.len()).map(|member| self.member_bonus(member)).collect(),
+                snaps: (0..self.snaps.len()).map(|snap| self.snap_bonus(snap)).collect(),
+                weight: 16777216.0,
+            }));
+        }
         Some(Box::new(super::PowerObjective))
     }
     fn seed_ready(&self, detail: &Value) -> bool {
@@ -800,8 +811,8 @@ impl Objective for Combined<'_> {
     }
     fn prepare_assignment(&mut self, members: &[usize], options: &[Vec<i32>]) {
         self.options = options.to_vec();
-        let mut rank_power_exact = self.prepared_rank_members.is_some();
-        if let Some(prepared) = &mut self.prepared_rank_members {
+        let mut power_exact = self.prepared_power_members.is_some();
+        if let Some(prepared) = &mut self.prepared_power_members {
             prepared.clear();
         }
         let roster: Vec<_> = members.iter().map(|&m| self.members[m].clone()).collect();
@@ -822,7 +833,7 @@ impl Objective for Combined<'_> {
                     .map(|(slot, &m)| {
                         let base = song.bases[m].fixed_points;
                         let leader = power::leader_points(&song.bases[m], &percents[slot]);
-                        rank_power_exact = rank_power_exact
+                        power_exact = power_exact
                             && base.unsigned_abs() <= EXACT_POWER_COMPONENT
                             && leader.unsigned_abs() <= EXACT_POWER_COMPONENT;
                         (base + leader) as f64
@@ -845,8 +856,8 @@ impl Objective for Combined<'_> {
             song.objective.prepare_assignment_power(song.base_power);
             song.objective.prepare_assignment(members, options);
         }
-        if rank_power_exact {
-            self.prepared_rank_members.as_mut().unwrap().extend_from_slice(members);
+        if power_exact {
+            self.prepared_power_members.as_mut().unwrap().extend_from_slice(members);
         }
         self.joint_slots.clear();
         if self.joint_linear() {
@@ -1034,14 +1045,10 @@ impl Objective for Combined<'_> {
         if !self.joint_linear() || !cutoff.key.is_finite() {
             return self.exact(team, power, slots).map(search::Evaluation::Exact);
         }
-        let members: Vec<_> = team.members.iter().map(|&member| self.members[member].clone()).collect();
-        let snaps: Vec<_> = team.snaps.iter().map(|&snap| (snap >= 0).then(|| self.snaps[snap as usize].clone())).collect();
-        let mut powers: Vec<Arc<power::TeamPower>> = Vec::with_capacity(self.songs.len());
+        let powers = self.team_powers(team)?;
         let mut upper = Vec::with_capacity(self.songs.len());
         let width = self.snaps.len() + 1;
-        for (index, song) in self.songs.iter_mut().enumerate() {
-            let power = if self.power_groups[index] == index { Arc::new(power::team_power(self.master, self.player, &members, &snaps, 0, Some(&song.music), self.effects)?) }
-                else { Arc::clone(&powers[self.power_groups[index]]) };
+        for (song, power) in self.songs.iter_mut().zip(&powers) {
             let mut totals = Totals { power: power.total as f64, ..Totals::default() };
             for (&member, &snap) in team.members.iter().zip(&team.snaps) {
                 let skill = song.skills[member * width + if snap < 0 { width - 1 } else { snap as usize }];
@@ -1049,7 +1056,6 @@ impl Objective for Combined<'_> {
                 totals.skill_low = (totals.skill_low + skill.0).next_down();
             }
             upper.push(song.objective.interval(team, totals).1);
-            powers.push(power);
         }
         if powers.iter().any(|power| !(0..=i32::MAX as i64).contains(&power.total)
             || power.slots.iter().any(|slot| !(0..=i32::MAX as i64).contains(slot))) {
@@ -1058,7 +1064,7 @@ impl Objective for Combined<'_> {
         let mut sum = 0.0;
         let count = self.songs.len() as f64;
         for (index, (song, power)) in self.songs.iter_mut().zip(&powers).enumerate() {
-            let slots: Vec<_> = power.slots.iter().map(|&value| value as f64).collect();
+            let slots = power.slots.map(|value| value as f64);
             sum += song.objective.exact_value(team, power.total as f64, &slots)?;
             let bound = (upper[index + 1..].iter().fold(sum, |sum, &value| (sum + value).next_up()) / count).next_up();
             if bound < cutoff.key || cutoff.prune_equal && bound == cutoff.key {
@@ -1073,7 +1079,45 @@ impl Objective for Combined<'_> {
     }
 }
 
+#[derive(Copy, Clone)]
+struct TeamScorePower {
+    total: i64,
+    slots: [i64; 5],
+}
+
 impl Combined<'_> {
+    fn team_powers(&self, team: &Team) -> Result<Vec<TeamScorePower>, String> {
+        let prepared = self.prepared_power_members.as_deref() == Some(team.members.as_slice());
+        let resolved = (!prepared).then(|| {
+            let members: Vec<_> = team.members.iter().map(|&m| self.members[m].clone()).collect();
+            let snaps: Vec<_> = team.snaps.iter()
+                .map(|&s| (s >= 0).then(|| self.snaps[s as usize].clone()))
+                .collect();
+            (members, snaps)
+        });
+        let empty = self.snaps.len();
+        let mut powers = Vec::with_capacity(self.songs.len());
+        for (index, song) in self.songs.iter().enumerate() {
+            let representative = self.power_groups[index];
+            let power = if representative != index {
+                powers[representative]
+            } else if let Some((members, snaps)) = &resolved {
+                let power = power::team_power(self.master, self.player, members, snaps, 0, Some(&song.music), self.effects)?;
+                TeamScorePower { total: power.total, slots: power.slots.try_into().map_err(|_| "shared-team-size")? }
+            } else {
+                // prepare_assignment certifies that all components and their
+                // five-slot sum fit exactly in binary64.
+                let slots = std::array::from_fn(|slot| {
+                    let snap = team.snaps[slot];
+                    song.slots[slot][if snap < 0 { empty } else { snap as usize }] as i64
+                });
+                TeamScorePower { total: slots.iter().sum(), slots }
+            };
+            powers.push(power);
+        }
+        Ok(powers)
+    }
+
     fn score_team(&mut self, team: &Team, cutoff: Option<f64>) -> Result<search::Evaluation, String> {
         if !self.eligible(team) {
             return Ok(search::Evaluation::Exact(Exact {
@@ -1081,30 +1125,8 @@ impl Combined<'_> {
                 detail: Value::Null,
             }));
         }
-        let members: Vec<_> = team
-            .members
-            .iter()
-            .map(|&m| self.members[m].clone())
-            .collect();
-        let snaps: Vec<_> = team
-            .snaps
-            .iter()
-            .map(|&s| (s >= 0).then(|| self.snaps[s as usize].clone()))
-            .collect();
         let chart_count = self.songs.len();
-        let mut powers: Vec<Arc<power::TeamPower>> = Vec::with_capacity(chart_count);
-        for (index, song) in self.songs.iter().enumerate() {
-            let p = if self.power_groups[index] == index { Arc::new(power::team_power(
-                self.master,
-                self.player,
-                &members,
-                &snaps,
-                0,
-                Some(&song.music),
-                self.effects,
-            )?) } else { Arc::clone(&powers[self.power_groups[index]]) };
-            powers.push(p);
-        }
+        let powers = self.team_powers(team)?;
         let bound = cutoff.filter(|_| {
             !self.songs.iter().any(|song| song.unbounded)
                 && powers.iter().all(|power| {
@@ -1144,12 +1166,14 @@ impl Combined<'_> {
             let mut exact = song.objective.exact(
                 team,
                 p.total as f64,
-                &p.slots.iter().map(|&v| v as f64).collect::<Vec<_>>(),
+                &p.slots.map(|value| value as f64),
             )?;
             if self.prune_chart_replay { self.song_evaluations += 1; }
             if bound.is_some() {
-                let primary = Fraction::from_json(&exact.detail["rewardRanking"][0]).unwrap();
-                prefix = (prefix + primary.upper()).next_up();
+                let upper = self.plan.as_ref().map_or(exact.key, |_| {
+                    Fraction::from_json(&exact.detail["rewardRanking"][0]).unwrap().upper()
+                });
+                prefix = (prefix + upper).next_up();
             }
             if exact.detail["settlement"].is_object() {
                 exact.detail["otherMean"] = exact.detail["settlement"]["otherMean"].clone();
@@ -1533,10 +1557,14 @@ impl Engine {
             Vec::new()
         };
         let linear_groups = linear_groups(&objectives);
-        let mut power_groups: Vec<_> = (0..objectives.len()).collect();
-        for group in &linear_groups {
-            for &song in &group.songs { power_groups[song] = group.song; }
-        }
+        // The shared Snapshot table implies equal SlotBases. Music type is
+        // additionally required because leader conditions can depend on it.
+        let power_groups: Vec<_> = objectives.iter().enumerate().map(|(index, song)| {
+            objectives[..index].iter().position(|previous|
+                previous.music.music_type == song.music.music_type
+                    && Arc::ptr_eq(&previous.snap_power, &song.snap_power)
+            ).unwrap_or(index)
+        }).collect();
         let mut seen_programs = std::collections::HashMap::new();
         let program_groups = objectives.iter().enumerate().map(|(index, song)| song.objective.snap_program_identity()
             .map_or(index, |identity| *seen_programs.entry(identity).or_insert(index))).collect();
@@ -1550,16 +1578,16 @@ impl Engine {
             None
         };
         let prune_chart_replay = event && !battle && route_kind == RouteKind::Live && songs.len() > 1
-            && plan.as_ref().is_some_and(|plan| {
+            && plan.as_ref().is_none_or(|plan| {
                 plan.criterion == crate::reward_plan::Aggregation::Mean
                     && matches!(plan.levels[0].as_slice(), [term] if term.metric == Metric::Points)
             });
         // The rank gate calls team_power with no event effects. The assignment tables
         // only match that call when they were built for each song without effects.
         let reuse_rank_power = event && !battle && route_kind == RouteKind::Live && effects.is_empty()
-            && plan.as_ref().is_some_and(|plan| plan.minimum_rank == Some(7))
-            && power_groups.iter().copied().eq(0..objectives.len())
-            && objectives.iter().all(|song| song.snap_power.iter().all(|value| value.abs() <= EXACT_POWER_COMPONENT as f64));
+            && plan.as_ref().is_some_and(|plan| plan.minimum_rank == Some(7));
+        let exact_power = objectives.iter().enumerate().all(|(index, song)| power_groups[index] != index
+            || song.snap_power.iter().all(|value| value.abs() <= EXACT_POWER_COMPONENT as f64));
         let mut combined = Combined {
             master: &self.master,
             player: &player,
@@ -1569,7 +1597,8 @@ impl Engine {
             songs: objectives,
             linear_groups,
             power_groups,
-            prepared_rank_members: reuse_rank_power.then(|| Vec::with_capacity(5)),
+            prepared_power_members: exact_power.then(|| Vec::with_capacity(5)),
+            reuse_rank_power,
             program_groups,
             leader_profiles: profiles,
             options: Vec::new(),
