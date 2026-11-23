@@ -201,6 +201,7 @@ pub struct Calculator<'a> {
     memo: Option<Rc<NoteMemo>>,
     memo_rows: [Option<NoteCells>; 7],
     memo_ups: [f64; 7],
+    memo_grades: u8,
     memo_dirty: bool,
     memo_gekiso: u64,
 }
@@ -226,6 +227,7 @@ impl<'a> Calculator<'a> {
             memo: None,
             memo_rows: std::array::from_fn(|_| None),
             memo_ups: [0.0; 7],
+            memo_grades: 0,
             memo_dirty: true,
             memo_gekiso: 0,
         }
@@ -239,32 +241,41 @@ impl<'a> Calculator<'a> {
         self.bases = Some(Rc::clone(&memo.bases));
         self.memo = Some(memo);
         self.memo_rows = std::array::from_fn(|_| None);
+        self.memo_grades = 0;
         self.memo_dirty = true;
     }
     fn memo_score(&mut self, life: i32, op: i32, grade: i32, combo: i32, gekiso: f64) -> Result<Option<i32>, String> {
         let memo = self.memo.as_ref().unwrap();
+        let grade_index = grade as usize;
+        if grade_index >= self.memo_rows.len() { return Ok(None); }
         if self.memo_dirty || self.memo_gekiso != gekiso.to_bits() {
             self.memo_gekiso = gekiso.to_bits();
-            for grade in 0..7 {
-                let up = f(self.factors.note + self.factors.judgement(grade as i32));
-                self.memo_ups[grade] = up;
-                self.memo_rows[grade] = if let Some(previous) = (0..grade).find(|&index| self.memo_ups[index].to_bits() == up.to_bits()) {
-                    self.memo_rows[previous].clone()
-                } else { memo.state(self.factors.combo, up, self.memo_gekiso) };
-            }
+            self.memo_grades = 0;
             self.memo_dirty = false;
         }
-        let Some(row) = self.memo_rows.get(grade as usize).and_then(Option::as_ref) else { return Ok(None); };
-        let Some(&base) = memo.base_ids.get(op as usize).and_then(|row| row.get(grade as usize)) else { return Ok(None); };
+        let Some(&base) = memo.base_ids.get(op as usize).and_then(|row| row.get(grade_index)) else { return Ok(None); };
         if base == 0 { return Ok(None); }
         let Some(&bucket) = memo.combo_ids.get(combo as usize) else { return Ok(None); };
         let percent = self.factors.luck.wrapping_add(100).min(200);
         let Some(luck) = memo.lucks.iter().position(|&value| value == percent) else { return Ok(None); };
+        if self.memo_grades & (1 << grade_index) == 0 {
+            let up = f(self.factors.note + self.factors.judgement(grade));
+            self.memo_ups[grade_index] = up;
+            let previous = (0..self.memo_rows.len()).find(|&index| {
+                self.memo_grades & (1 << index) != 0 && self.memo_ups[index].to_bits() == up.to_bits()
+            });
+            self.memo_rows[grade_index] = match previous {
+                Some(index) => self.memo_rows[index].clone(),
+                None => memo.state(self.factors.combo, up, self.memo_gekiso),
+            };
+            self.memo_grades |= 1 << grade_index;
+        }
+        let Some(row) = &self.memo_rows[grade_index] else { return Ok(None); };
         let index = (((base as usize - 1) * memo.combos.len() + bucket) * 2 + usize::from(life <= 0)) * memo.lucks.len() + luck;
         let cached = row.borrow()[index];
         if let Some(value) = cached { return Ok(Some(value)); }
         let combo_factor = f(gekiso * f(self.factors.combo + memo.combos[bucket]));
-        let score_up = self.memo_ups[grade as usize];
+        let score_up = self.memo_ups[grade_index];
         let luck = f(f(percent as f64) / 100.0);
         let value = self.core(life, op, grade, combo_factor, score_up, luck)?;
         row.borrow_mut()[index] = Some(value);
@@ -575,7 +586,14 @@ impl<'a> Incremental<'a> {
         info: Option<&dyn GekisoCombo>,
     ) -> Result<(), String> {
         let (fl, nl) = (&self.factors[frame / 64][frame % 64], &self.notes[frame / 64][frame % 64]);
-        if fl.is_empty() && nl.is_empty() {
+        if fl.is_empty() && nl.len() <= 1 {
+            if !nl.is_empty() {
+                let note = &mut Rc::make_mut(&mut self.notes[frame / 64])[frame % 64][0];
+                let count = self.calculator.note_combos.as_ref()
+                    .map_or_else(|| combo.at(note.time), |counts| counts[note.id as usize]);
+                note.added = self.calculator.note_score(count, note, info)?;
+                self.score = self.score.wrapping_add(note.added);
+            }
             if let Some(&value) = self.fixed.get(&(frame as i32)) {
                 self.score = self.score.wrapping_add(value);
                 self.rank_bonus = self.rank_bonus.wrapping_add(value);

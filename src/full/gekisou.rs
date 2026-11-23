@@ -7,7 +7,7 @@ use super::{
 };
 use crate::{master::GekisoTables, num::f};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 pub const WAIT: i32 = 1;
 pub const STANDBY: i32 = 2;
 pub const START: i32 = 3;
@@ -49,7 +49,7 @@ fn lottery_table(items: &[Item], random: i32) -> Result<Option<i32>, String> {
 }
 #[derive(Clone)]
 struct LuckTable {
-    items: Vec<Item>,
+    items: Arc<[Item]>,
     total: i32,
     buff: f64,
 }
@@ -61,7 +61,7 @@ impl LuckTable {
             return Err("luck bonus table with a total weight below 1".into());
         }
         Ok(Self {
-            items,
+            items: items.into(),
             total,
             buff: 0.0,
         })
@@ -73,7 +73,7 @@ impl LuckTable {
         if minimum < 1 {
             let value = core::srem(random.wrapping_abs(), self.total);
             let mut cumulative = 0i32;
-            for &(w, r) in &self.items {
+            for &(w, r) in self.items.iter() {
                 cumulative = cumulative.wrapping_add(buffed(self.buff, w));
                 if value < cumulative {
                     return Some(r);
@@ -82,7 +82,7 @@ impl LuckTable {
             return None;
         }
         let (mut included, mut excluded, mut count) = (0i32, 0i32, 0i32);
-        for &(w, r) in &self.items {
+        for &(w, r) in self.items.iter() {
             let weight = buffed(self.buff, w);
             if minimum <= r {
                 count += 1;
@@ -98,7 +98,7 @@ impl LuckTable {
         let total = included.wrapping_add(per.wrapping_mul(count));
         let value = core::srem(random.wrapping_abs(), total);
         let mut cumulative = 0i32;
-        for &(w, r) in &self.items {
+        for &(w, r) in self.items.iter() {
             if minimum <= r {
                 cumulative = cumulative
                     .wrapping_add(per)
@@ -113,10 +113,10 @@ impl LuckTable {
 }
 #[derive(Clone)]
 pub struct Lottery {
-    good: Option<Vec<Item>>,
-    great: Option<Vec<Item>>,
-    perfect: Option<Vec<Item>>,
-    hold: Vec<Item>,
+    good: Option<Arc<[Item]>>,
+    great: Option<Arc<[Item]>>,
+    perfect: Option<Arc<[Item]>>,
+    hold: Arc<[Item]>,
     tables: Vec<LuckTable>,
     minimum: Vec<[i32; 3]>,
     minimum_counter: i32,
@@ -149,10 +149,10 @@ impl Lottery {
             }
         }
         Ok(Self {
-            good,
-            great,
-            perfect,
-            hold,
+            good: good.map(Arc::from),
+            great: great.map(Arc::from),
+            perfect: perfect.map(Arc::from),
+            hold: hold.into(),
             tables: bonus
                 .into_iter()
                 .map(LuckTable::new)
@@ -221,13 +221,13 @@ impl Lottery {
         }
         let sample = random.integer(STREAM_LUCK);
         let items = if sub_note(op) {
-            Some(&self.hold)
+            Some(self.hold.as_ref())
         } else if (judgement.wrapping_sub(5) as u32) < 2 {
-            self.perfect.as_ref()
+            self.perfect.as_deref()
         } else if judgement == 4 {
-            self.great.as_ref()
+            self.great.as_deref()
         } else if judgement == 3 {
-            self.good.as_ref()
+            self.good.as_deref()
         } else {
             return Ok(0);
         };
@@ -470,7 +470,8 @@ pub(crate) struct ComboHistoryUpdate {
 }
 #[derive(Clone)]
 pub struct Controller {
-    pub ranges: Vec<Range>,
+    pub ranges: Arc<[Range]>,
+    targets_by_note: Option<Arc<[u8]>>,
     pub states: Vec<State>,
     pub machine: Lottery,
     rush_percent: i32,
@@ -486,8 +487,9 @@ pub struct Controller {
     needs_recalculation: bool,
     full_recalculation: bool,
     sequence: i32,
-    history: Vec<Vec<(i32, i32, i32)>>,
-    snapshot: Vec<Vec<i32>>,
+    history: Vec<Arc<Vec<(i32, i32, i32)>>>,
+    snapshot: Vec<Arc<Vec<i32>>>,
+    track_counts: bool,
     combo_history_updates: Option<Vec<ComboHistoryUpdate>>,
     resume: Vec<Resume>,
     resumed_unlimited: Vec<Vec<(i32, i32)>>,
@@ -548,8 +550,21 @@ impl Controller {
             })
             .collect();
         let n = ranges.len();
+        let last_note = notes.iter().map(|&(id, _)| id).max().unwrap_or(0);
+        let targets_by_note = (n <= u8::BITS as usize && last_note >= 0
+            && last_note as usize <= notes.len().saturating_mul(2)
+            && notes.iter().all(|&(id, _)| id >= 0)).then(|| {
+                let mut targets = vec![0u8; last_note as usize + 1];
+                for (range, settings) in ranges.iter().enumerate() {
+                    for &id in &settings.targets {
+                        targets[id as usize] |= 1 << range;
+                    }
+                }
+                Arc::from(targets)
+            });
         Ok(Self {
-            ranges,
+            ranges: ranges.into(),
+            targets_by_note,
             states,
             machine: Lottery::new(tables)?,
             rush_percent,
@@ -565,8 +580,9 @@ impl Controller {
             needs_recalculation: false,
             full_recalculation: false,
             sequence: 0,
-            history: vec![Vec::new(); n],
-            snapshot: vec![Vec::new(); n],
+            history: vec![Arc::new(Vec::new()); n],
+            snapshot: vec![Arc::new(Vec::new()); n],
+            track_counts: true,
             combo_history_updates: None,
             resume: vec![Resume::default(); n],
             resumed_unlimited: vec![Vec::new(); n],
@@ -749,6 +765,12 @@ impl Controller {
         self.combo_history_updates = Some(Vec::new());
     }
 
+    pub(crate) fn only_lottery_scores(&mut self) {
+        debug_assert!(self.ranges.iter().all(|range| range.mission == MISSION_LUCK));
+        debug_assert!(self.history.iter().all(|notes| notes.is_empty()));
+        self.track_counts = false;
+    }
+
     pub(crate) fn take_combo_history_updates(&mut self) -> impl Iterator<Item = ComboHistoryUpdate> + '_ {
         self.combo_history_updates.iter_mut().flat_map(|updates| updates.drain(..))
     }
@@ -789,7 +811,12 @@ impl Controller {
                 s.just = 0;
                 s.raw_just = 0;
                 s.cumulative = 0;
-                self.snapshot[index].clear();
+                let snapshot = &mut self.snapshot[index];
+                if let Some(snapshot) = Arc::get_mut(snapshot) {
+                    snapshot.clear();
+                } else if !snapshot.is_empty() {
+                    *snapshot = Arc::new(Vec::new());
+                }
                 self.unlimited.clear();
                 self.limited.clear();
                 cb = 1.0;
@@ -852,7 +879,7 @@ impl Controller {
                     i_combo += 1;
                 }
                 self.entry(index, judgement, core::floor_i32(cb), core::floor_i32(jb));
-                self.snapshot[index].push(self.states[index].combo);
+                Arc::make_mut(&mut self.snapshot[index]).push(self.states[index].combo);
                 k += 1;
             }
             if let Some(updates) = &mut self.combo_history_updates {
@@ -1040,17 +1067,19 @@ impl Controller {
         if judgement == 0 || judgement == 7 {
             return Ok(());
         }
-        if judgement == 5 || judgement == 6 {
-            self.states[index].perfect = self.states[index].perfect.wrapping_add(1);
-        }
-        self.history[index].push((time, judgement, self.sequence));
-        self.sequence = self.sequence.wrapping_add(1);
-        self.needs_recalculation = true;
-        if (judgement.wrapping_sub(3) as u32) < 4 {
-            self.states[index].last_combo_ms = time;
-        }
-        if judgement == 6 {
-            self.states[index].last_just_ms = time;
+        if self.track_counts {
+            if judgement == 5 || judgement == 6 {
+                self.states[index].perfect = self.states[index].perfect.wrapping_add(1);
+            }
+            Arc::make_mut(&mut self.history[index]).push((time, judgement, self.sequence));
+            self.sequence = self.sequence.wrapping_add(1);
+            self.needs_recalculation = true;
+            if (judgement.wrapping_sub(3) as u32) < 4 {
+                self.states[index].last_combo_ms = time;
+            }
+            if judgement == 6 {
+                self.states[index].last_just_ms = time;
+            }
         }
         if self.ranges[index].mission == MISSION_LUCK {
             if self.states[index].state < START {
@@ -1079,7 +1108,12 @@ impl Controller {
         }
         for index in 0..self.states.len() {
             for &(id, op, time, judgement) in judged {
-                if self.ranges[index].targets.contains(&id) {
+                let targeted = if let Some(targets) = &self.targets_by_note {
+                    targets.get(id as usize).is_some_and(|&mask| mask & (1 << index) != 0)
+                } else {
+                    self.ranges[index].targets.contains(&id)
+                };
+                if targeted {
                     self.judge(index, op, time, judgement, env)?;
                 }
             }

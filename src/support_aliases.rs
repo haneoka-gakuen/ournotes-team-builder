@@ -68,6 +68,7 @@ pub(crate) fn stable_life_conditions(
     true
 }
 
+#[derive(Clone)]
 pub(crate) struct JustCounters {
     members: std::collections::BTreeSet<(i32, i32)>,
 }
@@ -395,6 +396,7 @@ impl SupportAliases {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct ContextFields {
     local: bool,
     global: Vec<&'static str>,

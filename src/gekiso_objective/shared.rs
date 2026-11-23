@@ -27,11 +27,10 @@ struct SongObjective<'k, 'a> {
     power_cap: f64,
     base: f64,
     slots: Arc<Vec<Vec<f64>>>,
-    domain_power: Vec<f64>,
-    member_power: Vec<f64>,
+    member_power: Arc<Vec<f64>>,
     member_skill: Vec<f64>,
-    free_power: [f64; 6],
-    free_skill: [f64; 6],
+    free_power: Arc<Vec<[f64; 5]>>,
+    free_skill: Vec<[f64; 5]>,
     power_choices: Arc<Vec<Vec<(i32, f64)>>>,
     skill_choices: Vec<Vec<(i32, f64)>>,
 }
@@ -181,9 +180,7 @@ impl<'k, 'a> Combined<'k, 'a> {
                 let weights = (0..members.len())
                     .flat_map(|m| (0..width).map(move |j| (m, j)))
                     .map(|(m, j)| {
-                        adapter
-                            .skill(m, if j == width - 1 { -1 } else { j as i32 })
-                            .1
+                        adapter.upper_skill(m, if j == width - 1 { -1 } else { j as i32 })
                     })
                     .collect();
                 adapter.prepare_power(Arc::clone(&snap_power), width);
@@ -196,11 +193,10 @@ impl<'k, 'a> Combined<'k, 'a> {
                     power_cap,
                     base: 0.0,
                     slots: Arc::new(Vec::new()),
-                    domain_power: Vec::new(),
-                    member_power: Vec::new(),
+                    member_power: Arc::new(Vec::new()),
                     member_skill: Vec::new(),
-                    free_power: [0.0; 6],
-                    free_skill: [0.0; 6],
+                    free_power: Arc::new(Vec::new()),
+                    free_skill: Vec::new(),
                     power_choices: Arc::new(Vec::new()),
                     skill_choices: Vec::new(),
                 }
@@ -315,20 +311,19 @@ impl<'k, 'a> Combined<'k, 'a> {
             .iter()
             .map(|&s| (s >= 0).then(|| kernel.snaps[s as usize].clone()))
             .collect();
+        let mut power_domains = HashMap::default();
         let powers: Vec<_> = self
             .songs
             .iter()
             .take(if self.same_power { 1 } else { self.songs.len() })
             .map(|song| {
-                power::team_power(
-                    song.adapter.kernel.master,
-                    self.player,
-                    &members,
-                    &snaps,
-                    0,
-                    Some(song.music),
-                    &[],
-                )
+                let key = (Arc::as_ptr(&song.snap_power), song.music.music_type);
+                if let Some(power) = power_domains.get(&key) { return Ok(Arc::clone(power)); }
+                let power = Arc::new(power::team_power(
+                    song.adapter.kernel.master, self.player, &members, &snaps, 0, Some(song.music), &[],
+                )?);
+                power_domains.insert(key, Arc::clone(&power));
+                Ok::<_, String>(power)
             })
             .collect::<Result<_, _>>()?;
         let cutoff = cutoff.filter(|c| c.key.is_finite());
@@ -371,6 +366,16 @@ impl<'k, 'a> Combined<'k, 'a> {
         }
         let mut order: Vec<_> = (0..self.songs.len()).collect();
         order.sort_by(|&a, &b| bounds[b].total_cmp(&bounds[a]));
+        let count = bounds.len();
+        let leaves = count.next_power_of_two();
+        let mut remainder = cutoff.filter(|_| bounds.iter().all(|&value| value >= 0.0)).map(|_| {
+            let mut sums = vec![0.0; leaves * 2];
+            sums[leaves..leaves + count].copy_from_slice(&bounds);
+            for node in (1..leaves).rev() {
+                sums[node] = (sums[node * 2] + sums[node * 2 + 1]).next_up();
+            }
+            sums
+        });
         let mut details = vec![Value::Null; self.songs.len()];
         let mut scores = vec![0.0; self.songs.len()];
         let score_song = |song: &mut SongObjective<'_, '_>, power: i64| -> Result<Exact, String> {
@@ -379,19 +384,25 @@ impl<'k, 'a> Combined<'k, 'a> {
             Ok(score)
         };
         let same_power = self.same_power;
-        let mut accept = |index, score: Exact| {
-            let power: &power::TeamPower = &powers[if same_power { 0 } else { index }];
+        let mut accept = |index: usize, score: Exact| {
+            debug_assert!(score.key <= bounds[index], "shared song {} score {} exceeds {}", index, score.key, bounds[index]);
             scores[index] = score.key;
-            bounds[index] = score.key;
-            details[index] = json!({"detail":score.detail,"power":power.total,"slotPowers":power.slots});
-            if let Some(cutoff) = cutoff {
-                let upper = (bounds.iter().fold(0.0_f64, |sum, v| (sum + v).next_up())
-                    / bounds.len() as f64)
-                    .next_up();
+            if score.key < 0.0 { remainder = None; }
+            if let Some((cutoff, sums)) = cutoff.zip(remainder.as_mut()) {
+                let mut node = leaves + index;
+                sums[node] = score.key;
+                while node > 1 {
+                    node /= 2;
+                    sums[node] = (sums[node * 2] + sums[node * 2 + 1]).next_up();
+                }
+                // Cover the rounding of the final sum in original song order.
+                let sum = (sums[1] * (1.0 + count as f64 * f64::EPSILON)).next_up();
+                let upper = (sum / count as f64).next_up();
                 if upper < cutoff.key || cutoff.prune_equal && upper == cutoff.key {
                     return Some(upper);
                 }
             }
+            details[index] = score.detail;
             None
         };
         #[cfg(not(target_arch = "wasm32"))]
@@ -425,8 +436,13 @@ impl<'k, 'a> Combined<'k, 'a> {
                 }
             }
         }
-        let mut detail = json!({"songs":details});
-        if let Some(window) = crate::just_window::aggregate(details.iter().map(|detail| &detail["detail"]["justWindow"])) { detail["justWindow"] = window; }
+        let window = crate::just_window::aggregate(details.iter().map(|detail| &detail["justWindow"]));
+        let songs: Vec<_> = details.into_iter().enumerate().map(|(index, detail)| {
+            let power = &powers[if same_power { 0 } else { index }];
+            json!({"detail":detail,"power":power.total,"slotPowers":power.slots})
+        }).collect();
+        let mut detail = json!({"songs":songs});
+        if let Some(window) = window { detail["justWindow"] = window; }
         Ok(search::Evaluation::Exact(Exact {
             key: scores.iter().sum::<f64>() / scores.len() as f64,
             detail,
@@ -808,8 +824,31 @@ impl Objective for Combined<'_, '_> {
             .next_up()
     }
     fn prepare_members(&mut self, characters: &[Vec<usize>]) {
+        fn suffix(characters: &[Vec<usize>], values: &[f64]) -> Vec<[f64; 5]> {
+            let mut rows = vec![[f64::NEG_INFINITY; 5]; characters.len() + 1];
+            rows[characters.len()][0] = 0.0;
+            for index in (0..characters.len()).rev() {
+                let peak = characters[index].iter().map(|&member| values[member])
+                    .fold(f64::NEG_INFINITY, f64::max);
+                let next = rows[index + 1];
+                rows[index] = std::array::from_fn(|count| {
+                    if count == 0 { return 0.0; }
+                    if peak == f64::NEG_INFINITY || next[count - 1] == f64::NEG_INFINITY {
+                        return next[count];
+                    }
+                    next[count].max((next[count - 1] + peak).next_up())
+                });
+            }
+            rows
+        }
+        let mut domains = HashMap::default();
         for song in &mut self.songs {
             song.adapter.prepare_members(characters);
+            if self.affine.is_none() {
+                song.free_power = Arc::clone(domains.entry(Arc::as_ptr(&song.member_power))
+                    .or_insert_with(|| Arc::new(suffix(characters, &song.member_power))));
+                song.free_skill = suffix(characters, &song.member_skill);
+            }
         }
     }
     fn product_base(&self) -> Option<f64> {
@@ -826,39 +865,35 @@ impl Objective for Combined<'_, '_> {
         }])
     }
     fn prepare_member_domains_at(&mut self, leader: usize, _power: &[f64], options: &[Vec<i32>]) {
+        let first = &self.songs[0].adapter.kernel;
+        let profile = power::leader_profile(first.master, &first.members[leader]);
+        let mut domains = HashMap::default();
         for song in &mut self.songs {
             let k = &song.adapter.kernel;
             let width = k.snaps.len() + 1;
-            let profile = power::leader_profile(k.master, &k.members[leader]);
-            song.domain_power = k
-                .members
-                .iter()
-                .enumerate()
-                .map(|(m, member)| {
+            // The snapshot table is interned by the common parameters and
+            // fixed points of every member. Those inputs also define this
+            // leader's optimistic base range.
+            let (base, member_power) = domains.entry(Arc::as_ptr(&song.snap_power)).or_insert_with(|| {
+                let base: Vec<_> = k.members.iter().enumerate().map(|(m, member)| {
                     (song.bases[m].fixed_points
                         + power::leader_points(
                             &song.bases[m],
                             &power::leader_percent_bound(k.master, &profile, member),
                         )) as f64
-                })
-                .collect();
-            song.adapter
-                .prepare_member_domains_at(leader, &song.domain_power, options);
-            song.member_power = options.iter().enumerate().map(|(member, choices)| {
-                let best = choices.iter().map(|&snap| song.snap_power[member * width + if snap < 0 { width - 1 } else { snap as usize }])
-                    .fold(f64::NEG_INFINITY, f64::max);
-                (song.domain_power[member] + best).next_up()
-            }).collect();
+                }).collect();
+                let totals: Vec<_> = options.iter().enumerate().map(|(member, choices)| {
+                    let best = choices.iter().map(|&snap| song.snap_power[member * width + if snap < 0 { width - 1 } else { snap as usize }])
+                        .fold(f64::NEG_INFINITY, f64::max);
+                    (base[member] + best).next_up()
+                }).collect();
+                (base, Arc::new(totals))
+            });
+            song.adapter.prepare_member_domains_at(leader, base, options);
+            song.member_power = Arc::clone(member_power);
             song.member_skill = options.iter().enumerate().map(|(member, choices)| choices.iter()
                 .map(|&snap| song.weights[member * width + if snap < 0 { width - 1 } else { snap as usize }])
                 .fold(f64::NEG_INFINITY, f64::max)).collect();
-            for (values, sums) in [(&song.member_power, &mut song.free_power), (&song.member_skill, &mut song.free_skill)] {
-                let mut ranked = values.clone();
-                ranked.sort_unstable_by(|a, b| b.total_cmp(a));
-                sums.fill(f64::NEG_INFINITY);
-                sums[0] = 0.0;
-                for (index, value) in ranked.into_iter().take(5).enumerate() { sums[index + 1] = (sums[index] + value).next_up(); }
-            }
         }
     }
     fn member_bound_at(
@@ -873,8 +908,8 @@ impl Objective for Combined<'_, '_> {
             return Some(self.bound(t));
         }
         let totals: Vec<_> = self.songs.iter().map(|song| Totals {
-            power: members.iter().fold(song.free_power[left], |sum, &member| (sum + song.member_power[member]).next_up()).min(song.power_cap),
-            skill: members.iter().fold(song.free_skill[left], |sum, &member| (sum + song.member_skill[member]).next_up()).min(t.skill),
+            power: members.iter().fold(song.free_power[from][left], |sum, &member| (sum + song.member_power[member]).next_up()).min(song.power_cap),
+            skill: members.iter().fold(song.free_skill[from][left], |sum, &member| (sum + song.member_skill[member]).next_up()).min(t.skill),
             ..t
         }).collect();
         let mut bounds: Vec<_> = self.songs.iter_mut().zip(&totals).map(|(song, &t)| song.adapter.bound(t)).collect();
@@ -927,13 +962,15 @@ impl Objective for Combined<'_, '_> {
         let roster: Vec<_> = members.iter().map(|&m| self.songs[0].adapter.kernel.members[m].clone()).collect();
         let profile = power::leader_profile(master, &roster[0]);
         let mut power_tables = HashMap::default();
+        let mut leader_percents = HashMap::default();
         for index in 0..self.songs.len() {
             let previous = if self.same_power && index > 0 {
                 Some(0)
             } else {
                 let song = &mut self.songs[index];
                 let kernel = &song.adapter.kernel;
-                let percents = power::leader_percents(master, &profile, &roster, 0, Some(song.music));
+                let percents = leader_percents.entry(song.music.music_type)
+                    .or_insert_with(|| power::leader_percents(master, &profile, &roster, 0, Some(song.music)));
                 let width = kernel.snaps.len() + 1;
                 let base: [f64; 5] = std::array::from_fn(|i| {
                     let m = members[i];
@@ -1141,22 +1178,29 @@ fn initial_hit(env: &Environment<'_>, charts: &mut [Chart], music: &[Music], see
         details.push(json!({"detail":score.detail,"power":power.total,"slotPowers":power.slots}));
     };
     #[cfg(not(target_arch = "wasm32"))]
-    let parallel = !deadline.is_finite() && (16..=512).contains(&charts.len())
+    let parallel = (16..=512).contains(&charts.len())
         && crate::parallel::workers(charts.len()) > 1;
     #[cfg(target_arch = "wasm32")]
     let parallel = false;
     if parallel {
         #[cfg(not(target_arch = "wasm32"))]
         {
+            let remaining = (deadline - (env.now)()).max(0.0);
+            let access = std::time::Instant::now();
             let items: Vec<_> = charts.iter_mut().zip(music).map(|(chart, music)| {
                 (std::sync::Mutex::new(chart), music)
             }).collect();
             for result in crate::parallel::map(&items, |(chart, music)| {
-                Ok::<_, String>(crate::parallel::serial(|| score_chart(&mut **chart.lock().unwrap(), music)))
+                if access.elapsed().as_secs_f64() * 1000.0 >= remaining {
+                    Ok::<_, String>(Ok(None))
+                } else {
+                    Ok(crate::parallel::serial(|| score_chart(&mut **chart.lock().unwrap(), music)))
+                }
             })? {
                 let Some(result) = result? else { return Ok(None); };
                 collect(result);
             }
+            if (env.now)() >= deadline { return Ok(None); }
         }
     } else {
         for (chart, music) in charts.iter_mut().zip(music) {
@@ -1254,6 +1298,7 @@ pub(crate) fn search_shared(input: SharedInput<'_>) -> Result<search::Output, St
         return Ok(search::Output { hits: ranked(&hits, k), proven: false, bound: None, stats: search::Stats { elapsed_ms: (env.now)()-started, ..Default::default() } });
     }
     let section_charts = sections.map(|_| charts.iter().map(|chart| chart.converted_judgements(&chart.judgements).unwrap()).collect::<Vec<_>>());
+    let shared_lottery_bound = sections.is_none() && charts.len() >= 16;
     let mut windows = Vec::with_capacity(charts.len());
     for chart in charts.iter() {
         let window = env.window_policy.map(|minimum| crate::just_window::Prepared::new(env.master, chart, env.members, env.snaps, minimum, &seeds)).transpose()?;
@@ -1262,17 +1307,19 @@ pub(crate) fn search_shared(input: SharedInput<'_>) -> Result<search::Output, St
         }
         windows.push(window);
     }
+    let mut preparation = KernelPreparation::new(env.master, env.members, env.snaps);
     let mut kernels: Vec<_> = charts
         .iter_mut()
         .zip(windows)
         .map(|(chart, window)| {
-            let mut kernel = Kernel::new(
+            let mut kernel = Kernel::with_preparation(
                 env.master,
                 env.members,
                 env.snaps,
                 chart,
                 seeds.clone(),
                 Criterion::Mean,
+                &mut preparation,
             );
             kernel.just_window = window;
             kernel
@@ -1375,25 +1422,34 @@ pub(crate) fn search_shared(input: SharedInput<'_>) -> Result<search::Output, St
             proven = false;
             break;
         }
-        let mut adapters = Vec::new();
-        for kernel in &mut kernels {
-            if (env.now)() >= deadline { proven=false; break; }
-            let own_level = if same_levels {
-                level
-            } else {
-                kernel.maximum_level
-            };
-            let Some(adapter) = Adapter::new(kernel, own_level, false, false, deadline, env.now)
-            else {
-                proven = false;
-                break;
-            };
-            adapters.push(adapter);
-        }
-        if !proven || (env.now)() >= deadline {
+        let prepare = |kernel, now: &dyn Fn() -> f64| {
+            prepare_shared_adapter(kernel, level, same_levels, shared_lottery_bound, deadline, now)
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        let parallel = kernels.len() >= 16 && crate::parallel::workers(kernels.len()) > 1;
+        #[cfg(target_arch = "wasm32")]
+        let parallel = false;
+        let adapters = if parallel {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let started = (env.now)();
+                let instant = std::time::Instant::now();
+                let now = || started + instant.elapsed().as_secs_f64() * 1000.0;
+                let tasks: Vec<_> = kernels.iter_mut().map(|kernel| std::sync::Mutex::new(Some(kernel))).collect();
+                crate::parallel::map(&tasks, |task| {
+                    let kernel = task.lock().unwrap().take().unwrap();
+                    Ok::<_, String>(crate::parallel::serial(|| prepare(kernel, &now)))
+                })?.into_iter().collect::<Option<Vec<_>>>()
+            }
+            #[cfg(target_arch = "wasm32")]
+            unreachable!()
+        } else {
+            kernels.iter_mut().map(|kernel| prepare(kernel, env.now)).collect()
+        };
+        let Some(adapters) = adapters.filter(|_| (env.now)() < deadline) else {
             proven=false;
             break;
-        }
+        };
         let current = ranked(&hits, k);
         let mut objective = Combined::new(
             adapters,
@@ -1473,6 +1529,19 @@ pub(crate) fn search_shared(input: SharedInput<'_>) -> Result<search::Output, St
         bound,
         stats,
     })
+}
+
+fn prepare_shared_adapter<'k, 'a>(
+    kernel: &'k mut Kernel<'a>,
+    level: i32,
+    same_levels: bool,
+    lottery_bound: bool,
+    deadline: f64,
+    now: &dyn Fn() -> f64,
+) -> Option<Adapter<'k, 'a>> {
+    if now() >= deadline { return None; }
+    let level = if same_levels { level } else { kernel.maximum_level };
+    Adapter::with_lottery_bound(kernel, level, false, false, lottery_bound, deadline, now)
 }
 
 impl Kernel<'_> {

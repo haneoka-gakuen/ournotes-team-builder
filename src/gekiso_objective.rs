@@ -865,6 +865,51 @@ struct RushProjection {
     bytes: usize,
 }
 type SupportValues = HashMap<Vec<(i32, i32)>, f64>;
+#[derive(Clone)]
+struct RosterSupport {
+    values: Arc<Vec<Option<Performer>>>,
+    changes_context: Arc<Vec<bool>>,
+}
+
+struct KernelPreparation {
+    read_all: Vec<&'static str>,
+    read_members: Vec<&'static str>,
+    support: HashMap<Vec<i32>, RosterSupport>,
+    ordinary: Arc<crate::skills::Prepared>,
+    member_fields: crate::support_aliases::ContextFields,
+    just_counters: crate::support_aliases::JustCounters,
+    steady: bool,
+    life_by_mission: HashMap<Vec<i32>, bool>,
+    ordinary_roles: HashMap<(bool, bool), Arc<Vec<u32>>>,
+}
+
+impl KernelPreparation {
+    fn new(master: &Master, members: &[Member], snaps: &[Snap]) -> Self {
+        let ordinary = crate::skills::prepare(master, members, snaps);
+        let steady = master.gekiso_skills.values().chain(master.gekiso_support_skills.values())
+            .all(|skill| skill.effects.iter().all(|row| {
+                row.kind != 3000 && row.kind != 3002 && !(row.kind == 12006 && row.value < 5)
+            })) && ordinary.slots.iter().all(|slot| {
+                slot.recovery >= 0 && slot.effects.iter().all(|effect| {
+                    effect.gate.blocks(master.live.life_base) == effect.gate.blocks(2.0 * master.live.life_base)
+                }) && slot.convert.as_ref().is_none_or(|conversion| {
+                    !conversion.judgements.contains(&6) && master.live.damage[conversion.judgement] == 0.0
+                })
+            });
+        Self {
+            read_all: read_attributes(master, true),
+            read_members: read_attributes(master, false),
+            support: HashMap::default(),
+            ordinary,
+            member_fields: crate::support_aliases::ContextFields::new(master),
+            just_counters: crate::support_aliases::JustCounters::new(master, members),
+            steady,
+            life_by_mission: HashMap::default(),
+            ordinary_roles: HashMap::default(),
+        }
+    }
+}
+
 pub struct Kernel<'a> {
     master: &'a Master,
     members: &'a [Member],
@@ -879,12 +924,13 @@ pub struct Kernel<'a> {
     member_bound_ids: Vec<u32>,
     member_bound_decks: Vec<Option<Performer>>,
     just_counters: crate::support_aliases::JustCounters,
-    support: Vec<Option<Performer>>,
-    support_chain: Vec<bool>,
+    support: Arc<Vec<Option<Performer>>>,
+    support_chain: Arc<Vec<bool>>,
     performer_key_cache: HashMap<Performer, u32>,
     context_keys: HashMap<Performer, u32>,
     normalized_performers: HashMap<u32, (Performer, u32)>,
     slots: Arc<Vec<Slot>>,
+    ordinary_roles: Arc<Vec<u32>>,
     shapes: HashMap<(Vec<u64>, Performer), u32>,
     shape_ids: Vec<u32>,
     bound_shape_ids: Vec<u32>,
@@ -1409,8 +1455,21 @@ impl<'a> Kernel<'a> {
         seeds: Vec<i32>,
         criterion: Criterion,
     ) -> Self {
-        let read_all = read_attributes(master, true);
-        let read_members = read_attributes(master, false);
+        Self::with_preparation(master, members, snaps, chart, seeds, criterion,
+            &mut KernelPreparation::new(master, members, snaps))
+    }
+
+    fn with_preparation(
+        master: &'a Master,
+        members: &'a [Member],
+        snaps: &'a [Snap],
+        chart: &'a mut Chart,
+        seeds: Vec<i32>,
+        criterion: Criterion,
+        preparation: &mut KernelPreparation,
+    ) -> Self {
+        let read_all = preparation.read_all.clone();
+        let read_members = preparation.read_members.clone();
         let missions: HashSet<_> = chart
             .setup
             .missions
@@ -1449,84 +1508,91 @@ impl<'a> Kernel<'a> {
             })
             .collect();
         let band_only = read_all == ["bandId"];
-        let snap_supports: Vec<_> = snaps
-            .iter()
-            .map(|snap| {
-                let skills: Vec<_> = snap
-                    .card
-                    .gekiso_support_skills
-                    .into_iter()
-                    .zip(snap.gekiso_skill_levels)
-                    .filter(|(id, _)| *id != 0)
+        let mut mission_key: Vec<_> = missions.iter().copied().collect();
+        mission_key.sort_unstable();
+        let RosterSupport { values: support, changes_context: support_chain } = preparation.support
+            .entry(mission_key)
+            .or_insert_with(|| {
+                let snap_supports: Vec<_> = snaps
+                    .iter()
+                    .map(|snap| {
+                        let skills: Vec<_> = snap
+                            .card
+                            .gekiso_support_skills
+                            .into_iter()
+                            .zip(snap.gekiso_skill_levels)
+                            .filter(|(id, _)| *id != 0)
+                            .collect();
+                        let runs = skills.iter().any(|&(id, _)| {
+                            let mission = master
+                                .gekiso_support_skills
+                                .get(&id)
+                                .map(|s| s.mission_type)
+                                .unwrap_or(0);
+                            mission == 4 || missions.contains(&mission) || missions.contains(&4)
+                        });
+                        if skills.is_empty() || !runs {
+                            return None;
+                        }
+                        let favoured = if band_only {
+                            favoured_band(master, &skills)
+                        } else {
+                            0
+                        };
+                        Some((skills, favoured))
+                    })
                     .collect();
-                let runs = skills.iter().any(|&(id, _)| {
-                    let mission = master
-                        .gekiso_support_skills
-                        .get(&id)
-                        .map(|s| s.mission_type)
-                        .unwrap_or(0);
-                    mission == 4 || missions.contains(&mission) || missions.contains(&4)
-                });
-                if skills.is_empty() || !runs {
-                    return None;
-                }
-                let favoured = if band_only {
-                    favoured_band(master, &skills)
-                } else {
-                    0
-                };
-                Some((skills, favoured))
-            })
-            .collect();
-        let mut support = Vec::with_capacity(members.len() * snaps.len());
-        let mut supports: HashMap<_, Performer> = HashMap::default();
-        for (i, member) in members.iter().enumerate() {
-            for snap in &snap_supports {
-                let Some((skills, favoured)) = snap.as_ref().filter(|_| has_gk[i]) else {
-                    support.push(None);
-                    continue;
-                };
-                let band = if band_only && *favoured != 0 {
-                    if member.card.band_id == *favoured {
-                        *favoured
-                    } else if *favoured == 1 {
-                        2
-                    } else {
-                        1
-                    }
-                } else {
-                    member.card.band_id
-                };
-                let fields = if band_only {
-                    [band, 0, 0]
-                } else {
-                    [band, member.card.card_type, member.card.character_id]
-                };
-                let value = supports
-                    .entry((skills.as_slice(), fields))
-                    .or_insert_with(|| {
-                        if band_only {
-                            Performer {
-                                band_id: band,
-                                mission_only: Some(1),
-                                gekisou_support_skills: skills.clone(),
-                                ..Performer::default()
+                let mut support = Vec::with_capacity(members.len() * snaps.len());
+                let mut supports: HashMap<_, Performer> = HashMap::default();
+                for (i, member) in members.iter().enumerate() {
+                    for snap in &snap_supports {
+                        let Some((skills, favoured)) = snap.as_ref().filter(|_| has_gk[i]) else {
+                            support.push(None);
+                            continue;
+                        };
+                        let band = if band_only && *favoured != 0 {
+                            if member.card.band_id == *favoured {
+                                *favoured
+                            } else if *favoured == 1 {
+                                2
+                            } else {
+                                1
                             }
                         } else {
-                            let mut p = Performer::from_member(master, member, None);
-                            p.live_skill = None;
-                            p.gekisou_skill = None;
-                            p.gekisou_support_skills = skills.clone();
-                            p.mission_only = Some(1);
-                            p
-                        }
-                    });
-                support.push(Some(value.clone()));
-            }
-        }
-        // Release constructor-only groups before preparing the slot table and contexts.
-        drop(supports);
-        drop(snap_supports);
+                            member.card.band_id
+                        };
+                        let fields = if band_only {
+                            [band, 0, 0]
+                        } else {
+                            [band, member.card.card_type, member.card.character_id]
+                        };
+                        let value = supports
+                            .entry((skills.as_slice(), fields))
+                            .or_insert_with(|| {
+                                if band_only {
+                                    Performer {
+                                        band_id: band,
+                                        mission_only: Some(1),
+                                        gekisou_support_skills: skills.clone(),
+                                        ..Performer::default()
+                                    }
+                                } else {
+                                    let mut p = Performer::from_member(master, member, None);
+                                    p.live_skill = None;
+                                    p.gekisou_skill = None;
+                                    p.gekisou_support_skills = skills.clone();
+                                    p.mission_only = Some(1);
+                                    p
+                                }
+                            });
+                        support.push(Some(value.clone()));
+                    }
+                }
+                let support_chain = support.iter().map(|performer| {
+                    performer.as_ref().is_some_and(|performer| changes_context(master, performer))
+                }).collect();
+                RosterSupport { values: Arc::new(support), changes_context: Arc::new(support_chain) }
+            }).clone();
         let bonuses = combo_bonuses(master, members, &chart.setup.missions);
         let opening_bonuses = opening_combo_bonuses(master, members, &chart.setup.missions);
         let template = if combo_ranges {
@@ -1562,49 +1628,37 @@ impl<'a> Kernel<'a> {
         } else {
             vec![0]
         };
-        let prepared = crate::skills::prepare(master, members, snaps);
         let steady_life = chart.accuracy.miss_every == 0
+            && preparation.steady
             && chart.judgements.iter().all(|&grade| master.live.damage[grade] == 0.0)
-            && crate::support_aliases::stable_life_conditions(
+            && *preparation.life_by_mission.entry(chart.setup.missions.clone()).or_insert_with(|| {
+                crate::support_aliases::stable_life_conditions(
                 master,
                 members,
                 snaps,
                 &chart.setup.missions,
-            )
-            && master
-                .gekiso_skills
-                .values()
-                .chain(master.gekiso_support_skills.values())
-                .all(|s| {
-                    s.effects.iter().all(|r| {
-                        r.kind != 3000 && r.kind != 3002 && !(r.kind == 12006 && r.value < 5)
-                    })
-                })
-            && prepared.slots.iter().all(|s| {
-                s.recovery >= 0 && s.effects.iter().all(|e| {
-                    e.gate.blocks(master.live.life_base)
-                        == e.gate.blocks(2.0 * master.live.life_base)
-                }) && s
-                    .convert
-                    .as_ref()
-                    .is_none_or(|c| !c.judgements.contains(&6) && master.live.damage[c.judgement] == 0.0)
+                )
             });
         let healthy = chart.accuracy.great == 0.0 && steady_life;
-        let slots = if steady_life { prepared.for_gekiso(master.live.life_base, !healthy) }
-            else { Arc::clone(&prepared.slots) };
+        let slots = if steady_life { Arc::clone(&preparation.ordinary).for_gekiso(master.live.life_base, !healthy) }
+            else { Arc::clone(&preparation.ordinary.slots) };
+        let ordinary_roles = Arc::clone(preparation.ordinary_roles.entry((steady_life, healthy))
+            .or_insert_with(|| {
+                let mut shapes = HashMap::default();
+                Arc::new(slots.iter().map(|slot| {
+                    let next = shapes.len() as u32;
+                    *shapes.entry(slot.signature()).or_insert(next)
+                }).collect())
+            }));
         let cache = std::mem::take(&mut chart.contexts);
         let cache_order = std::mem::take(&mut chart.context_order);
         let cache_bytes = std::mem::replace(&mut chart.context_bytes, 0);
         let cache_records = std::mem::take(&mut chart.context_records);
-        let support_chain = support
-            .iter()
-            .map(|p| p.as_ref().is_some_and(|p| changes_context(master, p)))
-            .collect();
         let just_context = crate::rewards::JustContext::new(master, chart, members, snaps);
         let support_aliases =
             crate::support_aliases::SupportAliases::new(&chart.setup.missions, snaps, healthy);
-        let mut member_fields = crate::support_aliases::ContextFields::new(master);
-        let just_counters = crate::support_aliases::JustCounters::new(master, members);
+        let mut member_fields = preparation.member_fields.clone();
+        let just_counters = preparation.just_counters.clone();
         let member_bound_decks: Vec<_> = gk_members
             .iter()
             .cloned()
@@ -1691,6 +1745,7 @@ impl<'a> Kernel<'a> {
             context_keys: HashMap::default(),
             normalized_performers: HashMap::default(),
             slots,
+            ordinary_roles,
             shapes: HashMap::default(),
             shape_ids: vec![u32::MAX; members.len() * (snaps.len() + 1)],
             bound_shape_ids: vec![u32::MAX; members.len() * (snaps.len() + 1)],
@@ -5214,7 +5269,12 @@ impl Kernel<'_> {
                 gekisou_support_skills: skills,
                 ..Performer::default()
             };
-            let value = self.gain(std::slice::from_ref(&p), &[], None, 0);
+            let inactive = p.gekisou_support_skills.iter().all(|&(id, _)| {
+                self.master.gekiso_support_skills.get(&id).is_some_and(|skill| {
+                    skill.mission_type != 4 && !self.chart.setup.missions.contains(&skill.mission_type)
+                })
+            });
+            let value = if inactive { 0.0 } else { self.gain(std::slice::from_ref(&p), &[], None, 0) };
             supports.push((p, value));
         }
         let mut ranked = supports.clone();
@@ -6695,6 +6755,7 @@ pub struct Adapter<'k, 'a> {
     ranges: HashMap<usize, (f64, f64)>,
     assignment: Option<Assignment>,
     event_rows: HashMap<usize, [f64; 5]>,
+    live_event_rows: HashMap<u32, [f64; 5]>,
     global_rows: HashMap<usize, [f64; 5]>,
     suffix_rows: Vec<[f64; 5]>,
     max_choices: Vec<Vec<i32>>,
@@ -6739,6 +6800,27 @@ pub struct Adapter<'k, 'a> {
     reuse_assignment: bool,
 }
 impl<'k, 'a> Adapter<'k, 'a> {
+    fn upper_skill(&mut self, member: usize, snap: i32) -> f64 {
+        if let Some(bound) = &self.deterministic {
+            return bound.weight(member, snap, self.kernel.criterion != Criterion::Max);
+        }
+        if self.preserve_snap_options() { return 0.0; }
+        let index = self.kernel.slot_index(member, snap);
+        if let Some(&(_, upper)) = self.ranges.get(&index) { return upper; }
+        let gain = self.kernel.support_high(member, snap, self.level)
+            + if self.surrogate { self.kernel.member_gain[member] } else { 0.0 };
+        let role = self.kernel.ordinary_roles[index];
+        let mut row = *self.live_event_rows.entry(role).or_insert_with(|| {
+            self.kernel.event_weights(self.kernel.slot(member, snap), &self.data.as_ref().unwrap().weights)
+        });
+        let mean = row.iter().fold(0.0, |sum, value| sum + value) / 5.0 + gain;
+        let maximum = self.kernel.criterion == Criterion::Max;
+        if maximum || self.bounded_minimum() {
+            for value in &mut row { *value = (*value + gain).next_up(); }
+            self.event_rows.insert(index, row);
+        }
+        if maximum { row.into_iter().fold(f64::NEG_INFINITY, f64::max) } else { mean }
+    }
     fn shared_joint_upper(&self, members: &[usize], assigned: &[i32], from: usize, totals: Totals, cutoff: f64) -> Option<f64> {
         Some(self.deterministic.as_ref()?.joint_score_ceiling(members, assigned, from,
             self.base_power, (totals, cutoff), self.kernel.criterion))
@@ -6792,13 +6874,26 @@ impl<'k, 'a> Adapter<'k, 'a> {
         deadline: f64,
         now: &dyn Fn() -> f64,
     ) -> Option<Self> {
+        Self::with_lottery_bound(kernel, level, surrogate, estimate, false, deadline, now)
+    }
+
+    fn with_lottery_bound(
+        kernel: &'k mut Kernel<'a>,
+        level: i32,
+        surrogate: bool,
+        estimate: bool,
+        nominal_lottery_bound: bool,
+        deadline: f64,
+        now: &dyn Fn() -> f64,
+    ) -> Option<Self> {
         let n = kernel.members.len();
         let global_luck =
             (!surrogate && !estimate && kernel.chart.luck && !kernel.seeds.is_empty())
                 .then(|| kernel.global_fixed_luck())
                 .flatten();
         let deterministic =
-            if !surrogate && !estimate && kernel.chart.luck && !kernel.seeds.is_empty() {
+            if !surrogate && !estimate && kernel.chart.luck
+                && (!kernel.seeds.is_empty() || nominal_lottery_bound && kernel.healthy) {
                 crate::rewards::DeterministicBound::with_luck_preparation(
                     kernel.master,
                     kernel.chart,
@@ -6863,6 +6958,7 @@ impl<'k, 'a> Adapter<'k, 'a> {
             ranges: HashMap::default(),
             assignment: None,
             event_rows: HashMap::default(),
+            live_event_rows: HashMap::default(),
             global_rows: HashMap::default(),
             suffix_rows: Vec::new(),
             max_choices: vec![Vec::new(); n],
@@ -8624,39 +8720,7 @@ impl Objective for Adapter<'_, '_> {
         if let Some(&value) = self.ranges.get(&index) {
             return value;
         }
-        let gain = self.kernel.support_high(m, s, self.level)
-            + if self.surrogate {
-                self.kernel.member_gain[m]
-            } else {
-                0.0
-            };
-        let maximum = self.kernel.criterion == Criterion::Max;
-        let top = if maximum || self.bounded_minimum() {
-            let mut row = self
-                .kernel
-                .event_weights(self.kernel.slot(m, s), &self.data.as_ref().unwrap().weights);
-            let mean = if maximum {
-                0.0
-            } else {
-                row.iter().fold(0.0, |sum, value| sum + value) / 5.0 + gain
-            };
-            for value in &mut row {
-                *value = (*value + gain).next_up();
-            }
-            let top = if maximum {
-                row.iter().copied().fold(f64::NEG_INFINITY, f64::max)
-            } else {
-                mean
-            };
-            self.event_rows.insert(index, row);
-            top
-        } else {
-            self.kernel.live_weight(
-                self.kernel.slot(m, s),
-                &self.data.as_ref().unwrap().weights,
-                Criterion::Mean,
-            ) + gain
-        };
+        let top = self.upper_skill(m, s);
         let value = (
             if self.surrogate {
                 top
@@ -11048,14 +11112,12 @@ fn replay_combo_ceiling(
                 })
             })
     };
+    let keeps_combo = |row: &SkillEffect| {
+        (row.kind == 13005 || row.kind == 12006 && (3..=6).contains(&row.value))
+            && row.targets.iter().any(|id| matches!(master.targets[id].judgement, 1 | 2))
+    };
     let quota = |row: &SkillEffect, actor: &Performer, live: bool| -> usize {
-        if !matches!(row.kind, 12006 | 13005)
-            || row.kind == 12006 && !(3..=6).contains(&row.value)
-            || !row
-                .targets
-                .iter()
-                .any(|id| matches!(master.targets[id].judgement, 1 | 2))
-            || !possible(row.condition_group, actor)
+        if !keeps_combo(row) || !possible(row.condition_group, actor)
             || !live && !possible(row.trigger_group, actor)
         {
             return 0;
@@ -11116,43 +11178,20 @@ fn replay_combo_ceiling(
     let mut snap_budgets: Vec<_> = snaps
         .iter()
         .map(|snap| {
+            let normal = snap.card.support_skills.into_iter().zip(snap.skill_levels)
+                .flat_map(|(id, level)| master.support_skills.get(&id).into_iter().flatten()
+                    .filter(move |row| row.level == level));
+            let gekiso = snap.card.gekiso_support_skills.into_iter().zip(snap.gekiso_skill_levels)
+                .flat_map(|(id, level)| master.gekiso_support_skills.get(&id)
+                    .filter(|skill| skill.mission_type == 4 || chart.setup.missions.contains(&skill.mission_type))
+                    .into_iter().flat_map(|skill| &skill.effects).filter(move |row| row.level == level));
+            let converters: Vec<_> = normal.chain(gekiso).filter(|row| keeps_combo(row)).collect();
+            if converters.is_empty() { return 0; }
             members
                 .iter()
                 .map(|member| {
                     let actor = Performer::from_member(master, member, Some(snap));
-                    let live = snap
-                        .card
-                        .support_skills
-                        .into_iter()
-                        .zip(snap.skill_levels)
-                        .flat_map(|(id, level)| {
-                            master
-                                .support_skills
-                                .get(&id)
-                                .into_iter()
-                                .flatten()
-                                .filter(move |row| row.level == level)
-                        })
-                        .map(|row| quota(row, &actor, false));
-                    let gk = snap
-                        .card
-                        .gekiso_support_skills
-                        .into_iter()
-                        .zip(snap.gekiso_skill_levels)
-                        .flat_map(|(id, level)| {
-                            master
-                                .gekiso_support_skills
-                                .get(&id)
-                                .filter(|skill| {
-                                    skill.mission_type == 4
-                                        || chart.setup.missions.contains(&skill.mission_type)
-                                })
-                                .into_iter()
-                                .flat_map(|skill| &skill.effects)
-                                .filter(move |row| row.level == level)
-                        })
-                        .map(|row| quota(row, &actor, false));
-                    live.chain(gk)
+                    converters.iter().map(|row| quota(row, &actor, false))
                         .fold(0usize, |sum, value| sum.saturating_add(value).min(total))
                 })
                 .max()
@@ -11185,13 +11224,14 @@ fn replay_combo_ceiling(
         .iter()
         .map(|note| {
             let before = times.partition_point(|&time| time < note.time_ms);
-            let last = breaks
-                .iter()
-                .rev()
-                .filter(|&&(time, frame)| {
-                    time < note.time_ms && frame <= delivery[note.id as usize]
-                })
-                .nth(budget);
+            let eligible = breaks.partition_point(|&(time, _)| time < note.time_ms);
+            let last = if eligible <= budget {
+                None
+            } else {
+                breaks[..eligible].iter().rev()
+                    .filter(|&&(_, frame)| frame <= delivery[note.id as usize])
+                    .nth(budget)
+            };
             let count = last.map_or(before, |&(time, _)| {
                 before - times.partition_point(|&at| at < time)
             });
@@ -11391,8 +11431,8 @@ fn replay_limits(master: &Master, chart: &Chart, members: &[Member], snaps: &[Sn
         } else { usize::MAX }
     };
     let live_events = chart.full.events.len();
-    let mut member_healing = 0i64;
-    let mut snap_healing = 0i64;
+    let mut member_healing = Vec::with_capacity(members.len());
+    let mut snap_healing = Vec::with_capacity(snaps.len());
     for (index, member) in members.iter().enumerate() {
         let mut heal = 0;
         for row in master.live_skills.get(&member.card.live_skill_id).into_iter().flatten()
@@ -11410,7 +11450,7 @@ fn replay_limits(master: &Master, chart: &Chart, members: &[Member], snaps: &[Sn
                 visit(row, quota(row), false, Some(index), &mut heal);
             }
         }
-        member_healing = member_healing.max(heal);
+        member_healing.push(heal);
     }
     for snap in snaps {
         let mut heal = 0;
@@ -11428,7 +11468,7 @@ fn replay_limits(master: &Master, chart: &Chart, members: &[Member], snaps: &[Sn
                 }
             }
         }
-        snap_healing = snap_healing.max(heal);
+        snap_healing.push(heal);
     }
 
     // Recovery has no effect at zero LIFE. Count the most damage every
@@ -11459,7 +11499,8 @@ fn replay_limits(master: &Master, chart: &Chart, members: &[Member], snaps: &[Sn
         None
     })();
     let health = health_known.then(|| replay_health::Rules {
-        healing_per_event: member_healing.saturating_add(snap_healing),
+        member_healing,
+        snap_healing,
         prevented_damage: converters.iter().fold(0i64, |sum, &(_, count, saved)| {
             sum.saturating_add(i64::try_from(count).unwrap_or(i64::MAX).saturating_mul(saved))
         }),
@@ -11582,6 +11623,63 @@ fn replay_support_key(master: &Master, actor: &Performer, global_converters: &Ha
     }
     Some(key)
 }
+
+fn replay_gekiso_support_key(master: &Master, actor: &Performer) -> Option<Vec<u64>> {
+    if actor.gekisou_support_skills.is_empty() || actor.gekisou_skill.is_none() {
+        return Some(Vec::new());
+    }
+    let &[(id, level)] = actor.gekisou_support_skills.as_slice() else { return None; };
+    let skill = master.gekiso_support_skills.get(&id)?;
+    let mut rows: Vec<_> = skill.effects.iter().filter(|row| row.level == level).collect();
+    if rows.iter().any(|row| !matches!(row.kind, 2000 | 2001 | 12004)
+        || [row.trigger_group, row.release_group, row.reset_group].iter().any(|&group| {
+            group != 0 && master.condition_sets.get(&group).is_none_or(|sets| {
+                sets.iter().flatten().any(|id| master.conditions.get(id).is_none_or(|condition|
+                    !matches!(condition.kind, 7010 | 7013 | 7020 | 7021)))
+            })
+        })) { return None; }
+    rows.sort_by_key(|row| row.id);
+    if rows.windows(2).any(|pair| pair[0].id == pair[1].id) { return None; }
+    let mut key = vec![skill.mission_type as u64];
+    for row in rows {
+        let mut applies = row.condition_group == 0;
+        if row.condition_group != 0 {
+            for set in master.condition_sets.get(&row.condition_group)? {
+                let mut matched = true;
+                for condition in set {
+                    let condition = master.conditions.get(condition)?;
+                    if condition.kind != 5000 { return None; }
+                    let mut target_match = false;
+                    for id in &condition.targets {
+                        target_match |= crate::full::conditions::performer_matches(actor, master.targets.get(id)?);
+                    }
+                    matched &= target_match == condition.positive;
+                }
+                applies |= matched;
+            }
+        }
+        if !applies { continue; }
+        // One support updater owns these rows. Their source IDs only name
+        // its private state, while their relative application order matters.
+        key.extend([
+            row.kind as u64, row.value as u64, row.seconds.to_bits(), row.trigger_type as u64,
+            row.trigger_group as u64, row.release_group as u64, row.reset_group as u64,
+            row.execute_limit as u64, row.limit_count as u64, row.cumulative_id as u64,
+            row.max_value as u64, row.targets.len() as u64,
+        ]);
+        key.extend(row.targets.iter().map(|&id| id as u64));
+    }
+    if key.len() == 1 { key.clear(); }
+    Some(key)
+}
+
+#[derive(Hash, PartialEq, Eq)]
+struct ReplayShape {
+    actor: Performer,
+    support: Vec<u64>,
+    gekiso_support: Vec<u64>,
+}
+
 struct ReplayObjective<'a> {
     master: &'a Master,
     members: &'a [Member],
@@ -11592,7 +11690,7 @@ struct ReplayObjective<'a> {
     bonuses: Vec<i32>,
     bound: Option<crate::rewards::DeterministicBound>,
     coefficient: f64,
-    shapes: HashMap<(Performer, Vec<u64>), u32>,
+    shapes: HashMap<ReplayShape, u32>,
     conversion_rows: HashSet<i32>,
     shape_ids: Vec<u32>,
     alias_allowed: bool,
@@ -11603,9 +11701,20 @@ struct ReplayObjective<'a> {
     health: Option<replay_health::HealthBound>,
     health_roster: [usize; 5],
     health_ceiling: f64,
+    health_options: [i64; 5],
     dead_before_recovery: bool,
 }
 impl ReplayObjective<'_> {
+    fn assignment_health(&self, members: &[usize], snaps: &[i32], fixed: usize) -> f64 {
+        if members != self.health_roster { return f64::INFINITY; }
+        let Some(health) = &self.health else { return f64::INFINITY; };
+        let choices = std::array::from_fn(|slot| {
+            if slot < fixed { health.snap_healing(snaps[slot]) } else { self.health_options[slot] }
+        });
+        let coefficient = health.coefficient(members, choices);
+        if fixed == 5 { coefficient } else { coefficient.min(self.health_ceiling) }
+    }
+
     fn shape_id(&mut self, member: usize, snap: i32) -> u32 {
         let index = member * (self.snaps.len() + 1) + (snap + 1) as usize;
         if self.shape_ids[index] == u32::MAX {
@@ -11614,9 +11723,13 @@ impl ReplayObjective<'_> {
             let key = self.alias_allowed.then(|| {
                 replay_support_key(self.master, &actor, &self.conversion_rows, self.dead_before_recovery)
             }).flatten();
+            let gekiso_key = self.alias_allowed.then(|| replay_gekiso_support_key(self.master, &actor)).flatten();
             if key.is_some() { actor.support_skills.clear(); }
+            if gekiso_key.is_some() { actor.gekisou_support_skills.clear(); }
             let next = self.shapes.len() as u32;
-            self.shape_ids[index] = *self.shapes.entry((actor, key.unwrap_or_default())).or_insert(next);
+            self.shape_ids[index] = *self.shapes.entry(ReplayShape {
+                actor, support: key.unwrap_or_default(), gekiso_support: gekiso_key.unwrap_or_default(),
+            }).or_insert(next);
         }
         self.shape_ids[index]
     }
@@ -11675,9 +11788,7 @@ impl Objective for ReplayObjective<'_> {
             .bound
             .as_mut()
             .map(|b| b.score_ceiling(&team.members, &team.snaps, 5, totals.power, self.criterion));
-        let life = if team.members.as_slice() == self.health_roster {
-            (totals.power * self.health_ceiling).next_up()
-        } else { f64::INFINITY };
+        let life = (totals.power * self.assignment_health(&team.members, &team.snaps, 5)).next_up();
         (0.0, upper.unwrap_or(f64::INFINITY).min(self.bound(totals)).min(life))
     }
     fn prepare_members(&mut self, characters: &[Vec<usize>]) {
@@ -11700,15 +11811,17 @@ impl Objective for ReplayObjective<'_> {
     fn roster_bound(&mut self, members: &[usize], t: Totals, _limit: f64) -> Option<f64> {
         let health = self.health.as_ref()?;
         self.health_roster.copy_from_slice(members);
-        self.health_ceiling = health.coefficient(members);
+        self.health_ceiling = health.roster(members);
+        self.health_options = [i64::MAX; 5];
         self.health_ceiling.is_finite().then(|| (t.power * self.health_ceiling).next_up())
     }
     fn prepare_assignment(&mut self, members: &[usize], options: &[Vec<i32>]) {
-        if members != self.health_roster {
-            if let Some(health) = &self.health {
-                self.health_roster.copy_from_slice(members);
-                self.health_ceiling = health.coefficient(members);
-            }
+        if let Some(health) = &self.health {
+            self.health_roster.copy_from_slice(members);
+            self.health_options = std::array::from_fn(|slot| {
+                options[slot].iter().map(|&snap| health.snap_healing(snap)).max().unwrap_or(0)
+            });
+            self.health_ceiling = health.coefficient(members, self.health_options);
         }
         if let Some(window) = &mut self.just_window { window.prepare_assignment(members, options); }
         if let Some(b) = &mut self.bound {
@@ -11723,9 +11836,7 @@ impl Objective for ReplayObjective<'_> {
         from: usize,
         limit: f64,
     ) -> Option<f64> {
-        let life = if members == self.health_roster {
-            (t.power * self.health_ceiling).next_up()
-        } else { f64::INFINITY };
+        let life = (t.power * self.assignment_health(members, assigned, from)).next_up();
         if life < limit { return Some(life); }
         self.bound.as_mut().map(|b| {
             let upper=b.score_ceiling(members,assigned,from,t.power,self.criterion);
@@ -11778,8 +11889,8 @@ impl Objective for ReplayObjective<'_> {
         }
         debug_assert!(power < 0.0 || !self.coefficient.is_finite()
             || result.key <= (power * self.coefficient).next_up(), "full replay coefficient");
-        debug_assert!(team.members.as_slice() != self.health_roster || power < 0.0 || !self.health_ceiling.is_finite()
-            || result.key <= (power * self.health_ceiling).next_up(), "replay LIFE bound");
+        debug_assert!(power <= 0.0 || result.key <= (power * self.assignment_health(&team.members, &team.snaps, 5)).next_up(),
+            "replay LIFE bound");
         #[cfg(debug_assertions)]
         if let Some(bound) = &mut self.bound {
             let upper=bound.fixed_score_ceiling(&team.members,&team.snaps,power,self.criterion);
@@ -12238,6 +12349,7 @@ fn search_levels(
             health,
             health_roster: [usize::MAX; 5],
             health_ceiling: f64::INFINITY,
+            health_options: [i64::MAX; 5],
             dead_before_recovery: limits.dead_after.is_some(),
         };
         let mut candidate = |hits: &[Hit]| {

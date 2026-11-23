@@ -148,6 +148,16 @@ impl IdleInput {
     }
 }
 impl Checker {
+    pub(crate) fn reads_combo_or_just(&self) -> bool {
+        match &self.test {
+            Test::And(items) | Test::Or(items) => items.iter().any(Self::reads_combo_or_just),
+            Test::Not(inner) => inner.reads_combo_or_just(),
+            Test::LiveMultiple { .. } | Test::LiveAtLeast(_) | Test::ComboAtLeast(_)
+            | Test::GkInterval { .. } | Test::JustAtLeast(_) | Test::JustEdge { .. } => true,
+            _ => false,
+        }
+    }
+
     pub(crate) fn fixed_life(&mut self, life: i32) {
         let fixed = match &mut self.test {
             Test::Life {

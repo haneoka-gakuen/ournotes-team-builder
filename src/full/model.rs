@@ -915,12 +915,10 @@ impl<'a> Model<'a> {
             });
         }
         let steady_rows = effects.iter().all(|effect| !self.rows[effect.row].while_executing);
-        self.condition.push(CondSkill {
-            member,
-            skill_type,
-            steady_rows,
-            updater: ConditionUpdater::new(effects, gate)?,
-        });
+        let updater = ConditionUpdater::new(effects, gate)?;
+        if !updater.is_inactive() {
+            self.condition.push(CondSkill { member, skill_type, steady_rows, updater });
+        }
         Ok(())
     }
     pub(crate) fn set_event_members(&mut self, events: &[(usize, i32)]) {
@@ -1052,9 +1050,18 @@ impl<'a> Model<'a> {
     pub fn frame(&mut self, time: i32, judged: &[JudgedNote], dt: f64) -> Result<(), String> {
         self.frame_inner::<false, false>(time, judged, dt).map(|_| ())
     }
-    pub(crate) fn can_record_lottery(&self) -> bool {
-        self.live.is_empty() && self.rows.iter().all(|row|
-            (11000..=11005).contains(&row.kind) || matches!(row.kind, 2000 | 2002 | 2004 | 2005 | 4004))
+    pub(crate) fn prepare_lottery_record(&mut self) -> bool {
+        let supported = self.live.is_empty() && self.rows.iter().all(|row|
+            (11000..=11005).contains(&row.kind) || matches!(row.kind, 2000 | 2002 | 2004 | 2005 | 3004 | 4004))
+            && self.condition.iter().flat_map(|skill| &skill.updater.effects).all(|effect| {
+                !matches!(effect.cumulative, Some(Cumulative::Combo { .. }))
+                    && [&effect.trigger, &effect.condition, &effect.release, &effect.reset]
+                        .into_iter().flatten().all(|checker| !checker.reads_combo_or_just())
+            });
+        if supported {
+            self.gk.as_mut().unwrap().controller.only_lottery_scores();
+        }
+        supported
     }
     pub(crate) fn record_lottery_frame(&mut self, time: i32, judged: &[JudgedNote], dt: f64) -> Result<(), String> {
         debug_assert!(self.score.score.record_only && self.score.score.factored_record);

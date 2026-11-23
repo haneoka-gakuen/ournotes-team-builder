@@ -428,6 +428,20 @@ fn ordinary_row(master: &Master, row: &SkillEffect) -> bool {
             .get(&row.cumulative_id)
             .is_some_and(|counter| !(7000..=7002).contains(&counter.kind)))
 }
+fn fixed_damage_reduction(master: &Master, row: &SkillEffect) -> bool {
+    let condition_is = |group: i32, kind: i32| {
+        master.condition_sets.get(&group).is_some_and(|sets| {
+            matches!(sets.as_slice(), [set] if matches!(set.as_slice(), [id]
+                if master.conditions.get(id).is_some_and(|condition| condition.kind == kind && condition.positive)))
+        })
+    };
+    row.kind == 3004 && row.trigger_type == 2 && row.seconds == 0.0
+        && row.cumulative_id == 0 && row.execute_limit == 0 && row.reset_group == 0
+        && condition_is(row.trigger_group, 7020)
+        && (row.release_group == 0 || condition_is(row.release_group, 7013))
+        && (row.condition_group == 0 || master.condition_sets.get(&row.condition_group)
+            .is_some_and(|sets| sets.iter().flatten().all(|id| master.conditions[id].kind == 5000)))
+}
 fn ordinary(master: &Master, actor: &Performer) -> Option<(bool, bool)> {
     if let Some((id, level)) = actor.live_skill {
         if master
@@ -562,7 +576,7 @@ fn ignore_dead_heal_order(master: &Master, chart: &Chart, deck: &[Performer], se
         skill.effects.iter().filter(move |row| row.level == level && (skill.mission_type == 4 || chart.setup.missions.contains(&skill.mission_type)))
     }))).collect();
     let fast = chart.setup.fevers.iter().all(|&(start, _)| start >= first)
-        && !gk.iter().any(|row| matches!(row.kind, 3000..=3004))
+        && !gk.iter().any(|row| matches!(row.kind, 3000..=3004) && !fixed_damage_reduction(master, row))
         && gk.iter().filter(|row| matches!(row.kind, 12006 | 13005))
             .all(|row| matches!(row.trigger_type, 1 | 2) && gate(row.trigger_group, &[7010, 7013, 7020]))
         && normal.iter().flatten().all(|row| ordinary_row(master, row)
@@ -1006,6 +1020,7 @@ fn control_program(master: &Master, chart: &Chart, deck: &[Performer]) -> Vec<u6
     }
     result
 }
+
 fn context(
     master: &Master,
     control: &Master,
@@ -1087,9 +1102,10 @@ fn context(
                 .flat_map(|(skill, level)| skill.effects.iter().filter(move |row| row.level == level))
                 .all(|row| (2000..=2005).contains(&row.kind)
                     || (11000..=11005).contains(&row.kind)
+                    || fixed_damage_reduction(control, row)
                     || matches!(row.kind, 4004 | 12000 | 12002 | 12003 | 12004 | 13000 | 13002 | 13003 | 13004))
     });
-    let sampled = if fixed_inputs {
+    let mut sampled = if fixed_inputs {
         let mut actors = reduced.clone();
         for actor in &mut actors { actor.support_skills.clear(); }
         let mut model = Model::new(control, &actors, &chart.full.notes, &key.events,
@@ -1101,7 +1117,7 @@ fn context(
         Some(model)
     } else { None };
     let lottery_record = chart.setup.missions.iter().all(|&mission| mission == 2)
-        && sampled.as_ref().is_some_and(Model::can_record_lottery);
+        && sampled.as_mut().is_some_and(Model::prepare_lottery_record);
     let mut prepared: Option<Vec<FixedFrame>> = None;
     let mut prepared_next = Vec::new();
     let mut note_life = if fixed_inputs { vec![0; chart.full.notes.len() + 1] } else { Vec::new() };
@@ -1277,6 +1293,14 @@ struct ScoreTree<'a, 'o> {
     reuse_ordinary: bool,
 }
 impl<'a> ScoreTree<'a, '_> {
+    fn select_ordinary_tape(&self, state: &mut ScoreState<'a>, order: usize) {
+        let tape = self.ordinary.as_ref().unwrap()[order].as_ref().unwrap();
+        state.ordinary_at = tape.partition_point(|&(frame, _)| frame < state.frame);
+        state.next_frame = tape.get(state.ordinary_at)
+            .map_or(i32::MAX, |&(frame, _)| self.chart.play.frames[frame].time_ms);
+        state.ordinary_replay = Some(Arc::clone(tape));
+    }
+
     fn calculate(&self, state: &mut ScoreState<'a>, time: i32) -> Result<(), String> {
         state.last[0] = state.last[1];
         let gekiso = state.gekiso_combo.as_ref().map(|combo| combo as &dyn crate::full::score::GekisoCombo);
@@ -1441,10 +1465,7 @@ impl<'a> ScoreTree<'a, '_> {
             program.set_event_members(&events);
         }
         if self.reuse_ordinary {
-            let tape = self.ordinary.as_ref().unwrap()[orders[0]].as_ref().unwrap();
-            state.ordinary_at = tape.partition_point(|&(frame, _)| frame < state.frame);
-            state.next_frame = tape.get(state.ordinary_at).map_or(i32::MAX, |&(frame, _)| self.chart.play.frames[frame].time_ms);
-            state.ordinary_replay = Some(Arc::clone(tape));
+            self.select_ordinary_tape(&mut state, orders[0]);
         }
         let split = (fixed..self.chronological.len()).find(|&at| {
             let event = self.chart.full.events[self.chronological[at]].0;
@@ -1492,6 +1513,7 @@ fn score_orders<'a>(
     power: i32,
     orders: &[usize],
     (ordinary, ordinary_orders, note_memo): (&'a Master, Option<&mut OrdinaryOrders>, &mut Option<std::rc::Rc<crate::full::score::NoteMemo>>),
+    (prefix_end, prefix): (usize, &mut Option<ScoreState<'a>>),
 ) -> Result<Option<Vec<ReplayValue>>, String> {
     let reuse_ordinary = ordinary_orders.as_ref().is_some_and(|rows| orders.iter().all(|&order| rows[order].is_some()));
     let trace = draw;
@@ -1533,7 +1555,7 @@ fn score_orders<'a>(
     );
     calculator.note_combos.clone_from(&draw.combos);
     calculator.share_note_memo(note_memo, chart.full.notes.len());
-    let state = ScoreState {
+    let mut state = ScoreState {
         program,
         ordinary_record: Vec::new(),
         ordinary_replay: None,
@@ -1564,7 +1586,18 @@ fn score_orders<'a>(
         reuse_ordinary,
     };
     let mut values = vec![(0.0, [0.0; 3]); 120];
-    tree.visit(state, orders, 0, 0, &mut values)?;
+    let mut from = 0;
+    if reuse_ordinary && prefix_end > 0 {
+        if let Some(prior) = prefix.as_ref() {
+            state = prior.clone();
+        } else {
+            tree.select_ordinary_tape(&mut state, orders[0]);
+            tree.advance(&mut state, 0, prefix_end)?;
+            *prefix = Some(state.clone());
+        }
+        from = prefix_end;
+    }
+    tree.visit(state, orders, from, 0, &mut values)?;
     Ok(Some(values))
 }
 pub(super) fn scores(
@@ -1581,7 +1614,6 @@ pub(super) fn scores(
             .missions
             .iter()
             .any(|&mission| !(1..=3).contains(&mission))
-        || chart.setup.missions.contains(&1) && uses_full_replay(master, chart, seeds)
         || chart.luck && seeds.is_empty()
         || !chart.luck && replay_random_skills(master, chart, deck)
     {
@@ -1639,6 +1671,13 @@ pub(super) fn scores(
         }
         groups[group].push(index);
     }
+    // A damaging COMBO play can have a separate controller for every
+    // ordinary order. Split out its score timeline only when the orders share it.
+    if chart.setup.missions.contains(&1) && uses_full_replay(master, chart, seeds)
+        && groups.len() > 1
+    {
+        return Ok(None);
+    }
     let generation = crate::cancellation_generation();
     let mut values = vec![0.0; 120];
     let mut range_values = [[0.0; 3]; 120];
@@ -1659,6 +1698,18 @@ pub(super) fn scores(
         let mut ordinary_orders: OrdinaryOrders = std::array::from_fn(|_| None);
         let reuse_ordinary = context.shared_inputs && draws.iter().skip(1)
             .any(|draw| !Arc::ptr_eq(draw, &draws[0]));
+        let mut sample_prefix = None;
+        let prefix_end = if reuse_ordinary {
+            // Stop before the first ordinary activation. A different control
+            // stream or combo table keeps its own scoring prefix.
+            let first = &draws[0];
+            let end = first.offsets.iter().copied().min().unwrap_or(0).min(first.bytes.len());
+            if draws.iter().skip(1).all(|draw| {
+                draw.offsets.iter().copied().min().is_some_and(|at| at >= end)
+                    && draw.base == first.base && draw.combos == first.combos
+                    && draw.bytes.get(..end) == Some(&first.bytes[..end])
+            }) { end } else { 0 }
+        } else { 0 };
         for draw in draws {
             if generation != crate::cancellation_generation() {
                 return Err("cancelled".into());
@@ -1667,7 +1718,8 @@ pub(super) fn scores(
                 std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     let Some(result) = score_orders(master, chart, deck, draw, power, &orders,
-                        (&ordinary_master, reuse_ordinary.then_some(&mut ordinary_orders), &mut note_memo))? else {
+                        (&ordinary_master, reuse_ordinary.then_some(&mut ordinary_orders), &mut note_memo),
+                        (prefix_end, &mut sample_prefix))? else {
                         return Ok(None);
                     };
                     entry.insert(result)

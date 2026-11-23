@@ -154,10 +154,15 @@ fn draws_random(checker: &Checker) -> bool {
     }
 }
 fn inactive(effect: &Effect) -> bool {
+    let always_false = |checker: &Checker| match &checker.test {
+        Test::Fixed(false) => true,
+        Test::Not(inner) => matches!(inner.test, Test::Fixed(true)),
+        _ => false,
+    };
     effect
         .condition
         .as_ref()
-        .is_some_and(|checker| matches!(checker.test, Test::Fixed(false)))
+        .is_some_and(always_false)
         && !effect.trigger.as_ref().is_some_and(draws_random)
         && !effect.reset.as_ref().is_some_and(draws_random)
 }
@@ -335,6 +340,9 @@ fn effects_lottery_pause(effects: &[Effect]) -> bool {
         })
 }
 impl ConditionUpdater {
+    pub(crate) fn is_inactive(&self) -> bool {
+        self.sorted.is_empty()
+    }
     pub(crate) fn fixed_life(&mut self, life: i32) {
         for effect in &mut self.effects {
             for checker in [

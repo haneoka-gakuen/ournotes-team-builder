@@ -523,6 +523,8 @@ pub(crate) fn score_coefficient_with_weights(
             0.0
         };
         let note_multiplier = add(add(1.0, peak), error);
+        let before_ranges = add(1.0, error);
+        let first_range = chart.setup.fevers.iter().map(|&(start, _)| start).min().unwrap_or(i32::MAX);
         let operations = (10 * max_actions + 1) as f64;
         if operations * u > 0.25 {
             return None;
@@ -575,6 +577,8 @@ pub(crate) fn score_coefficient_with_weights(
         let rush_cap = if chronological_rush && luck_ranges.is_some() {
             f(f((100 + live.gekiso.rush_percent) as f64) / 100.0)
         } else { 2.0 };
+        let gekiso_combo_cap = f(1.0 + live.combo.get(&1).into_iter().flatten()
+            .map(|&(_, bonus)| bonus).fold(0.0_f64, f64::max).min(1.0));
         for (i, note) in chart.notes.iter().enumerate() {
             let frac = chart.note_frac[i];
             let combo = if let Some(weights) = &weights {
@@ -613,7 +617,7 @@ pub(crate) fn score_coefficient_with_weights(
                         && start as i64 - 40 <= note.time_ms as i64
                         && note.time_ms as i64 <= end as i64 + 40
                 }) {
-                2.0
+                gekiso_combo_cap
             } else {
                 1.0
             };
@@ -625,12 +629,18 @@ pub(crate) fn score_coefficient_with_weights(
             let mut c = mul(live.adjustment, chart.difficulty_factor);
             let grade = chart.judgements[i];
             let capped = weights.as_ref().is_some_and(|weights| weights.promotions[grade] < grade_counts.unwrap()[grade]);
+            // These Gekiso bonuses require a range start or an active Rush.
+            let multiplier = if note.time_ms < first_range.saturating_sub(40) {
+                before_ranges
+            } else {
+                note_multiplier
+            };
             for term in [
                 frac,
                 combo,
                 gk,
                 luck,
-                add(note_multiplier, factor),
+                add(multiplier, factor),
                 round_factor,
             ] {
                 c = mul(c, term);

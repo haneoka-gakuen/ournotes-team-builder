@@ -1,5 +1,6 @@
 //! Most-recent-first judgement conversion and activation limits.
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::rc::Rc;
 #[derive(Clone)]
 pub struct Effect {
     pub kind: i32,
@@ -13,7 +14,7 @@ struct Parameter {
     key: Key,
     count: i32,
     maximum: i32,
-    targets: Vec<i32>,
+    targets: Rc<[i32]>,
     to: i32,
 }
 /// Identifies one effect instance: a live skill row of a member's activation, or a condition updater.
@@ -21,45 +22,21 @@ struct Parameter {
 pub struct Key(pub u8, pub i32, pub u32, pub u32);
 #[derive(Clone)]
 pub struct Conversion {
-    no_just: HashSet<i32>,
-    order: Vec<i32>,
-    registered: HashSet<i32>,
-    function_id: i32,
-    ids: HashMap<Key, i32>,
-    parameters: HashMap<i32, Parameter>,
+    no_just: Rc<HashSet<i32>>,
+    active: Vec<Parameter>,
     finished: HashMap<Key, i32>,
-    context: HashMap<i32, Vec<i32>>,
+    context: HashMap<i32, Rc<[i32]>>,
     pub converted: i32,
 }
 impl Conversion {
     pub fn new(no_just: HashSet<i32>) -> Self {
         Self {
-            no_just,
-            order: Vec::new(),
-            registered: HashSet::default(),
-            function_id: 0,
-            ids: HashMap::default(),
-            parameters: HashMap::default(),
+            no_just: Rc::new(no_just),
+            active: Vec::new(),
             finished: HashMap::default(),
             context: HashMap::default(),
             converted: 0,
         }
-    }
-    fn register(&mut self) -> i32 {
-        self.function_id += 1;
-        let id = self.function_id;
-        self.registered.insert(id);
-        self.order.insert(0, id);
-        id
-    }
-    fn unregister(&mut self, id: i32) -> Result<(), String> {
-        if !self.registered.remove(&id) {
-            return Err(format!("judgement convert function {id} is not registered"));
-        }
-        if let Some(index) = self.order.iter().position(|&i| i == id) {
-            self.order.remove(index);
-        }
-        Ok(())
     }
     pub fn convert(
         &mut self,
@@ -67,52 +44,23 @@ impl Conversion {
         judgement_type: i32,
         time: i32,
     ) -> Result<i32, String> {
-        let mut i = 0;
-        while i < self.order.len() {
-            let id = self.order[i];
-            if !self.registered.contains(&id) {
-                i += 1;
+        for index in (0..self.active.len()).rev() {
+            let parameter = &mut self.active[index];
+            if parameter.to == -1 || parameter.to == judgement || !parameter.targets.contains(&judgement)
+                || (parameter.to == 6 && self.no_just.contains(&judgement_type))
+            {
                 continue;
             }
-            let out = self.try_convert(id, judgement, judgement_type, time)?;
-            if out != judgement {
-                return Ok(out);
+            parameter.count += 1;
+            let to = parameter.to;
+            if parameter.maximum > 0 && parameter.maximum <= parameter.count {
+                let key = self.active.remove(index).key;
+                self.finished.insert(key, time);
             }
-            if i < self.order.len() && self.order[i] == id {
-                i += 1;
-            }
+            self.converted += 1;
+            return Ok(to);
         }
         Ok(judgement)
-    }
-    fn try_convert(
-        &mut self,
-        id: i32,
-        current: i32,
-        judgement_type: i32,
-        time: i32,
-    ) -> Result<i32, String> {
-        let Some(parameter) = self.parameters.get_mut(&id) else {
-            return Ok(current);
-        };
-        if parameter.to == -1
-            || !parameter.targets.contains(&current)
-            || current == parameter.to
-            || (parameter.to == 6 && self.no_just.contains(&judgement_type))
-        {
-            return Ok(current);
-        }
-        parameter.count += 1;
-        let to = parameter.to;
-        let key = parameter.key;
-        let complete = parameter.maximum > 0 && parameter.maximum <= parameter.count;
-        if complete {
-            self.unregister(id)?;
-            self.ids.remove(&key);
-            self.parameters.remove(&id);
-            self.finished.insert(key, time);
-        }
-        self.converted += 1;
-        Ok(to)
     }
     pub fn update(
         &mut self,
@@ -125,15 +73,14 @@ impl Conversion {
             state = 4;
         }
         if state == 4 {
-            if let Some(id) = self.ids.remove(&key) {
-                self.unregister(id)?;
-                self.parameters.remove(&id);
+            if let Some(index) = self.active.iter().position(|parameter| parameter.key == key) {
+                self.active.remove(index);
             }
         } else if state == 2 {
             let targets = self
                 .context
                 .entry(effect.id)
-                .or_insert_with(|| effect.targets.clone())
+                .or_insert_with(|| Rc::from(effect.targets.as_slice()))
                 .clone();
             let to = if effect.kind == 13005 {
                 6
@@ -142,21 +89,10 @@ impl Conversion {
             } else {
                 -1
             };
-            let id = self.register();
-            if self.ids.contains_key(&key) {
+            if self.active.iter().any(|parameter| parameter.key == key) {
                 return Err("judgement convert state registered twice".into());
             }
-            self.ids.insert(key, id);
-            self.parameters.insert(
-                id,
-                Parameter {
-                    key,
-                    count: 0,
-                    maximum: effect.limit,
-                    targets,
-                    to,
-                },
-            );
+            self.active.push(Parameter { key, count: 0, maximum: effect.limit, targets, to });
         }
         Ok(finished)
     }

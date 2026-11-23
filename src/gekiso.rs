@@ -2618,6 +2618,7 @@ struct ReplayLayout {
     chronological: Vec<usize>,
     live_capacity: [usize; 5],
     multiplicities: Vec<usize>,
+    branches: Mutex<HashMap<Vec<usize>, Arc<ReplayBranch>>>,
 }
 
 fn replay_layout(chart: &Chart, orders: &[usize]) -> Result<ReplayLayout, String> {
@@ -2659,7 +2660,8 @@ fn replay_layout(chart: &Chart, orders: &[usize]) -> Result<ReplayLayout, String
     for &index in &indices {
         multiplicities[index] += 1;
     }
-    Ok(ReplayLayout { events: chart.full.events.clone(), event_orders, indices, chronological, live_capacity, multiplicities })
+    Ok(ReplayLayout { events: chart.full.events.clone(), event_orders, indices, chronological,
+        live_capacity, multiplicities, branches: Mutex::new(HashMap::default()) })
 }
 
 fn replay_selected_orders(
@@ -2676,7 +2678,8 @@ fn replay_selected_orders(
     }
     let generation = crate::cancellation_generation();
     let local;
-    let layout = if orders.len() == live::orders().len() && orders.iter().copied().eq(0..orders.len()) {
+    let full = orders.len() == live::orders().len() && orders.iter().copied().eq(0..orders.len());
+    let layout = if full {
         if chart.replay_layout.get().is_none() {
             let _ = chart.replay_layout.set(replay_layout(chart, orders)?);
         }
@@ -2728,22 +2731,36 @@ fn replay_selected_orders(
     };
     let batches = crate::parallel::map(&jobs, |orders| -> Result<_, String> {
         let mut totals = vec![(0.0, [0.0; 3]); event_orders.len()];
-        let prepared = (runs.len() > 1).then(|| tree.prepare_branch(orders.clone(), 0, 0));
+        let prepared = (full || runs.len() > 1).then(|| {
+            let mut branches = layout.branches.lock().unwrap();
+            if let Some(plan) = branches.get(orders) { return Arc::clone(plan); }
+            let plan = Arc::new(tree.prepare_branch(orders.clone(), 0, 0));
+            branches.insert(orders.clone(), Arc::clone(&plan));
+            plan
+        });
         let mut values = vec![(0.0, [0.0; 3]); event_orders.len()];
-        for &seed in runs {
-            let mut params = chart.params();
-            params.power = power;
-            params.music_type = chart.music_type;
-            let mut model = Model::with_live_capacity(
-                master,
-                deck,
-                &chart.full.notes,
-                &event_orders[orders[0]],
-                params,
-                Some(&chart.setup),
-                (seed, false, Some(&layout.live_capacity)),
-            )?;
-            chart.fixed_life(&mut model);
+        let mut params = chart.params();
+        params.power = power;
+        let mut template = Model::with_live_capacity(
+            master,
+            deck,
+            &chart.full.notes,
+            &event_orders[orders[0]],
+            params,
+            Some(&chart.setup),
+            (runs[0], false, Some(&layout.live_capacity)),
+        )?;
+        chart.fixed_life(&mut template);
+        let mut memo = None;
+        template.score.score.calculator.share_note_memo(&mut memo, chart.full.notes.len());
+        let mut template = Some(template);
+        for (index, &seed) in runs.iter().enumerate() {
+            let mut model = if index + 1 == runs.len() {
+                template.take().unwrap()
+            } else {
+                template.as_ref().unwrap().clone()
+            };
+            model.random = Random::new(seed);
             let complete = if let Some(plan) = &prepared {
                 tree.visit_prepared(model, plan, &mut values)?
             } else {
