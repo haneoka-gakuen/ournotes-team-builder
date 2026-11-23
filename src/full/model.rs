@@ -119,8 +119,8 @@ struct ComboObserver {
 struct ConditionInputs {
     always: u64,
     ungated: u64,
-    missions: HashMap<i32, u64>,
-    members: HashMap<usize, u64>,
+    missions: [u64; 5],
+    members: Vec<u64>,
     ranges: u64,
     lottery: u64,
     judgements: u64,
@@ -141,14 +141,15 @@ impl ConditionSchedule {
             let bit = 1u64 << i;
             match condition.updater.gate {
                 None | Some(gekisou::MISSION_ALL) => inputs.ungated |= bit,
-                Some(mission) => *inputs.missions.entry(mission).or_default() |= bit,
+                Some(mission) => *inputs.missions.get_mut(mission as usize)? |= bit,
             }
             let Some(idle) = condition.updater.idle_inputs() else {
                 inputs.always |= bit;
                 continue;
             };
             for &member in &idle.members {
-                *inputs.members.entry(member).or_default() |= bit;
+                if member >= inputs.members.len() { inputs.members.resize(member + 1, 0); }
+                inputs.members[member] |= bit;
             }
             if idle.ranges {
                 inputs.ranges |= bit;
@@ -178,7 +179,7 @@ impl ConditionSchedule {
         let inputs = &self.inputs;
         let mut selected = inputs.always;
         for &(member, _) in events {
-            selected |= inputs.members.get(&member).copied().unwrap_or(0);
+            selected |= inputs.members.get(member).copied().unwrap_or(0);
         }
         if judged {
             selected |= inputs.judgements;
@@ -199,13 +200,13 @@ impl ConditionSchedule {
             for &i in &g.controller.updates {
                 gated |= inputs
                     .missions
-                    .get(&g.controller.ranges[i].mission)
+                    .get(g.controller.ranges[i].mission as usize)
                     .copied()
                     .unwrap_or(0);
             }
             if g.controller.current_playing >= 0 {
                 let mission = g.controller.ranges[g.controller.current_playing as usize].mission;
-                gated |= inputs.missions.get(&mission).copied().unwrap_or(0);
+                gated |= inputs.missions.get(mission as usize).copied().unwrap_or(0);
             }
             selected &= gated;
         }

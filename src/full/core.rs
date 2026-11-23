@@ -1,6 +1,7 @@
 //! Native numeric conversions, .NET random streams, combo and life replay.
 use crate::num::f;
 use std::collections::BTreeMap;
+use std::rc::Rc;
 pub const I32_MIN: i32 = i32::MIN;
 pub fn sat_i32(x: f64) -> i32 {
     x as i32
@@ -257,11 +258,13 @@ pub struct Life {
     frames: usize,
     // The measured WASM hot path uses compact ordered buckets; native keeps its tree.
     #[cfg(not(target_arch = "wasm32"))]
-    commands: BTreeMap<usize, Vec<Command>>,
+    commands: BTreeMap<usize, Rc<Vec<Command>>>,
     #[cfg(target_arch = "wasm32")]
-    commands: Vec<(usize, Vec<Command>)>,
+    commands: Vec<(usize, Rc<Vec<Command>>)>,
     cached_frame: i32,
     cached: [i32; 3],
+    dead_since: Option<i32>,
+    has_recovery: bool,
 }
 impl Life {
     pub fn new(initial: i32, damage: [f64; 7], music_length: i32) -> Self {
@@ -286,6 +289,8 @@ impl Life {
             commands: Vec::new(),
             cached_frame: -1,
             cached: [0; 3],
+            dead_since: None,
+            has_recovery: false,
         }
     }
     pub fn maximum(&self) -> i32 {
@@ -303,8 +308,11 @@ impl Life {
     }
     #[cfg(not(target_arch = "wasm32"))]
     fn add(&mut self, command: Command) {
+        if self.dead_since.is_some_and(|time| command.time <= time) {
+            self.dead_since = None;
+        }
         let frame = self.frame_of(command.time);
-        let commands = self.commands.entry(frame).or_default();
+        let commands = Rc::make_mut(self.commands.entry(frame).or_default());
         let at = commands.partition_point(|c| c.time <= command.time);
         commands.insert(at, command);
         if frame as i32 <= self.cached_frame {
@@ -315,15 +323,18 @@ impl Life {
 
     #[cfg(target_arch = "wasm32")]
     fn add(&mut self, command: Command) {
+        if self.dead_since.is_some_and(|time| command.time <= time) {
+            self.dead_since = None;
+        }
         let frame = self.frame_of(command.time);
         let index = match self.commands.binary_search_by_key(&frame, |(at, _)| *at) {
             Ok(index) => index,
             Err(index) => {
-                self.commands.insert(index, (frame, Vec::new()));
+                self.commands.insert(index, (frame, Rc::default()));
                 index
             }
         };
-        let commands = &mut self.commands[index].1;
+        let commands = Rc::make_mut(&mut self.commands[index].1);
         let at = commands.partition_point(|c| c.time <= command.time);
         commands.insert(at, command);
         if frame as i32 <= self.cached_frame {
@@ -349,6 +360,7 @@ impl Life {
     }
     pub fn recovery(&mut self, time: i32, amount: i32, over_heal: bool) {
         if amount > 0 {
+            self.has_recovery = true;
             self.add(Command {
                 time,
                 kind: Kind::Recovery,
@@ -406,6 +418,7 @@ impl Life {
         }
     }
     fn update_maximum(&mut self) {
+        self.dead_since = None;
         let sum = self
             .limits
             .values()
@@ -471,6 +484,7 @@ impl Life {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn at(&mut self, time: i32) -> i32 {
         if let Some(values) = self.frozen { return values[self.frozen_phase].0; }
+        if self.dead_since.is_some_and(|dead| dead <= time) { return 0; }
         if self.commands.is_empty() {
             return self.initial;
         }
@@ -483,7 +497,7 @@ impl Life {
             (self.cached, (c + 1) as usize)
         };
         for commands in self.commands.range(start..frame.max(start)).map(|(_, v)| v) {
-            for command in commands {
+            for command in commands.iter() {
                 self.step(&mut state, command);
             }
         }
@@ -491,18 +505,22 @@ impl Life {
             self.cached_frame = frame as i32 - 1;
             self.cached = state;
         }
-        for command in self.commands.get(&frame).into_iter().flatten() {
+        for command in self.commands.get(&frame).into_iter().flat_map(|commands| commands.iter()) {
             if command.time > time {
                 break;
             }
             self.step(&mut state, command);
         }
+        // Once zero was reached without any recovery, a later change to
+        // maximum LIFE cannot change that history.
+        if !full && !self.has_recovery && state[0] == 0 { self.dead_since = Some(time); }
         state[0]
     }
 
     #[cfg(target_arch = "wasm32")]
     pub fn at(&mut self, time: i32) -> i32 {
         if let Some(values) = self.frozen { return values[self.frozen_phase].0; }
+        if self.dead_since.is_some_and(|dead| dead <= time) { return 0; }
         if self.commands.is_empty() {
             return self.initial;
         }
@@ -523,7 +541,7 @@ impl Life {
             self.commands[..end].partition_point(|(at, _)| *at < start)
         };
         for (_, commands) in &self.commands[begin..end] {
-            for command in commands {
+            for command in commands.iter() {
                 self.step(&mut state, command);
             }
         }
@@ -536,13 +554,14 @@ impl Life {
             .get(end)
             .filter(|(at, _)| *at == frame)
             .into_iter()
-            .flat_map(|(_, commands)| commands)
+            .flat_map(|(_, commands)| commands.iter())
         {
             if command.time > time {
                 break;
             }
             self.step(&mut state, command);
         }
+        if !full && !self.has_recovery && state[0] == 0 { self.dead_since = Some(time); }
         state[0]
     }
     pub fn sync(&mut self, time: i32) {

@@ -58,6 +58,7 @@ pub struct Chart {
     pub(crate) deterministic_ranges: OnceLock<Option<Vec<(i32, i32)>>>,
     pub(crate) factor_operations: OnceLock<usize>,
     sparse_inputs: OnceLock<Vec<usize>>,
+    replay_layout: OnceLock<ReplayLayout>,
     curves: HashMap<Vec<u64>, Arc<Recorded>>,
     curve_bytes: usize,
     /// Lottery frame streams by their recorded range states: decks almost always share one.
@@ -366,6 +367,7 @@ impl Chart {
             deterministic_ranges: OnceLock::new(),
             factor_operations: OnceLock::new(),
             sparse_inputs: OnceLock::new(),
+            replay_layout: OnceLock::new(),
             curves: HashMap::default(),
             curve_bytes: 0,
             frame_streams: HashMap::default(),
@@ -418,6 +420,7 @@ impl Chart {
             deterministic_ranges: self.deterministic_ranges.clone(),
             factor_operations: self.factor_operations.clone(),
             sparse_inputs: self.sparse_inputs.clone(),
+            replay_layout: OnceLock::new(),
             curves: HashMap::default(),
             curve_bytes: 0,
             frame_streams: HashMap::default(),
@@ -2280,6 +2283,16 @@ struct OrderSplit {
     frame: usize,
     end: usize,
 }
+struct ReplayBranch {
+    representative: usize,
+    from: usize,
+    until: usize,
+    next: ReplayBranchEnd,
+}
+enum ReplayBranchEnd {
+    Orders(Vec<usize>),
+    Split(Vec<ReplayBranch>),
+}
 
 impl<const SECTIONS:bool,const COUNTS:bool> ReplayTree<'_,SECTIONS,COUNTS> {
     fn advance(&self, model: &mut Model<'_>, from: usize, to: usize) -> Result<bool, String> {
@@ -2333,6 +2346,61 @@ impl<const SECTIONS:bool,const COUNTS:bool> ReplayTree<'_,SECTIONS,COUNTS> {
         groups.into_values()
     }
 
+    fn prepare_branch(&self, orders: Vec<usize>, from: usize, fixed: usize) -> ReplayBranch {
+        let representative = orders[0];
+        if let Some(split) = self.order_split(&orders, fixed) {
+            let children = self.order_groups(&orders, &split)
+                .map(|group| self.prepare_branch(group, split.frame, split.end)).collect();
+            ReplayBranch { representative, from, until: split.frame, next: ReplayBranchEnd::Split(children) }
+        } else {
+            ReplayBranch { representative, from, until: self.chart.play.frames.len(), next: ReplayBranchEnd::Orders(orders) }
+        }
+    }
+
+    fn complete_orders(&self, model: &Model<'_>, orders: &[usize], values: &mut [ReplayValue]) -> bool {
+        if let Some(detail) = self.detail { detail(model, orders); }
+        let mut ranges = [0.0; 3];
+        if let Some(g) = &model.gk {
+            for (score, state) in ranges.iter_mut().zip(&g.controller.states) {
+                *score = state.score() as f64;
+            }
+        }
+        let score = model.score.score.score as f64;
+        if self.observe.is_some_and(|observe| {
+            !observe(
+                score,
+                orders.iter().map(|&order| self.multiplicities[order]).sum(),
+                orders.iter().fold(0.0_f64, |sum, &order| (sum + self.upper[order]).next_down()),
+            )
+        }) {
+            self.stopped.store(true, Ordering::Relaxed);
+            return false;
+        }
+        for &order in orders {
+            values[order] = (score, ranges);
+        }
+        true
+    }
+
+    fn visit_prepared(&self, mut model: Model<'_>, branch: &ReplayBranch, values: &mut [ReplayValue]) -> Result<bool, String> {
+        if self.stopped.load(Ordering::Relaxed) || !self.advance(&mut model, branch.from, branch.until)? {
+            return Ok(false);
+        }
+        match &branch.next {
+            ReplayBranchEnd::Orders(orders) => Ok(self.complete_orders(&model, orders, values)),
+            ReplayBranchEnd::Split(children) => {
+                let (last, others) = children.split_last().unwrap();
+                for child in others {
+                    let mut copy = model.clone();
+                    copy.set_event_members(&self.events[child.representative]);
+                    if !self.visit_prepared(copy, child, values)? { return Ok(false); }
+                }
+                model.set_event_members(&self.events[last.representative]);
+                self.visit_prepared(model, last, values)
+            }
+        }
+    }
+
     fn visit(
         &self,
         mut model: Model<'_>,
@@ -2358,28 +2426,7 @@ impl<const SECTIONS:bool,const COUNTS:bool> ReplayTree<'_,SECTIONS,COUNTS> {
             return Ok(false);
         }
         let Some(split) = split else {
-            if let Some(detail) = self.detail { detail(&model, orders); }
-            let mut ranges = [0.0; 3];
-            if let Some(g) = &model.gk {
-                for (score, state) in ranges.iter_mut().zip(&g.controller.states) {
-                    *score = state.score() as f64;
-                }
-            }
-            let score = model.score.score.score as f64;
-            if self.observe.is_some_and(|observe| {
-                !observe(
-                    score,
-                    orders.iter().map(|&order| self.multiplicities[order]).sum(),
-                    orders.iter().fold(0.0_f64, |sum, &order| (sum + self.upper[order]).next_down()),
-                )
-            }) {
-                self.stopped.store(true, Ordering::Relaxed);
-                return Ok(false);
-            }
-            for &order in orders {
-                values[order] = (score, ranges);
-            }
-            return Ok(true);
+            return Ok(self.complete_orders(&model, orders, values));
         };
         let mut groups = self.order_groups(orders, &split).peekable();
         while let Some(orders) = groups.next() {
@@ -2563,19 +2610,16 @@ pub(crate) fn replay_order_subset(
     replay_selected_orders(master, chart, deck, &[0], power, orders, None).map(Option::unwrap)
 }
 
-fn replay_selected_orders(
-    master: &Master,
-    chart: &Chart,
-    deck: &[Performer],
-    runs: &[i32],
-    power: i32,
-    orders: &[usize],
-    observation: Option<(&[f64], &ReplayObserver<'_>)>,
-) -> Result<Option<Vec<ReplayValue>>, String> {
-    if orders.is_empty() {
-        return Ok(Some(Vec::new()));
-    }
-    let generation = crate::cancellation_generation();
+struct ReplayLayout {
+    events: Vec<(usize, i32)>,
+    event_orders: Vec<Vec<(usize, i32)>>,
+    indices: Vec<usize>,
+    chronological: Vec<usize>,
+    live_capacity: [usize; 5],
+    multiplicities: Vec<usize>,
+}
+
+fn replay_layout(chart: &Chart, orders: &[usize]) -> Result<ReplayLayout, String> {
     let mut event_orders = Vec::new();
     let mut indices = Vec::with_capacity(orders.len());
     let mut cache = HashMap::default();
@@ -2610,23 +2654,54 @@ fn replay_selected_orders(
         for (maximum, count) in live_capacity.iter_mut().zip(counts) { *maximum = (*maximum).max(count); }
     }
     chronological.sort_by_key(|&event| (chart.full.events[event].1, event));
-    let mut upper = vec![0.0_f64; event_orders.len()];
-    if let Some((ceilings, _)) = observation {
-        for (&index, &value) in indices.iter().zip(ceilings) { upper[index] = (upper[index] + value).next_down(); }
-    }
     let mut multiplicities = vec![0; event_orders.len()];
     for &index in &indices {
         multiplicities[index] += 1;
     }
+    Ok(ReplayLayout { events: chart.full.events.clone(), event_orders, indices, chronological, live_capacity, multiplicities })
+}
+
+fn replay_selected_orders(
+    master: &Master,
+    chart: &Chart,
+    deck: &[Performer],
+    runs: &[i32],
+    power: i32,
+    orders: &[usize],
+    observation: Option<(&[f64], &ReplayObserver<'_>)>,
+) -> Result<Option<Vec<ReplayValue>>, String> {
+    if orders.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    let generation = crate::cancellation_generation();
+    let local;
+    let layout = if orders.len() == live::orders().len() && orders.iter().copied().eq(0..orders.len()) {
+        if chart.replay_layout.get().is_none() {
+            let _ = chart.replay_layout.set(replay_layout(chart, orders)?);
+        }
+        let shared = chart.replay_layout.get().unwrap();
+        if shared.events == chart.full.events { shared }
+        else { local = replay_layout(chart, orders)?; &local }
+    } else {
+        local = replay_layout(chart, orders)?;
+        &local
+    };
+    let event_orders = &layout.event_orders;
+    let mut upper = vec![0.0_f64; event_orders.len()];
+    if let Some((ceilings, _)) = observation {
+        for (&index, &value) in layout.indices.iter().zip(ceilings) {
+            upper[index] = (upper[index] + value).next_down();
+        }
+    }
     let tree = ReplayTree::<false> {
         deadline: f64::INFINITY,
         chart,
-        events: &event_orders,
-        chronological,
+        events: event_orders,
+        chronological: layout.chronological.clone(),
         generation,
         observe: observation.map(|(_, observer)| observer),
         upper: &upper,
-        multiplicities: &multiplicities,
+        multiplicities: &layout.multiplicities,
         stopped: AtomicBool::new(false),
         detail: None,
     };
@@ -2652,6 +2727,8 @@ fn replay_selected_orders(
     };
     let batches = crate::parallel::map(&jobs, |orders| -> Result<_, String> {
         let mut totals = vec![(0.0, [0.0; 3]); event_orders.len()];
+        let prepared = (runs.len() > 1).then(|| tree.prepare_branch(orders.clone(), 0, 0));
+        let mut values = vec![(0.0, [0.0; 3]); event_orders.len()];
         for &seed in runs {
             let mut params = chart.params();
             params.power = power;
@@ -2663,11 +2740,15 @@ fn replay_selected_orders(
                 &event_orders[orders[0]],
                 params,
                 Some(&chart.setup),
-                (seed, false, Some(&live_capacity)),
+                (seed, false, Some(&layout.live_capacity)),
             )?;
             chart.fixed_life(&mut model);
-            let mut values = vec![(0.0, [0.0; 3]); event_orders.len()];
-            if !tree.visit(model, orders, 0, 0, &mut values)? {
+            let complete = if let Some(plan) = &prepared {
+                tree.visit_prepared(model, plan, &mut values)?
+            } else {
+                tree.visit(model, orders, 0, 0, &mut values)?
+            };
+            if !complete {
                 return Ok(None);
             }
             for &order in orders {
@@ -2702,7 +2783,7 @@ fn replay_selected_orders(
             replays[order] = value;
         }
     }
-    Ok(Some(indices.iter().map(|&i| replays[i]).collect()))
+    Ok(Some(layout.indices.iter().map(|&i| replays[i]).collect()))
 }
 
 pub(crate) fn settle_extreme(

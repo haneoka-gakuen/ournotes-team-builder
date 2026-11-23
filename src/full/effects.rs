@@ -310,7 +310,8 @@ pub struct ConditionUpdater {
     executing: Vec<usize>,
     execute_count: HashMap<i32, i32>,
     trigger_checked: bool,
-    cache: Vec<Option<Trigger>>,
+    triggers_active: bool,
+    cache: Vec<Trigger>,
     idle_inputs: Option<IdleInputs>,
     second_phase: bool,
     first_phase: bool,
@@ -411,7 +412,8 @@ impl ConditionUpdater {
         } else {
             Some(IdleInputs::default())
         };
-        for effect in &effects {
+        for &index in &sorted {
+            let effect = &effects[index];
             let input = effect.trigger.as_ref().and_then(Checker::idle_input);
             if idle.is_none()
                 || effect.trigger_type != ONE_SHOT
@@ -426,8 +428,8 @@ impl ConditionUpdater {
         let range_stable = effects_range_stable(&effects);
         let lottery_pause = effects_lottery_pause(&effects);
         let count = effects.len();
-        let second_phase = effects.iter().any(|effect| effect.phase == 2);
-        let first_phase = effects.iter().any(|effect| effect.phase == 1);
+        let second_phase = sorted.iter().any(|&index| effects[index].phase == 2);
+        let first_phase = sorted.iter().any(|&index| effects[index].phase == 1);
         Ok(Self {
             effects,
             gate,
@@ -439,7 +441,8 @@ impl ConditionUpdater {
             executing: Vec::new(),
             execute_count: HashMap::default(),
             trigger_checked: false,
-            cache: vec![None; count],
+            triggers_active: false,
+            cache: vec![Trigger::default(); count],
             idle_inputs: idle,
             second_phase,
             first_phase,
@@ -456,7 +459,8 @@ impl ConditionUpdater {
         !self.executing.is_empty()
     }
     pub(crate) fn inputs_only(&self, recorded: bool) -> bool {
-        self.effects.iter().all(|effect| {
+        self.sorted.iter().all(|&index| {
+            let effect = &self.effects[index];
             [&effect.trigger, &effect.condition, &effect.release, &effect.reset].into_iter().flatten().all(|checker| checker.inputs_only(recorded))
                 && !matches!(effect.cumulative, Some(Cumulative::Elapsed { .. }))
         })
@@ -482,6 +486,7 @@ impl ConditionUpdater {
     }
     pub fn begin_frame(&mut self) {
         self.trigger_checked = false;
+        self.triggers_active = false;
         self.quiet = false;
     }
     fn update_one(
@@ -535,11 +540,10 @@ impl ConditionUpdater {
         input: &FrameInput,
         ctx: &mut Context<'_>,
         checked_gate: Option<bool>,
-    ) -> Result<bool, String> {
+    ) -> Result<(), String> {
         self.trigger_checked = true;
-        self.cache.fill(None);
         if input.finished || !checked_gate.map_or_else(|| mission_gate(self.gate, ctx), Ok)? {
-            return Ok(false);
+            return Ok(());
         }
         if self
             .idle_inputs
@@ -549,7 +553,7 @@ impl ConditionUpdater {
             for &index in &self.sorted {
                 self.effects[index].trigger.as_mut().unwrap().override_time = None;
             }
-            return Ok(false);
+            return Ok(());
         }
         for &index in &self.resets {
             let effect = &mut self.effects[index];
@@ -558,7 +562,7 @@ impl ConditionUpdater {
             }
         }
         for &e in &self.sorted {
-            self.cache[e] = Some(if let Some(checker) = &mut self.effects[e].trigger {
+            self.cache[e] = if let Some(checker) = &mut self.effects[e].trigger {
                 let hit = checker.check(ctx)?.0;
                 Trigger {
                     hit,
@@ -566,9 +570,10 @@ impl ConditionUpdater {
                 }
             } else {
                 Trigger::default()
-            });
+            };
         }
-        Ok(true)
+        self.triggers_active = true;
+        Ok(())
     }
     #[inline(always)]
     pub fn update(
@@ -613,15 +618,16 @@ impl ConditionUpdater {
                 }
             }
         }
-        if !self.trigger_checked && !self.prepare_triggers(input, ctx, checked_gate)? {
+        if !self.trigger_checked {
+            self.prepare_triggers(input, ctx, checked_gate)?;
+        }
+        if !self.triggers_active {
             self.finish(&done);
             return Ok(());
         }
         for k in 0..self.sorted.len() {
             let e = self.sorted[k];
-            let Some(trigger) = self.cache[e] else {
-                continue;
-            };
+            let trigger = self.cache[e];
             let effect = &self.effects[e];
             if effect.trigger_type == SUSTAINED {
                 if phase < 1 || effect.phase == phase {
