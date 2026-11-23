@@ -1,5 +1,6 @@
 //! Gekiso context caches and safe level/support bounds for exact search.
 mod shared;
+mod replay_health;
 pub(crate) mod sections;
 use crate::{
     full::conditions::Performer,
@@ -11302,6 +11303,7 @@ struct ReplayLimits {
     grades: [f64; 7],
     promotions: [usize; 7],
     dead_after: Option<i32>,
+    health: Option<replay_health::Rules>,
 }
 
 fn replay_limits(master: &Master, chart: &Chart, members: &[Member], snaps: &[Snap]) -> ReplayLimits {
@@ -11330,10 +11332,37 @@ fn replay_limits(master: &Master, chart: &Chart, members: &[Member], snaps: &[Sn
     let mut promotions = [0usize; 7];
     let mut first_protection = i32::MAX;
     let mut converters = Vec::new();
-    let mut visit = |row: &SkillEffect, limit: usize, ordinary: bool| {
+    let mut reductions = vec![Vec::new(); members.len()];
+    let padding = chart.play.frames.windows(2)
+        .map(|frames| frames[1].time_ms.saturating_sub(frames[0].time_ms)).max().unwrap_or(0)
+        .saturating_add(40);
+    let mut health_known = chart.accuracy.miss_every > 0
+        && chart.setup.fevers.iter().all(|&(start, end)| end.saturating_sub(start) > padding.saturating_mul(2));
+    let mut visit = |row: &SkillEffect, limit: usize, ordinary: bool, member: Option<usize>, healing: &mut i64| {
         let start = onset(row, ordinary);
         if matches!(row.kind, 3001 | 3003 | 3004) {
             first_protection = first_protection.min(start);
+        }
+        if health_known {
+            match row.kind {
+                3001 if ordinary || row.trigger_type == 1 && matches!(trigger(row), Some(4010 | 5020)) => {
+                    *healing = healing.saturating_add(i64::from(row.value.max(0)));
+                }
+                3004 if !ordinary && member.is_some() && (0..=10_000).contains(&row.value)
+                    && (0.0..=600.0).contains(&row.seconds) && (row.release_group == 0 || gate(row.release_group) == Some(7013))
+                    && (row.trigger_type == 1 && trigger(row) == Some(7010)
+                        || row.trigger_type == 2 && row.seconds == 0.0 && trigger(row) == Some(7020)) =>
+                {
+                    let full_range = row.trigger_type == 2 || row.release_group != 0;
+                    reductions[member.unwrap()].extend(chart.setup.fevers.iter().map(|&(start, end)| {
+                        let end = if full_range { end } else { start.saturating_add((row.seconds * 1000.0).ceil() as i32) };
+                        replay_health::Reduction { from: start.saturating_sub(padding),
+                            through: end.saturating_add(padding), points: row.value }
+                    }));
+                }
+                3001 | 3003 | 3004 => health_known = false,
+                _ => {}
+            }
         }
         let to = match row.kind {
             12006 if (1..=6).contains(&row.value) => row.value as usize,
@@ -11362,27 +11391,32 @@ fn replay_limits(master: &Master, chart: &Chart, members: &[Member], snaps: &[Sn
         } else { usize::MAX }
     };
     let live_events = chart.full.events.len();
-    for member in members {
+    let mut member_healing = 0i64;
+    let mut snap_healing = 0i64;
+    for (index, member) in members.iter().enumerate() {
+        let mut heal = 0;
         for row in master.live_skills.get(&member.card.live_skill_id).into_iter().flatten()
             .filter(|row| row.level == member.growth.live_skill_level)
         {
             let count = if row.limit_count > 0 {
                 (row.limit_count as usize).saturating_mul(live_events)
             } else { usize::MAX };
-            visit(row, count, true);
+            visit(row, count, true, Some(index), &mut heal);
         }
         if let Some(skill) = master.gekiso_skills.get(&member.card.gekiso_skill_id)
             .filter(|skill| skill.mission_type == 4 || chart.setup.missions.contains(&skill.mission_type))
         {
             for row in skill.effects.iter().filter(|row| row.level == member.growth.gekiso_skill_level) {
-                visit(row, quota(row), false);
+                visit(row, quota(row), false, Some(index), &mut heal);
             }
         }
+        member_healing = member_healing.max(heal);
     }
     for snap in snaps {
+        let mut heal = 0;
         for (id, level) in snap.card.support_skills.into_iter().zip(snap.skill_levels) {
             for row in master.support_skills.get(&id).into_iter().flatten().filter(|row| row.level == level) {
-                visit(row, quota(row), false);
+                visit(row, quota(row), false, None, &mut heal);
             }
         }
         for (id, level) in snap.card.gekiso_support_skills.into_iter().zip(snap.gekiso_skill_levels) {
@@ -11390,10 +11424,11 @@ fn replay_limits(master: &Master, chart: &Chart, members: &[Member], snaps: &[Sn
                 .filter(|skill| skill.mission_type == 4 || chart.setup.missions.contains(&skill.mission_type))
             {
                 for row in skill.effects.iter().filter(|row| row.level == level) {
-                    visit(row, quota(row), false);
+                    visit(row, quota(row), false, None, &mut heal);
                 }
             }
         }
+        snap_healing = snap_healing.max(heal);
     }
 
     // Recovery has no effect at zero LIFE. Count the most damage every
@@ -11423,10 +11458,17 @@ fn replay_limits(master: &Master, chart: &Chart, members: &[Member], snaps: &[Sn
         }
         None
     })();
-    ReplayLimits { grades, promotions, dead_after }
+    let health = health_known.then(|| replay_health::Rules {
+        healing_per_event: member_healing.saturating_add(snap_healing),
+        prevented_damage: converters.iter().fold(0i64, |sum, &(_, count, saved)| {
+            sum.saturating_add(i64::try_from(count).unwrap_or(i64::MAX).saturating_mul(saved))
+        }),
+        reductions,
+    });
+    ReplayLimits { grades, promotions, dead_after, health }
 }
 
-fn replay_support_key(master: &Master, actor: &Performer, global_converters: &HashSet<i32>) -> Option<Vec<u64>> {
+fn replay_support_key(master: &Master, actor: &Performer, global_converters: &HashSet<i32>, dead_before_recovery: bool) -> Option<Vec<u64>> {
     if actor.support_skills.len() > 1 {
         return None;
     }
@@ -11512,6 +11554,11 @@ fn replay_support_key(master: &Master, actor: &Performer, global_converters: &Ha
                     continue;
                 }
             }
+            if dead_before_recovery && row.kind == 3001
+                && !protected.contains(&row.id) && !global_converters.contains(&row.id)
+            {
+                continue;
+            }
             key.extend([
                 row.kind as u64,
                 row.value as u64,
@@ -11552,6 +11599,11 @@ struct ReplayObjective<'a> {
     base_power: f64,
     just_window: Option<crate::just_window::Prepared>,
     scores: HashMap<([u32; 5], i32, i32), Exact>,
+    cooperative_floor: bool,
+    health: Option<replay_health::HealthBound>,
+    health_roster: [usize; 5],
+    health_ceiling: f64,
+    dead_before_recovery: bool,
 }
 impl ReplayObjective<'_> {
     fn shape_id(&mut self, member: usize, snap: i32) -> u32 {
@@ -11559,7 +11611,9 @@ impl ReplayObjective<'_> {
         if self.shape_ids[index] == u32::MAX {
             let mut actor = Performer::from_member(self.master, &self.members[member], (snap >= 0).then(|| &self.snaps[snap as usize]));
             actor.gekisou_support_skills.retain(|&(id,_)| self.master.gekiso_support_skills.get(&id).is_some_and(|skill| skill.mission_type==4 || self.chart.setup.missions.contains(&skill.mission_type)));
-            let key = self.alias_allowed.then(||replay_support_key(self.master,&actor,&self.conversion_rows)).flatten();
+            let key = self.alias_allowed.then(|| {
+                replay_support_key(self.master, &actor, &self.conversion_rows, self.dead_before_recovery)
+            }).flatten();
             if key.is_some() { actor.support_skills.clear(); }
             let next = self.shapes.len() as u32;
             self.shape_ids[index] = *self.shapes.entry((actor, key.unwrap_or_default())).or_insert(next);
@@ -11568,6 +11622,8 @@ impl ReplayObjective<'_> {
     }
 }
 impl Objective for ReplayObjective<'_> {
+    fn live_floor(&self) -> bool { self.cooperative_floor }
+    fn live_floor_exclusive(&self) -> bool { false }
     fn needs_power_cap(&self)->bool { true }
     fn prepare_dominance(&mut self, power:f64) { self.alias_allowed=power*self.coefficient < i32::MAX as f64; }
     fn prepare_assignment_power(&mut self,power:f64) {self.base_power=power;}
@@ -11619,7 +11675,10 @@ impl Objective for ReplayObjective<'_> {
             .bound
             .as_mut()
             .map(|b| b.score_ceiling(&team.members, &team.snaps, 5, totals.power, self.criterion));
-        (0.0, upper.unwrap_or(f64::INFINITY).min(self.bound(totals)))
+        let life = if team.members.as_slice() == self.health_roster {
+            (totals.power * self.health_ceiling).next_up()
+        } else { f64::INFINITY };
+        (0.0, upper.unwrap_or(f64::INFINITY).min(self.bound(totals)).min(life))
     }
     fn prepare_members(&mut self, characters: &[Vec<usize>]) {
         if let Some(b) = &mut self.bound {
@@ -11638,7 +11697,19 @@ impl Objective for ReplayObjective<'_> {
             .as_mut()
             .map(|b| b.member_score_ceiling(members, from, t.power, self.criterion))
     }
+    fn roster_bound(&mut self, members: &[usize], t: Totals, _limit: f64) -> Option<f64> {
+        let health = self.health.as_ref()?;
+        self.health_roster.copy_from_slice(members);
+        self.health_ceiling = health.coefficient(members);
+        self.health_ceiling.is_finite().then(|| (t.power * self.health_ceiling).next_up())
+    }
     fn prepare_assignment(&mut self, members: &[usize], options: &[Vec<i32>]) {
+        if members != self.health_roster {
+            if let Some(health) = &self.health {
+                self.health_roster.copy_from_slice(members);
+                self.health_ceiling = health.coefficient(members);
+            }
+        }
         if let Some(window) = &mut self.just_window { window.prepare_assignment(members, options); }
         if let Some(b) = &mut self.bound {
             b.prepare_score_assignment(members, options);
@@ -11652,10 +11723,14 @@ impl Objective for ReplayObjective<'_> {
         from: usize,
         limit: f64,
     ) -> Option<f64> {
+        let life = if members == self.health_roster {
+            (t.power * self.health_ceiling).next_up()
+        } else { f64::INFINITY };
+        if life < limit { return Some(life); }
         self.bound.as_mut().map(|b| {
             let upper=b.score_ceiling(members,assigned,from,t.power,self.criterion);
-            if upper<limit {upper} else {upper.min(b.joint_score_ceiling(members,assigned,from,self.base_power,(t,limit),self.criterion))}
-        })
+            if upper<limit {upper.min(life)} else {upper.min(life).min(b.joint_score_ceiling(members,assigned,from,self.base_power,(t,limit),self.criterion))}
+        }).or_else(|| life.is_finite().then_some(life))
     }
     fn product_base(&self) -> Option<f64> {
         self.bound.as_ref().map(|b| b.base)
@@ -11703,6 +11778,8 @@ impl Objective for ReplayObjective<'_> {
         }
         debug_assert!(power < 0.0 || !self.coefficient.is_finite()
             || result.key <= (power * self.coefficient).next_up(), "full replay coefficient");
+        debug_assert!(team.members.as_slice() != self.health_roster || power < 0.0 || !self.health_ceiling.is_finite()
+            || result.key <= (power * self.health_ceiling).next_up(), "replay LIFE bound");
         #[cfg(debug_assertions)]
         if let Some(bound) = &mut self.bound {
             let upper=bound.fixed_score_ceiling(&team.members,&team.snaps,power,self.criterion);
@@ -12128,12 +12205,16 @@ fn search_levels(
         }
         let combo = replay_combo_ceiling(env.master, chart, env.members, env.snaps);
         let limits = replay_limits(env.master, chart, env.members, env.snaps);
+        let mut unpenalized = Vec::new();
         let coefficient = crate::rewards::score_coefficient_with_weights(
             env.master, chart, env.members, env.snaps, None,
             Some(crate::rewards::ReplayScoreWeights {
                 grades: limits.grades, promotions: limits.promotions, combo: &combo, dead_after: limits.dead_after,
+                unpenalized: limits.health.as_ref().map(|_| &mut unpenalized),
             }),
         );
+        let health = limits.health.filter(|_| coefficient.is_finite())
+            .and_then(|rules| replay_health::HealthBound::new(env.master, chart, rules, unpenalized));
         let bound = replay_bound(env.master, chart, env.members, env.snaps, &combo, limits.dead_after)?;
         let mut objective = ReplayObjective {
             master: env.master,
@@ -12153,6 +12234,11 @@ fn search_levels(
             base_power: 0.0,
             just_window,
             scores: HashMap::default(),
+            cooperative_floor,
+            health,
+            health_roster: [usize::MAX; 5],
+            health_ceiling: f64::INFINITY,
+            dead_before_recovery: limits.dead_after.is_some(),
         };
         let mut candidate = |hits: &[Hit]| {
             if let Some(callback) = on_candidate.as_deref_mut() {

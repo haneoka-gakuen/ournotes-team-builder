@@ -366,6 +366,7 @@ pub(crate) struct ReplayScoreWeights<'a> {
     pub(crate) promotions: [usize; 7],
     pub(crate) combo: &'a [f64],
     pub(crate) dead_after: Option<i32>,
+    pub(crate) unpenalized: Option<&'a mut Vec<(i32, f64)>>,
 }
 
 pub(crate) fn score_coefficient_with_weights(
@@ -374,9 +375,9 @@ pub(crate) fn score_coefficient_with_weights(
     members: &[Member],
     snaps: &[Snap],
     bindings: Option<&[Option<Snap>]>,
-    weights: Option<ReplayScoreWeights<'_>>,
+    mut weights: Option<ReplayScoreWeights<'_>>,
 ) -> f64 {
-    let make = || -> Option<f64> {
+    let mut make = || -> Option<f64> {
         if bindings.is_some_and(|b| b.len() != members.len() || members.len() > 5) {
             return None;
         }
@@ -553,7 +554,14 @@ pub(crate) fn score_coefficient_with_weights(
             counts
         }));
         let mut promoted: [Vec<f64>; 7] = std::array::from_fn(|_| Vec::new());
-        let luck_ranges = (chart.luck && live.gekiso.rush_percent == 100
+        let chronological_rush = weights.is_some() && chart.setup.missions.iter().all(|&mission| mission == 2)
+            && chart.play.frames.iter().enumerate().all(|(index, frame)| {
+                let previous = index.checked_sub(1).map(|index| chart.play.frames[index].time_ms);
+                frame.judged.windows(2).all(|notes| notes[0].time_ms <= notes[1].time_ms)
+                    && frame.judged.iter().all(|note| note.time_ms <= frame.time_ms
+                        && previous.is_none_or(|time| note.time_ms > time))
+            });
+        let luck_ranges = (chart.luck && (live.gekiso.rush_percent == 100 || chronological_rush)
             && chart.play.frames.windows(2).all(|frames| {
                 (10..=40).contains(&(frames[1].time_ms - frames[0].time_ms))
             }) && chart.play.frames.iter().all(|frame| frame.judged.iter().all(|note| {
@@ -562,6 +570,11 @@ pub(crate) fn score_coefficient_with_weights(
             .then(|| deterministic_ranges(master, chart))
             .flatten()
             .filter(|ranges| ranges.windows(2).all(|pair| pair[0].1 < pair[1].0));
+        // With chronological delivery and disjoint ranges, a Rush handle ends
+        // before the next one starts, including the range's completion frames.
+        let rush_cap = if chronological_rush && luck_ranges.is_some() {
+            f(f((100 + live.gekiso.rush_percent) as f64) / 100.0)
+        } else { 2.0 };
         for (i, note) in chart.notes.iter().enumerate() {
             let frac = chart.note_frac[i];
             let combo = if let Some(weights) = &weights {
@@ -608,10 +621,10 @@ pub(crate) fn score_coefficient_with_weights(
             let luck = if !chart.luck || live.gekiso.rush_percent == 0
                 || luck_ranges.is_some_and(|ranges| !ranges.iter().enumerate().any(|(range, &(start, end))| {
                     chart.setup.missions[range] == 2 && start <= note.time_ms && note.time_ms <= end
-                })) { 1.0 } else { 2.0 };
+                })) { 1.0 } else { rush_cap };
             let mut c = mul(live.adjustment, chart.difficulty_factor);
             let grade = chart.judgements[i];
-            let cap = weights.as_ref().filter(|weights| weights.promotions[grade] < grade_counts.unwrap()[grade]);
+            let capped = weights.as_ref().is_some_and(|weights| weights.promotions[grade] < grade_counts.unwrap()[grade]);
             for term in [
                 frac,
                 combo,
@@ -622,9 +635,6 @@ pub(crate) fn score_coefficient_with_weights(
             ] {
                 c = mul(c, term);
             }
-            if weights.as_ref().and_then(|weights| weights.dead_after).is_some_and(|at| note.time_ms > at) {
-                c = mul(c, live.life_onus);
-            }
             c = up(c / chart.full.converted as f64);
             let range = chart.range_of[i];
             if range >= 0 {
@@ -633,8 +643,17 @@ pub(crate) fn score_coefficient_with_weights(
                     add(1.0, up(chart.range_percent[range as usize] as f64 / 100.0)),
                 );
             }
+            if let Some(weights) = &mut weights {
+                if let Some(out) = &mut weights.unpenalized {
+                    out.push((note.time_ms, mul(c, weights.grades[grade])));
+                }
+                if weights.dead_after.is_some_and(|at| note.time_ms > at) {
+                    c = mul(c, live.life_onus);
+                }
+            }
             let raw = chart.judge_frac[grade];
-            if let Some(weights) = cap {
+            if capped {
+                let weights = weights.as_ref().unwrap();
                 coefficient = add(coefficient, mul(c, raw));
                 if weights.promotions[grade] > 0 {
                     promoted[grade].push(mul(c, (weights.grades[grade] - raw).next_up()));
