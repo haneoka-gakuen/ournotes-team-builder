@@ -284,8 +284,9 @@ impl<'a> Source<'a> {
     }
     fn mean_assignment_score(&mut self, members: &[usize], assigned: &[i32], from: usize, totals: Totals) -> f64 {
         let upper = match self {
-            Self::Ordinary(value) => value.score_upper_orders(members, assigned, from, totals.power)
-                .map(|scores| (scores.into_iter().fold(0.0, |sum, score| (sum + score).next_up()) / 120.0).next_up()),
+            Self::Ordinary(value) => value.mean_assignment_score_upper(members, assigned, from, totals.power)
+                .or_else(|| value.score_upper_orders(members, assigned, from, totals.power)
+                    .map(|scores| (scores.into_iter().fold(0.0, |sum, score| (sum + score).next_up()) / 120.0).next_up())),
             Self::Gekiso(value) => value.mean_assignment_score(members, assigned, from, totals.power),
         };
         upper.unwrap_or_else(|| self.score_upper(totals))
@@ -1392,6 +1393,17 @@ impl Objective for Ranked<'_> {
     fn exact(&mut self, team: &Team, power: f64, slots: &[f64]) -> Result<Exact, String> {
         let result = self.source.objective().exact(team, power, slots)?;
         self.finish(team, power, result)
+    }
+    fn event_primary_upper(&mut self, team: &Team, power: i32) -> Result<Option<f64>, String> {
+        let plan = &self.context.plan;
+        let [term] = plan.levels[0].as_slice() else { return Ok(None); };
+        if plan.maximize_bonus || plan.criterion != Aggregation::Mean || term.metric != Metric::Points {
+            return Ok(None);
+        }
+        let Source::Ordinary(event) = &mut self.source else { return Ok(None); };
+        Ok(event.replay_point_sum(team, power)?.map(|(points, count)| {
+            ((points as f64 * term.weight as f64).next_up() / count as f64).next_up()
+        }))
     }
     fn evaluate(
         &mut self,

@@ -168,8 +168,15 @@ impl Engine {
             return self.run_arena_sections(input, started, now);
         }
         let arena = input["request"]["goal"]["arena"].is_object();
-        let (mut scoped, scoped_input, songs, sources) = if arena {
-            self.arena_view(input)?
+        let (view, songs, sources) = if arena {
+            let (scoped, scoped_input, songs, sources) = self.arena_view(input)?;
+            if input["request"]["goal"]["arena"]["mode"] != "shared" {
+                let mut scoped = scoped;
+                let mut result = scoped.run(&scoped_input, started, now)?;
+                result["cachedCharts"] = json!(self.cached_chart_keys());
+                return Ok(result);
+            }
+            (Some((scoped, scoped_input)), songs, sources)
         } else {
             let songs: Vec<_> = master::rows(&input["request"]["goal"]["songs"])
                 .into_iter()
@@ -186,54 +193,49 @@ impl Engine {
                         .clone(),
                 );
             }
-            (
-                self.call_view(self.master.clone()),
-                input.clone(),
-                songs,
-                sources,
-            )
+            (None, songs, sources)
         };
-        if arena && input["request"]["goal"]["arena"]["mode"] != "shared" {
-            let mut result = scoped.run(&scoped_input, started, now)?;
-            result["cachedCharts"] = json!(self.cached_chart_keys());
-            return Ok(result);
-        }
+        let (engine, scoped_input) = view.as_ref().map_or((&*self, input), |(engine, input)| (engine, input));
+        let master = &engine.master;
         let _slots = crate::objectives::slot_table_scope();
         let request = &scoped_input["request"];
         let goal = &request["goal"];
         if goal["criterion"] != "mean" || goal["opponents"].is_array() {
             return Err("arena-shared-mean-required".into());
         }
-        let cards = search_box(&scoped.master, request)?;
+        let cards = search_box(master, request)?;
         crate::progress::keys(&cards.members, &cards.snaps);
-        let player = power::player_state(&scoped.master, &request["player"]);
-        let accuracy =
-            serde_json::from_value(goal["accuracy"].clone()).map_err(|e| e.to_string())?;
+        let player = power::player_state(master, &request["player"]);
+        let accuracy = serde::Deserialize::deserialize(&goal["accuracy"]).map_err(|e| e.to_string())?;
+        let ranks = gekiso_ranks(goal);
         let mut charts = Vec::with_capacity(songs.len());
         let mut music = Vec::with_capacity(songs.len());
         let mut compiled = Vec::with_capacity(songs.len());
         for (song, source) in songs.iter().zip(&sources) {
             let id = master::int(&song["songId"]);
             let difficulty = master::int(&song["difficulty"]);
-            let item = scoped.master.songs.get(&id).ok_or("unknown song")?;
+            let item = master.songs.get(&id).ok_or("unknown song")?;
             let level = item
                 .difficulties
                 .iter()
                 .find(|row| row.difficulty == difficulty)
                 .ok_or("unknown difficulty")?;
-            let view = power::music_view(&scoped.master, id, None)?;
+            let view = power::music_view(master, id, None)?;
             let mut chart = gekiso::Chart::new(
-                &scoped.master,
+                master,
                 source,
                 level.play_level,
                 item.missions.clone(),
                 accuracy,
-                gekiso_ranks(goal),
+                ranks.clone(),
             )?;
             chart.music_type = view.music_type;
             charts.push(chart);
             music.push(view);
-            compiled.push(chart::compile(&scoped.master, item, level, source));
+            let key = (id, difficulty);
+            let cached = engine.charts.get(&key).filter(|_| engine.sources.get(&key) == Some(source));
+            compiled.push(cached.cloned()
+                .unwrap_or_else(|| chart::compile(master, item, level, source)));
         }
         let deadline = request["deadline"].as_f64().unwrap_or_else(|| {
             request["timeLimitMs"]
@@ -274,7 +276,7 @@ impl Engine {
         }
         let output = gekiso_objective::search_shared(gekiso_objective::SharedInput {
             env: gekiso_objective::Environment {
-                master: &scoped.master,
+                master,
                 player: &player,
                 members: &cards.members,
                 snaps: &cards.snaps,

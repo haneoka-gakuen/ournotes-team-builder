@@ -1081,6 +1081,42 @@ impl EventObjective {
         self.coefficients.insert(ids, Arc::clone(&coefficients));
         coefficients
     }
+    pub(crate) fn mean_assignment_score_upper(
+        &mut self,
+        members: &[usize],
+        assigned: &[i32],
+        from: usize,
+        power: f64,
+    ) -> Option<f64> {
+        let core = self.core.as_ref()?;
+        if core.unbounded || core.input.judgements.is_some() || self.score_cap != f64::INFINITY
+            || !(0.0..=i32::MAX as f64).contains(&power)
+        {
+            return None;
+        }
+        let base = core.high.total;
+        let count = core.input.converted_count as f64;
+        if !base.is_finite() || base < 0.0 || count == 0.0 { return None; }
+        // Each slot visits every skill position equally over the 120 orders.
+        // This average is an upper bound without building the whole vector.
+        let mut skill = 0.0_f64;
+        for (slot, &member) in members.iter().enumerate() {
+            let id = if slot < from {
+                self.slot_profile(member, assigned[slot])
+            } else {
+                self.assignment_profiles[slot]
+            };
+            let row = self.profiles.get(id as usize)?;
+            if row.iter().any(|&value| value < 0.0 || !value.is_finite()) { return None; }
+            let total = row.iter().fold(0.0_f64, |sum, value| (sum + value).next_up());
+            skill = (skill + (total / 5.0).next_up()).next_up();
+        }
+        if !skill.is_finite() { return None; }
+        let coefficient = ((base + skill).next_up() / count).next_up();
+        Some((((coefficient * (1.0 + RELATIVE_ERROR)).next_up()
+            * (1.0 + 256.0 * f64::EPSILON)).next_up() * power).next_up())
+    }
+
     pub(crate) fn score_upper_orders(
         &mut self,
         members: &[usize],
@@ -1361,6 +1397,22 @@ impl EventObjective {
     }
     fn rank(&self, score: f64) -> i32 {
         chart::score_rank(self.chart.as_ref().unwrap(), score)
+    }
+    pub(crate) fn replay_point_sum(&mut self, team: &Team, power: i32) -> Result<Option<(i64, usize)>, String> {
+        let Some(core) = &mut self.core else { return Ok(None); };
+        let scores = core.evaluate(team, power)?;
+        let count = scores.scores.len();
+        if count != crate::live::orders().len() || !scores.min.is_finite() || !scores.max.is_finite() {
+            return Ok(None);
+        }
+        let bonus = self.team_bonus(team);
+        let rank = self.rank(scores.min);
+        let points = |rank| self.route.points(bonus, rank) as i64;
+        if rank == self.rank(scores.max) {
+            return Ok(Some((points(rank) * count as i64, count)));
+        }
+        let total = scores.scores.iter().map(|&score| points(self.rank(score))).sum();
+        Ok(Some((total, count)))
     }
     fn rank_bound(&self, score: f64) -> i32 {
         self.rank(score.min(self.score_cap))

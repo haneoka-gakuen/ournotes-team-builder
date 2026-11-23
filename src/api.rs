@@ -697,9 +697,9 @@ fn constraints(
 }
 fn search_box(master: &Master, request: &Value) -> Result<power::BoxCards, String> {
     let members: Vec<MemberInput> =
-        serde_json::from_value(request["members"].clone()).map_err(|e| e.to_string())?;
+        serde::Deserialize::deserialize(&request["members"]).map_err(|e| e.to_string())?;
     let snaps: Vec<SnapInput> =
-        serde_json::from_value(request["snaps"].clone()).map_err(|e| e.to_string())?;
+        serde::Deserialize::deserialize(&request["snaps"]).map_err(|e| e.to_string())?;
     let mut cards = power::resolve_box(master, &members, &snaps, request["unknownPolicy"] != "min");
     let c = &request["constraints"];
     fn keys(rows: &Value) -> std::collections::BTreeSet<&str> {
@@ -1849,6 +1849,21 @@ impl Engine {
         started: f64,
         now: &dyn Fn() -> f64,
     ) -> Result<Value, String> {
+        if request["goal"]["ranking"] == "pt-only" && request["goal"]["gekiso"].is_null() {
+            let issues = crate::pt::validate(&self.master, request)?;
+            if !issues.is_empty() {
+                return Err(format!("pt-input:{}", issues.join(",")));
+            }
+        }
+        self.search_event_validated(request, started, now)
+    }
+
+    fn search_event_validated(
+        &self,
+        request: &Value,
+        started: f64,
+        now: &dyn Fn() -> f64,
+    ) -> Result<Value, String> {
         use crate::{
             event::{ChallengePoints, EventObjective, Route, RouteKind, ScoreTie, SkipTie},
             objectives::{Criterion, LiveCore, LiveObjective, ScoreCap},
@@ -1859,12 +1874,6 @@ impl Engine {
             return Err("event-protocol-not-supported".into());
         }
         let pt = goal["ranking"] == "pt-only";
-        if pt {
-            let issues = crate::pt::validate(&self.master, request)?;
-            if !issues.is_empty() {
-                return Err(format!("pt-input:{}", issues.join(",")));
-            }
-        }
         let cards = search_box(&self.master, request)?;
         crate::progress::keys(&cards.members, &cards.snaps);
         let player = power::player_state(&self.master, &request["player"]);
@@ -2505,7 +2514,7 @@ impl Engine {
                 let source = if entry["source"].is_null() {
                     crate::runtime_chart::convert(&entry["chart"])?
                 } else {
-                    serde_json::from_value(entry["source"].clone()).map_err(|e| e.to_string())?
+                    serde::Deserialize::deserialize(&entry["source"]).map_err(|e| e.to_string())?
                 };
                 self.insert_chart(key.0, key.1, source)?;
             }
@@ -2779,7 +2788,7 @@ impl Engine {
                 let source = if entry["source"].is_null() {
                     crate::runtime_chart::convert(&entry["chart"])?
                 } else {
-                    serde_json::from_value(entry["source"].clone()).map_err(|e| e.to_string())?
+                    serde::Deserialize::deserialize(&entry["source"]).map_err(|e| e.to_string())?
                 };
                 self.insert_chart(key.0, key.1, source)?;
             }
@@ -2802,9 +2811,9 @@ impl Engine {
                 "score" => self.search_score(&single, started, now)?,
                 "event" => {
                     if single["goal"]["gekiso"].is_null() {
-                        self.search_event(&single, started, now)?
+                        self.search_event_validated(&single, started, now)?
                     } else {
-                        self.search_rewards(&single, started, now)?
+                        self.search_rewards_validated(&single, started, now)?
                     }
                 }
                 "gekiso" => self.search_gekiso(
@@ -2875,6 +2884,21 @@ impl Engine {
         started: f64,
         now: &dyn Fn() -> f64,
     ) -> Result<Value, String> {
+        if request["goal"]["ranking"] == "pt-only" && request["goal"]["route"] == "live" {
+            let issues = crate::pt::validate(&self.master, request)?;
+            if !issues.is_empty() {
+                return Err(format!("pt-input:{}", issues.join(",")));
+            }
+        }
+        self.search_rewards_validated(request, started, now)
+    }
+
+    fn search_rewards_validated(
+        &self,
+        request: &Value,
+        started: f64,
+        now: &dyn Fn() -> f64,
+    ) -> Result<Value, String> {
         use crate::{
             event::{BonusSurrogate, Route, RouteKind},
             full::play::Accuracy,
@@ -2885,10 +2909,6 @@ impl Engine {
         let goal = &request["goal"];
         if goal["ranking"] != "pt-only" || goal["route"] != "live" {
             return Err("gekiso-reward-mode".into());
-        }
-        let issues = crate::pt::validate(&self.master, request)?;
-        if !issues.is_empty() {
-            return Err(format!("pt-input:{}", issues.join(",")));
         }
         let cards = search_box(&self.master, request)?;
         let player = power::player_state(&self.master, &request["player"]);
@@ -3759,7 +3779,7 @@ impl Engine {
             let source = if entry["source"].is_null() {
                 crate::runtime_chart::convert(&entry["chart"])?
             } else {
-                serde_json::from_value(entry["source"].clone()).map_err(|e| e.to_string())?
+                serde::Deserialize::deserialize(&entry["source"]).map_err(|e| e.to_string())?
             };
             self.insert_chart(key.0, key.1, source)?;
         } else if self.charts.contains_key(&key) {

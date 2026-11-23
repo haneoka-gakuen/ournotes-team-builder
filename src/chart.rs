@@ -84,16 +84,17 @@ pub fn compile(master: &Master, song: &Song, difficulty: &Difficulty, source: &S
             f(percent / 100.0)
         })
         .collect();
-    let fallback = source
-        .notes
-        .iter()
-        .map(|n| EnumerationNote {
-            time_ms: n.time_ms,
-            op: n.operate_type,
-            judgement_type: n.judgement_type,
-        })
-        .collect();
-    let enumeration = source.enumeration.as_ref().unwrap_or(&fallback);
+    let fallback;
+    let enumeration = if let Some(enumeration) = &source.enumeration {
+        enumeration
+    } else {
+        fallback = source.notes.iter().map(|note| EnumerationNote {
+            time_ms: note.time_ms,
+            op: note.operate_type,
+            judgement_type: note.judgement_type,
+        }).collect();
+        &fallback
+    };
     let frame = |ms: i32| {
         if ms < 0 {
             0

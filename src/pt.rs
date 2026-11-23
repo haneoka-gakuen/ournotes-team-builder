@@ -144,9 +144,9 @@ pub fn validate(master: &Master, request: &Value) -> Result<Vec<String>, String>
         )
     }
     let member_inputs: Vec<MemberInput> =
-        serde_json::from_value(request["members"].clone()).map_err(|e| e.to_string())?;
+        serde::Deserialize::deserialize(&request["members"]).map_err(|e| e.to_string())?;
     let snap_inputs: Vec<SnapInput> =
-        serde_json::from_value(request["snaps"].clone()).map_err(|e| e.to_string())?;
+        serde::Deserialize::deserialize(&request["snaps"]).map_err(|e| e.to_string())?;
     if member_inputs
         .iter()
         .map(|m| &m.key)

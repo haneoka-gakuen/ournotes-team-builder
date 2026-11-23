@@ -306,6 +306,21 @@ impl Combined<'_> {
         let mut power_sum = 0.0_f64;
         let score_tie = self.plan.as_ref().is_some_and(Plan::score_tie);
         let mut rank_sums = self.reward_cutoff.as_ref().map(|_| [0.0_f64; 3]);
+        let event_bonus = self.prune_chart_replay.then(|| {
+            let objective = &self.songs[0].objective;
+            members.iter().enumerate().map(|(slot, &member)| {
+                let choices = if slot < from {
+                    std::slice::from_ref(&assigned[slot])
+                } else {
+                    &self.options[slot]
+                };
+                let snap_bonus = choices.iter().filter(|&&snap| snap >= 0
+                    && (slot < from || !assigned[..from].contains(&snap)))
+                    .map(|&snap| objective.snap_bonus(snap as usize))
+                    .fold(0.0_f64, f64::max);
+                objective.member_bonus(member) + snap_bonus
+            }).sum::<f64>()
+        });
         for song in &mut self.songs {
             let mut t = Totals::default();
             for (slot, &m) in members.iter().enumerate() {
@@ -325,25 +340,29 @@ impl Combined<'_> {
                     power = power.max(song.slots[slot][col]);
                     skill = skill.max(weights.1);
                     skill_low = skill_low.min(weights.0);
-                    if snap >= 0 {
+                    if event_bonus.is_none() && snap >= 0 {
                         bonus = bonus.max(song.objective.snap_bonus(snap as usize));
                     }
                 }
                 t.power = (t.power + power).next_up();
                 t.skill = (t.skill + skill).next_up();
                 t.skill_low += skill_low;
-                t.bonus += song.objective.member_bonus(m) + bonus;
+                if event_bonus.is_none() {
+                    t.bonus += song.objective.member_bonus(m) + bonus;
+                }
             }
+            if let Some(bonus) = event_bonus { t.bonus = bonus; }
             power_sum = (power_sum + t.power).next_up();
             if score_tie { song.ranking_totals = t; }
-            let bound = song.objective.bound(t);
             let ranked = rank_sums.as_ref().and_then(|_| {
                 song.objective.ranked_assignment_upper(members, t, assigned, from)
             });
-            let mut bound = bound.min(ranked.map_or_else(
-                || song.objective.cheap_assignment_bound(members, t, assigned, from),
-                |levels| levels[0],
-            ));
+            let mut bound = match ranked {
+                Some(levels) if event_bonus.is_some() => levels[0],
+                Some(levels) => levels[0].min(song.objective.bound(t)),
+                None => song.objective.cheap_assignment_bound(members, t, assigned, from)
+                    .min(song.objective.bound(t)),
+            };
             if let Some(value) = song.objective.assignment_bound(members, t, assigned, from) {
                 bound = bound.min(value);
             }
@@ -1136,15 +1155,17 @@ impl Combined<'_> {
         }).and_then(|limit| {
             let width = self.snaps.len() + 1;
             let mut suffix = vec![0.0_f64; chart_count + 1];
+            let objective = &self.songs[0].objective;
+            let mut bonus = 0.0;
+            for (&member, &snap) in team.members.iter().zip(&team.snaps) {
+                bonus += objective.member_bonus(member);
+                if snap >= 0 { bonus += objective.snap_bonus(snap as usize); }
+            }
             for (index, (song, power)) in self.songs.iter_mut().zip(&powers).enumerate().rev() {
-                let mut totals = Totals { power: power.total as f64, ..Totals::default() };
+                let mut totals = Totals { power: power.total as f64, bonus, ..Totals::default() };
                 for (&member, &snap) in team.members.iter().zip(&team.snaps) {
                     let column = if snap < 0 { width - 1 } else { snap as usize };
                     totals.skill = (totals.skill + song.skills[member * width + column].1).next_up();
-                    totals.bonus += song.objective.member_bonus(member);
-                    if snap >= 0 {
-                        totals.bonus += song.objective.snap_bonus(snap as usize);
-                    }
                 }
                 let upper = song.objective.bound(totals);
                 if !upper.is_finite() { return None; }
@@ -1152,6 +1173,27 @@ impl Combined<'_> {
             }
             Some((limit, suffix))
         });
+        // Most losing formations only need a prefix of the reward totals. Keep
+        // the score replays cached and assemble the full details for survivors.
+        let mut replayed = 0;
+        if let Some((limit, suffix)) = bound.as_ref().filter(|_| self.plan.is_some()) {
+            let mut prefix = 0.0_f64;
+            for (index, (song, power)) in self.songs.iter_mut().zip(&powers).enumerate() {
+                let upper = ((prefix + suffix[index]).next_up() / chart_count as f64).next_up();
+                if upper < *limit {
+                    self.skipped_song_evaluations += (chart_count - index) as u64;
+                    return Ok(search::Evaluation::Pruned(upper));
+                }
+                let Some(value) = song.objective.event_primary_upper(team, power.total as i32)? else { break; };
+                replayed += 1;
+                self.song_evaluations += 1;
+                prefix = (prefix + value).next_up();
+            }
+            let upper = (prefix / chart_count as f64).next_up();
+            if replayed == chart_count && upper < *limit {
+                return Ok(search::Evaluation::Pruned(upper));
+            }
+        }
         let mut prefix = 0.0_f64;
         let mut parts = Vec::with_capacity(chart_count);
         for (index, (song, p)) in self.songs.iter_mut().zip(&powers).enumerate() {
@@ -1168,7 +1210,7 @@ impl Combined<'_> {
                 p.total as f64,
                 &p.slots.map(|value| value as f64),
             )?;
-            if self.prune_chart_replay { self.song_evaluations += 1; }
+            if self.prune_chart_replay && index >= replayed { self.song_evaluations += 1; }
             if bound.is_some() {
                 let upper = self.plan.as_ref().map_or(exact.key, |_| {
                     Fraction::from_json(&exact.detail["rewardRanking"][0]).unwrap().upper()

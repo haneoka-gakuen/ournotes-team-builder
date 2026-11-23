@@ -88,6 +88,9 @@ pub trait Objective {
     fn observe_hits(&mut self, hits: &[Hit]) {
         if let Some(hit) = hits.first() { self.observe_hit(hit); }
     }
+    fn event_primary_upper(&mut self, _team: &Team, _power: i32) -> Result<Option<f64>, String> {
+        Ok(None)
+    }
     fn compare_rank(&self, _a: &Hit, _b: &Hit) -> Option<std::cmp::Ordering> { None }
     fn seed_objective(&self) -> Option<Box<dyn Objective>> {
         None
