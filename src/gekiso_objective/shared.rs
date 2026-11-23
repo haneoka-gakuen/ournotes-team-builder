@@ -44,6 +44,10 @@ struct WindowBudget {
     values: [Vec<f64>; 5],
     choices: [[Vec<(i32, f64)>; 2]; 5],
 }
+struct SharedPowerBound {
+    songs: Vec<usize>,
+    bound: crate::rewards::FixedRegionBound,
+}
 impl Objective for PowerSeed {
     fn skill(&mut self, _member: usize, _snap: i32) -> (f64, f64) {
         (0.0, 0.0)
@@ -82,7 +86,7 @@ struct Combined<'k, 'a> {
     floor: f64,
     k: usize,
     last_bounds: Vec<f64>,
-    joint: Option<crate::rewards::FixedRegionBound>,
+    joint: Option<Vec<SharedPowerBound>>,
     joint_options: Vec<Vec<i32>>,
     window_rows: [Option<(f64, Vec<f64>)>; 6],
     window_bounds: [Option<crate::rewards::WindowScoreBound>; 6],
@@ -90,6 +94,8 @@ struct Combined<'k, 'a> {
     window_converters: Option<Vec<bool>>,
     window_options: [bool; 5],
     window_budgets: Vec<WindowBudget>,
+    dominance_profiles: Option<(Vec<u32>, HashMap<Vec<u32>, u32>)>,
+    dominance_power: Vec<usize>,
 }
 
 impl<'k, 'a> Combined<'k, 'a> {
@@ -252,6 +258,14 @@ impl<'k, 'a> Combined<'k, 'a> {
                 Some(mask)
             })()
         } else { None };
+        let entries = songs[0].snap_power.len();
+        let dominance_profiles = (songs.len() > 1
+            && entries.saturating_mul(songs.len()) <= 1_048_576)
+            .then(|| (vec![u32::MAX; entries], HashMap::default()));
+        let mut powers = HashSet::default();
+        let dominance_power = songs.iter().enumerate()
+            .filter_map(|(index, song)| powers.insert(Arc::as_ptr(&song.snap_power)).then_some(index))
+            .collect();
         Self {
             songs,
             player,
@@ -274,6 +288,8 @@ impl<'k, 'a> Combined<'k, 'a> {
             window_converters,
             window_options: [false; 5],
             window_budgets: Vec::new(),
+            dominance_profiles,
+            dominance_power,
         }
     }
 
@@ -357,21 +373,54 @@ impl<'k, 'a> Combined<'k, 'a> {
         order.sort_by(|&a, &b| bounds[b].total_cmp(&bounds[a]));
         let mut details = vec![Value::Null; self.songs.len()];
         let mut scores = vec![0.0; self.songs.len()];
-        for index in order {
-            let song = &mut self.songs[index];
-            let mut score = song
-                .adapter
-                .kernel
-                .exact(team, powers[if self.same_power { 0 } else { index }].total as i32, true)?;
-            song.adapter.kernel.decorate_window(team, powers[if self.same_power { 0 } else { index }].total as i32, &mut score.detail)?;
+        let score_song = |song: &mut SongObjective<'_, '_>, power: i64| -> Result<Exact, String> {
+            let mut score = song.adapter.kernel.exact(team, power as i32, true)?;
+            song.adapter.kernel.decorate_window(team, power as i32, &mut score.detail)?;
+            Ok(score)
+        };
+        let same_power = self.same_power;
+        let mut accept = |index, score: Exact| {
+            let power: &power::TeamPower = &powers[if same_power { 0 } else { index }];
             scores[index] = score.key;
             bounds[index] = score.key;
-            details[index] = json!({"detail":score.detail,"power":powers[if self.same_power { 0 } else { index }].total,"slotPowers":powers[if self.same_power { 0 } else { index }].slots});
+            details[index] = json!({"detail":score.detail,"power":power.total,"slotPowers":power.slots});
             if let Some(cutoff) = cutoff {
                 let upper = (bounds.iter().fold(0.0_f64, |sum, v| (sum + v).next_up())
                     / bounds.len() as f64)
                     .next_up();
                 if upper < cutoff.key || cutoff.prune_equal && upper == cutoff.key {
+                    return Some(upper);
+                }
+            }
+            None
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        let workers = crate::parallel::workers(self.songs.len());
+        #[cfg(target_arch = "wasm32")]
+        let workers = 1;
+        if workers > 1 && self.songs.len() >= 16 {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let mut songs: Vec<_> = self.songs.iter_mut().map(Some).collect();
+                for batch in order.chunks(workers * 2) {
+                    let tasks: Vec<_> = batch.iter().map(|&index| {
+                        (index, std::sync::Mutex::new(songs[index].take().unwrap()))
+                    }).collect();
+                    let values = crate::parallel::map(&tasks, |(index, song)| {
+                        let power = powers[if same_power { 0 } else { *index }].total;
+                        Ok::<_, String>(crate::parallel::serial(|| score_song(&mut **song.lock().unwrap(), power)))
+                    })?;
+                    for (&index, score) in batch.iter().zip(values) {
+                        if let Some(upper) = accept(index, score?) {
+                            return Ok(search::Evaluation::Pruned(upper));
+                        }
+                    }
+                }
+            }
+        } else {
+            for index in order {
+                let score = score_song(&mut self.songs[index], powers[if same_power { 0 } else { index }].total)?;
+                if let Some(upper) = accept(index, score) {
                     return Ok(search::Evaluation::Pruned(upper));
                 }
             }
@@ -473,31 +522,82 @@ impl<'k, 'a> Combined<'k, 'a> {
         total
     }
 
-    fn joint_bound(&mut self, assigned: &[i32], from: usize, totals: Totals, cutoff: f64) -> Option<f64> {
-        if !self.same_power || self.songs.len() < 2 { return None; }
+    fn joint_bound(&mut self, assigned: &[i32], from: usize, totals: Totals, cutoff: f64, upper: f64) -> Option<f64> {
+        if self.songs.len() < 2 { return None; }
+        let single_domain = self.same_power && self.songs.iter().all(|song| song.adapter.combo_bound.is_some());
+        if !single_domain && (!cutoff.is_finite() || cutoff <= 0.0 || upper > cutoff * 1.05) {
+            return None;
+        }
         if self.joint.is_none() {
             let width = self.songs[0].adapter.kernel.snaps.len() + 1;
-            let count = self.songs.len() as f64;
-            let mut base = 0.0_f64;
-            let mut rows = vec![[0.0_f64; 5]; width * 5];
-            for song in &self.songs {
-                let shared = song.adapter.combo_bound.as_ref()?;
-                let (constant, profiles) = shared.lock().unwrap_or_else(|error| error.into_inner()).assignment_mean_rows(&self.roster)?;
-                base = (base + (constant / count).next_up()).next_up();
-                for (row, profile) in rows.iter_mut().zip(profiles) {
-                    let value = (row[0] + (profile / count).next_up()).next_up();
-                    row.fill(value);
+            let mut by_power = HashMap::default();
+            let mut domains: Vec<Vec<usize>> = Vec::new();
+            for (index, song) in self.songs.iter().enumerate() {
+                if song.adapter.combo_bound.is_none() { continue; }
+                let next = domains.len();
+                let group = *by_power.entry(Arc::as_ptr(&song.slots)).or_insert(next);
+                if group == next { domains.push(Vec::new()); }
+                domains[group].push(index);
+            }
+            let mut groups = Vec::new();
+            for domain in domains.into_iter().filter(|domain| domain.len() > 1) {
+                let rows = domain.into_iter().filter_map(|index| {
+                    let shared = self.songs[index].adapter.combo_bound.as_ref()?;
+                    let (constant, profiles) = shared.lock().unwrap_or_else(|error| error.into_inner())
+                        .assignment_mean_rows(&self.roster)?;
+                    Some((index, constant, profiles))
+                }).collect::<Vec<_>>();
+                if rows.len() < 2 { continue; }
+                let count = rows.len() as f64;
+                let mut indices = Vec::with_capacity(rows.len());
+                let mut base = 0.0_f64;
+                let mut combined = vec![[0.0_f64; 5]; width * 5];
+                for (index, constant, profiles) in rows {
+                    indices.push(index);
+                    base = (base + (constant / count).next_up()).next_up();
+                    for (row, profile) in combined.iter_mut().zip(profiles) {
+                        let value = (row[0] + (profile / count).next_up()).next_up();
+                        row.fill(value);
+                    }
+                }
+                let component = Arc::new(crate::rewards::FixedComponent { base, converted: 1.0, width, rows: combined });
+                let Some(rows) = crate::rewards::FixedRegionRows::new(&[component], Arc::new(AtomicUsize::new(0)), 0) else { continue; };
+                let song = &self.songs[indices[0]];
+                let powers = Arc::new(self.roster.iter().flat_map(|&member| song.snap_power[member * width..(member + 1) * width].iter().copied()).collect());
+                if let Some(bound) = crate::rewards::FixedRegionBound::new(Arc::new(rows), &[0, 1, 2, 3, 4], powers) {
+                    groups.push(SharedPowerBound { songs: indices, bound });
                 }
             }
-            let component = Arc::new(crate::rewards::FixedComponent { base, converted: 1.0, width, rows });
-            let rows = Arc::new(crate::rewards::FixedRegionRows::new(&[component], Arc::new(AtomicUsize::new(0)), 0)?);
-            let song = &self.songs[0];
-            let powers = Arc::new(self.roster.iter().flat_map(|&member| song.snap_power[member * width..(member + 1) * width].iter().copied()).collect());
-            self.joint = crate::rewards::FixedRegionBound::new(rows, &[0, 1, 2, 3, 4], powers);
+            self.joint = Some(groups);
         }
-        let joint = self.joint.as_mut()?;
-        joint.prepare_prefix(&self.joint_options, assigned, from);
-        Some(joint.physical_score_ceiling(self.songs[0].base, totals, Criterion::Mean, None, cutoff))
+        let groups = self.joint.as_mut()?;
+        if groups.is_empty() { return None; }
+        let mut bounds = self.last_bounds.clone();
+        let count = self.songs.len() as f64;
+        let mut total = f64::INFINITY;
+        for group in groups {
+            let group_size = group.songs.len() as f64;
+            let first = group.songs[0];
+            let song = &self.songs[first];
+            let outside = bounds.iter().enumerate().filter(|(index, _)| group.songs.binary_search(index).is_err())
+                .fold(0.0_f64, |sum, (_, value)| (sum + value).next_up());
+            let target = ((cutoff * count).next_down() - outside).next_down().max(0.0) / group_size;
+            let domain = if self.same_power {
+                totals
+            } else {
+                Self::totals(song, &self.roster, assigned, from)
+            };
+            group.bound.prepare_prefix(&self.joint_options, assigned, from);
+            let cap = (group_size * group.bound.physical_score_ceiling(song.base, domain, Criterion::Mean, None, target)).next_up();
+            let separate = group.songs.iter().fold(0.0_f64, |sum, &i| (sum + bounds[i]).next_up());
+            if cap < separate {
+                for &index in &group.songs { bounds[index] = 0.0; }
+                bounds[first] = cap;
+            }
+            total = (bounds.iter().fold(0.0_f64, |sum, value| (sum + value).next_up()) / count).next_up();
+            if total < cutoff { break; }
+        }
+        Some(total)
     }
 
     fn upper(
@@ -661,6 +761,21 @@ impl Objective for Combined<'_, '_> {
         true
     }
     fn snap_dominance(&mut self, member: usize, snap: i32) -> Vec<f64> {
+        if let Some((ids, profiles)) = &mut self.dominance_profiles {
+            let width = self.songs[0].adapter.kernel.snaps.len() + 1;
+            let column = if snap < 0 { width - 1 } else { snap as usize };
+            let slot = member * width + column;
+            if ids[slot] == u32::MAX {
+                let key = self.songs.iter_mut().map(|song| song.adapter.shape_id(member, snap)).collect();
+                let id = profiles.len() as u32;
+                ids[slot] = *profiles.entry(key).or_insert(id);
+            }
+            let shape = ids[slot] as f64;
+            // Each old [shape, -shape] pair required equality. A single
+            // interned tuple and one power per shared table give the same test.
+            return [shape, -shape].into_iter().chain(self.dominance_power.iter()
+                .map(|&song| self.songs[song].snap_power[slot])).collect();
+        }
         self.songs
             .iter_mut()
             .flat_map(|song| {
@@ -811,23 +926,35 @@ impl Objective for Combined<'_, '_> {
         let master = self.songs[0].adapter.kernel.master;
         let roster: Vec<_> = members.iter().map(|&m| self.songs[0].adapter.kernel.members[m].clone()).collect();
         let profile = power::leader_profile(master, &roster[0]);
+        let mut power_tables = HashMap::default();
         for index in 0..self.songs.len() {
-            if self.same_power && index > 0 {
-                self.songs[index].slots = Arc::clone(&self.songs[0].slots);
-                self.songs[index].base = self.songs[0].base;
-                self.songs[index].power_choices = Arc::clone(&self.songs[0].power_choices);
+            let previous = if self.same_power && index > 0 {
+                Some(0)
             } else {
                 let song = &mut self.songs[index];
                 let kernel = &song.adapter.kernel;
                 let percents = power::leader_percents(master, &profile, &roster, 0, Some(song.music));
                 let width = kernel.snaps.len() + 1;
-                let base: Vec<_> = members.iter().enumerate().map(|(i, &m)| {
+                let base: [f64; 5] = std::array::from_fn(|i| {
+                    let m = members[i];
                     (song.bases[m].fixed_points + power::leader_points(&song.bases[m], &percents[i])) as f64
-                }).collect();
-                song.base = base.iter().sum();
-                song.slots = Arc::new(members.iter().enumerate().map(|(slot, &m)| {
-                    (0..width).map(|j| base[slot] + song.snap_power[m * width + j]).collect()
-                }).collect());
+                });
+                let key = (Arc::as_ptr(&song.snap_power), base.map(f64::to_bits));
+                if let Some(&known) = power_tables.get(&key) {
+                    Some(known)
+                } else {
+                    power_tables.insert(key, index);
+                    song.base = base.iter().sum();
+                    song.slots = Arc::new(members.iter().enumerate().map(|(slot, &m)| {
+                        (0..width).map(|j| base[slot] + song.snap_power[m * width + j]).collect()
+                    }).collect());
+                    None
+                }
+            };
+            if let Some(known) = previous {
+                self.songs[index].slots = Arc::clone(&self.songs[known].slots);
+                self.songs[index].base = self.songs[known].base;
+                self.songs[index].power_choices = Arc::clone(&self.songs[known].power_choices);
             }
             let song = &mut self.songs[index];
             let width = song.adapter.kernel.snaps.len() + 1;
@@ -847,7 +974,7 @@ impl Objective for Combined<'_, '_> {
                 choices.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
                 choices
             };
-            if !self.same_power || index == 0 {
+            if previous.is_none() {
                 song.power_choices = Arc::new((0..5).map(|slot| best_five(slot, &song.slots[slot])).collect());
             }
             song.skill_choices = members
@@ -890,7 +1017,7 @@ impl Objective for Combined<'_, '_> {
         if let Some(upper) = window.filter(|&upper| upper < limit) { return Some(coarse.min(upper)); }
         let upper = coarse.min(self.upper(members, assigned, from, true, limit));
         let upper = window.map_or(upper, |window| upper.min(window));
-        Some(if upper < limit { upper } else { self.joint_bound(assigned, from, t, limit).map_or(upper, |joint| upper.min(joint)) })
+        Some(if upper < limit { upper } else { self.joint_bound(assigned, from, t, limit, upper).map_or(upper, |joint| upper.min(joint)) })
     }
     fn interval(&mut self, team: &Team, _t: Totals) -> (f64, f64) {
         if self
@@ -987,26 +1114,56 @@ fn initial_hit(env: &Environment<'_>, charts: &mut [Chart], music: &[Music], see
     let local = Team { members: (0..5).collect(), snaps: team.snaps.iter().scan(0, |next, &index| {
         Some(if index < 0 { -1 } else { let value = *next; *next += 1; value })
     }).collect() };
+    let (master, player, policy, generation) = (env.master, env.player, env.window_policy, env.generation);
+    let (min_bonus, max_bonus) = (env.constraints.min_bonus, env.constraints.max_bonus);
+    let score_chart = |chart: &mut Chart, music: &Music| -> Result<Option<(Exact, power::TeamPower)>, String> {
+        if generation != crate::cancellation_generation() { return Ok(None); }
+        let power = power::team_power(master, player, &members, &snaps, 0, Some(music), &[])?;
+        let mut kernel = Kernel::new(master, &members, &selected, chart, seeds.to_vec(), Criterion::Mean);
+        let bonus: f64 = kernel.bonuses.iter().map(|&value| value as f64).sum();
+        if min_bonus.is_some_and(|minimum| bonus < minimum)
+            || max_bonus.is_some_and(|maximum| bonus > maximum)
+            || !kernel.meets_combo(&local.members, minimum.max(1)) { return Ok(None); }
+        kernel.just_window = policy.map(|policy| crate::just_window::Prepared::new(master, kernel.chart, &members, &selected, policy, seeds)).transpose()?;
+        if !kernel.feasible_team(&local, power.total as f64)? { return Ok(None); }
+        let mut score = kernel.exact(&local, power.total as i32, true)?;
+        kernel.decorate_window(&local, power.total as i32, &mut score.detail)?;
+        Ok(Some((score, power)))
+    };
     let mut details = Vec::with_capacity(charts.len());
     let mut total = 0.0;
     let mut powers = 0.0;
     let mut slot_powers = vec![0.0; 5];
-    for (chart, music) in charts.iter_mut().zip(music) {
-        if (env.now)() >= deadline || env.generation != crate::cancellation_generation() { return Ok(None); }
-        let power = power::team_power(env.master, env.player, &members, &snaps, 0, Some(music), &[])?;
-        let mut kernel = Kernel::new(env.master, &members, &selected, chart, seeds.to_vec(), Criterion::Mean);
-        let bonus: f64 = kernel.bonuses.iter().map(|&value| value as f64).sum();
-        if env.constraints.min_bonus.is_some_and(|minimum| bonus < minimum)
-            || env.constraints.max_bonus.is_some_and(|maximum| bonus > maximum)
-            || !kernel.meets_combo(&local.members, minimum.max(1)) { return Ok(None); }
-        kernel.just_window = env.window_policy.map(|policy| crate::just_window::Prepared::new(env.master, kernel.chart, &members, &selected, policy, seeds)).transpose()?;
-        if !kernel.feasible_team(&local, power.total as f64)? { return Ok(None); }
-        let mut score = kernel.exact(&local, power.total as i32, true)?;
-        kernel.decorate_window(&local, power.total as i32, &mut score.detail)?;
+    let mut collect = |(score, power): (Exact, power::TeamPower)| {
         total += score.key;
         powers += power.total as f64;
         for (sum, value) in slot_powers.iter_mut().zip(&power.slots) { *sum += *value as f64; }
         details.push(json!({"detail":score.detail,"power":power.total,"slotPowers":power.slots}));
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    let parallel = !deadline.is_finite() && (16..=512).contains(&charts.len())
+        && crate::parallel::workers(charts.len()) > 1;
+    #[cfg(target_arch = "wasm32")]
+    let parallel = false;
+    if parallel {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let items: Vec<_> = charts.iter_mut().zip(music).map(|(chart, music)| {
+                (std::sync::Mutex::new(chart), music)
+            }).collect();
+            for result in crate::parallel::map(&items, |(chart, music)| {
+                Ok::<_, String>(crate::parallel::serial(|| score_chart(&mut **chart.lock().unwrap(), music)))
+            })? {
+                let Some(result) = result? else { return Ok(None); };
+                collect(result);
+            }
+        }
+    } else {
+        for (chart, music) in charts.iter_mut().zip(music) {
+            if (env.now)() >= deadline { return Ok(None); }
+            let Some(result) = score_chart(chart, music)? else { return Ok(None); };
+            collect(result);
+        }
     }
     let count = charts.len() as f64;
     for value in &mut slot_powers { *value /= count; }
@@ -1035,7 +1192,15 @@ pub(crate) fn search_shared(input: SharedInput<'_>) -> Result<search::Output, St
     let started = (env.now)();
     let mut early = None;
     if !seeded && sections.is_none() {
+        let constraints = &env.constraints;
+        let locked = constraints.leader.filter(|&leader| leader >= 0).is_some_and(|leader| {
+            let members: BTreeSet<_> = constraints.required_members.iter().copied()
+                .chain(constraints.bindings.keys().copied()).chain(std::iter::once(leader as usize)).collect();
+            members.len() == 5 && members.iter().all(|member| constraints.bindings.contains_key(member))
+        }) && shard.is_none() && k == 1;
+        let mut sole_formation = false;
         if initial.is_empty() && k == 1 && charts.len() >= 8 && env.window_policy.is_some()
+            && !locked
             && seeds.is_empty() && charts.iter().all(|chart| chart.accuracy.great == 0.0
                 && chart.accuracy.miss_every == 0 && chart.setup.missions.iter().all(|&mission| mission == 3)) {
             let scout = search_scored(Input {
@@ -1053,7 +1218,7 @@ pub(crate) fn search_shared(input: SharedInput<'_>) -> Result<search::Output, St
         if initial.is_empty() {
             let mut objective = PowerSeed { bonuses: combo_bonuses(env.master, env.members, &charts[0].setup.missions) };
             let mut trial = env.constraints.clone();
-            if charts.len()>8 && charts.iter().all(|chart|!chart.luck&&chart.setup.missions.iter().all(|&mission|mission==3))
+            if !locked && charts.len()>8 && charts.iter().all(|chart|!chart.luck&&chart.setup.missions.iter().all(|&mission|mission==3))
                 && trial.required_snaps.is_empty() && trial.bindings.values().all(|&snap|snap<0) {
                 let eligible: Vec<_> = env.members.iter().map(|member| gekiso::seed_actor(env.master,&charts[0],&Performer::from_member(env.master,member,None))).collect();
                 if trial.required_members.iter().chain(trial.bindings.keys()).all(|&index|eligible[index])
@@ -1064,11 +1229,18 @@ pub(crate) fn search_shared(input: SharedInput<'_>) -> Result<search::Output, St
             }
             let warm = crate::progress::with_callback(None, || env.run(&mut objective, Run { constraints: trial, k: 1,
                 deadline: deadline.min(started + 40.0), seeds: Vec::new(), shard: None, floor: f64::NEG_INFINITY }, None, None))?;
-            if let Some(hit) = warm.hits.first() { initial.push(hit.team.clone()); }
+            if let Some(hit) = warm.hits.first() {
+                sole_formation = locked && warm.proven;
+                initial.push(hit.team.clone());
+            }
         }
         if let Some(team) = initial.first() {
             early = initial_hit(&env, charts, music, &seeds, team, min_combo_bonus, deadline)?;
             if let (Some(hit), Some(callback)) = (&early, on_candidate.as_deref_mut()) { callback(std::slice::from_ref(hit)); }
+            if sole_formation && early.is_some() && (env.now)() < deadline && env.generation == crate::cancellation_generation() {
+                return Ok(search::Output { hits: early.into_iter().collect(), proven: true, bound: None,
+                    stats: search::Stats { elapsed_ms: (env.now)() - started, ..Default::default() } });
+            }
         }
     }
     let mut hits = Vec::new();

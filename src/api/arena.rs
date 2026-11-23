@@ -208,10 +208,10 @@ impl Engine {
         let player = power::player_state(master, &request["player"]);
         let accuracy = serde::Deserialize::deserialize(&goal["accuracy"]).map_err(|e| e.to_string())?;
         let ranks = gekiso_ranks(goal);
-        let mut charts = Vec::with_capacity(songs.len());
-        let mut music = Vec::with_capacity(songs.len());
-        let mut compiled = Vec::with_capacity(songs.len());
-        for (song, source) in songs.iter().zip(&sources) {
+        let jobs: Vec<_> = songs.iter().zip(&sources).collect();
+        let cached_charts = &engine.charts;
+        let cached_sources = &engine.sources;
+        let prepared = crate::parallel::map(&jobs, |&(song, source)| {
             let id = master::int(&song["songId"]);
             let difficulty = master::int(&song["difficulty"]);
             let item = master.songs.get(&id).ok_or("unknown song")?;
@@ -230,12 +230,18 @@ impl Engine {
                 ranks.clone(),
             )?;
             chart.music_type = view.music_type;
+            let key = (id, difficulty);
+            let cached = cached_charts.get(&key).filter(|_| cached_sources.get(&key) == Some(source));
+            let compiled = cached.cloned().unwrap_or_else(|| chart::compile(master, item, level, source));
+            Ok::<_, String>((chart, view, compiled))
+        })?;
+        let mut charts = Vec::with_capacity(prepared.len());
+        let mut music = Vec::with_capacity(prepared.len());
+        let mut compiled = Vec::with_capacity(prepared.len());
+        for (chart, view, data) in prepared {
             charts.push(chart);
             music.push(view);
-            let key = (id, difficulty);
-            let cached = engine.charts.get(&key).filter(|_| engine.sources.get(&key) == Some(source));
-            compiled.push(cached.cloned()
-                .unwrap_or_else(|| chart::compile(master, item, level, source)));
+            compiled.push(data);
         }
         let deadline = request["deadline"].as_f64().unwrap_or_else(|| {
             request["timeLimitMs"]
