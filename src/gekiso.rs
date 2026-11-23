@@ -909,6 +909,7 @@ impl RushSupportPlan {
                     }
                 }
                 ReplayCommand::Input(_) | ReplayCommand::Ordinary(_, _) | ReplayCommand::Rank(_, _, _) => {}
+                ReplayCommand::ComboHistory(_) => return None,
             }
         }
         let mut result = Context {

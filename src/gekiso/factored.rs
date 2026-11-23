@@ -98,6 +98,16 @@ impl ScoreTape {
                     put(&mut bytes, note.life);
                     bytes.push(note.score_type as u8);
                 }
+                ReplayCommand::ComboHistory(update) => {
+                    bytes.push(8);
+                    bytes.push(update.range as u8);
+                    put(&mut bytes, update.from as i32);
+                    put(&mut bytes, (update.rest.len() + 1) as i32);
+                    for (time, combo) in std::iter::once(update.first).chain(update.rest.iter().copied()) {
+                        put(&mut bytes, time);
+                        put(&mut bytes, combo);
+                    }
+                }
                 ReplayCommand::Factor(c) => {
                     bytes.push(2);
                     for value in [
@@ -1058,12 +1068,14 @@ fn context(
     model.score.score.factored_record = true;
     model.score.score.record_only = true;
     model.score.score.calculator.factors_only = true;
+    let combo = chart.setup.missions.contains(&1);
+    if combo { model.gk.as_mut().unwrap().controller.record_combo_history(); }
     let runs = if chart.luck {
         seeds.to_vec()
     } else {
         vec![seeds.first().copied().unwrap_or(0)]
     };
-    let fixed_inputs = runs.len() > 1 && reduced.iter().all(|actor| {
+    let fixed_inputs = !combo && runs.len() > 1 && reduced.iter().all(|actor| {
         actor.support_skills.iter().all(|&(id, level)| control.support_skills[&id]
             .iter().filter(|row| row.level == level).all(|row|
                 (matches!(row.kind, 3000..=3004 | 12006 | 15000)) && ordinary_row(control, row)))
@@ -1221,6 +1233,24 @@ fn context(
 type OrdinaryTape = Arc<Vec<(usize, FactorCommand)>>;
 type OrdinaryOrders = [Option<OrdinaryTape>; 120];
 #[derive(Clone)]
+struct ComboPlayback<'a> {
+    ranges: &'a [(i32, i32)],
+    missions: &'a [i32],
+    history: [Vec<(i32, i32)>; 3],
+}
+impl crate::full::score::GekisoCombo for ComboPlayback<'_> {
+    fn combo(&self, time: i32) -> Option<i32> {
+        let range = self.ranges.iter().zip(self.missions).position(|(&(start, end), &mission)| {
+            mission == 1 && start <= time && time <= end
+        })?;
+        let previous = core::frame(time).wrapping_mul(40).wrapping_sub(40);
+        let row = &self.history[range];
+        let at = row.partition_point(|&(time, _)| time <= previous);
+        Some(at.checked_sub(1).map_or(0, |index| row[index].1))
+    }
+}
+
+#[derive(Clone)]
 struct ScoreState<'a> {
     program: Option<Model<'a>>,
     ordinary_record: Vec<(usize, FactorCommand)>,
@@ -1228,6 +1258,7 @@ struct ScoreState<'a> {
     ordinary_at: usize,
     score: Incremental<'a>,
     combo: core::Combo,
+    gekiso_combo: Option<ComboPlayback<'a>>,
     judged: Vec<crate::full::play::JudgedNote>,
     life: [i32; 4],
     last: [i32; 2],
@@ -1248,7 +1279,8 @@ struct ScoreTree<'a, 'o> {
 impl<'a> ScoreTree<'a, '_> {
     fn calculate(&self, state: &mut ScoreState<'a>, time: i32) -> Result<(), String> {
         state.last[0] = state.last[1];
-        state.last[1] = state.score.calculate(time, &state.combo, None)?;
+        let gekiso = state.gekiso_combo.as_ref().map(|combo| combo as &dyn crate::full::score::GekisoCombo);
+        state.last[1] = state.score.calculate(time, &state.combo, gekiso)?;
         Ok(())
     }
     fn ordinary(&self, state: &mut ScoreState<'a>) -> Result<(), String> {
@@ -1348,8 +1380,8 @@ impl<'a> ScoreTree<'a, '_> {
                             && time < state.next_frame {
                             let next = self.chart.play.frames[state.frame..end]
                                 .partition_point(|frame| frame.time_ms < state.next_frame) + state.frame;
-                            let score = state.score.calculate(self.chart.play.frames[next - 1].time_ms, &state.combo, None)?;
-                            state.last = [score; 2];
+                            self.calculate(state, self.chart.play.frames[next - 1].time_ms)?;
+                            state.last[0] = state.last[1];
                             state.frame = next;
                         } else {
                             self.calculate(state, time)?;
@@ -1368,6 +1400,15 @@ impl<'a> ScoreTree<'a, '_> {
                     let bonus =
                         crate::num::i32((i64::from(own) * i64::from(percent)) as f64 / 100.0);
                     state.score.add_fixed(end, bonus);
+                }
+                8 => {
+                    let range = self.trace.bytes[at] as usize;
+                    at += 1;
+                    let from = self.trace.i32(&mut at) as usize;
+                    let len = self.trace.i32(&mut at) as usize;
+                    let history = &mut state.gekiso_combo.as_mut().unwrap().history[range];
+                    history.truncate(from);
+                    history.extend((0..len).map(|_| (self.trace.i32(&mut at), self.trace.i32(&mut at))));
                 }
                 16..=31 => {
                     for (field, life) in state.life.iter_mut().enumerate() {
@@ -1499,6 +1540,10 @@ fn score_orders<'a>(
         ordinary_at: 0,
         score: Incremental::new(calculator, params.music_length),
         combo: core::Combo::default(),
+        gekiso_combo: chart.setup.missions.contains(&1).then(|| ComboPlayback {
+            ranges: &chart.setup.fevers, missions: &chart.setup.missions,
+            history: std::array::from_fn(|_| Vec::new()),
+        }),
         judged: Vec::new(),
         life: [draw.base; 4],
         last: [0; 2],
@@ -1535,7 +1580,8 @@ pub(super) fn scores(
             .setup
             .missions
             .iter()
-            .any(|&mission| mission != 2 && mission != 3)
+            .any(|&mission| !(1..=3).contains(&mission))
+        || chart.setup.missions.contains(&1) && uses_full_replay(master, chart, seeds)
         || chart.luck && seeds.is_empty()
         || !chart.luck && replay_random_skills(master, chart, deck)
     {

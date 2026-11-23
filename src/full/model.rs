@@ -1496,6 +1496,11 @@ impl<'a> Model<'a> {
         };
         g.controller
             .update(time, &self.gk_judged, &g.fever_updates, current, &mut env)?;
+        if self.score.score.factored_record {
+            self.score.score.replay.as_mut().unwrap().extend(
+                g.controller.take_combo_history_updates().map(score::ReplayCommand::ComboHistory),
+            );
+        }
         g.previous_lots.clone_from(&g.controller.lot_results);
         g.previous_lot_ms = if g.previous_lots.is_empty() { 0 } else { time };
         let Some(index) = g

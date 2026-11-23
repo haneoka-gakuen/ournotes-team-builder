@@ -462,6 +462,13 @@ pub struct Environment<'a> {
 }
 pub type GkNote = (i32, i32, i32, i32);
 #[derive(Clone)]
+pub(crate) struct ComboHistoryUpdate {
+    pub(crate) range: usize,
+    pub(crate) from: usize,
+    pub(crate) first: (i32, i32),
+    pub(crate) rest: Vec<(i32, i32)>,
+}
+#[derive(Clone)]
 pub struct Controller {
     pub ranges: Vec<Range>,
     pub states: Vec<State>,
@@ -481,6 +488,7 @@ pub struct Controller {
     sequence: i32,
     history: Vec<Vec<(i32, i32, i32)>>,
     snapshot: Vec<Vec<i32>>,
+    combo_history_updates: Option<Vec<ComboHistoryUpdate>>,
     resume: Vec<Resume>,
     resumed_unlimited: Vec<Vec<(i32, i32)>>,
     resumed_limited: Vec<Vec<(i32, i32, i32)>>,
@@ -559,6 +567,7 @@ impl Controller {
             sequence: 0,
             history: vec![Vec::new(); n],
             snapshot: vec![Vec::new(); n],
+            combo_history_updates: None,
             resume: vec![Resume::default(); n],
             resumed_unlimited: vec![Vec::new(); n],
             resumed_limited: vec![Vec::new(); n],
@@ -736,6 +745,14 @@ impl Controller {
     pub fn lot_buff(&self, time: i32) -> i32 {
         core::floor_i32(f(Storage::at(&self.storage.lot, time) * 100.0))
     }
+    pub(crate) fn record_combo_history(&mut self) {
+        self.combo_history_updates = Some(Vec::new());
+    }
+
+    pub(crate) fn take_combo_history_updates(&mut self) -> impl Iterator<Item = ComboHistoryUpdate> + '_ {
+        self.combo_history_updates.iter_mut().flat_map(|updates| updates.drain(..))
+    }
+
     fn recalculate(&mut self) {
         for index in 0..self.states.len() {
             if self.states[index].state >= DELAY || self.history[index].is_empty() {
@@ -784,6 +801,7 @@ impl Controller {
                 i_just = 0;
                 i_combo = 0;
             }
+            let from = k;
             while k < self.history[index].len() {
                 let (time, judgement, sequence) = self.history[index][k];
                 while i_cb < self.combo_stack.len() {
@@ -836,6 +854,14 @@ impl Controller {
                 self.entry(index, judgement, core::floor_i32(cb), core::floor_i32(jb));
                 self.snapshot[index].push(self.states[index].combo);
                 k += 1;
+            }
+            if let Some(updates) = &mut self.combo_history_updates {
+                if from < k && self.ranges[index].mission == MISSION_COMBO {
+                    let first = (self.history[index][from].0, self.snapshot[index][from]);
+                    let rest = self.history[index][from + 1..k].iter().zip(&self.snapshot[index][from + 1..k])
+                        .map(|(&(time, _, _), &combo)| (time, combo)).collect();
+                    updates.push(ComboHistoryUpdate { range: index, from, first, rest });
+                }
             }
             let s = &self.states[index];
             self.resume[index] = Resume {

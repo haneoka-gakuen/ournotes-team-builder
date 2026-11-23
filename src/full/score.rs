@@ -143,7 +143,7 @@ pub(crate) struct NoteMemo {
     combos: Vec<f64>,
     cells: usize,
     lucks: Vec<i32>,
-    states: RefCell<FxHashMap<[u64; 2], NoteCells>>,
+    states: RefCell<FxHashMap<[u64; 3], NoteCells>>,
 }
 impl NoteMemo {
     fn new(calculator: &Calculator<'_>, maximum: usize) -> Self {
@@ -175,8 +175,8 @@ impl NoteMemo {
             .and_then(|n| n.checked_mul(lucks.len())).unwrap_or(usize::MAX);
         Self { bases, base_ids, combo_ids, combos, cells, lucks, states: RefCell::new(FxHashMap::default()) }
     }
-    fn state(&self, combo: f64, up: f64) -> Option<NoteCells> {
-        let key = [combo.to_bits(), up.to_bits()];
+    fn state(&self, combo: f64, up: f64, gekiso: u64) -> Option<NoteCells> {
+        let key = [combo.to_bits(), up.to_bits(), gekiso];
         let mut states = self.states.borrow_mut();
         if let Some(row) = states.get(&key) { return Some(Rc::clone(row)); }
         let limit = 4 * 1024 * 1024 / std::mem::size_of::<Option<i32>>();
@@ -202,6 +202,7 @@ pub struct Calculator<'a> {
     memo_rows: [Option<NoteCells>; 7],
     memo_ups: [f64; 7],
     memo_dirty: bool,
+    memo_gekiso: u64,
 }
 impl<'a> Calculator<'a> {
     pub fn new(
@@ -226,6 +227,7 @@ impl<'a> Calculator<'a> {
             memo_rows: std::array::from_fn(|_| None),
             memo_ups: [0.0; 7],
             memo_dirty: true,
+            memo_gekiso: 0,
         }
     }
     pub(crate) fn share_note_memo(&mut self, shared: &mut Option<Rc<NoteMemo>>, maximum: usize) {
@@ -239,15 +241,16 @@ impl<'a> Calculator<'a> {
         self.memo_rows = std::array::from_fn(|_| None);
         self.memo_dirty = true;
     }
-    fn memo_score(&mut self, life: i32, op: i32, grade: i32, combo: i32) -> Result<Option<i32>, String> {
+    fn memo_score(&mut self, life: i32, op: i32, grade: i32, combo: i32, gekiso: f64) -> Result<Option<i32>, String> {
         let memo = self.memo.as_ref().unwrap();
-        if self.memo_dirty {
+        if self.memo_dirty || self.memo_gekiso != gekiso.to_bits() {
+            self.memo_gekiso = gekiso.to_bits();
             for grade in 0..7 {
                 let up = f(self.factors.note + self.factors.judgement(grade as i32));
                 self.memo_ups[grade] = up;
                 self.memo_rows[grade] = if let Some(previous) = (0..grade).find(|&index| self.memo_ups[index].to_bits() == up.to_bits()) {
                     self.memo_rows[previous].clone()
-                } else { memo.state(self.factors.combo, up) };
+                } else { memo.state(self.factors.combo, up, self.memo_gekiso) };
             }
             self.memo_dirty = false;
         }
@@ -260,7 +263,7 @@ impl<'a> Calculator<'a> {
         let index = (((base as usize - 1) * memo.combos.len() + bucket) * 2 + usize::from(life <= 0)) * memo.lucks.len() + luck;
         let cached = row.borrow()[index];
         if let Some(value) = cached { return Ok(Some(value)); }
-        let combo_factor = f(1.0 * f(self.factors.combo + memo.combos[bucket]));
+        let combo_factor = f(gekiso * f(self.factors.combo + memo.combos[bucket]));
         let score_up = self.memo_ups[grade as usize];
         let luck = f(f(percent as f64) / 100.0);
         let value = self.core(life, op, grade, combo_factor, score_up, luck)?;
@@ -307,10 +310,10 @@ impl<'a> Calculator<'a> {
     ) -> Result<i32, String> {
         let (life, time, op, score_type, note_id) =
             (note.life, note.time, note.op, note.score_type, note.id);
-        if self.memo.is_some() && info.is_none() && !self.factors_only {
-            if let Some(value) = self.memo_score(life, op, score_type, combo)? { return Ok(value); }
-        }
         let gk = self.gekiso_factor(info, time);
+        if self.memo.is_some() && !self.factors_only {
+            if let Some(value) = self.memo_score(life, op, score_type, combo, gk)? { return Ok(value); }
+        }
         let judge = self.factors.judgement(score_type);
         let luck_percent = self.factors.luck.wrapping_add(100).min(200);
         let luck = f(f(luck_percent as f64) / 100.0);
@@ -383,6 +386,7 @@ pub struct NoteCommand {
 #[derive(Clone)]
 pub(crate) enum ReplayCommand {
     Note(NoteCommand),
+    ComboHistory(super::gekisou::ComboHistoryUpdate),
     Factor(FactorCommand),
     Calculate(i32),
     Rush(i32, i32),
