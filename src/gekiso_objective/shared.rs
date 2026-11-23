@@ -1236,6 +1236,12 @@ pub(crate) fn search_shared(input: SharedInput<'_>) -> Result<search::Output, St
         objective.floor = if sections.is_some() { f64::NEG_INFINITY } else { current.get(k - 1).map_or(floor, |hit| hit.key.max(floor)) };
         if seeded {
             objective.completed = initial.clone();
+        } else if sections.is_none() && k == 1 {
+            // The retained incumbent has already replayed every requested chart
+            // and skill order with this physical formation.
+            objective.completed.extend(current.iter()
+                .filter(|hit| hit.key.is_finite())
+                .map(|hit| hit.team.clone()));
         }
         let constraints = if same_levels {
             level_constraints(&env.constraints, level, maximum)
