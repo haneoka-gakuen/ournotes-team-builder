@@ -1742,13 +1742,12 @@ impl Engine {
                     })
             })
             .unwrap_or_default();
+        let direct_replay = shard.is_some() && gekiso::uses_full_replay(&self.master, &chart, &seeds);
         let cooperative_floor = self.trusted_scores
             && minimum_just_window.is_none()
             && identity.is_some()
             && k == 1
-            && criterion == Criterion::Max
-            && chart.luck
-            && seeds.len() >= 16
+            && (direct_replay || criterion == Criterion::Max && chart.luck && seeds.len() >= 16)
             && request["noFloor"] != true
             && request["seedOnly"] != true
             && (cfg!(not(target_arch = "wasm32")) || request["cooperativeFloor"] == true);
@@ -3767,20 +3766,16 @@ fn hit_json(
 }
 
 impl Engine {
-    fn load_source(&mut self, input: &Value, song: &Value) -> Result<(), String> {
-        let key = (
-            master::int(&song["songId"]),
-            master::int(&song["difficulty"]),
-        );
-        if let Some(entry) = master::rows(&input["charts"])
-            .into_iter()
-            .find(|r| r["song"] == *song)
-        {
-            let source = if entry["source"].is_null() {
-                crate::runtime_chart::convert(&entry["chart"])?
-            } else {
-                serde::Deserialize::deserialize(&entry["source"]).map_err(|e| e.to_string())?
-            };
+    fn chart_source(entry: &Value) -> Result<Source, String> {
+        if entry["source"].is_null() {
+            crate::runtime_chart::convert(&entry["chart"])
+        } else {
+            serde::Deserialize::deserialize(&entry["source"]).map_err(|e| e.to_string())
+        }
+    }
+
+    fn update_chart_source(&mut self, key: (i32, i32), source: Option<Source>) -> Result<(), String> {
+        if let Some(source) = source {
             self.insert_chart(key.0, key.1, source)?;
         } else if self.charts.contains_key(&key) {
             self.chart_order.retain(|&old| old != key);
@@ -3789,6 +3784,36 @@ impl Engine {
             return Err(format!("missing-chart:{}:{}", key.0, key.1));
         }
         Ok(())
+    }
+
+    fn load_source(&mut self, input: &Value, song: &Value) -> Result<(), String> {
+        let key = (
+            master::int(&song["songId"]),
+            master::int(&song["difficulty"]),
+        );
+        let source = master::rows(&input["charts"])
+            .into_iter()
+            .find(|r| r["song"] == *song)
+            .map(Self::chart_source).transpose()?;
+        self.update_chart_source(key, source)
+    }
+
+    fn load_sources(&mut self, input: &Value, songs: &[Value]) -> Result<Vec<Source>, String> {
+        let entries = master::rows(&input["charts"]);
+        let parse = |song: &Value| {
+            entries.iter().copied().find(|r| r["song"] == *song).map(Self::chart_source).transpose()
+        };
+        let mut parallel = if songs.len() <= CHART_CACHE_LIMIT && crate::parallel::workers(songs.len()) > 1 {
+            Some(crate::parallel::map(songs, parse)?.into_iter())
+        } else { None };
+        let mut loaded = Vec::with_capacity(songs.len());
+        for song in songs {
+            let source = if let Some(sources) = &mut parallel { sources.next().unwrap() } else { parse(song)? };
+            let key = (master::int(&song["songId"]), master::int(&song["difficulty"]));
+            self.update_chart_source(key, source)?;
+            loaded.push(self.sources[&key].clone());
+        }
+        Ok(loaded)
     }
     pub fn plan(
         &mut self,

@@ -92,19 +92,17 @@ impl Engine {
             scoped_input["request"]["gekiso"]["arena"] = Value::Null;
         }
         scoped_input["request"]["arena"] = Value::Null;
-        let mut sources = Vec::with_capacity(songs.len());
-        for song in &songs {
-            self.load_source(input, song)?;
-            if preload {
-                self.inherit_chart(&mut scoped, (master::int(&song["songId"]), master::int(&song["difficulty"])));
+        let sources = self.load_sources(input, &songs)?;
+        if preload {
+            for (song, source) in songs.iter().zip(&sources) {
+                let key = (master::int(&song["songId"]), master::int(&song["difficulty"]));
+                if scoped.charts.contains_key(&key) { continue; }
+                if self.sources.get(&key) == Some(source) {
+                    self.inherit_chart(&mut scoped, key);
+                } else {
+                    scoped.insert_chart(key.0, key.1, source.clone())?;
+                }
             }
-            sources.push(
-                self.sources[&(
-                    master::int(&song["songId"]),
-                    master::int(&song["difficulty"]),
-                )]
-                    .clone(),
-            );
         }
         scoped_input["charts"] = if preload { json!([]) } else { json!(songs
             .iter()
@@ -182,17 +180,7 @@ impl Engine {
                 .into_iter()
                 .cloned()
                 .collect();
-            let mut sources = Vec::with_capacity(songs.len());
-            for song in &songs {
-                self.load_source(input, song)?;
-                sources.push(
-                    self.sources[&(
-                        master::int(&song["songId"]),
-                        master::int(&song["difficulty"]),
-                    )]
-                        .clone(),
-                );
-            }
+            let sources = self.load_sources(input, &songs)?;
             (None, songs, sources)
         };
         let (engine, scoped_input) = view.as_ref().map_or((&*self, input), |(engine, input)| (engine, input));
