@@ -6,6 +6,29 @@ pub(crate) struct RushTrace {
     pub rush: RushCommands,
     pub support: RushCommands,
 }
+
+pub(crate) struct PreparedLotteryNotes {
+    judged: Vec<gekisou::GkNote>,
+    score: Vec<score::NoteCommand>,
+}
+
+pub(super) fn prepare_notes(model: &Model<'_>, input: &[JudgedNote], life: &[i32]) -> Result<PreparedLotteryNotes, String> {
+    let mut judged = Vec::with_capacity(input.len());
+    let mut score = Vec::new();
+    for input in input {
+        let note = model.notes.get(&input.note_id)
+            .ok_or_else(|| format!("unknown note {}", input.note_id))?;
+        judged.push((note.id, note.op, note.time_ms, input.judgement));
+        if model.master.live.note_percent.contains_key(&note.op) {
+            let grade = input.judgement + 1;
+            let score_type = if (0..9).contains(&grade) { [0, 0, 6, 5, 4, 3, 2, 1, 0][grade as usize] } else { 0 };
+            score.push(score::NoteCommand {
+                time: note.time_ms, life: life[note.id as usize], id: note.id, op: note.op, score_type,
+            });
+        }
+    }
+    Ok(PreparedLotteryNotes { judged, score })
+}
 fn support_probe(master: &Master) -> Option<Performer> {
     for (&id, skill) in master
         .gekiso_support_skills
@@ -184,6 +207,7 @@ pub(crate) fn rush_windows(
                 &mut model,
                 input.time_ms,
                 &input.judged,
+                None,
                 chart.play.dt[k],
                 &mut judged,
                 &mut due,
@@ -217,18 +241,15 @@ pub(crate) fn rush_windows(
     Ok(Some(traces))
 }
 
-pub(super) fn record_frame(model: &mut Model<'_>, time: i32, input: &[JudgedNote], dt: f64) -> Result<(), String> {
-    let mut judged = std::mem::take(&mut model.gk_judged);
-    let mut due = Vec::new();
-    let result = frame::<true>(model, time, input, dt, &mut judged, &mut due);
-    model.gk_judged = judged;
-    result
+pub(super) fn record_frame(model: &mut Model<'_>, time: i32, input: &[JudgedNote], prepared: &PreparedLotteryNotes, dt: f64) -> Result<(), String> {
+    frame::<true>(model, time, input, Some(prepared), dt, &mut Vec::new(), &mut Vec::new())
 }
 
 fn frame<const FACTORED: bool>(
     model: &mut Model<'_>,
     time: i32,
     input: &[JudgedNote],
+    prepared: Option<&PreparedLotteryNotes>,
     dt: f64,
     judged: &mut Vec<gekisou::GkNote>,
     due: &mut Vec<usize>,
@@ -258,48 +279,38 @@ fn frame<const FACTORED: bool>(
         .frame_events
         .extend(due.iter().map(|&i| model.events[i]));
     model.judged.clear();
-    judged.clear();
-    let mut broken = false;
-    for j in input {
-        let n = model
-            .notes
-            .get(&j.note_id)
-            .ok_or_else(|| format!("unknown note {}", j.note_id))?;
-        let converted = if FACTORED { j.judgement } else {
-            model.conversion.convert(j.judgement, n.judgement_type, j.time_ms)?
-        };
-        if !FACTORED { model.combo.add(n.time_ms, converted); }
-        model.judged.push((n.id, converted, n.time_ms));
-        judged.push((n.id, n.op, n.time_ms, converted));
-        broken |= converted == 1 || converted == 2;
-    }
-    if !FACTORED {
+    let judged = if FACTORED {
+        let prepared = prepared.unwrap();
+        model.judged.extend(prepared.judged.iter().map(|&(id, _, time, grade)| (id, grade, time)));
+        let replay = model.score.score.replay.as_mut().unwrap();
+        if !input.is_empty() {
+            replay.push(score::ReplayCommand::Input(input.to_vec()));
+        }
+        replay.extend(prepared.score.iter().cloned().map(score::ReplayCommand::Note));
+        model.score.score.calculate(time, &model.combo, None)?;
+        &prepared.judged[..]
+    } else {
+        judged.clear();
+        let mut broken = false;
+        for j in input {
+            let n = model.notes.get(&j.note_id).ok_or_else(|| format!("unknown note {}", j.note_id))?;
+            let converted = model.conversion.convert(j.judgement, n.judgement_type, j.time_ms)?;
+            model.combo.add(n.time_ms, converted);
+            model.judged.push((n.id, converted, n.time_ms));
+            judged.push((n.id, n.op, n.time_ms, converted));
+            broken |= converted == 1 || converted == 2;
+        }
         let combo = model.combo.at(time);
         let added = (combo - model.previous_combo).max(0);
         model.previous_combo = combo;
         if broken { model.current_combo = 0; }
         model.current_combo = model.current_combo.wrapping_add(added);
-    }
-    if FACTORED && !model.judged.is_empty() {
-        model.score.score.replay.as_mut().unwrap().push(score::ReplayCommand::Input(
-            model.judged.iter().map(|&(note_id, judgement, time_ms)| JudgedNote { note_id, judgement, time_ms }).collect()));
-    }
-    if !FACTORED {
         for &(_, _, note_time, converted) in judged.iter() {
             model.life.note_damage(note_time, converted as usize);
             model.life.at(note_time);
         }
-    }
-    if FACTORED {
-        for &(id, op, time, converted) in judged.iter() {
-            if model.master.live.note_percent.contains_key(&op) {
-                let j = converted + 1;
-                let score_type = if (0..9).contains(&j) { [0, 0, 6, 5, 4, 3, 2, 1, 0][j as usize] } else { 0 };
-                model.score.score.add_note(time, model.life.at(time), id, op, score_type);
-            }
-        }
-        model.score.score.calculate(time, &model.combo, None)?;
-    }
+        judged.as_slice()
+    };
     let indices = model.condition_indices();
     let mut listed = std::mem::take(&mut model.listed);
     let mut updated = std::mem::take(&mut model.updated);

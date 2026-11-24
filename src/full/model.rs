@@ -1121,9 +1121,14 @@ impl<'a> Model<'a> {
         }
         supported
     }
-    pub(crate) fn record_lottery_frame(&mut self, time: i32, judged: &[JudgedNote], dt: f64) -> Result<(), String> {
+    pub(crate) fn prepare_lottery_notes(&self, judged: &[JudgedNote], life: &[i32]) -> Result<lottery::PreparedLotteryNotes, String> {
+        lottery::prepare_notes(self, judged, life)
+    }
+
+    pub(crate) fn record_lottery_frame(&mut self, time: i32, judged: &[JudgedNote],
+        prepared: &lottery::PreparedLotteryNotes, dt: f64) -> Result<(), String> {
         debug_assert!(self.score.score.record_only && self.score.score.factored_record);
-        lottery::record_frame(self, time, judged, dt)
+        lottery::record_frame(self, time, judged, prepared, dt)
     }
 
     pub(crate) fn lottery_gap_is_inert(&self, through: Option<i32>) -> bool {

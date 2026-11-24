@@ -4387,7 +4387,6 @@ impl DeterministicBound {
         roster: Option<&[usize; 5]>,
     ) -> Option<Self> {
         let luck_cap = chart.luck;
-        let luck_commands = luck.map_or(chart.play.frames.len(), |trace| trace.changes);
         if luck.is_some_and(|luck| luck.moments.is_some() || luck.nominal_weights.is_some()) {
             let reads_luck = |row: &SkillEffect| {
                 [
@@ -4549,6 +4548,17 @@ impl DeterministicBound {
         if ranges.windows(2).any(|r| r[0].1 >= r[1].0) {
             return None;
         }
+        // An unconditional Rush-linked support can change its trigger only
+        // during a LUCK range or when that range completes. The deterministic
+        // ranges already include its completion and the following frame.
+        let rush_frames: usize = ranges.iter().zip(&chart.setup.missions)
+            .filter(|(_, mission)| **mission == 2)
+            .map(|(&(start, end), _)| {
+                let first = chart.play.frames.partition_point(|frame| frame.time_ms < start);
+                let last = chart.play.frames.partition_point(|frame| frame.time_ms <= end);
+                last.saturating_sub(first)
+            }).sum();
+        let luck_commands = luck.map_or(rush_frames, |trace| trace.changes.min(rush_frames));
         let mut judged_times: Vec<_> = chart
             .play
             .frames

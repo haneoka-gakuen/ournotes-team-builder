@@ -145,6 +145,33 @@ pub struct SkillEffect {
     pub max_value: i32,
 }
 impl SkillEffect {
+    /// The browser uses the positional representation for its skill tables.
+    fn from_skill_row(row: &Value) -> Self {
+        if let Some([id, level, trigger, limit, reset, kind, value, seconds,
+            condition, trigger_group, release, cumulative, targets, limit_count, max_value]) =
+            row.as_array().map(Vec::as_slice)
+        {
+            return Self {
+                id: int(id),
+                level: int(level),
+                trigger_type: int(trigger),
+                execute_limit: int(limit),
+                reset_group: int(reset),
+                kind: int(kind),
+                value: int(value),
+                seconds: number(seconds, 0.0),
+                condition_group: int(condition),
+                trigger_group: int(trigger_group),
+                release_group: int(release),
+                cumulative_id: int(cumulative),
+                targets: ids(targets),
+                limit_count: int(limit_count),
+                max_value: int(max_value),
+            };
+        }
+        Self::from(&native_view(row))
+    }
+
     pub fn from(r: &Value) -> Self {
         Self {
             id: int(&r["id"]),
@@ -512,7 +539,7 @@ fn skill_map(v: &Value) -> BTreeMap<i32, Vec<SkillEffect>> {
                     id,
                     rows(&v["effects"])
                         .iter()
-                        .map(|r| SkillEffect::from(native_view(r).as_ref()))
+                        .map(|row| SkillEffect::from_skill_row(row))
                         .collect(),
                 )
             })
@@ -531,7 +558,7 @@ fn gekiso_map(v: &Value) -> BTreeMap<i32, GekisoSkill> {
                         mission_type: int(&v["gekisouMissionType"]),
                         effects: rows(&v["effects"])
                             .iter()
-                            .map(|r| SkillEffect::from(native_view(r).as_ref()))
+                            .map(|row| SkillEffect::from_skill_row(row))
                             .collect(),
                     },
                 )

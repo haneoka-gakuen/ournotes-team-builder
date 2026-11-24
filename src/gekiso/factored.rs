@@ -1513,6 +1513,7 @@ fn context<'a>(
     let mut lottery_record = false;
     let mut prepared: Option<Vec<FixedFrame>> = None;
     let mut prepared_next = Vec::new();
+    let mut lottery_notes = Vec::new();
     let mut note_life = if fixed_inputs { vec![0; chart.full.notes.len() + 1] } else { Vec::new() };
     let mut draws: Vec<Arc<ScoreTape>> = Vec::new();
     let mut unique = HashMap::<Arc<ScoreTape>, ()>::default();
@@ -1535,7 +1536,12 @@ fn context<'a>(
                 replay.score.score.calculator.factors_only = true;
                 lottery_record = chart.setup.missions.iter().all(|&mission| mission == 2)
                     && replay.prepare_lottery_record();
-                if lottery_record { quiet_intervals = lottery_gaps(chart); }
+                if lottery_record {
+                    quiet_intervals = lottery_gaps(chart);
+                    lottery_notes = prepared.as_ref().unwrap().iter().map(|frame| {
+                        replay.prepare_lottery_notes(&frame.judged, &note_life)
+                    }).collect::<Result<_, _>>()?;
+                }
                 sampled = Some(replay);
             }
         }
@@ -1631,7 +1637,9 @@ fn context<'a>(
             } else {
                 if let Some(prepared) = fixed {
                     if lottery_record {
-                        current.record_lottery_frame(frame.time_ms, &prepared[index].judged, chart.play.dt[index])?;
+                        current.record_lottery_frame(
+                            frame.time_ms, &prepared[index].judged, &lottery_notes[index], chart.play.dt[index],
+                        )?;
                     } else {
                         current.frame(frame.time_ms, &prepared[index].judged, chart.play.dt[index])?;
                     }
@@ -1672,7 +1680,7 @@ fn context<'a>(
                 prepared_next[index] = after;
             }
             prepared = Some(inputs);
-        } else if fixed_inputs {
+        } else if fixed_inputs && !lottery_record {
             for command in &mut trace {
                 if let ReplayCommand::Note(note) = command { note.life = note_life[note.id as usize]; }
             }
@@ -2133,7 +2141,7 @@ fn score_orders<'a, const SETTLE: bool>(
     power: i32,
     (orders, branch): (&[usize], &OrderBranch),
     (ordinary, ordinary_orders, note_memo): (&'a Master, Option<&mut OrdinaryOrders>, &mut Option<std::rc::Rc<crate::full::score::NoteMemo>>),
-    (prefix_end, prefix): (usize, &mut Option<ScoreState<'a>>),
+    (prefix_end, prefix, template): (usize, &mut Option<ScoreState<'a>>, Option<&mut Option<Model<'a>>>),
     observe: Option<&dyn Fn(usize, f64) -> bool>,
 ) -> Result<Option<Vec<ReplayValue>>, String> {
     let reuse_ordinary = ordinary_orders.as_ref().is_some_and(|rows| orders.iter().all(|&order| rows[order].is_some()));
@@ -2158,18 +2166,27 @@ fn score_orders<'a, const SETTLE: bool>(
                 order.get(event).copied().map(|actor| (actor, time))
                     .ok_or_else(|| format!("ordinary skill event {event} out of range"))
             }).collect::<Result<_, _>>()?;
-            let mut capacity = [0; 5];
-            for &(member, _) in &events {
-                capacity[member] += 1;
+            if let Some(template) = template.as_deref().and_then(Option::as_ref) {
+                let mut program = template.clone();
+                program.set_event_members(&events);
+                Some(program)
+            } else {
+                let mut capacity = [0; 5];
+                for &(member, _) in &events {
+                    capacity[member] += 1;
+                }
+                let capacity = [capacity.into_iter().max().unwrap_or(0); 5];
+                let mut program = Model::with_prepared_notes(
+                    ordinary, deck, chart.prepared_notes(), &events, params.clone(), None,
+                    (0, false, Some(&capacity)),
+                )?;
+                program.score.score.replay = Some(Vec::new());
+                program.score.score.record_only = true;
+                if let Some(template) = template {
+                    *template = Some(program.clone());
+                }
+                Some(program)
             }
-            let capacity = [capacity.into_iter().max().unwrap_or(0); 5];
-            let mut program = Model::with_prepared_notes(
-                ordinary, deck, chart.prepared_notes(), &events, params.clone(), None,
-                (0, false, Some(&capacity)),
-            )?;
-            program.score.score.replay = Some(Vec::new());
-            program.score.score.record_only = true;
-            Some(program)
         };
         let sparse = program.as_ref().is_none_or(Model::sparse_score_frames);
         let mut calculator = Calculator::new(
@@ -2349,6 +2366,7 @@ fn settle_profiles(
     let mut group_score_prefix = None;
     let mut group_score_tape: Option<Arc<ScoreTape>> = None;
     let share_group_score = sample_cache.prefixes.is_some();
+    let mut ordinary_template = None;
     let control_deck = control_deck(master, &control, chart, deck, seeds, &ordinary);
     for orders in groups {
         let branch = OrderBranch::for_chart(chart, &orders)?;
@@ -2373,7 +2391,7 @@ fn settle_profiles(
                         }
                         let Some(result) = score_orders::<true>(master, chart, deck, draw, power, ordered,
                             (&ordinary_master, shared_inputs.then_some(&mut ordinary_orders), &mut note_memo),
-                            (prefix_end, &mut prefix), Some(observe))? else { return Ok(false); };
+                            (prefix_end, &mut prefix, None), Some(observe))? else { return Ok(false); };
                         (entry.insert(result), false)
                     }
                 };
@@ -2431,7 +2449,7 @@ fn settle_profiles(
         } else { 0 };
         let classes = if observe.is_none() && reuse_ordinary && draws.len() >= 8 {
             let Some(first) = score_orders::<true>(master, chart, deck, &draws[0], power, ordered,
-                (&ordinary_master, Some(&mut ordinary_orders), &mut note_memo), (0, &mut sample_prefix), None)?
+                (&ordinary_master, Some(&mut ordinary_orders), &mut note_memo), (0, &mut sample_prefix, None), None)?
             else { return Ok(None); };
             scored.insert(Arc::as_ptr(&draws[0]), first);
             OrdinaryClasses::new(chart, draws, &orders, &ordinary_orders)?
@@ -2451,7 +2469,7 @@ fn settle_profiles(
                     let mut prefix = None;
                     batch.iter().map(|draw| {
                         score_orders::<true>(master, chart, deck, draw, power, tail_layout,
-                            (&ordinary_master, Some(&mut ordinary), &mut memo), (prefix_end, &mut prefix), None)
+                            (&ordinary_master, Some(&mut ordinary), &mut memo), (prefix_end, &mut prefix, None), None)
                     }).collect::<Result<Vec<_>, String>>()
                 })?.into_iter().flatten().collect();
                 for (draw, result) in tail.iter().zip(results) {
@@ -2471,7 +2489,7 @@ fn settle_profiles(
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     let Some(mut result) = score_orders::<true>(master, chart, deck, draw, power, tail_layout,
                         (&ordinary_master, reuse_ordinary.then_some(&mut ordinary_orders), &mut note_memo),
-                        (prefix_end, score_prefix), observe)? else {
+                        (prefix_end, score_prefix, share_group_score.then_some(&mut ordinary_template)), observe)? else {
                         return Ok(None);
                     };
                     if let Some(classes) = &classes { classes.expand(&orders, &mut result); }

@@ -128,6 +128,29 @@ impl PlainScoreBound {
     }
 }
 
+#[derive(Clone, Copy)]
+struct TailOffer {
+    snap: i32,
+    values: [f64; 3],
+}
+
+fn tail_frontier(offers: &[TailOffer]) -> Option<Vec<TailOffer>> {
+    let mut identities = HashSet::default();
+    if offers.iter().any(|offer| !identities.insert(offer.snap)
+        || offer.values.iter().any(|v| !v.is_finite() || *v < 0.0))
+    {
+        return None;
+    }
+    Some(offers.iter().copied().enumerate().filter(|&(i, offer)| {
+        // At most four other slots can take a snapshot from this row.
+        // Order ties so dominance is a strict partial order.
+        offers.iter().enumerate().filter(|&(j, other)| {
+            (j < i || other.values != offer.values)
+                && other.values.iter().zip(offer.values).all(|(&a, b)| a >= b)
+        }).take(5).count() < 5
+    }).map(|(_, offer)| offer).collect())
+}
+
 struct SharedPowerBound {
     songs: Vec<usize>,
     bound: crate::rewards::FixedRegionBound,
@@ -141,6 +164,7 @@ struct SharedPowerBound {
     prices_offsets: bool,
     prices: Vec<SharedPrice>,
     plain_score: Option<PlainScoreBound>,
+    tail: Option<Vec<TailOffer>>,
 }
 pub(super) struct SharedPrice {
     base: f64,
@@ -841,7 +865,12 @@ impl<'k, 'a> Combined<'k, 'a> {
         for index in order {
             let cached = cutoff.and_then(|_| {
                 let power = powers[if same_power { 0 } else { index }].total;
-                self.songs[index].adapter.kernel.cached_nominal_mean(team, power as i32)
+                let kernel = &self.songs[index].adapter.kernel;
+                if kernel.chart.luck {
+                    kernel.cached_nominal_mean(team, power as i32)
+                } else {
+                    kernel.cached_shared_mean(team, power as f64)
+                }
             });
             if let Some(upper) = cached {
                 if let Some(upper) = accept(index, ChartSettlement::Upper(upper), &mut pending) {
@@ -1204,12 +1233,22 @@ impl<'k, 'a> Combined<'k, 'a> {
             let prices = SharedPrice::for_options(base_power, base, width, &combined, &powers, &self.joint_options);
             let component = Arc::new(crate::rewards::FixedComponent { base, converted: 1.0, width, rows: combined });
             let Some(rows) = crate::rewards::FixedRegionRows::new(&[component], Arc::new(AtomicUsize::new(0)), 0) else { continue; };
+            let tail_is_monotone = song.exact_prepared_power
+                && powers.iter().all(|&power| power.is_finite() && power >= 0.0);
             if let Some(bound) = crate::rewards::FixedRegionBound::new(Arc::new(rows), &[0, 1, 2, 3, 4], powers) {
                 let offset_choices = std::array::from_fn(|slot| {
                     Self::best_offers(&self.joint_options[slot], |snap| offsets[slot][(snap + 1) as usize])
                 });
+                let tail = if tail_is_monotone && self.joint_options[4].len() >= 4 {
+                    let offers: Vec<_> = self.joint_options[4].iter().map(|&snap| {
+                        let physical = if snap < 0 { width - 1 } else { snap as usize };
+                        let index = (snap + 1) as usize;
+                        TailOffer { snap, values: [song.slots[4][physical], profiles[index][4], offsets[4][index]] }
+                    }).collect();
+                    tail_frontier(&offers)
+                } else { None };
                 groups.push(SharedPowerBound { songs: indices, bound, base_power, coefficient: base,
-                    profiles, profile_choices, offset, offsets, offset_choices, prices_offsets, prices, plain_score });
+                    profiles, profile_choices, offset, offsets, offset_choices, prices_offsets, prices, plain_score, tail });
             }
         }
         let mut covered = vec![false; self.songs.len()];
@@ -1882,6 +1921,55 @@ impl Objective for Combined<'_, '_> {
         }
         self.upper(members, assigned, from, false, f64::INFINITY, t.power)
     }
+    fn assignment_options(
+        &self,
+        members: &[usize],
+        assigned: &[i32],
+        from: usize,
+        limit: f64,
+    ) -> Option<Vec<i32>> {
+        if !(3..=4).contains(&from) || self.roster != members || !limit.is_finite() || limit <= 0.0
+            || !self.joint_uncovered.is_empty() || self.joint_options[from].len() < 4
+        {
+            return None;
+        }
+        let [group] = self.joint.as_deref()? else { return None; };
+        let last = group.tail.as_deref();
+        if from == 3 && last.is_none() { return None; }
+        let song = &self.songs[group.songs[0]];
+        let width = song.adapter.kernel.snaps.len() + 1;
+        let values = |slot: usize, snap: i32| {
+            let physical = if snap < 0 { width - 1 } else { snap as usize };
+            let index = (snap + 1) as usize;
+            [song.slots[slot][physical], group.profiles[index][slot], group.offsets[slot][index]]
+        };
+        let extend = |prefix: [f64; 3], values: [f64; 3]|
+            std::array::from_fn(|i| (prefix[i] + values[i]).next_up());
+        let prefix = assigned[..from].iter().enumerate()
+            .fold([0.0, group.coefficient, group.offset], |prefix, (slot, &snap)| extend(prefix, values(slot, snap)));
+        let count = self.songs.len() as f64;
+        let can_beat = |[power, coefficient, offset]: [f64; 3]| {
+            let power = ((power - song.base).next_up() + group.base_power).next_up();
+            let score = ((power * coefficient).next_up() + offset).next_up();
+            let upper = (((score * count).next_up() * (1.0 + count * f64::EPSILON)).next_up() / count).next_up();
+            !(upper < limit)
+        };
+        let available = |snap: i32| snap < 0 || !assigned[..from].contains(&snap);
+        if from == 4 && last.is_some_and(|tail| !tail.iter().any(|row| {
+            available(row.snap) && can_beat(extend(prefix, row.values))
+        })) {
+            return Some(Vec::new());
+        }
+        Some(self.joint_options[from].iter().copied().filter(|&snap| {
+            if !available(snap) { return false; }
+            let prefix = extend(prefix, values(from, snap));
+            if from == 4 { return can_beat(prefix); }
+            last.unwrap().iter().any(|row| {
+                available(row.snap) && (row.snap < 0 || row.snap != snap) && can_beat(extend(prefix, row.values))
+            })
+        }).collect())
+    }
+
     fn assignment_order_bound(
         &mut self,
         members: &[usize],
@@ -2665,6 +2753,24 @@ impl Kernel<'_> {
                 .sum::<i32>()
                 >= minimum
     }
+    fn shared_coefficient_upper(&self, power: f64, coefficient: f64) -> f64 {
+        ((power * coefficient).next_up() * (1.0 + 3e-12) + (self.chart.notes.len() + 4) as f64).next_up()
+    }
+
+    fn cached_shared_mean(&self, team: &Team, power: f64) -> Option<f64> {
+        if !self.healthy || !self.steady_life || !self.owner_local || self.chart.luck
+            || !self.seeds.is_empty() || self.shared_mean_coefficients.is_empty()
+        {
+            return None;
+        }
+        let shapes = std::array::from_fn(|slot| {
+            self.shape_ids[self.slot_index(team.members[slot], team.snaps[slot])]
+        });
+        self.shared_mean_coefficients.get(&shapes).map(|&coefficient| {
+            self.shared_coefficient_upper(power, coefficient)
+        })
+    }
+
     fn shared_mean_upper(
         &mut self,
         team: &Team,
@@ -2677,7 +2783,7 @@ impl Kernel<'_> {
             || self.has_converter(team)) { return None; }
         let key = std::array::from_fn(|slot| self.shape_id(team.members[slot], team.snaps[slot]));
         if let Some(&coefficient) = self.shared_mean_coefficients.get(&key) {
-            return Some(((power * coefficient).next_up() * (1.0 + 3e-12) + (self.chart.notes.len() + 4) as f64).next_up());
+            return Some(self.shared_coefficient_upper(power, coefficient));
         }
         let mut deck = self.deck_of(team);
         for actor in &mut deck {
@@ -2693,9 +2799,6 @@ impl Kernel<'_> {
         let mean = crate::rewards::mean_score_coefficient(self.master, self.chart, &weights, &slots)?;
         if self.shared_mean_coefficients.len() >= 4096 { self.shared_mean_coefficients.clear(); }
         self.shared_mean_coefficients.insert(key, mean);
-        Some(
-            ((power * mean).next_up() * (1.0 + 3e-12) + (self.chart.notes.len() + 4) as f64)
-                .next_up(),
-        )
+        Some(self.shared_coefficient_upper(power, mean))
     }
 }
