@@ -16,6 +16,7 @@ impl Engine {
         let request = &input["request"];
         let mut plan = Plan::parse(&request["goal"]["rewardPlan"])?;
         let mut challenge = None;
+        let mut alternatives = Vec::new();
         if let Some(auto) = plan.auto_cp.take() {
             let mut calibration = input.clone();
             let cal = &mut calibration["request"];
@@ -79,11 +80,15 @@ impl Engine {
                 });
             }
             challenge = Some(response["overall"][0].clone());
+            alternatives = master::rows(&response["results"]).into_iter()
+                .filter_map(|row| master::rows(&row["hits"]).first().map(|hit| (*hit).clone()))
+                .collect();
         }
         if request["resolveRewardPlan"] == true {
             let mut response = json!({"results":[],"overall":[],"unknownCards":[],"elapsedMs":now()-started,"resolvedRewardPlan":plan});
             if let Some(challenge) = challenge {
                 response["cpChallenge"] = challenge;
+                response["cpChallengeAlternatives"] = json!(alternatives);
             }
             return Ok(response);
         }
@@ -93,6 +98,7 @@ impl Engine {
         response["resolvedRewardPlan"] = json!(plan);
         if let Some(challenge) = challenge {
             response["cpChallenge"] = challenge;
+            response["cpChallengeAlternatives"] = json!(alternatives);
         }
         Ok(response)
     }

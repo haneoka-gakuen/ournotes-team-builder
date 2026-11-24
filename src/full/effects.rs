@@ -21,6 +21,24 @@ pub struct State {
     pub cumulative_unit: i32,
     pub cumulative_max: i32,
 }
+impl State {
+    pub(super) fn score_wake(&self, seconds: f64, time: i32) -> i32 {
+        match self.state {
+            STAY => i32::MAX,
+            EXECUTING if seconds <= 0.0 => i32::MAX,
+            EXECUTING => {
+                let duration = f(f(seconds * 1000.0) + self.extended_ms);
+                let elapsed = f(time.wrapping_sub(self.execute_ms) as f64);
+                if duration < elapsed || !duration.is_finite() || duration >= 16_000_000.0 {
+                    time
+                } else {
+                    self.execute_ms.saturating_add(core::floor_i32_f64(duration).saturating_add(1))
+                }
+            }
+            _ => time,
+        }
+    }
+}
 impl Default for State {
     fn default() -> Self {
         Self {
@@ -473,13 +491,23 @@ impl ConditionUpdater {
                 && !matches!(effect.cumulative, Some(Cumulative::Elapsed { .. }))
         })
     }
-    pub(crate) fn active_updaters(&self) -> impl Iterator<Item = &Updater> {
-        self.executing.iter().copied().chain(self.sustained.iter().flatten().flat_map(|state|
-            state.current.into_iter().chain(state.executing.iter().copied())))
-            .map(|index| &self.updaters[index])
+    pub(super) fn next_score_frame(&self, time: i32, mut next: i32) -> i32 {
+        let mut visit = |index: usize| {
+            let updater = &self.updaters[index];
+            next = next.min(updater.state.score_wake(self.effects[updater.effect].act, time));
+        };
+        for &index in &self.executing { visit(index); }
+        for state in self.sustained.iter().flatten() {
+            if let Some(index) = state.current { visit(index); }
+            for &index in &state.executing { visit(index); }
+        }
+        next
     }
     pub(crate) fn frame_settled(&self) -> bool {
-        self.active_updaters().all(|updater| matches!(updater.state.state, STAY | EXECUTING))
+        let settled = |index: usize| matches!(self.updaters[index].state.state, STAY | EXECUTING);
+        self.executing.iter().copied().all(settled) && self.sustained.iter().flatten().all(|state| {
+            state.current.is_none_or(settled) && state.executing.iter().copied().all(settled)
+        })
     }
     pub(crate) fn can_pause_lottery(&self) -> bool {
         self.lottery_pause && self.updaters.iter().all(|updater| matches!(updater.state.state, STAY | EXECUTING))

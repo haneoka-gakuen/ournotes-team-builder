@@ -123,14 +123,14 @@ pub(crate) fn rush_windows(
     let length = params.music_length;
     // Score buckets only retain Rush commands; their timestamps stay intact.
     params.music_length = 0;
-    let mut model = Model::new(
+    let mut model = Model::with_prepared_notes(
         master,
         &reduced,
-        &chart.full.notes,
+        chart.prepared_notes(),
         &chart.full.events,
         params,
         Some(&chart.setup),
-        (seeds[0], false),
+        (seeds[0], false, None),
     )?;
     chart.fixed_life(&mut model);
     model.params.music_length = length;
@@ -280,7 +280,7 @@ fn frame<const FACTORED: bool>(
         if broken { model.current_combo = 0; }
         model.current_combo = model.current_combo.wrapping_add(added);
     }
-    if FACTORED {
+    if FACTORED && !model.judged.is_empty() {
         model.score.score.replay.as_mut().unwrap().push(score::ReplayCommand::Input(
             model.judged.iter().map(|&(note_id, judgement, time_ms)| JudgedNote { note_id, judgement, time_ms }).collect()));
     }

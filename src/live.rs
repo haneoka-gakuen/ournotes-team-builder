@@ -962,20 +962,19 @@ fn partition(len: usize, mut below: impl FnMut(usize) -> bool) -> usize {
     low
 }
 fn slot_cumulative_commands(
-    input: &Input,
+    (times, clock, start): (&[i32], FrameClock, i32),
     factors: &[Cumulative],
     event: usize,
     judgements: Option<&[usize]>,
     delivery: Option<&Delivery>,
 ) -> Vec<Command> {
-    let n = input.times.len();
-    let start = input.skill_times[event];
+    let n = times.len();
     let frame_at =
-        |k: usize| delivery.map_or_else(|| input.frame_time(input.times[k]), |d| d.frames[k]);
+        |k: usize| delivery.map_or_else(|| clock.frame_time(times[k]), |d| d.frames[k]);
     let note_at = |k: usize| delivery.map_or(k, |d| d.notes[k]);
     let mut commands = Vec::new();
     for factor in factors {
-        let (activation, end) = factor.window(input.clock, start);
+        let (activation, end) = factor.window(clock, start);
         let (mut count, mut applied) = (0, 0);
         let mut first = partition(n, |k| frame_at(k) < activation);
         while first < n {
@@ -1054,7 +1053,7 @@ fn cumulative_commands(
     for (event, &position) in order.iter().enumerate().take(input.skill_times.len()) {
         if let Some(slot) = input.slots.get(position) {
             commands.extend(slot_cumulative_commands(
-                input, &slot.cumulative, event, judgements, delivery,
+                (&input.times, input.clock, input.skill_times[event]), &slot.cumulative, event, judgements, delivery,
             ));
         }
     }
@@ -1064,6 +1063,10 @@ fn cumulative_commands(
 
 pub(crate) fn cumulative_note_commands(input: &Input, order: &[usize; 5], grades: &[usize]) -> Vec<Command> {
     cumulative_commands(input, order, Some(grades), None)
+}
+
+pub(crate) fn nominal_slot_commands(times: &[i32], start: i32, slot: &Slot, grades: &[usize]) -> Vec<Command> {
+    slot_cumulative_commands((times, FrameClock::default(), start), &slot.cumulative, 0, Some(grades), None)
 }
 
 fn static_commands(input: &Input, order: &[usize; 5]) -> Vec<Command> {
@@ -2030,7 +2033,7 @@ impl<'a> PlayScorer<'a> {
                     self.cumulative_cache
                         .entry((trajectory, event, position))
                         .or_insert_with(|| {
-                            slot_cumulative_commands(input, &slot.cumulative, event, Some(converted), None)
+                            slot_cumulative_commands((&input.times, input.clock, input.skill_times[event]), &slot.cumulative, event, Some(converted), None)
                         }),
                 );
             }

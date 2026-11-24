@@ -289,6 +289,7 @@ impl Engine {
             shard,
             min_combo_bonus: master::int(&goal["minComboBonus"]),
             seeded,
+            defer_warm_start: request["deferWarmStart"] == true,
             cooperative_floor: self.trusted_scores
                 && request["cooperativeFloor"] == true
                 && request["noFloor"] != true

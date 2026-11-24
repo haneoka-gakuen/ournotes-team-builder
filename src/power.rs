@@ -90,6 +90,15 @@ pub struct Music {
     pub best_tags: Vec<i32>,
     pub memory_key: i32,
 }
+impl Music {
+    pub(crate) fn slot_base_key(&self, player: &Player) -> (i32, Vec<i32>, i32) {
+        let mut tags = self.best_tags.clone();
+        tags.sort_unstable();
+        tags.dedup();
+        let memory = player.music_memory.get(&self.memory_key).copied().unwrap_or(0);
+        (self.music_type, tags, memory)
+    }
+}
 #[derive(Clone)]
 pub struct SlotBase {
     pub common: Stat3,

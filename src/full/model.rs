@@ -6,7 +6,7 @@ use super::{
     core::{self, Combo, Life, Random},
     effects::{self, ConditionUpdater, FrameInput, State, Trigger},
     gekisou::{self, Controller, Environment, FeverUpdater, LuckHandle},
-    play::{JudgedNote, LiveNote, Setup},
+    play::{self, JudgedNote, LiveNote, Setup},
     score::{self, FactorCommand, Incremental},
 };
 use crate::{
@@ -14,7 +14,7 @@ use crate::{
     num::f,
 };
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
-use std::{rc::Rc, sync::Arc};
+use std::{rc::Rc, sync::{Arc, OnceLock}};
 #[derive(Clone)]
 pub struct Params {
     pub music_type: i32,
@@ -389,6 +389,37 @@ enum NoteIndex {
     Dense(Vec<LiveNote>),
     Sparse(HashMap<i32, LiveNote>),
 }
+pub(crate) struct PreparedNotes {
+    index: Arc<NoteIndex>,
+    times: Vec<(i32, i32)>,
+    life_length: i32,
+    geometry: OnceLock<(Vec<(i32, i32, i32)>, gekisou::Geometry)>,
+    chronological: OnceLock<Vec<(i32, i32)>>,
+}
+impl PreparedNotes {
+    pub(crate) fn new(notes: &[LiveNote], gekiso: bool) -> Self {
+        Self {
+            index: Arc::new(NoteIndex::new(notes)),
+            times: if gekiso { notes.iter().map(|note| (note.id, note.time_ms)).collect() } else { Vec::new() },
+            life_length: notes.iter().map(|note| note.time_ms).max().unwrap_or(0).max(0) + 1000,
+            geometry: OnceLock::new(),
+            chronological: OnceLock::new(),
+        }
+    }
+
+    fn geometry(&self, ranges: &[(i32, i32, i32)]) -> gekisou::Geometry {
+        let cached = self.geometry.get_or_init(|| (ranges.to_vec(), gekisou::Geometry::new(ranges, &self.times)));
+        if cached.0 == ranges { cached.1.clone() } else { gekisou::Geometry::new(ranges, &self.times) }
+    }
+
+    pub(crate) fn chronological(&self) -> &[(i32, i32)] {
+        self.chronological.get_or_init(|| {
+            let mut times = self.times.clone();
+            times.sort_unstable_by_key(|&(id, time)| (time, id));
+            times
+        })
+    }
+}
 impl NoteIndex {
     fn new(notes: &[LiveNote]) -> Self {
         if notes.iter().enumerate().all(|(index, note)| note.id == index as i32 + 1) {
@@ -407,7 +438,7 @@ impl NoteIndex {
 #[derive(Clone)]
 pub struct Model<'a> {
     pub master: &'a Master,
-    notes: Rc<NoteIndex>,
+    notes: Arc<NoteIndex>,
     events: Vec<(usize, i32)>,
     by_time: Vec<usize>,
     pub random: Random,
@@ -511,6 +542,17 @@ impl<'a> Model<'a> {
         setup: Option<&Setup>,
         mode: (i32, bool, Option<&[usize]>),
     ) -> Result<Self, String> {
+        Self::with_prepared_notes(master, deck, &PreparedNotes::new(notes, setup.is_some()), events, params, setup, mode)
+    }
+    pub(crate) fn with_prepared_notes(
+        master: &'a Master,
+        deck: &[Performer],
+        notes: &PreparedNotes,
+        events: &[(usize, i32)],
+        params: Params,
+        setup: Option<&Setup>,
+        mode: (i32, bool, Option<&[usize]>),
+    ) -> Result<Self, String> {
         let (seed, record, live_capacity) = mode;
         let mut by_time: Vec<_> = (0..events.len()).collect();
         by_time.sort_by_key(|&i| (events[i].1, i));
@@ -527,9 +569,8 @@ impl<'a> Model<'a> {
                     *setup.missions.get(i).ok_or("fewer missions than fevers")?,
                 ));
             }
-            let mut controller = Controller::new(
-                &ranges,
-                &notes.iter().map(|n| (n.id, n.time_ms)).collect::<Vec<_>>(),
+            let mut controller = Controller::with_geometry(
+                notes.geometry(&ranges),
                 &live.gekiso,
                 live.gekiso.rush_percent,
                 live.after_ms as i32,
@@ -568,14 +609,13 @@ impl<'a> Model<'a> {
             params.converted,
             params.assist,
         );
-        let life_length = notes.iter().map(|n| n.time_ms).max().unwrap_or(0).max(0) + 1000;
         let mut model = Self {
             master,
-            notes: Rc::new(NoteIndex::new(notes)),
+            notes: Arc::clone(&notes.index),
             events: events.to_vec(),
             by_time,
             random: Random::new(seed),
-            life: Life::new(live.life_base as i32, live.damage, life_length),
+            life: Life::new(live.life_base as i32, live.damage, notes.life_length),
             combo: Combo::default(),
             score: ScoreControl::new(Incremental::new(calculator, params.music_length)),
             conversion: convert::Conversion::new(
@@ -965,31 +1005,16 @@ impl<'a> Model<'a> {
             }))
     }
     pub(crate) fn next_score_frame(&self, time: i32) -> i32 {
-        fn wake(state: &State, seconds: f64, time: i32) -> i32 {
-            match state.state {
-                effects::STAY => i32::MAX,
-                effects::EXECUTING if seconds <= 0.0 => i32::MAX,
-                effects::EXECUTING => {
-                    let duration = f(f(seconds * 1000.0) + state.extended_ms);
-                    let elapsed = f(time.wrapping_sub(state.execute_ms) as f64);
-                    if duration < elapsed || !duration.is_finite() || duration >= 16_000_000.0 {
-                        time
-                    } else {
-                        state.execute_ms.saturating_add(core::floor_i32_f64(duration).saturating_add(1))
-                    }
-                }
-                _ => time,
+        let mut next = self.by_time.get(self.fired).map_or(i32::MAX, |&index| self.events[index].1);
+        for &index in &self.enabled {
+            for effect in &self.live[index].effects {
+                next = next.min(effect.state.score_wake(effect.act, time));
             }
         }
-        let live = self.enabled.iter().flat_map(|&index| &self.live[index].effects)
-            .map(|effect| wake(&effect.state, effect.act, time));
-        let supports = self.condition.iter().flat_map(|condition| {
-            condition.updater.active_updaters().map(|updater| {
-                wake(&updater.state, condition.updater.effects[updater.effect].act, time)
-            })
-        });
-        live.chain(supports).chain(self.by_time.get(self.fired).map(|&index| self.events[index].1))
-            .min().unwrap_or(i32::MAX)
+        for condition in &self.condition {
+            next = condition.updater.next_score_frame(time, next);
+        }
+        next
     }
     pub(crate) fn sparse_inputs(&self) -> bool {
         let recorded = self.record.is_some();
@@ -1030,6 +1055,33 @@ impl<'a> Model<'a> {
             self.score.score.calculate(time, &self.combo, self.gk.as_ref().map(|g| &g.controller as &dyn score::GekisoCombo))?;
         }
         Ok(())
+    }
+    pub(crate) fn record_idle_run(&mut self, time: i32, count: usize) -> bool {
+        if self.record.is_some() || !self.score.score.record_idle_run(count) {
+            return false;
+        }
+        self.frame_time = time;
+        self.life.enter_phase(2);
+        self.life.sync(time);
+        true
+    }
+    pub(crate) fn idle_frames(&mut self, frames: &[play::Frame]) -> Result<(), String> {
+        let Some((last, before)) = frames.split_last() else { return Ok(()); };
+        if !before.is_empty() && self.life.has_no_commands() && self.score.score.idle_ready() {
+            // No queued LIFE or score commands can make these frames differ.
+            // Keep every lottery frame while advancing the model clock once.
+            if let Some(record) = &mut self.record {
+                let previous = record.frames.last().unwrap();
+                let states = Arc::clone(&previous.states);
+                let playing = previous.playing;
+                record.frames.extend((0..before.len()).map(|_| LuckFrame {
+                    states: Arc::clone(&states), updates: Vec::new(), playing,
+                }));
+            }
+        } else {
+            for frame in before { self.idle_frame(frame.time_ms)?; }
+        }
+        self.idle_frame(last.time_ms)
     }
     fn condition_indices(&mut self) -> ConditionIndices {
         let mut selected = self.condition_schedule.as_ref().map(|schedule| schedule.select(
@@ -1205,7 +1257,7 @@ impl<'a> Model<'a> {
         }
         self.current_combo = self.current_combo.wrapping_add(added);
         let factored_record = !COUNTS_ONLY && self.score.score.factored_record;
-        if factored_record {
+        if factored_record && !self.judged.is_empty() {
             self.score.score.replay.as_mut().unwrap().push(score::ReplayCommand::Input(self.judged.iter().map(|&(note_id, judgement, time_ms)| super::play::JudgedNote { note_id, judgement, time_ms }).collect()));
         }
         for (n, converted) in &self.results {
@@ -1238,33 +1290,35 @@ impl<'a> Model<'a> {
         for &index in &self.enabled {
             self.live[index].trigger = Trigger::default();
         }
-        let mut started = false;
-        for pool in &mut self.pools {
-            let Some(&(_, event_time)) = self
-                .frame_events
-                .iter()
-                .rev()
-                .find(|event| event.0 == pool.member)
-            else {
-                continue;
-            };
-            if pool.available.is_empty() {
-                return Err("live skill pool is empty".into());
+        if !self.frame_events.is_empty() {
+            let mut started = false;
+            for pool in &mut self.pools {
+                let Some(&(_, event_time)) = self
+                    .frame_events
+                    .iter()
+                    .rev()
+                    .find(|event| event.0 == pool.member)
+                else {
+                    continue;
+                };
+                if pool.available.is_empty() {
+                    return Err("live skill pool is empty".into());
+                }
+                let index = pool.available.remove(0);
+                self.live[index].trigger = Trigger {
+                    hit: true,
+                    time: event_time,
+                };
+                for effect in &mut self.live[index].effects {
+                    effect.state.state = effects::STAY;
+                }
+                self.enabled.push(index);
+                started = true;
             }
-            let index = pool.available.remove(0);
-            self.live[index].trigger = Trigger {
-                hit: true,
-                time: event_time,
-            };
-            for effect in &mut self.live[index].effects {
-                effect.state.state = effects::STAY;
+            if started && self.enabled.len() > 1 {
+                self.enabled
+                    .sort_by_key(|&i| self.live[i].key as i64 * 10 + self.live[i].index as i64);
             }
-            self.enabled.push(index);
-            started = true;
-        }
-        if started && self.enabled.len() > 1 {
-            self.enabled
-                .sort_by_key(|&i| self.live[i].key as i64 * 10 + self.live[i].index as i64);
         }
         let condition_indices = self.condition_indices();
         for observer in &mut self.rush_observers {

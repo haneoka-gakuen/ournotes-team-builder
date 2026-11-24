@@ -193,14 +193,17 @@ pub(crate) struct SupportAliases {
     healthy: bool,
     candidates: Vec<(i32, i32)>,
     cache: HashMap<Performer, Vec<(i32, i32)>>,
+    owner_fields: Vec<&'static str>,
+    canonical: HashMap<Performer, HashMap<Vec<u64>, (i32, i32)>>,
     just_ceiling: Option<usize>,
 }
 impl SupportAliases {
     pub fn set_just_ceiling(&mut self, count: usize) {
         self.just_ceiling = Some(count);
         self.cache.clear();
+        self.canonical.clear();
     }
-    pub fn new(missions: &[i32], snaps: &[Snap], healthy: bool) -> Self {
+    pub fn new(fields: &ContextFields, missions: &[i32], snaps: &[Snap], healthy: bool) -> Self {
         let mut candidates: Vec<_> = snaps
             .iter()
             .flat_map(|s| {
@@ -218,6 +221,8 @@ impl SupportAliases {
             healthy,
             candidates,
             cache: HashMap::default(),
+            owner_fields: fields.global.clone(),
+            canonical: HashMap::default(),
             just_ceiling: None,
         }
     }
@@ -351,30 +356,24 @@ impl SupportAliases {
         })
     }
     pub fn apply(&mut self, master: &Master, p: &mut Performer) {
+        if p.gekisou_support_skills.is_empty() { return; }
         if let Some(skills) = self.cache.get(p) {
             p.gekisou_support_skills = skills.clone();
             return;
         }
         let original = p.clone();
-        let mut skills: Vec<_> = p
-            .gekisou_support_skills
-            .iter()
-            .copied()
-            .filter(|&pair| {
-                self.signature(master, pair, p)
-                    .is_none_or(|s| !s.is_empty())
-            })
-            .collect();
+        let mut skills = Vec::with_capacity(p.gekisou_support_skills.len());
+        let mut signature = None;
+        for &pair in &p.gekisou_support_skills {
+            let known = self.signature(master, pair, p);
+            if known.as_ref().is_some_and(Vec::is_empty) { continue; }
+            skills.push(pair);
+            signature = known;
+        }
         // Two supports with one canonical row ID would share an applier key.
         if skills.len() == 1 {
-            if let Some(signature) = self.signature(master, skills[0], p) {
-                if let Some(&canonical) = self
-                    .candidates
-                    .iter()
-                    .find(|&&pair| self.signature(master, pair, p).as_ref() == Some(&signature))
-                {
-                    skills[0] = canonical;
-                }
+            if let Some(signature) = signature {
+                skills[0] = self.canonical_skill(master, p, &signature).unwrap_or(skills[0]);
             }
         }
         if self.cache.len() >= 8192 {
@@ -382,6 +381,33 @@ impl SupportAliases {
         }
         self.cache.insert(original, skills.clone());
         p.gekisou_support_skills = skills;
+    }
+    fn canonical_skill(&mut self, master: &Master, p: &Performer, signature: &[u64]) -> Option<(i32, i32)> {
+        let reads = |field| self.owner_fields.contains(&field);
+        let owner = Performer {
+            band_id: if reads("bandId") { p.band_id } else { 0 },
+            card_type: if reads("cardType") { p.card_type } else { 0 },
+            character_id: if reads("characterId") { p.character_id } else { 0 },
+            tag_ids: if reads("tagIds") { p.tag_ids.clone() } else { Vec::new() },
+            live_skill_categories: if reads("liveSkillCategories") { p.live_skill_categories.clone() } else { Vec::new() },
+            gekisou_skill_categories: if reads("gekisouSkillCategories") { p.gekisou_skill_categories.clone() } else { Vec::new() },
+            gekisou_mission_type: if reads("gekisouMissionType") { p.gekisou_mission_type } else { 0 },
+            ..Performer::default()
+        };
+        if !self.canonical.contains_key(&owner) {
+            if self.canonical.len() >= 16 { self.canonical.clear(); }
+            let mut canonical = HashMap::default();
+            for &pair in &self.candidates {
+                if let Some(signature) = self.signature(master, pair, &owner).filter(|key| !key.is_empty()) {
+                    canonical.entry(signature).or_insert(pair);
+                }
+            }
+            self.canonical.insert(owner.clone(), canonical);
+        }
+        let canonical = self.canonical[&owner].get(signature).copied();
+        debug_assert_eq!(canonical, self.candidates.iter().copied().find(|&pair|
+            self.signature(master, pair, p).as_deref() == Some(signature)));
+        canonical
     }
     pub fn retain_active(&self, master: &Master, p: &mut Performer) {
         p.gekisou_support_skills = p
@@ -459,94 +485,15 @@ impl ContextFields {
         skills.dedup();
         let fields = if self.local {
             self.cache.entry(skills.clone()).or_insert_with(|| {
-                let mut active = master.clone();
-                active.gekiso_skills = std::sync::Arc::new(
-                    skills
-                        .iter()
-                        .filter(|&&(support, _)| !support)
-                        .filter_map(|&(_, id)| {
-                            master.gekiso_skills.get(&id).map(|s| (id, s.clone()))
-                        })
-                        .collect(),
-                );
-                active.gekiso_support_skills = std::sync::Arc::new(
-                    skills
-                        .iter()
-                        .filter(|&&(support, _)| support)
-                        .filter_map(|&(_, id)| {
-                            master
-                                .gekiso_support_skills
-                                .get(&id)
-                                .map(|s| (id, s.clone()))
-                        })
-                        .collect(),
-                );
-                crate::gekiso_objective::read_attributes(&active, true)
+                let active = skills.iter().filter_map(|&(support, id)| {
+                    if support { master.gekiso_support_skills.get(&id) } else { master.gekiso_skills.get(&id) }
+                });
+                crate::gekiso_objective::read_skill_attributes(master, active)
             })
         } else {
             &self.global
         };
-        if self.local && p.band_id != 0 {
-            let referenced = skills
-                .iter()
-                .filter_map(|&(support, id)| {
-                    if support {
-                        master.gekiso_support_skills.get(&id)
-                    } else {
-                        master.gekiso_skills.get(&id)
-                    }
-                })
-                .flat_map(|s| &s.effects)
-                .flat_map(|r| {
-                    [
-                        r.trigger_group,
-                        r.condition_group,
-                        r.release_group,
-                        r.reset_group,
-                    ]
-                })
-                .flat_map(|group| {
-                    master
-                        .condition_sets
-                        .get(&group)
-                        .into_iter()
-                        .flatten()
-                        .flatten()
-                })
-                .filter_map(|id| master.conditions.get(id))
-                .filter(|c| c.kind == 5000)
-                .flat_map(|c| &c.targets)
-                .any(|id| {
-                    master
-                        .targets
-                        .get(id)
-                        .is_some_and(|t| t.band_id == p.band_id)
-                });
-            if !referenced {
-                p.band_id = 0;
-            }
-        }
-        if !fields.contains(&"bandId") {
-            p.band_id = 0;
-        }
-        if !fields.contains(&"cardType") {
-            p.card_type = 0;
-        }
-        if !fields.contains(&"characterId") {
-            p.character_id = 0;
-        }
-        if !fields.contains(&"tagIds") {
-            p.tag_ids.clear();
-        }
-        if !fields.contains(&"liveSkillCategories") {
-            p.live_skill_categories.clear();
-        }
-        if !fields.contains(&"gekisouSkillCategories") {
-            p.gekisou_skill_categories.clear();
-        }
-        if !fields.contains(&"gekisouMissionType") {
-            p.gekisou_mission_type = 0;
-        }
+        normalize_owner_fields(master, p, &skills, fields, self.local);
         if self.local && p.gekisou_skill.is_none() {
             p.mission_only = if p.gekisou_support_skills.is_empty() {
                 None
@@ -554,5 +501,74 @@ impl ContextFields {
                 p.mission_only.map(|_| 1)
             };
         }
+    }
+}
+
+pub(crate) fn normalize_owner_fields(
+    master: &Master,
+    p: &mut Performer,
+    skills: &[(bool, i32)],
+    fields: &[&'static str],
+    local: bool,
+) {
+    if !fields.contains(&"bandId") {
+        p.band_id = 0;
+    } else if local && p.band_id != 0 {
+        let referenced = skills
+            .iter()
+            .filter_map(|&(support, id)| {
+                if support {
+                    master.gekiso_support_skills.get(&id)
+                } else {
+                    master.gekiso_skills.get(&id)
+                }
+            })
+            .flat_map(|s| &s.effects)
+            .flat_map(|r| {
+                [
+                    r.trigger_group,
+                    r.condition_group,
+                    r.release_group,
+                    r.reset_group,
+                ]
+            })
+            .flat_map(|group| {
+                master
+                    .condition_sets
+                    .get(&group)
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+            })
+            .filter_map(|id| master.conditions.get(id))
+            .filter(|c| c.kind == 5000)
+            .flat_map(|c| &c.targets)
+            .any(|id| {
+                master
+                    .targets
+                    .get(id)
+                    .is_some_and(|t| t.band_id == p.band_id)
+            });
+        if !referenced {
+            p.band_id = 0;
+        }
+    }
+    if !fields.contains(&"cardType") {
+        p.card_type = 0;
+    }
+    if !fields.contains(&"characterId") {
+        p.character_id = 0;
+    }
+    if !fields.contains(&"tagIds") {
+        p.tag_ids.clear();
+    }
+    if !fields.contains(&"liveSkillCategories") {
+        p.live_skill_categories.clear();
+    }
+    if !fields.contains(&"gekisouSkillCategories") {
+        p.gekisou_skill_categories.clear();
+    }
+    if !fields.contains(&"gekisouMissionType") {
+        p.gekisou_mission_type = 0;
     }
 }

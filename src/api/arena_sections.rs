@@ -85,7 +85,15 @@ impl Engine {
         validate_gekiso_counts(&request["gekiso"])?;
         let options = &request["gekiso"];
         let count = master::int(&options["seeds"]);
-        let seeds: Vec<_> = (0..if count > 0 { count } else { 32 }).collect();
+        let count = if count > 0 { count } else { 32 };
+        let distribution = request["sampleMetric"] == "score";
+        let ranks = gekiso_ranks(options);
+        if distribution && (ranks.len() != 3 || ranks.iter().any(|rank| !(1..=5).contains(rank))) {
+            return Err("invalid-section-placement".into());
+        }
+        let offset = master::int(&request["sampleOffset"]);
+        if !(0..=4096).contains(&offset) { return Err("invalid-sample-offset".into()); }
+        let seeds: Vec<_> = (offset..offset + count).collect();
         let mut values = Vec::new();
         for song in master::rows(&request["songs"]) {
             self.load_source(input, song)?;
@@ -95,10 +103,41 @@ impl Engine {
             let compiled = &self.charts[&(id, difficulty)];
             let source = &self.sources[&(id, difficulty)];
             let mut chart = gekiso::Chart::new(&self.master, source, compiled.difficulty.play_level,
-                compiled.song.missions.clone(), serde_json::from_value(options["accuracy"].clone()).map_err(|e| e.to_string())?, gekiso_ranks(options))?;
+                compiled.song.missions.clone(), serde_json::from_value(options["accuracy"].clone()).map_err(|e| e.to_string())?, ranks.clone())?;
             chart.music_type = resolved.music.music_type;
             let deck: Vec<_> = resolved.members.iter().zip(&resolved.snaps)
                 .map(|(member, snap)| Performer::from_member(&self.master, member, snap.as_ref())).collect();
+            if distribution {
+                if !chart.luck { continue; }
+                let reusable = chart.range_percent.len() == 3
+                    && !gekiso::replay_condition(&self.master, &chart, &deck, 7012)
+                    && crate::rewards::deterministic_ranges(&self.master, &chart)
+                        .is_some_and(|ranges| ranges.windows(2).all(|pair| pair[0].1 < pair[1].0));
+                let counts = gekiso::score_distribution(&self.master, &chart, &deck, &seeds, resolved.power.total as i32, reusable)?;
+                let samples = counts.values().sum::<usize>();
+                let mut histogram = BTreeMap::<i32, usize>::new();
+                let mut raw = Vec::new();
+                for ([score, a, b, c], count) in counts {
+                    *histogram.entry(score).or_default() += count;
+                    if reusable {
+                        let ranges = [a, b, c];
+                        let base = ranges.iter().zip(&chart.range_percent).fold(score, |base, (&raw, &percent)| {
+                            base.wrapping_sub(crate::num::i32((i64::from(raw) * i64::from(percent)) as f64 / 100.0))
+                        });
+                        raw.push((base, ranges, count));
+                    }
+                }
+                let scores: Vec<_> = histogram.into_iter().map(|(score, count)| json!({"score":score,"count":count})).collect();
+                let mut row = json!({"song":song,"missions":chart.setup.missions,"samples":samples,"distributions":[],"scores":scores,"scoredRanks":ranks});
+                if reusable {
+                    let mission = |range| chart.setup.missions.get(range).copied().unwrap_or(0);
+                    let pattern = crate::full::gekisou::mission_pattern(mission(0), mission(1), mission(2));
+                    let factors = crate::full::gekisou::ranking_factors(&self.master.live.gekiso, pattern);
+                    row["scoreReplay"] = json!({"factors": factors, "samples": raw});
+                }
+                values.push(row);
+                continue;
+            }
             let rows = gekiso::sections::metric_samples(&self.master, &chart, &deck, &seeds)?;
             let distributions: Vec<_> = (0..3).map(|range| {
                 let mut counts = BTreeMap::<i32, usize>::new();
@@ -707,6 +746,7 @@ impl Engine {
                 shard: None,
                 min_combo_bonus: master::int(&request["goal"]["minComboBonus"]),
                 seeded: false,
+                defer_warm_start: false,
                 cooperative_floor: false,
                 floor: f64::NEG_INFINITY,
                 on_candidate: Some(&mut publish),

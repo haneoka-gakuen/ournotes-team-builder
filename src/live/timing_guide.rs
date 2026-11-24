@@ -178,7 +178,7 @@ pub(super) fn build(
             .iter()
             .map(|&(event, factor)| {
                 slot_cumulative_commands(
-                    input,
+                    (&input.times, input.clock, input.skill_times[event]),
                     std::slice::from_ref(factor),
                     event,
                     grades.as_deref(),

@@ -33,31 +33,23 @@ pub(crate) fn slot_dominates(a: &crate::live::Slot, b: &crate::live::Slot) -> bo
     {
         return false;
     }
-    let mut times = vec![0];
-    for slot in [a, b] {
-        times.extend(
-            slot.effects
-                .iter()
-                .map(|e| crate::num::window_ms(e.seconds, slot.extension_ms)),
-        );
+    let end = |slot: &crate::live::Slot, effect: &crate::live::Effect|
+        crate::num::window_ms(effect.seconds, slot.extension_ms);
+    if [a, b].into_iter().any(|slot| slot.effects.iter().any(|effect| end(slot, effect) < 0)) {
+        return false;
     }
-    times.sort_unstable();
-    times.dedup();
-    for time in times {
-        for judgement in [5, 6] {
-            let value = |slot: &crate::live::Slot| {
-                slot.effects
-                    .iter()
-                    .filter(|e| {
-                        crate::num::window_ms(e.seconds, slot.extension_ms) > time
-                            && (e.kind == 2000 || e.judgements.contains(&judgement))
-                    })
-                    .map(|e| e.delta as i64)
-                    .sum::<i64>()
-            };
-            if value(a) < value(b) {
-                return false;
+    // Only an expiry in the proposed replacement can make its lead shrink.
+    for time in std::iter::once(0).chain(a.effects.iter().map(|effect| end(a, effect))) {
+        let totals = |slot: &crate::live::Slot| {
+            let mut values = [0i64; 2];
+            for effect in slot.effects.iter().filter(|effect| end(slot, effect) > time) {
+                if effect.kind == 2000 || effect.judgements.contains(&5) { values[0] += effect.delta as i64; }
+                if effect.kind == 2000 || effect.judgements.contains(&6) { values[1] += effect.delta as i64; }
             }
+            values
+        };
+        if totals(a).into_iter().zip(totals(b)).any(|(new, old)| new < old) {
+            return false;
         }
     }
     true
@@ -1370,6 +1362,56 @@ impl Compiler {
     ) -> Result<Option<f64>, String> {
         self.assignment_upper_inner(master, chart, input, None)
     }
+    pub(crate) fn assignment_mean_rows(
+        &mut self,
+        master: &Master,
+        chart: &gekiso::Chart,
+        rows: &[Vec<(usize, Choice<'_>)>; 5],
+        width: usize,
+    ) -> Result<Option<(f64, Vec<f64>, f64)>, String> {
+        self.trim_numeric_rows();
+        let Some(base) = self.upper(master, chart, &[])? else { return Ok(None); };
+        let mut profiles = vec![0.0; width * 5];
+        let mut commands = 0usize;
+        let mut absolute = 0.0_f64;
+        let mut normal_actions = 0usize;
+        let mut normal_absolute = 0.0_f64;
+        for (slot, choices) in rows.iter().enumerate() {
+            let (mut command_cap, mut absolute_cap, mut action_cap, mut normal_cap) =
+                (0usize, 0.0_f64, 0usize, 0.0_f64);
+            for (column, choice) in choices {
+                let Some(row) = self.numeric_row(master, chart, &base, choice)? else { return Ok(None); };
+                let mean = (row.events.iter().fold(0.0_f64, |sum, value| (sum + value).next_up()) / 5.0).next_up();
+                profiles[slot * width + column] = (mean + row.gain).next_up();
+                command_cap = command_cap.max(row.commands);
+                absolute_cap = absolute_cap.max(row.absolute);
+                action_cap = action_cap.max(row.normal_actions);
+                normal_cap = normal_cap.max(row.normal_absolute);
+            }
+            commands += command_cap;
+            absolute = (absolute + absolute_cap).next_up();
+            normal_actions += action_cap;
+            normal_absolute = (normal_absolute + normal_cap).next_up();
+        }
+        let Some((error, rounding)) = score_rounding(
+            master, chart, commands, absolute, normal_actions, normal_absolute
+        ) else { return Ok(None); };
+        let total = base.weights.general[chart.notes.len()];
+        let constant = (base.base + (error * total).next_up()).next_up();
+        let scale = (rounding / chart.full.converted as f64).next_up();
+        let constant = (constant * scale).next_up();
+        profiles.iter_mut().for_each(|value| *value = (*value * scale).next_up());
+        let allowance = (chart.notes.len() + 4) as f64;
+        Ok((constant.is_finite() && constant >= 0.0 && profiles.iter().all(|&row|
+            row.is_finite() && row >= 0.0)).then_some((constant, profiles, allowance)))
+    }
+    fn trim_numeric_rows(&mut self) {
+        if self.row_bytes > 16 * 1024 * 1024 {
+            self.numeric_rows.clear();
+            self.groups.clear();
+            self.row_bytes = 0;
+        }
+    }
     fn assignment_upper_inner(
         &mut self,
         master: &Master,
@@ -1378,11 +1420,7 @@ impl Compiler {
         hull: Option<&[Arc<Upper>]>,
     ) -> Result<Option<f64>, String> {
         use crate::objectives::Criterion;
-        if self.row_bytes > 16 * 1024 * 1024 {
-            self.numeric_rows.clear();
-            self.groups.clear();
-            self.row_bytes = 0;
-        }
+        self.trim_numeric_rows();
         if input.rows.iter().any(|row| row.snaps.is_empty()) {
             return Ok(Some(f64::NEG_INFINITY));
         }
@@ -1423,18 +1461,8 @@ impl Compiler {
             variable_cap = (variable_cap + high).next_up();
             groups.push(group);
         }
-        let Some(ranges) = crate::rewards::deterministic_ranges(master, chart) else {
-            return Ok(None);
-        };
-        let u = 2.0_f64.powi(-24);
-        let nu = (crate::rewards::factor_operations(chart, ranges) as f64 * commands as f64 * u)
-            .next_up();
-        let normal_nu = ((2 * normal_actions + 5) as f64 * u).next_up();
-        if nu >= 0.25 || normal_nu >= 0.25 {
-            return Ok(None);
-        }
-        let gk_error = (4.0 * nu * absolute / (1.0 - nu)).next_up();
-        let normal_error = (16.0 * normal_nu * normal_absolute / (1.0 - normal_nu)).next_up();
+        let Some((error, rounding)) = score_rounding(master, chart, commands,
+            absolute, normal_actions, normal_absolute) else { return Ok(None); };
         let (base_weight, total_weight) = if let Some(bases) = hull {
             bases
                 .iter()
@@ -1447,9 +1475,7 @@ impl Compiler {
         } else {
             (base.base, base.weights.general[chart.notes.len()])
         };
-        let constant = (base_weight
-            + ((gk_error + normal_error).next_up() * total_weight).next_up())
-        .next_up();
+        let constant = (base_weight + (error * total_weight).next_up()).next_up();
         let coefficient = (constant + variable_cap).next_up();
         let lambda = (coefficient / power_cap.max(1.0)).sqrt();
         if !lambda.is_finite() || lambda <= 0.0 {
@@ -1515,10 +1541,6 @@ impl Compiler {
             .next_up()
             + variable)
             .next_up();
-        let mut rounding = 1.0_f64;
-        for _ in 0..12 {
-            rounding = (rounding * (1.0 / (1.0 - u)).next_up()).next_up();
-        }
         let score =
             (((total * total).next_up() / 4.0).next_up() / chart.full.converted as f64).next_up();
         let mut upper = (score * rounding).next_up() + (chart.notes.len() + 4) as f64;
@@ -1578,4 +1600,18 @@ impl Compiler {
         }
         Ok(Some(upper))
     }
+}
+
+fn score_rounding(master: &Master, chart: &gekiso::Chart, commands: usize, absolute: f64,
+                  normal_actions: usize, normal_absolute: f64) -> Option<(f64, f64)> {
+    let ranges = crate::rewards::deterministic_ranges(master, chart)?;
+    let u = 2.0_f64.powi(-24);
+    let nu = (crate::rewards::factor_operations(chart, ranges) as f64 * commands as f64 * u).next_up();
+    let normal_nu = ((2 * normal_actions + 5) as f64 * u).next_up();
+    if nu >= 0.25 || normal_nu >= 0.25 { return None; }
+    let gk = (4.0 * nu * absolute / (1.0 - nu)).next_up();
+    let normal = (16.0 * normal_nu * normal_absolute / (1.0 - normal_nu)).next_up();
+    let rounding = (0..12).fold(1.0_f64, |value, _|
+        (value * (1.0 / (1.0 - u)).next_up()).next_up());
+    Some(((gk + normal).next_up(), rounding))
 }

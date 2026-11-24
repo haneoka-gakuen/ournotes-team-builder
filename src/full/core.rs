@@ -69,6 +69,10 @@ pub fn srem(a: i32, b: i32) -> i32 {
 pub fn frame(ms: i32) -> i32 {
     if ms < 0 {
         0
+    } else if ms <= 1 << 24 {
+        // Milliseconds are exactly representable here. A float division by
+        // 40 cannot round a noninteger quotient across an integer boundary.
+        (ms + 39) / 40
     } else {
         ceil_i32(f(f(ms as f64) / 40.0))
     }
@@ -267,6 +271,10 @@ pub struct Life {
     has_recovery: bool,
 }
 impl Life {
+    pub(crate) fn has_no_commands(&self) -> bool {
+        self.commands.is_empty()
+    }
+
     pub fn new(initial: i32, damage: [f64; 7], music_length: i32) -> Self {
         let length = frame(music_length).wrapping_add(2).max(1) as usize;
         Self {

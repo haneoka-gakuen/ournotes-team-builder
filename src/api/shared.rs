@@ -14,7 +14,7 @@ const EXACT_POWER_COMPONENT: u64 = 1 << 49;
 struct SongObjective<'a> {
     objective: Box<dyn Objective + 'a>,
     music: power::Music,
-    bases: Vec<power::SlotBase>,
+    bases: Arc<Vec<power::SlotBase>>,
     snap_power: Arc<Vec<f64>>,
     skills: Vec<(f64, f64)>,
     cap: f64,
@@ -51,7 +51,7 @@ fn linear_groups(songs: &[SongObjective<'_>]) -> Vec<LinearGroup> {
             let other = &songs[group.song];
             song.music.music_type == other.music.music_type
                 && song.snap_power == other.snap_power
-                && song.bases.iter().zip(&other.bases).all(|(a, b)| {
+                && song.bases.iter().zip(other.bases.iter()).all(|(a, b)| {
                     a.common == b.common && a.fixed_points == b.fixed_points
                 })
         });
@@ -89,6 +89,9 @@ struct Combined<'a> {
     prune_chart_replay: bool,
     song_evaluations: u64,
     skipped_song_evaluations: u64,
+    replay_order: Vec<usize>,
+    replay_gaps: Vec<f64>,
+    replay_order_refresh: u64,
     plan: Option<Plan>,
     affine: Option<f64>,
     leader: usize,
@@ -1155,6 +1158,7 @@ impl Combined<'_> {
         }).and_then(|limit| {
             let width = self.snaps.len() + 1;
             let mut suffix = vec![0.0_f64; chart_count + 1];
+            let mut chart_uppers = vec![0.0; chart_count];
             let objective = &self.songs[0].objective;
             let mut bonus = 0.0;
             for (&member, &snap) in team.members.iter().zip(&team.snaps) {
@@ -1169,35 +1173,57 @@ impl Combined<'_> {
                 }
                 let upper = song.objective.bound(totals);
                 if !upper.is_finite() { return None; }
+                chart_uppers[index] = upper;
                 suffix[index] = (upper + suffix[index + 1]).next_up();
             }
-            Some((limit, suffix))
+            Some((limit, suffix, chart_uppers))
         });
         // Most losing formations only need a prefix of the reward totals. Keep
         // the score replays cached and assemble the full details for survivors.
-        let mut replayed = 0;
-        if let Some((limit, suffix)) = bound.as_ref().filter(|_| self.plan.is_some()) {
-            let mut prefix = 0.0_f64;
-            for (index, (song, power)) in self.songs.iter_mut().zip(&powers).enumerate() {
-                let upper = ((prefix + suffix[index]).next_up() / chart_count as f64).next_up();
+        let mut replayed = vec![false; chart_count];
+        if let Some((limit, suffix, caps)) = bound.as_ref().filter(|(_, _, caps)| {
+            self.plan.is_some() && caps.iter().all(|&upper| upper >= 0.0)
+        }) {
+            let prioritize = chart_count >= 8;
+            if prioritize && self.song_evaluations >= self.replay_order_refresh {
+                self.replay_order.sort_unstable_by(|&a, &b| {
+                    (caps[b] * self.replay_gaps[b]).total_cmp(&(caps[a] * self.replay_gaps[a]))
+                        .then(a.cmp(&b))
+                });
+                self.replay_order_refresh = self.song_evaluations.saturating_add(256);
+            }
+            let mut sum = suffix[0];
+            let mut checked = 0;
+            let rounding = (1.0 + chart_count as f64 * f64::EPSILON).next_up();
+            let mean = |sum: f64| ((sum * rounding).next_up() / chart_count as f64).next_up();
+            for position in 0..chart_count {
+                let upper = mean(sum);
                 if upper < *limit {
-                    self.skipped_song_evaluations += (chart_count - index) as u64;
+                    self.skipped_song_evaluations += (chart_count - checked) as u64;
                     return Ok(search::Evaluation::Pruned(upper));
                 }
-                let Some(value) = song.objective.event_primary_upper(team, power.total as i32)? else { break; };
-                replayed += 1;
+                let index = if prioritize { self.replay_order[position] } else { position };
+                let song = &mut self.songs[index];
+                let Some(value) = song.objective.event_primary_upper(team, powers[index].total as i32)? else { break; };
+                if !value.is_finite() || value < 0.0 { break; }
+                if prioritize && caps[index] > 0.0 {
+                    let gap = ((caps[index] - value) / caps[index]).clamp(0.0, 1.0);
+                    self.replay_gaps[index] += (gap - self.replay_gaps[index]) * 0.125;
+                }
+                replayed[index] = true;
+                checked += 1;
                 self.song_evaluations += 1;
-                prefix = (prefix + value).next_up();
+                sum = ((sum - caps[index]).next_up() + value.min(caps[index])).next_up();
             }
-            let upper = (prefix / chart_count as f64).next_up();
-            if replayed == chart_count && upper < *limit {
+            let upper = mean(sum);
+            if checked == chart_count && upper < *limit {
                 return Ok(search::Evaluation::Pruned(upper));
             }
         }
         let mut prefix = 0.0_f64;
         let mut parts = Vec::with_capacity(chart_count);
         for (index, (song, p)) in self.songs.iter_mut().zip(&powers).enumerate() {
-            if let Some((limit, suffix)) = &bound {
+            if let Some((limit, suffix, _)) = &bound {
                 let upper = ((prefix + suffix[index]).next_up() / chart_count as f64).next_up();
                 // A PT tie can still improve another reward, score, or power.
                 if upper < *limit {
@@ -1210,7 +1236,7 @@ impl Combined<'_> {
                 p.total as f64,
                 &p.slots.map(|value| value as f64),
             )?;
-            if self.prune_chart_replay && index >= replayed { self.song_evaluations += 1; }
+            if self.prune_chart_replay && !replayed[index] { self.song_evaluations += 1; }
             if bound.is_some() {
                 let upper = self.plan.as_ref().map_or(exact.key, |_| {
                     Fraction::from_json(&exact.detail["rewardRanking"][0]).unwrap().upper()
@@ -1362,6 +1388,11 @@ impl Engine {
             }
         }
         let mut objectives = Vec::new();
+        let mut bases_by_music = rustc_hash::FxHashMap::default();
+        let event_member_power: Vec<_> = cards.members.iter()
+            .map(|member| power::member_event_percent(&effects, member, 2)).collect();
+        let event_snap_power: Vec<_> = cards.snaps.iter()
+            .map(|snap| power::snap_event_percent(&effects, snap, 2)).collect();
         let profiles: Vec<_> = cards.members.iter().map(|member| power::leader_profile(&self.master, member)).collect();
         for ((song, chart), source) in songs.iter().zip(&charts).zip(&sources) {
             let music = power::music_view(&self.master, master::int(&song["songId"]), challenge)?;
@@ -1492,28 +1523,21 @@ impl Engine {
                 })
             };
             let width = cards.snaps.len() + 1;
-            let bases: Vec<_> = cards
-                .members
-                .iter()
-                .map(|m| {
-                    power::slot_base(
-                        &self.master,
-                        &player,
-                        m,
-                        Some(&music),
-                        power::member_event_percent(&effects, m, 2),
-                    )
-                })
-                .collect();
-            let shared = objectives.iter().find(|song: &&SongObjective<'_>| song.bases.iter().zip(&bases).all(|(a, b)| a.common == b.common && a.fixed_points == b.fixed_points));
+            let bases = Arc::clone(bases_by_music.entry(music.slot_base_key(&player)).or_insert_with(|| {
+                Arc::new(cards.members.iter().zip(&event_member_power).map(|(member, &bonus)| {
+                    power::slot_base(&self.master, &player, member, Some(&music), bonus)
+                }).collect::<Vec<_>>())
+            }));
+            let shared = objectives.iter().find(|song: &&SongObjective<'_>| Arc::ptr_eq(&song.bases, &bases)
+                || song.bases.iter().zip(bases.iter()).all(|(a, b)| a.common == b.common && a.fixed_points == b.fixed_points));
             let snap_power = shared.map(|song| Arc::clone(&song.snap_power));
             let shared_cap = shared.map(|song| song.cap);
             let master = &self.master;
             let snap_power = snap_power.unwrap_or_else(|| Arc::new(cards.members.iter().enumerate().flat_map(|(m, member)| {
                 let base = &bases[m];
-                let effects = &effects;
-                cards.snaps.iter().map(Some).chain(std::iter::once(None)).map(move |snap|
-                    power::snap_points(master, base, member, snap, snap.map_or(0, |s| power::snap_event_percent(effects, s, 2))) as f64)
+                cards.snaps.iter().map(Some).zip(event_snap_power.iter().copied())
+                    .chain(std::iter::once((None, 0))).map(move |(snap, bonus)|
+                        power::snap_points(master, base, member, snap, bonus) as f64)
             }).collect()));
             let skills = (0..cards.members.len()).flat_map(|m| (0..width).map(move |s| (m, s)))
                 .map(|(m, s)| objective.skill(m, if s == width - 1 { -1 } else { s as i32 })).collect();
@@ -1559,7 +1583,7 @@ impl Engine {
                     && song
                         .bases
                         .iter()
-                        .zip(&objectives[0].bases)
+                        .zip(objectives[0].bases.iter())
                         .all(|(a, b)| a.common == b.common && a.fixed_points == b.fixed_points)
             }))
         .then(|| {
@@ -1649,6 +1673,9 @@ impl Engine {
             prune_chart_replay,
             song_evaluations: 0,
             skipped_song_evaluations: 0,
+            replay_order: (0..songs.len()).collect(),
+            replay_gaps: vec![0.125; songs.len()],
+            replay_order_refresh: 0,
             plan,
             affine,
             leader: 0,
@@ -1677,7 +1704,7 @@ impl Engine {
                 &json!({"song":null,"hits":hits.iter().map(|h|shared_hit(h,&songs,&charts,&cards.members,&cards.snaps,battle,event,goal)).collect::<Vec<_>>()}),
             )
         };
-        let output = search::search(search::Input {
+        let output = search::search_current(search::Input {
             master: &self.master,
             player: &player,
             members: &cards.members,

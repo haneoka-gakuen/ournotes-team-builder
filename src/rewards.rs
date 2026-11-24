@@ -235,6 +235,8 @@ fn range_delta(master: &Master, row: &SkillEffect) -> Option<f64> {
 struct Budget {
     positive: f64,
     sustained: f64,
+    regional: f64,
+    other: f64,
     commands: usize,
 }
 fn admitted(master: &Master, rows: Option<&Vec<SkillEffect>>, level: i32) -> Option<Budget> {
@@ -247,6 +249,7 @@ fn admitted(master: &Master, rows: Option<&Vec<SkillEffect>>, level: i32) -> Opt
         return None;
     }
     let mut budget = Budget::default();
+    let mut scores = Vec::new();
     for row in active {
         if row.value < 0
             || row.value > 1000000
@@ -266,12 +269,46 @@ fn admitted(master: &Master, rows: Option<&Vec<SkillEffect>>, level: i32) -> Opt
             continue;
         }
         let delta = range_delta(master, row)?;
+        scores.push((row, delta));
+    }
+    let owner_gate = |row: &SkillEffect| {
+        let [set] = master.condition_sets.get(&row.condition_group)?.as_slice() else { return None; };
+        let [id] = set.as_slice() else { return None; };
+        master.conditions.get(id).filter(|condition| condition.kind == 5000)
+    };
+    let mut paired = vec![false; scores.len()];
+    let mut ignored = vec![false; scores.len()];
+    for (i, &(row, value)) in scores.iter().enumerate() {
+        if paired[i] { continue; }
+        let Some(owner) = owner_gate(row) else { continue; };
+        if let Some((j, &(_, other_value))) = scores.iter().enumerate().skip(i + 1).find(|&(j, &(other, _))| {
+            !paired[j] && row.trigger_type == other.trigger_type && row.trigger_group == other.trigger_group
+                && row.seconds.to_bits() == other.seconds.to_bits() && row.release_group == other.release_group
+                && owner_gate(other).is_some_and(|condition| {
+                    owner.positive != condition.positive && owner.targets == condition.targets
+                })
+        }) {
+            paired[i] = true;
+            paired[j] = true;
+            ignored[if value >= other_value { j } else { i }] = true;
+        }
+    }
+    for ((row, delta), ignored) in scores.into_iter().zip(ignored) {
+        if ignored { continue; }
         budget.positive = add(budget.positive, mul(3.0, delta));
         // An untimed Rush effect uses one sustained updater for this row.
         // Its previous activation ends before another can be registered.
         let occurrences = if row.trigger_type == 2 && row.seconds == 0.0
             && row.release_group == 0 { 1.0 } else { 3.0 };
         budget.sustained = add(budget.sustained, mul(occurrences, delta));
+        let ends_with_range = row.trigger_type == 1 && master.condition_sets.get(&row.release_group)
+            .is_some_and(|sets| matches!(sets.as_slice(), [set] if matches!(set.as_slice(), [id]
+                if master.conditions.get(id).is_some_and(|condition| condition.kind == 7013 && condition.positive))));
+        if ends_with_range {
+            budget.regional = add(budget.regional, delta);
+        } else {
+            budget.other = add(budget.other, mul(occurrences, delta));
+        }
         budget.commands += 6;
     }
     Some(budget)
@@ -334,6 +371,8 @@ fn snap_budget(master: &Master, chart: &gekiso::Chart, snap: &Snap) -> Option<Bu
         }
         total.budget.positive = add(total.budget.positive, part.budget.positive);
         total.budget.sustained = add(total.budget.sustained, part.budget.sustained);
+        total.budget.regional = add(total.budget.regional, part.budget.regional);
+        total.budget.other = add(total.budget.other, part.budget.other);
         total.budget.commands += part.budget.commands;
         total.raises |= part.raises;
     }
@@ -365,8 +404,10 @@ pub(crate) struct ReplayScoreWeights<'a> {
     pub(crate) grades: [f64; 7],
     pub(crate) promotions: [usize; 7],
     pub(crate) combo: &'a [f64],
+    pub(crate) plain_combo: Option<&'a [f64]>,
+    pub(crate) opening_grades: Option<&'a [usize]>,
     pub(crate) dead_after: Option<i32>,
-    pub(crate) unpenalized: Option<&'a mut Vec<(i32, f64)>>,
+    pub(crate) unpenalized: Option<&'a mut Vec<(i32, [f64; 2])>>,
 }
 
 pub(crate) fn score_coefficient_with_weights(
@@ -406,6 +447,17 @@ pub(crate) fn score_coefficient_with_weights(
         let peak = if weights.is_some() {
             add(largest(&mb, |budget| budget.sustained), largest(&sb, |budget| budget.sustained))
         } else { positive };
+        let separate_ranges = weights.is_some() && !chart.luck
+            && chart.setup.fevers.iter().all(|&(start, end)| end.saturating_sub(start) > 120)
+            && chart.setup.fevers.windows(2).all(|pair| pair[0].1.saturating_add(80) < pair[1].0)
+            && chart.play.frames.windows(2).all(|pair| (10..=40).contains(&(pair[1].time_ms - pair[0].time_ms)));
+        let in_range_peak = separate_ranges.then(|| {
+            let local = |budget: &Budget| add(budget.regional, budget.other);
+            add(largest(&mb, local), largest(&sb, local))
+        });
+        let other_peak = separate_ranges.then(|| {
+            add(largest(&mb, |budget| budget.other), largest(&sb, |budget| budget.other))
+        });
         let note_commands = commands(&mb) + commands(&sb);
         let live = &master.live;
         if !(0.0..=1.0).contains(&live.life_onus)
@@ -524,6 +576,8 @@ pub(crate) fn score_coefficient_with_weights(
         };
         let note_multiplier = add(add(1.0, peak), error);
         let before_ranges = add(1.0, error);
+        let in_range = in_range_peak.map(|bound| add(add(1.0, bound), error));
+        let outside_ranges = other_peak.map(|bound| add(add(1.0, bound), error));
         let first_range = chart.setup.fevers.iter().map(|&(start, _)| start).min().unwrap_or(i32::MAX);
         let operations = (10 * max_actions + 1) as f64;
         if operations * u > 0.25 {
@@ -555,6 +609,10 @@ pub(crate) fn score_coefficient_with_weights(
             counts[grade] += 1;
             counts
         }));
+        let unchanged_damage: [f64; 7] = std::array::from_fn(|grade| {
+            chart.judge_frac.iter().enumerate().filter(|(next, _)| live.damage[*next] >= live.damage[grade])
+                .map(|(_, &value)| value).fold(0.0_f64, f64::max)
+        });
         let mut promoted: [Vec<f64>; 7] = std::array::from_fn(|_| Vec::new());
         let chronological_rush = weights.is_some() && chart.setup.missions.iter().all(|&mission| mission == 2)
             && chart.play.frames.iter().enumerate().all(|(index, frame)| {
@@ -563,17 +621,17 @@ pub(crate) fn score_coefficient_with_weights(
                     && frame.judged.iter().all(|note| note.time_ms <= frame.time_ms
                         && previous.is_none_or(|time| note.time_ms > time))
             });
-        let luck_ranges = (chart.luck && (live.gekiso.rush_percent == 100 || chronological_rush)
+        let luck_ranges = (chart.luck
             && chart.play.frames.windows(2).all(|frames| {
                 (10..=40).contains(&(frames[1].time_ms - frames[0].time_ms))
-            }) && chart.play.frames.iter().all(|frame| frame.judged.iter().all(|note| {
-                (note.time_ms as i64 - frame.time_ms as i64).abs() <= 40
-            })))
+            }) && chart.setup.fevers.iter().all(|&(start, end)| 40 <= start && start < end))
             .then(|| deterministic_ranges(master, chart))
             .flatten()
             .filter(|ranges| ranges.windows(2).all(|pair| pair[0].1 < pair[1].0));
-        // With chronological delivery and disjoint ranges, a Rush handle ends
-        // before the next one starts, including the range's completion frames.
+        // A Rush is opened with a targeted note's time or a playing frame's
+        // time. FINISH closes its handle even when a judgable input arrived
+        // late. Keep the full capped multiplier inside each disjoint range
+        // when its commands can arrive out of time order.
         let rush_cap = if chronological_rush && luck_ranges.is_some() {
             f(f((100 + live.gekiso.rush_percent) as f64) / 100.0)
         } else { 2.0 };
@@ -628,10 +686,17 @@ pub(crate) fn score_coefficient_with_weights(
                 })) { 1.0 } else { rush_cap };
             let mut c = mul(live.adjustment, chart.difficulty_factor);
             let grade = chart.judgements[i];
-            let capped = weights.as_ref().is_some_and(|weights| weights.promotions[grade] < grade_counts.unwrap()[grade]);
+            let initial = weights.as_ref().and_then(|weights| weights.opening_grades)
+                .filter(|_| matches!(grade, 1 | 2)).map(|projected| chart.judge_frac[projected[i]]);
+            let capped = initial.is_none()
+                && weights.as_ref().is_some_and(|weights| weights.promotions[grade] < grade_counts.unwrap()[grade]);
             // These Gekiso bonuses require a range start or an active Rush.
             let multiplier = if note.time_ms < first_range.saturating_sub(40) {
                 before_ranges
+            } else if let Some((inside, outside)) = in_range.zip(outside_ranges) {
+                if chart.setup.fevers.iter().any(|&(start, end)| {
+                    start.saturating_sub(40) <= note.time_ms && note.time_ms <= end.saturating_add(40)
+                }) { inside } else { outside }
             } else {
                 note_multiplier
             };
@@ -655,7 +720,11 @@ pub(crate) fn score_coefficient_with_weights(
             }
             if let Some(weights) = &mut weights {
                 if let Some(out) = &mut weights.unpenalized {
-                    out.push((note.time_ms, mul(c, weights.grades[grade])));
+                    let best = initial.unwrap_or(weights.grades[grade]);
+                    let plain = weights.plain_combo.map_or(c, |plain| {
+                        mul(c, up(plain[i] / combo))
+                    });
+                    out.push((note.time_ms, [mul(c, best), mul(plain, best.min(unchanged_damage[grade]))]));
                 }
                 if weights.dead_after.is_some_and(|at| note.time_ms > at) {
                     c = mul(c, live.life_onus);
@@ -669,7 +738,8 @@ pub(crate) fn score_coefficient_with_weights(
                     promoted[grade].push(mul(c, (weights.grades[grade] - raw).next_up()));
                 }
             } else {
-                let judgement = weights.as_ref().map_or(if fixed_judgements { raw } else { fraction }, |weights| weights.grades[grade]);
+                let judgement = initial.unwrap_or_else(|| weights.as_ref()
+                    .map_or(if fixed_judgements { raw } else { fraction }, |weights| weights.grades[grade]));
                 coefficient = add(coefficient, mul(c, judgement));
             }
         }
@@ -743,6 +813,7 @@ impl JustContext {
         chart: &gekiso::Chart,
         members: &[Member],
         snaps: &[Snap],
+        damage_free: bool,
     ) -> Option<Self> {
         if chart.setup.missions.iter().any(|&m| m != 3) {
             return None;
@@ -783,18 +854,13 @@ impl JustContext {
                 .iter()
                 .filter(|r| r.level == m.growth.gekiso_skill_level)
                 .collect();
-            if !rows
-                .iter()
-                .all(|r| [13000, 13002, 13003, 13004, 4004].contains(&r.kind) && safe(r))
-            {
+            if !rows.iter().all(|r| safe(r) && (
+                [13000, 13002, 13003, 13004, 4004].contains(&r.kind)
+                    || damage_free && r.kind == 3004 && r.value >= 0
+            )) {
                 return None;
             }
-            if rows
-                .iter()
-                .all(|r| [13000, 13002, 13003, 13004, 4004].contains(&r.kind) && safe(r))
-            {
-                member.insert((m.card.gekiso_skill_id, m.growth.gekiso_skill_level));
-            }
+            member.insert((m.card.gekiso_skill_id, m.growth.gekiso_skill_level));
         }
         let mut support = HashMap::default();
         let mut shapes = HashMap::<Vec<u64>, (i32, i32)>::default();
@@ -1016,24 +1082,24 @@ pub(crate) fn factor_operations(chart: &gekiso::Chart, ranges: &[(i32, i32)]) ->
             .unwrap_or(3)
     })
 }
-fn static_gk_group(master: &Master, group: i32, p: &Performer) -> Option<bool> {
+pub(crate) fn static_gk_group(master: &Master, group: i32, p: &Performer) -> Option<bool> {
     if group == 0 {
         return Some(true);
     }
+    let sets = master.condition_sets.get(&group)?;
+    if sets.iter().all(Vec::is_empty) { return Some(true); }
     let mut any = false;
-    for set in master.condition_sets.get(&group)? {
+    for set in sets.iter().filter(|set| !set.is_empty()) {
         let mut matched = true;
         for id in set {
             let c = master.conditions.get(id)?;
             if c.kind != 5000 {
                 return None;
             }
-            let found = c.targets.iter().any(|id| {
-                master
-                    .targets
-                    .get(id)
-                    .is_some_and(|t| crate::full::conditions::performer_matches(p, t))
-            });
+            let mut found = false;
+            for id in &c.targets {
+                found |= crate::full::conditions::performer_matches(p, master.targets.get(id)?);
+            }
             matched &= found == c.positive;
         }
         any |= matched;
@@ -1045,6 +1111,7 @@ struct CounterFrame {
     combo: f64,
     extras: [f64; 6],
     mission: i32,
+    range: usize,
 }
 fn possible_healthy_group(master: &Master, group: i32) -> bool {
     if group == 0 {
@@ -1101,6 +1168,7 @@ pub(crate) struct LuckMoments {
 pub(crate) struct LuckEnvelope {
     pub(crate) fingerprint: OnceLock<u64>,
     pub moments: Option<Arc<LuckMoments>>,
+    pub nominal_weights: Option<Arc<Vec<[u64; 2]>>>,
     pub changes: usize,
     pub rush: Vec<bool>,
     pub support: Vec<bool>,
@@ -1109,6 +1177,7 @@ impl PartialEq for LuckEnvelope {
     fn eq(&self, other: &Self) -> bool {
         self.changes == other.changes
             && self.moments == other.moments
+            && self.nominal_weights == other.nominal_weights
             && self.rush == other.rush
             && self.support == other.support
     }
@@ -1121,6 +1190,7 @@ impl std::hash::Hash for LuckEnvelope {
             let mut hasher = rustc_hash::FxHasher::default();
             self.changes.hash(&mut hasher);
             self.moments.hash(&mut hasher);
+            self.nominal_weights.hash(&mut hasher);
             self.rush.hash(&mut hasher);
             self.support.hash(&mut hasher);
             hasher.finish()
@@ -1522,8 +1592,10 @@ impl FixedRegionBound {
             row.resize(columns, -1e100);
         }
         let mut upper = initial;
-        for scale in [1.0, 0.75, 1.5] {
-            let lambda = ratio * scale;
+        let mean_only = required.is_none() && criterion == crate::objectives::Criterion::Mean;
+        let mut trials = [ratio, ratio * 0.75, ratio * 1.5];
+        for pass in 0..trials.len() {
+            let lambda = trials[pass];
             let mut event_rows = [[[f64::NEG_INFINITY; 2]; 5]; 5];
             for (slot, row) in self.matrix.iter_mut().enumerate() {
                 row.fill(-1e100);
@@ -1560,13 +1632,16 @@ impl FixedRegionBound {
                     }] = add(mul(lambda, power), up(weight / lambda));
                 }
             }
-            let highs: [f64; 5] = std::array::from_fn(|slot| {
+            let highs: [(usize, f64); 5] = std::array::from_fn(|slot| {
                 self.matrix[slot]
                     .iter()
                     .copied()
-                    .fold(f64::NEG_INFINITY, f64::max)
+                    .enumerate()
+                    .fold((0, f64::NEG_INFINITY), |best, point| {
+                        if point.1 > best.1 { point } else { best }
+                    })
             });
-            let mut variable = highs.into_iter().fold(0.0, add);
+            let mut variable = highs.iter().fold(0.0, |sum, &(_, value)| add(sum, value));
             if let Some((required, minimum, maximum)) = required {
                 let mut dp = [f64::NEG_INFINITY; 6];
                 dp[0] = 0.0;
@@ -1635,7 +1710,12 @@ impl FixedRegionBound {
             if upper < cutoff {
                 return upper;
             }
-            variable = variable.min(self.matching.maximum_upper(&self.matrix, columns));
+            let distinct = mean_only && highs.iter().enumerate().all(|(index, &(column, _))| {
+                    highs[..index].iter().all(|&(other, _)| other != column)
+                });
+            if !distinct {
+                variable = variable.min(self.matching.maximum_upper(&self.matrix, columns));
+            }
             if variable < -1e50 {
                 return f64::NEG_INFINITY;
             }
@@ -1644,12 +1724,32 @@ impl FixedRegionBound {
             if upper < cutoff {
                 return upper;
             }
+            if pass == 0 && mean_only {
+                let (mut power, mut coefficient) = (base_power, self.base);
+                for (slot, &(column, _)) in highs.iter().enumerate() {
+                    let physical = column.min(self.width - 1);
+                    let profile = if physical == self.width - 1 { 0 } else { physical + 1 };
+                    power += self.powers[slot * self.width + physical];
+                    coefficient += self.rows.member(self.members[slot]).means[profile];
+                }
+                let balanced = (coefficient / power).sqrt();
+                if balanced.is_finite() && balanced > 0.0 {
+                    let balanced = balanced.clamp(ratio * 0.75, ratio * 1.5);
+                    if (balanced / ratio - 1.0).abs() > 1e-6 {
+                        // The best choices at this price suggest where the
+                        // power and coefficient terms balance next.
+                        trials[1] = balanced;
+                        trials[2] = ratio * (balanced / ratio).sqrt();
+                    }
+                }
+            }
         }
         upper
     }
 }
 pub(crate) struct BoundPreparation {
     layout: Arc<CumulativeLayout>,
+    ordinary: Vec<PreparedOrdinary>,
     slots: Vec<PreparedSlot>,
     row_ids: Vec<u32>,
     member_rows: Vec<Vec<u32>>,
@@ -1661,11 +1761,13 @@ struct PreparedSlot {
     converts: f64,
     regional_converts: Option<Vec<f64>>,
     score_rows: Vec<[i32; 5]>,
+    ordinary: u32,
+    pulse: Option<PreparedPulse>,
+}
+struct PreparedOrdinary {
     normal: (usize, f64),
     shape: Vec<(i32, f64)>,
     windows: Vec<PreparedWindow>,
-    conversion_key: Vec<u64>,
-    pulse: Option<PreparedPulse>,
 }
 struct PreparedPulse {
     duration: i32,
@@ -1685,8 +1787,7 @@ impl PreparedSlot {
         let mut key = vec![
             self.positive.to_bits(),
             self.converts.to_bits(),
-            self.normal.0 as u64,
-            self.normal.1.to_bits(),
+            u64::from(self.ordinary),
         ];
         match &self.regional_converts {
             None => key.push(0),
@@ -1697,6 +1798,15 @@ impl PreparedSlot {
         }
         key.push(self.score_rows.len() as u64);
         key.extend(self.score_rows.iter().flatten().map(|&x| x as u64));
+        if let Some(pulse) = &self.pulse {
+            key.extend([1, pulse.duration as u64, pulse.quota as u64, u64::from(pulse.mask), pulse.judgement as u64]);
+        } else { key.push(0); }
+        key
+    }
+}
+impl PreparedOrdinary {
+    fn template_key(&self, conversion: &[u64]) -> Vec<u64> {
+        let mut key = vec![self.normal.0 as u64, self.normal.1.to_bits()];
         key.push(self.shape.len() as u64);
         for &(duration, delta) in &self.shape {
             key.extend([duration as u64, delta.to_bits()]);
@@ -1708,11 +1818,8 @@ impl PreparedSlot {
                 key.extend([start as u64, end as u64]);
             }
         }
-        key.push(self.conversion_key.len() as u64);
-        key.extend_from_slice(&self.conversion_key);
-        if let Some(pulse) = &self.pulse {
-            key.extend([1, pulse.duration as u64, pulse.quota as u64, u64::from(pulse.mask), pulse.judgement as u64]);
-        } else { key.push(0); }
+        key.push(conversion.len() as u64);
+        key.extend_from_slice(conversion);
         key
     }
 }
@@ -1740,6 +1847,12 @@ fn cumulative_windows(
     }
     let duration = factor.bound_duration_ms().saturating_add(live::FrameClock::default().advance_ms());
     let padding = chart.delivery_radius_ms.saturating_add(40);
+    let events: Vec<_> = chart.full.events.iter().take(5).map(|&(_, at)| {
+        let before = times.partition_point(|&time| time < at.saturating_sub(padding));
+        let end = chart.times.partition_point(|&time|
+            time < factor.window(live::FrameClock::default(), at).1);
+        (at, before, end)
+    }).collect();
     let mut previous = 0.0_f64;
     let mut windows = Vec::new();
     for step in 1..=cap {
@@ -1749,19 +1862,11 @@ fn cumulative_windows(
         if delta <= 0.0 {
             continue;
         }
-        let intervals = chart
-            .full
-            .events
-            .iter()
-            .take(5)
-            .map(|&(_, at)| {
-                let before = times.partition_point(|&time| time < at.saturating_sub(padding));
+        let intervals = events.iter()
+            .map(|&(at, before, end)| {
                 let threshold = before
                     .saturating_add((step as usize).saturating_mul(factor.unit as usize))
                     .saturating_sub(1);
-                let end = chart
-                    .times
-                    .partition_point(|&time| time < factor.window(live::FrameClock::default(), at).1);
                 let first = times
                     .get(threshold)
                     .map(|&time| time.saturating_sub(padding).max(at));
@@ -1798,7 +1903,6 @@ impl BoundPreparation {
             .iter()
             .map(|f| f.judged.len())
             .sum::<usize>();
-        let static_group = |group: i32, p: &Performer| static_gk_group(master, group, p);
         let single = |group: i32, kind: i32| {
             master.condition_sets.get(&group).is_some_and(|sets| {
                 sets.len() == 1
@@ -1812,23 +1916,104 @@ impl BoundPreparation {
         let mut slots = Vec::new();
         let mut row_ids = Vec::new();
         let mut templates = HashMap::<Vec<u64>, u32>::default();
-        let mut prepared_skills = None;
+        let prepared_skills = skills::prepare(master, members, snaps);
+        let fixed_just = chart.accuracy.miss_every == 0 && chart.accuracy.great == 0.0
+            && chart.notes.iter().zip(&chart.judgements).all(|(note, &grade)| {
+                grade == 6 || grade == 5 && master.live.timing_types.contains(&note.judgement_type)
+                    && !master.live.just_types.contains(&note.judgement_type)
+            })
+            && prepared_skills.slots.iter().all(|slot| slot.convert.as_ref().is_none_or(|convert|
+                convert.judgements.iter().all(|&grade| grade < 5 || grade == convert.judgement)));
+        let regional_judged = OnceLock::<Vec<usize>>::new();
         let mut count_times: Vec<_> = chart.full.notes.iter().filter(|note|crate::full::play::is_judged(note.op)).map(|note|note.time_ms).collect();
         count_times.sort_unstable();
         let mut cumulative_cache = HashMap::default();
+        let mut ordinary = Vec::new();
+        let mut ordinary_signature = Vec::new();
+        let mut ordinary_inputs = HashMap::default();
+        let mut ordinary_profiles = HashMap::default();
+        let mut ordinary_profile = |slot: &live::Slot| -> Option<(PreparedOrdinary, Vec<u64>)> {
+            if slot
+                .convert
+                .as_ref()
+                .is_some_and(|c| c.judgements.contains(&6))
+            {
+                return None;
+            }
+            let (actions, absolute) = live::rounding_profile(slot, Some(master.live.life_base));
+            let mut shape = Vec::new();
+            let mut normal_windows = Vec::new();
+            for effect in &slot.effects {
+                if effect.delta < 0
+                    || effect.gate.blocks(master.live.life_base)
+                        != effect.gate.blocks(2.0 * master.live.life_base)
+                {
+                    return None;
+                }
+                if effect.gate.blocks(master.live.life_base) {
+                    continue;
+                }
+                let delta = f(effect.delta as f64 / 100000.0);
+                shape.push((window_ms(effect.seconds, slot.extension_ms), delta));
+                if effect.kind != 2000
+                    && !effect.judgements.iter().any(|&j| (4..=6).contains(&j))
+                {
+                    continue;
+                }
+                let intervals = chart
+                    .full
+                    .events
+                    .iter()
+                    .take(5)
+                    .map(|&(_, time)| {
+                        let start = chart.times.partition_point(|&t| t < time);
+                        let end = chart.times.partition_point(|&t| {
+                            t < time + window_ms(effect.seconds, slot.extension_ms)
+                        });
+                        (start, end)
+                    })
+                    .collect();
+                let mask = if effect.kind == 2000 {0} else {effect.judgements.iter().fold(0u8,|mask,&grade|mask | (1 << grade))};
+                normal_windows.push(PreparedWindow { delta, mask, duration: window_ms(effect.seconds, slot.extension_ms), intervals });
+            }
+            for factor in &slot.cumulative {
+                let delta = f(factor.at_cap() as f64 / 100000.0);
+                let duration = factor.bound_duration_ms();
+                shape.push((duration.saturating_add(live::FrameClock::default().advance_ms()), delta));
+                let key=(factor.unit,factor.value,factor.maximum,factor.cap,duration);
+                let windows = cumulative_cache.entry(key).or_insert_with(|| cumulative_windows(factor,chart,&count_times));
+                if let Some(windows) = windows {
+                    normal_windows.extend(windows.iter().cloned());
+                } else {
+                    let intervals = chart.full.events.iter().take(5).map(|&(_,time)| {
+                        let (start,end)=factor.window(live::FrameClock::default(),time);
+                        (chart.times.partition_point(|&t|t<start),chart.times.partition_point(|&t|t<end))
+                    }).collect();
+                    normal_windows.push(PreparedWindow { delta, mask: 0, duration, intervals });
+                }
+            }
+            let conversion_key = if chart.accuracy.great == 0.0 { Vec::new() } else { slot.conversion_signature().unwrap_or_default() };
+            Some((PreparedOrdinary { normal: (actions, absolute), shape, windows: normal_windows }, conversion_key))
+        };
         for (member_index, member) in members.iter().enumerate() {
+            let performer = Performer::from_member(master, member, None);
+            let mut static_groups = HashMap::default();
+            let mut static_group = |group| *static_groups.entry(group)
+                .or_insert_with(|| static_gk_group(master, group, &performer));
             for (snap_index, snap) in std::iter::once(None)
                 .chain(snaps.iter().map(Some))
                 .enumerate()
             {
-                let p = Performer::from_member(master, member, snap);
                 let mut positive = 0.0;
                 let mut converts = 0.0;
                 let mut regional_converts = Some(vec![0.0_f64; ranges.len()]);
                 let mut score_rows = Vec::new();
                 // Supports only execute for members with a Gekiso mission.
-                if p.gekisou_skill.is_some() {
-                    for &(id, level) in &p.gekisou_support_skills {
+                if performer.gekisou_skill.is_some() {
+                    let skills = snap.into_iter().flat_map(|snap| {
+                        snap.card.gekiso_support_skills.into_iter().zip(snap.gekiso_skill_levels)
+                    });
+                    for (id, level) in skills.filter(|&(id, _)| id != 0) {
                         let skill = master.gekiso_support_skills.get(&id)?;
                         if skill.mission_type != 4
                             && !chart.setup.missions.contains(&skill.mission_type)
@@ -1853,7 +2038,7 @@ impl BoundPreparation {
                                     {
                                         return None;
                                     }
-                                    if row.value > 0 && static_group(row.condition_group, &p)? {
+                                    if row.value > 0 && static_group(row.condition_group)? {
                                         score_rows.push([row.value, row.value, -1, 1000, 2]);
                                         positive =
                                             add(positive, up(f(f(row.value as f64) / 10000.0)));
@@ -1876,6 +2061,7 @@ impl BoundPreparation {
                             }
 
                             if row.kind == 13005 {
+                                if fixed_just { continue; }
                                 if row.limit_count <= 0
                                     || row.trigger_type != 1
                                     || !single(row.release_group, 7013)
@@ -1910,7 +2096,7 @@ impl BoundPreparation {
                                 {
                                     return None;
                                 }
-                                if static_group(row.condition_group, &p)? {
+                                if static_group(row.condition_group)? {
                                     let guarded = groups[0]
                                         .iter()
                                         .filter_map(|id| master.conditions.get(id))
@@ -1926,7 +2112,16 @@ impl BoundPreparation {
                                         });
                                     if let Some(condition) = guarded {
                                         let mut total = 0.0;
-                                        for (range, &(start, end)) in ranges.iter().enumerate() {
+                                        let counts = regional_judged.get_or_init(|| {
+                                            let mut counts = vec![0; ranges.len()];
+                                            for note in chart.play.frames.iter().flat_map(|frame| &frame.judged) {
+                                                for (&(start, end), count) in ranges.iter().zip(&mut counts) {
+                                                    if start <= note.time_ms && note.time_ms <= end { *count += 1; }
+                                                }
+                                            }
+                                            counts
+                                        });
+                                        for (range, &count) in counts.iter().enumerate() {
                                             if !condition.targets.iter().any(|id| {
                                                 let mission = master.targets[id].mission_type;
                                                 mission == 4
@@ -1934,15 +2129,6 @@ impl BoundPreparation {
                                             }) {
                                                 continue;
                                             }
-                                            let count = chart
-                                                .play
-                                                .frames
-                                                .iter()
-                                                .flat_map(|f| &f.judged)
-                                                .filter(|j| {
-                                                    start <= j.time_ms && j.time_ms <= end
-                                                })
-                                                .count();
                                             let budget = mul(
                                                 (count as f64 / n)
                                                     .floor()
@@ -1988,7 +2174,7 @@ impl BoundPreparation {
                             {
                                 return None;
                             }
-                            if static_group(row.condition_group, &p)? {
+                            if static_group(row.condition_group)? {
                                 let n = cumulative.values.first().copied().unwrap_or(0.0) as i32;
                                 let just = cumulative.kind == 7001
                                     || cumulative.targets.iter().all(|id| {
@@ -2006,77 +2192,29 @@ impl BoundPreparation {
                         }
                     }
                 }
-                let raw =
-                    prepared_skills.get_or_insert_with(|| skills::prepare(master, members, snaps));
-                let slot = &raw.slots[member_index * (snaps.len() + 1) + snap_index];
-                if slot
-                    .convert
-                    .as_ref()
-                    .is_some_and(|c| c.judgements.contains(&6))
-                {
-                    return None;
-                }
-                let (actions, absolute) = live::rounding_profile(slot, Some(master.live.life_base));
-                let mut shape = Vec::new();
-                let mut normal_windows = Vec::new();
-                for effect in &slot.effects {
-                    if effect.delta < 0
-                        || effect.gate.blocks(master.live.life_base)
-                            != effect.gate.blocks(2.0 * master.live.life_base)
-                    {
-                        return None;
-                    }
-                    if effect.gate.blocks(master.live.life_base) {
-                        continue;
-                    }
-                    let delta = f(effect.delta as f64 / 100000.0);
-                    shape.push((window_ms(effect.seconds, slot.extension_ms), delta));
-                    if effect.kind != 2000
-                        && !effect.judgements.iter().any(|&j| (4..=6).contains(&j))
-                    {
-                        continue;
-                    }
-                    let intervals = chart
-                        .full
-                        .events
-                        .iter()
-                        .take(5)
-                        .map(|&(_, time)| {
-                            let start = chart.times.partition_point(|&t| t < time);
-                            let end = chart.times.partition_point(|&t| {
-                                t < time + window_ms(effect.seconds, slot.extension_ms)
-                            });
-                            (start, end)
-                        })
-                        .collect();
-                    let mask = if effect.kind == 2000 {0} else {effect.judgements.iter().fold(0u8,|mask,&grade|mask | (1 << grade))};
-                    normal_windows.push(PreparedWindow { delta, mask, duration: window_ms(effect.seconds, slot.extension_ms), intervals });
-                }
-                for factor in &slot.cumulative {
-                    let delta = f(factor.at_cap() as f64 / 100000.0);
-                    let duration = factor.bound_duration_ms();
-                    shape.push((duration.saturating_add(live::FrameClock::default().advance_ms()), delta));
-                    let key=(factor.unit,factor.value,factor.maximum,factor.cap,duration);
-                    let windows = cumulative_cache.entry(key).or_insert_with(|| cumulative_windows(factor,chart,&count_times));
-                    if let Some(windows) = windows {
-                        normal_windows.extend(windows.iter().cloned());
-                    } else {
-                        let intervals = chart.full.events.iter().take(5).map(|&(_,time)| {
-                            let (start,end)=factor.window(live::FrameClock::default(),time);
-                            (chart.times.partition_point(|&t|t<start),chart.times.partition_point(|&t|t<end))
-                        }).collect();
-                        normal_windows.push(PreparedWindow { delta, mask: 0, duration, intervals });
-                    }
-                }
                 score_rows.sort_unstable();
-                let conversion_key = if chart.accuracy.great == 0.0 { Vec::new() } else { slot.conversion_signature().unwrap_or_default() };
+                let slot = &prepared_skills.slots[member_index * (snaps.len() + 1) + snap_index];
+                slot.write_signature(&mut ordinary_signature);
+                let ordinary_id = if let Some(&id) = ordinary_inputs.get(&ordinary_signature) {
+                    id
+                } else {
+                    let (profile, conversion) = ordinary_profile(slot)?;
+                    let key = profile.template_key(&conversion);
+                    let next = ordinary.len() as u32;
+                    let id = *ordinary_profiles.entry(key).or_insert_with(|| {
+                        ordinary.push(profile);
+                        next
+                    });
+                    ordinary_inputs.insert(ordinary_signature.clone(), id);
+                    id
+                };
                 let pulse = if chart.accuracy.great != 0.0 && slot.convert.as_ref().is_some_and(|convert| convert.judgements.contains(&4)) {
                     let convert = slot.convert.as_ref().unwrap();
                     let snapshot = snap?;
                     let rows: Vec<_> = snapshot.card.support_skills.iter().zip(snapshot.skill_levels)
                         .flat_map(|(id, level)| master.support_skills.get(id).into_iter().flatten()
                             .filter(move |row| row.level == level && row.kind == 12006))
-                        .filter(|row| static_gk_group(master, row.condition_group, &p) != Some(false)).collect();
+                        .filter(|row| static_group(row.condition_group) != Some(false)).collect();
                     if rows.len() != 1 { return None; }
                     let row = rows[0];
                     let pulse = master.condition_sets.get(&row.trigger_group).is_some_and(|sets| sets.len() == 1
@@ -2095,10 +2233,7 @@ impl BoundPreparation {
                     converts,
                     regional_converts,
                     score_rows,
-                    normal: (actions, absolute),
-                    shape,
-                    windows: normal_windows,
-                    conversion_key,
+                    ordinary: ordinary_id,
                     pulse,
                 };
                 let key = slot.template_key();
@@ -2131,6 +2266,7 @@ impl BoundPreparation {
             .min(5);
         Some(Self {
             layout,
+            ordinary,
             slots,
             row_ids,
             member_rows,
@@ -2148,6 +2284,7 @@ enum ComboSource<'a> {
         Option<Arc<crate::reward_trace::ComboTrace>>,
         Arc<BoundPreparation>,
     ),
+    Replay(Option<Arc<BoundPreparation>>, &'a [usize], Option<&'a [usize]>),
 }
 struct ComboEnvelope {
     multiplier: f64,
@@ -2156,6 +2293,7 @@ struct ComboEnvelope {
     rush_weights: Option<Vec<f64>>,
     prepared: Option<Arc<BoundPreparation>>,
     rush_commands: usize,
+    streaks: Option<Vec<usize>>,
 }
 pub(crate) fn range_reset_only(master: &Master, group: i32) -> bool {
     group == 0
@@ -2421,6 +2559,7 @@ impl CumulativeLayout {
                     combo: (j + p + o) as f64,
                     extras: capacities,
                     mission: chart.setup.missions[range],
+                    range,
                 })
             })
             .collect();
@@ -2474,6 +2613,7 @@ struct CumulativeWindows {
     weights: Vec<f64>,
     gains: HashMap<Vec<[i32; 5]>, [f64; 6]>,
     rush_commands: usize,
+    streaks: Option<Vec<usize>>,
 }
 impl CumulativeWindows {
     fn new(
@@ -2518,6 +2658,7 @@ impl CumulativeWindows {
             weights,
             gains: HashMap::default(),
             rush_commands: envelope.rush_commands,
+            streaks: envelope.streaks,
         })
     }
     fn commands(&self, rows: &[[i32; 5]]) -> [usize; 6] {
@@ -2593,12 +2734,18 @@ impl CumulativeWindows {
                 }
                 for (c, total) in gain.iter_mut().enumerate() {
                     let counter = if kind == 7001 {
-                        frame.combo * self.multiplier
+                        self.streaks.as_ref().map_or(frame.combo, |streaks| {
+                            frame.combo.min(streaks[frame.range] as f64)
+                        }) * self.multiplier
                     } else {
                         frame.just + frame.extras[c]
                     };
                     let count = if n > 0 {
-                        (counter / n as f64).ceil()
+                        if kind == 7001 && self.streaks.is_some() && f(f(counter) / f(n as f64)) < 1.0 {
+                            0.0
+                        } else {
+                            (counter / n as f64).ceil()
+                        }
                     } else {
                         f64::INFINITY
                     };
@@ -4007,14 +4154,6 @@ impl DeterministicBound {
             prefixes: Mutex::new(std::array::from_fn(|_| None)),
         }));
     }
-    pub(crate) fn assignment_mean_rows(&self, members: &[usize]) -> Option<(f64, Vec<f64>)> {
-        if self.capacity != 0 { return None; }
-        let rows = members.iter().flat_map(|&member| (0..self.width).map(move |column| {
-            let id = self.ids[member * self.width + column][0] as usize;
-            up(up(self.shared_means[id]) / self.converted)
-        })).collect();
-        Some((up(self.base / self.converted), rows))
-    }
     pub(crate) fn fixed_component(&self) -> Option<FixedComponent> {
         (self.capacity == 0).then(|| FixedComponent {
             base: self.base,
@@ -4063,6 +4202,20 @@ impl DeterministicBound {
         };
         let mut bound = Self::with_envelope(master, chart, members, snaps, combo_multiplier, script, None)?;
         *source.1 = bound.preparation.take();
+        Some(bound)
+    }
+    pub(crate) fn with_replay_preparation(
+        master: &Master,
+        chart: &gekiso::Chart,
+        members: &[Member],
+        snaps: &[Snap],
+        combo_multiplier: f64,
+        streaks: (&[usize], Option<&[usize]>),
+        prepared: &mut Option<Arc<BoundPreparation>>,
+    ) -> Option<Self> {
+        let mut bound = Self::with_envelope(master, chart, members, snaps, combo_multiplier,
+            ComboSource::Replay(prepared.clone(), streaks.0, streaks.1), None)?;
+        *prepared = bound.preparation.take();
         Some(bound)
     }
     pub(crate) fn with_combo_trace(
@@ -4190,6 +4343,27 @@ impl DeterministicBound {
         *prepared = bound.preparation.take();
         Some(bound)
     }
+    pub(crate) fn with_roster_trace(
+        master: &Master,
+        chart: &gekiso::Chart,
+        members: &[Member],
+        snaps: &[Snap],
+        combo_multiplier: f64,
+        trace: Option<Arc<crate::reward_trace::ComboTrace>>,
+        luck: Option<&LuckEnvelope>,
+        prepared: &mut Option<Arc<BoundPreparation>>,
+        roster: &[usize; 5],
+    ) -> Option<Self> {
+        let script = match prepared.as_ref() {
+            Some(prepared) => ComboSource::Prepared(trace, Arc::clone(prepared)),
+            None => trace.map_or(ComboSource::None, ComboSource::Trace),
+        };
+        let mut bound = Self::with_scoped_envelope(
+            master, chart, members, snaps, combo_multiplier, script, luck, Some(roster),
+        )?;
+        *prepared = bound.preparation.take();
+        Some(bound)
+    }
     fn with_envelope(
         master: &Master,
         chart: &gekiso::Chart,
@@ -4199,9 +4373,22 @@ impl DeterministicBound {
         script: ComboSource<'_>,
         luck: Option<&LuckEnvelope>,
     ) -> Option<Self> {
+        Self::with_scoped_envelope(master, chart, members, snaps, combo_multiplier, script, luck, None)
+    }
+
+    fn with_scoped_envelope(
+        master: &Master,
+        chart: &gekiso::Chart,
+        members: &[Member],
+        snaps: &[Snap],
+        combo_multiplier: f64,
+        script: ComboSource<'_>,
+        luck: Option<&LuckEnvelope>,
+        roster: Option<&[usize; 5]>,
+    ) -> Option<Self> {
         let luck_cap = chart.luck;
         let luck_commands = luck.map_or(chart.play.frames.len(), |trace| trace.changes);
-        if luck.is_some_and(|luck| luck.moments.is_some()) {
+        if luck.is_some_and(|luck| luck.moments.is_some() || luck.nominal_weights.is_some()) {
             let reads_luck = |row: &SkillEffect| {
                 [
                     row.trigger_group,
@@ -4279,9 +4466,22 @@ impl DeterministicBound {
         }
 
         let great = chart.accuracy.great != 0.0;
-        let ordinary = great.then(|| crate::skills::prepare(master, members, snaps));
+        let all_perfect = !great && chart.accuracy.miss_every == 0
+            && chart.judgements.iter().all(|&grade| matches!(grade, 5 | 6));
+        let ordinary = (great || all_perfect).then(|| crate::skills::prepare(master, members, snaps));
+        let split_perfect = all_perfect && ordinary.as_ref().unwrap().slots.iter().all(|slot| {
+            slot.convert.as_ref().is_none_or(|convert| convert.judgements.iter()
+                .all(|&grade| grade < 5 || grade == convert.judgement))
+        });
+        let can_promote = split_perfect && snaps.iter().any(|snapshot| {
+            snapshot.card.gekiso_support_skills.iter().zip(snapshot.gekiso_skill_levels)
+                .any(|(id, level)| master.gekiso_support_skills.get(id).is_some_and(|skill| {
+                    (skill.mission_type == 4 || chart.setup.missions.contains(&skill.mission_type))
+                        && skill.effects.iter().any(|row| row.level == level && row.kind == 13005)
+                }))
+        });
         let great_script = match &script {
-            ComboSource::None => true,
+            ComboSource::None | ComboSource::Replay(..) => true,
             ComboSource::Prepared(None, _) => true,
             ComboSource::Actors(actors) | ComboSource::PreparedActors(actors, _) => actors.iter().all(|actor| actor.gekisou_skill.is_none_or(|(id, level)| {
                 master.gekiso_skills[&id].effects.iter().filter(|row| row.level == level)
@@ -4356,26 +4556,41 @@ impl DeterministicBound {
             .flat_map(|f| f.judged.iter().map(|n| n.time_ms))
             .collect();
         judged_times.sort_unstable();
-        let (trace, shared_preparation) = match script {
-            ComboSource::None => (None, None),
+        let (trace, shared_preparation, streaks, local_streaks) = match script {
+            ComboSource::None => (None, None, None, None),
             ComboSource::Actors(actors) => (
-                Some(Arc::new(crate::reward_trace::ComboTrace::new(
-                    master, chart, actors,
-                )?)),
-                None,
+                Some(Arc::new(crate::reward_trace::ComboTrace::new(master, chart, actors)?)),
+                None, None, None,
             ),
-            ComboSource::PreparedActors(actors, prepared) => (Some(Arc::new(crate::reward_trace::ComboTrace::new(master, chart, actors)?)), Some(prepared)),
-            ComboSource::Trace(trace) => (Some(trace), None),
-            ComboSource::Prepared(trace, prepared) => (trace, Some(prepared)),
+            ComboSource::PreparedActors(actors, prepared) => (
+                Some(Arc::new(crate::reward_trace::ComboTrace::new(master, chart, actors)?)),
+                Some(prepared), None, None,
+            ),
+            ComboSource::Trace(trace) => (Some(trace), None, None, None),
+            ComboSource::Prepared(trace, prepared) => (trace, Some(prepared), None, None),
+            ComboSource::Replay(prepared, streaks, notes) if streaks.len() == ranges.len()
+                && notes.is_none_or(|notes| notes.len() == chart.notes.len()) =>
+                (None, prepared, Some(streaks), notes),
+            ComboSource::Replay(..) => return None,
         };
         let fraction = chart.judge_frac.iter().copied().fold(0.0, f64::max);
         let mut prefix = vec![0.0];
         let mut all_max = 0.0;
         let mut raw_weights = Vec::new();
         let mut beta_weights = Vec::new();
-        let mut rush_weights = luck
-            .and_then(|luck| luck.moments.as_ref())
+        let mut rush_weights = luck.filter(|luck| luck.moments.is_some() || luck.nominal_weights.is_some())
             .map(|_| Vec::with_capacity(chart.notes.len()));
+        let grade_bound = |index: usize| {
+            let grade = chart.judgements[index];
+            let kind = chart.notes[index].judgement_type;
+            if can_promote && grade == 5 && luck.is_some_and(|luck| luck.nominal_weights.is_some())
+                && (!master.live.timing_types.contains(&kind) || master.live.just_types.contains(&kind))
+            {
+                chart.judge_frac[grade].max(chart.judge_frac[6])
+            } else {
+                chart.judge_frac[grade]
+            }
+        };
 
         for i in 0..chart.notes.len() {
             let range = chart.range_of[i];
@@ -4397,7 +4612,7 @@ impl DeterministicBound {
                 }
             } else if let Some(trace) = &trace {
                 up(trace.gk[i])
-            } else if let Some((_, &(start, _))) =
+            } else if let Some((range, &(start, _))) =
                 chart
                     .setup
                     .fevers
@@ -4412,6 +4627,8 @@ impl DeterministicBound {
                 let count = judged_times
                     .partition_point(|&t| t <= chart.times[i].saturating_add(40))
                     - judged_times.partition_point(|&t| t < start.saturating_sub(40));
+                let count = streaks.map_or(count, |streaks| count.min(streaks[range]));
+                let count = local_streaks.map_or(count, |notes| count.min(notes[i]));
                 let combo = count as f64 * combo_multiplier;
                 let factor = master
                     .live
@@ -4435,9 +4652,12 @@ impl DeterministicBound {
             ]
             .into_iter()
             .fold(master.live.adjustment, mul);
-            all_max = add(all_max, mul(mul(without_gk, gk), fraction));
             let mut mean_gk = gk;
-            if let Some(moments) = luck.and_then(|luck| luck.moments.as_ref()) {
+            if let Some(nominal) = luck.and_then(|luck| luck.nominal_weights.as_ref()) {
+                let [mean, support] = nominal[i].map(f64::from_bits);
+                mean_gk = mean;
+                rush_weights.as_mut().unwrap().push(mul(mul(without_gk, support), grade_bound(i)));
+            } else if let Some(moments) = luck.and_then(|luck| luck.moments.as_ref()) {
                 let probability = |count: usize| {
                     if count == 0 {
                         0.0
@@ -4463,19 +4683,27 @@ impl DeterministicBound {
                     chart.judge_frac[chart.judgements[i]],
                 ));
             }
+            all_max = add(all_max, mul(mul(without_gk, gk.max(mean_gk)), fraction));
             let raw = mul(without_gk, mean_gk);
             raw_weights.push(raw);
-            let beta = mul(raw, chart.judge_frac[chart.judgements[i]]);
+            let beta = mul(raw, grade_bound(i));
             prefix.push(add(*prefix.last().unwrap(), beta));
             beta_weights.push(beta);
         }
         let all = *prefix.last()?;
-        let judgement_prefixes: Option<[Vec<f64>; 7]> = great.then(|| std::array::from_fn(|grade| {
-            let mut prefix=vec![0.0];
-            for (index,&judgement) in chart.judgements.iter().enumerate() {
-                prefix.push(add(*prefix.last().unwrap(),if judgement==grade {beta_weights[index]}else{0.0}));
+        let judgement_prefixes: Option<[Vec<f64>; 7]> = (great || split_perfect).then(|| std::array::from_fn(|grade| {
+            if split_perfect && !matches!(grade, 5 | 6) { return Vec::new(); }
+            let mut values = Vec::with_capacity(chart.notes.len() + 1);
+            values.push(0.0);
+            for (index, &judgement) in chart.judgements.iter().enumerate() {
+                let possible_just = can_promote && grade == 6 && judgement == 5 && {
+                    let kind = chart.notes[index].judgement_type;
+                    !master.live.timing_types.contains(&kind) || master.live.just_types.contains(&kind)
+                };
+                let weight = if judgement == grade || possible_just { beta_weights[index] } else { 0.0 };
+                values.push(add(*values.last().unwrap(), weight));
             }
-            prefix
+            values
         }));
         let mut windows = CumulativeWindows::new(
             master,
@@ -4491,6 +4719,7 @@ impl DeterministicBound {
                 rush_weights,
                 prepared: shared_preparation.as_ref().map(Arc::clone),
                 rush_commands: luck_commands.max(1),
+                streaks: streaks.map(<[usize]>::to_vec),
             },
         )?;
         let mut support_gains = Vec::new();
@@ -4505,12 +4734,25 @@ impl DeterministicBound {
                 Arc::clone(&windows.layout),
             )?),
         };
+        let width = snaps.len() + 1;
+        let roster = roster.filter(|_| !great);
+        let scope = roster.map(|roster| {
+            let mut slots = vec![false; prepared.slots.len()];
+            let mut ordinary = vec![false; prepared.ordinary.len()];
+            for &member in roster {
+                for &id in &prepared.row_ids[member * width..(member + 1) * width] {
+                    slots[id as usize] = true;
+                    ordinary[prepared.slots[id as usize].ordinary as usize] = true;
+                }
+            }
+            (slots, ordinary)
+        });
+        let in_scope = |slot: usize| scope.as_ref().is_none_or(|(slots, _)| slots[slot]);
         let mut profiles = Vec::new();
         if let Some(trace) = &windows.trace {
-            let programs: Vec<_> = prepared
-                .slots
-                .iter()
-                .map(|slot| slot.score_rows.as_slice())
+            let programs: Vec<_> = prepared.slots.iter().enumerate()
+                .filter(|&(index, _)| in_scope(index))
+                .map(|(_, slot)| slot.score_rows.as_slice())
                 .collect();
             trace.prepare_supports(chart, &programs);
         }
@@ -4519,38 +4761,48 @@ impl DeterministicBound {
         let mut max_absolute = 0.0_f64;
         let mut conversions = Vec::new();
         let mut conversion_regions = Vec::new();
-        let mut ordinary_shapes = Vec::new();
-        for slot in &prepared.slots {
-            template_commands.push(windows.commands(&slot.score_rows));
-            support_gains.push(windows.gain(chart, &slot.score_rows));
+        let ordinary_profiles: Vec<_> = prepared.ordinary.iter().enumerate().map(|(index, ordinary)| {
             let mut row = [0.0; 5];
-            for window in &slot.windows {
+            if scope.as_ref().is_some_and(|(_, used)| !used[index]) { return row; }
+            for window in &ordinary.windows {
                 let (delta, mask) = (window.delta, window.mask);
                 for (event, &(start, end)) in window.intervals.iter().enumerate() {
                     let sum = if mask != 0 {
-                        judgement_prefixes.as_ref().map(|prefixes| (0..7).filter(|&grade|mask & (1 << grade)!=0)
+                        judgement_prefixes.as_ref().map(|prefixes| (0..7).filter(|&grade|mask & (1 << grade)!=0 && !prefixes[grade].is_empty())
                             .map(|grade|(prefixes[grade][end]-prefixes[grade][start]).max(0.0)).fold(0.0,add))
                     }else{None};
-                    let weight = sum.unwrap_or_else(||(prefix[end]-prefix[start]).max(0.0)) + (if great {4 * chart.notes.len() + 64} else {32}) as f64 * f64::EPSILON * all;
+                    let general = (prefix[end] - prefix[start]).max(0.0);
+                    let weight = sum.unwrap_or(general).min(general)
+                        + (if great {4 * chart.notes.len() + 64} else {32}) as f64 * f64::EPSILON * all;
                     row[event] = add(row[event], mul(delta, up(weight)));
                 }
             }
-            let (actions, absolute) = slot.normal;
+            let (actions, absolute) = ordinary.normal;
             max_actions = max_actions.max(actions);
             max_absolute = max_absolute.max(absolute);
-            ordinary_shapes.push(&slot.shape);
-            profiles.push(row);
+            row
+        }).collect();
+        for (index, slot) in prepared.slots.iter().enumerate() {
+            if in_scope(index) {
+                template_commands.push(windows.commands(&slot.score_rows));
+                support_gains.push(windows.gain(chart, &slot.score_rows));
+            } else {
+                template_commands.push([0; 6]);
+                support_gains.push([0.0; 6]);
+            }
+            profiles.push(ordinary_profiles[slot.ordinary as usize]);
             conversions.push(slot.converts);
             conversion_regions.push(&slot.regional_converts);
         }
         let normal_bounds: Vec<_> = prepared
             .row_ids
             .iter()
-            .map(|&id| prepared.slots[id as usize].normal)
+            .map(|&id| prepared.ordinary[prepared.slots[id as usize].ordinary as usize].normal)
             .collect();
         let mut positives = Vec::new();
         let mut commands = Vec::new();
-        for rows in prepared.row_ids.chunks(snaps.len() + 1) {
+        for (member, rows) in prepared.row_ids.chunks(width).enumerate() {
+            if roster.is_some_and(|roster| !roster.contains(&member)) { continue; }
             let mut member_positive = 0.0_f64;
             let mut member_commands = [0usize; 6];
             for &id in rows {
@@ -4577,11 +4829,11 @@ impl DeterministicBound {
                 for &(_,start) in chart.full.events.iter().take(5) {
                     let elapsed = i64::from(time)-i64::from(start);
                     if elapsed < -40 {continue;}
-                    let envelope = ordinary_shapes.iter().map(|shape| shape.iter()
+                    let envelope = prepared.ordinary.iter().map(|profile| profile.shape.iter()
                         .filter(|&&(duration,_)| elapsed < i64::from(duration)+40)
                         .map(|&(_,delta)|delta).fold(0.0,add)).fold(0.0,f64::max);
                     factor=add(factor,envelope);
-                    let channel=prepared.slots.iter().map(|slot| slot.windows.iter()
+                    let channel=prepared.ordinary.iter().map(|profile| profile.windows.iter()
                         .filter(|window| window.mask & (1 << 5)!=0 && window.mask & (1 << 4)==0 && elapsed < i64::from(window.duration)+40)
                         .map(|window|window.delta).fold(0.0,add)).fold(0.0,f64::max);
                     perfect=add(perfect,channel);
@@ -4671,15 +4923,14 @@ impl DeterministicBound {
             ),
             chart.range_percent.len() as f64,
         );
-        let width = snaps.len() + 1;
         let capacity = prepared.capacity;
         if great && capacity > 0 { return None; }
         let (prefix_gain, regional_prefix) = if capacity == 0 {
             (vec![0.0], vec![vec![0.0]; ranges.len()])
         } else {
-            let durations: Vec<_> = ordinary_shapes
+            let durations: Vec<_> = prepared.ordinary
                 .iter()
-                .flat_map(|shape| shape.iter())
+                .flat_map(|profile| profile.shape.iter())
                 .map(|&(d, _)| d)
                 .collect::<BTreeSet<_>>()
                 .into_iter()
@@ -4687,10 +4938,10 @@ impl DeterministicBound {
             let envelope: Vec<_> = durations
                 .iter()
                 .map(|&duration| {
-                    ordinary_shapes
+                    prepared.ordinary
                         .iter()
-                        .map(|shape| {
-                            shape
+                        .map(|profile| {
+                            profile.shape
                                 .iter()
                                 .filter(|&&(d, _)| d >= duration)
                                 .map(|&(_, delta)| delta)
@@ -4888,7 +5139,7 @@ impl DeterministicBound {
             result.baseline_gains.push(template_gains[id]);
             result.conversion_extras.push(template_extras[id]);
         }
-        for templates in &prepared.member_rows {
+        for templates in prepared.member_rows.iter().filter(|_| scope.is_none()) {
             let mut ids = [0; 6];
             for (c, id) in ids.iter_mut().enumerate() {
                 let mut row = [0.0_f64; 5];
@@ -5208,6 +5459,18 @@ impl DeterministicBound {
     pub(crate) fn prepare_score_assignment(&mut self, members: &[usize], options: &[Vec<i32>]) {
         self.prepare_score_rows(members, options, true);
     }
+    pub(crate) fn ensure_assignment_prices(&mut self, members: &[usize]) -> bool {
+        if members.iter().all(|&member| !self.score_frontiers[member].is_empty()) {
+            return true;
+        }
+        let Some(options) = members.iter().map(|&member| self.option_cache[member].clone())
+            .collect::<Option<Vec<_>>>()
+        else {
+            return false;
+        };
+        self.prepare_score_assignment(members, &options);
+        true
+    }
     fn window_coefficients(&mut self) -> Option<&[f64]> {
         if self.window_coefficients.is_none() {
             let values: Vec<f64> = self.ids.iter().map(|ids| {
@@ -5313,16 +5576,39 @@ impl DeterministicBound {
         });
     }
     pub(crate) fn conversion_mask(&self) -> &[bool] { &self.converters }
+    fn normalized_mean_row(&self, index: usize, count: usize, overlap: bool) -> f64 {
+        let mean = self.ids[index][..=count].iter().map(|&id| self.shared_means[id as usize])
+            .fold(f64::NEG_INFINITY, f64::max);
+        let value = if overlap { (up(mean) - self.conversion_extras[index]).next_up().max(0.0) } else { up(mean) };
+        up(value / self.converted)
+    }
+    fn normalized_mean_base(&self, overlap: bool) -> f64 {
+        up(add(self.base, if overlap { self.conversion_extra_cap } else { 0.0 }) / self.converted)
+    }
     pub(crate) fn normalized_window_rows(&self, converters: usize) -> Option<(f64, Vec<f64>)> {
         let count = converters.min(self.capacity);
-        let rows: Vec<_> = self.ids.iter().enumerate().map(|(index, ids)| {
-            let mean = ids[..=count].iter().map(|&id| self.shared_means[id as usize])
-                .fold(f64::NEG_INFINITY, f64::max);
-            let value = if count > 0 { (up(mean) - self.conversion_extras[index]).next_up().max(0.0) } else { up(mean) };
-            up(value / self.converted)
-        }).collect();
+        let rows: Vec<_> = (0..self.ids.len()).map(|index| self.normalized_mean_row(index, count, count > 0)).collect();
         (self.base >= 0.0 && rows.iter().all(|value| value.is_finite() && *value >= 0.0))
-            .then(|| (up(add(self.base, if count > 0 { self.conversion_extra_cap } else { 0.0 }) / self.converted), rows))
+            .then(|| (self.normalized_mean_base(count > 0), rows))
+    }
+    pub(crate) fn shared_assignment_mean_rows(&self, members: &[usize]) -> Option<(f64, Vec<f64>)> {
+        self.shared_mean_rows_for(members, self.capacity)
+    }
+    pub(crate) fn shared_mean_rows_for(&self, members: &[usize], maximum_converters: usize) -> Option<(f64, Vec<f64>)> {
+        let count = self.assignment_converters.iter().filter(|&&value| value).count()
+            .min(self.capacity).min(maximum_converters);
+        let minimum_extra = members.iter().fold(0.0_f64, |sum, &member|
+            (sum + self.option_minimum_conversion[member]).next_down());
+        let overlap = count > 0 && minimum_extra.is_finite() && minimum_extra > self.conversion_extra_cap;
+        let rows = members.iter().flat_map(|&member| {
+            let start = member * self.width;
+            (start..start + self.width).map(move |index| self.normalized_mean_row(index, count, overlap))
+        }).collect::<Vec<_>>();
+        // Replacing the global rounding allowance is valid for the entire
+        // domain. Moving the replacement to the constant can only round up.
+        let base = self.with_normal_error(self.normalized_mean_base(overlap), self.assignment_normal_error);
+        (self.base >= 0.0 && rows.iter().all(|value| value.is_finite() && *value >= 0.0))
+            .then_some((base, rows))
     }
     pub(crate) fn prepare_fixed_score_assignment(
         &mut self,
@@ -5795,7 +6081,21 @@ impl DeterministicBound {
             self.window_score_bound.as_ref().map_or(original, |bound| original.min(bound.upper(assigned, from)))
         } else { original }
     }
-    #[cfg(debug_assertions)]
+
+    pub(crate) fn formation_order_ceilings(&self, members: &[usize], snaps: &[i32], power: f64) -> [f64; 120] {
+        let positions: [usize; 5] = std::array::from_fn(|slot| {
+            members[slot] * self.width + (snaps[slot] + 1) as usize
+        });
+        let count = positions.iter().filter(|&&position| self.converters[position]).count().min(self.capacity);
+        let rows = positions.map(|position| self.shared[self.ids[position][count] as usize]);
+        std::array::from_fn(|index| {
+            let variable = live::orders()[index].iter().enumerate().fold(0.0, |sum, (event, &slot)| {
+                add(sum, rows[slot][event])
+            });
+            let coefficient = up(add(self.base, variable) / self.converted);
+            mul(power, self.with_normal_error(coefficient, self.assignment_normal_error))
+        })
+    }
     pub(crate) fn fixed_score_ceiling(&mut self,members:&[usize],snaps:&[i32],power:f64,criterion:crate::objectives::Criterion)->f64 {
         let count=members.iter().zip(snaps).filter(|&(&member,&snap)|self.converters[member*self.width+(snap+1)as usize]).count().min(self.capacity);
         let ids=std::array::from_fn(|slot|self.ids[members[slot]*self.width+(snaps[slot]+1)as usize][count]);
@@ -6374,6 +6674,12 @@ impl DeterministicBound {
             row.iter().copied().fold(0.0, f64::max)
         }
     }
+    pub(crate) fn mean_weights(&self) -> Vec<f64> {
+        self.ids.chunks_exact(self.width).flat_map(|row| {
+            // Search stores the empty snapshot after the physical snapshots.
+            row[1..].iter().chain(&row[..1]).map(|ids| self.shared_means[ids[self.capacity] as usize])
+        }).collect()
+    }
     pub(crate) fn score(&self, t: Totals) -> f64 {
         up(mul(t.power, add(self.base, t.skill)) / self.converted)
     }
@@ -6817,7 +7123,7 @@ impl<'a> RewardObjective<'a> {
                     .is_none_or(|c| !c.judgements.contains(&6))
             })
         });
-        let just_context = JustContext::new(master, &gekiso, members, snaps);
+        let just_context = JustContext::new(master, &gekiso, members, snaps, false);
         let canonical_slots = canonical_slots
             && master
                 .gekiso_skills
@@ -6850,6 +7156,7 @@ impl<'a> RewardObjective<'a> {
         let context_fields = crate::support_aliases::ContextFields::new(master);
         let primary_snap_bonus = Arc::new(primary_snap_bonus);
         let support_aliases = crate::support_aliases::SupportAliases::new(
+            &context_fields,
             &gekiso.setup.missions,
             snaps,
             canonical_slots,
@@ -11959,6 +12266,43 @@ pub(crate) fn order_score_coefficients_with_base(
     slots: &[Arc<live::Slot>],
     base: f64,
 ) -> Option<Vec<f64>> {
+    let prepared = prepare_order_coefficients(master, chart, weights, slots, base)?;
+    Some(live::orders().iter().map(|order| {
+        let coefficient = order.iter().enumerate().fold(prepared.base, |sum, (event, &slot)| {
+            add(sum, prepared.events[slot][event])
+        });
+        up(mul(coefficient, prepared.rounding) / prepared.converted)
+    }).collect())
+}
+
+pub(crate) fn mean_score_coefficient(
+    master: &Master,
+    chart: &gekiso::Chart,
+    weights: &crate::gekiso_objective::Weights,
+    slots: &[Arc<live::Slot>],
+) -> Option<f64> {
+    let prepared = prepare_order_coefficients(master, chart, weights, slots, weights.base)?;
+    // Every slot occupies every event in one fifth of the 120 skill orders.
+    let sum = prepared.events.into_iter().flatten().fold(prepared.base, |sum, value| {
+        add(sum, up(value / 5.0))
+    });
+    Some(up(mul(sum, prepared.rounding) / prepared.converted))
+}
+
+struct OrderCoefficients {
+    base: f64,
+    events: [[f64; 5]; 5],
+    rounding: f64,
+    converted: f64,
+}
+
+fn prepare_order_coefficients(
+    master: &Master,
+    chart: &gekiso::Chart,
+    weights: &crate::gekiso_objective::Weights,
+    slots: &[Arc<live::Slot>],
+    base: f64,
+) -> Option<OrderCoefficients> {
     let mut events = [[0.0; 5]; 5];
     let (mut absolute, mut actions) = (0.0, 0usize);
     for (slot_index, slot) in slots.iter().enumerate() {
@@ -12015,17 +12359,5 @@ pub(crate) fn order_score_coefficients_with_base(
     for _ in 0..12 {
         rounding = mul(rounding, rho);
     }
-    Some(
-        live::orders()
-            .iter()
-            .map(|order| {
-                let mut coefficient = add(base, residual);
-                for (event, &slot) in order.iter().enumerate() {
-                    coefficient = add(coefficient, events[slot][event]);
-                }
-                coefficient = mul(coefficient, rounding);
-                up(coefficient / chart.full.converted as f64)
-            })
-            .collect(),
-    )
+    Some(OrderCoefficients { base: add(base, residual), events, rounding, converted: chart.full.converted as f64 })
 }

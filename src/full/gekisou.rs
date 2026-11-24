@@ -509,14 +509,13 @@ pub struct Controller {
     pub current_playing: i32,
     pub weighted: bool,
 }
-impl Controller {
-    pub fn new(
-        ranges: &[(i32, i32, i32)],
-        notes: &[(i32, i32)],
-        tables: &GekisoTables,
-        rush_percent: i32,
-        last_note_delay: i32,
-    ) -> Result<Self, String> {
+#[derive(Clone)]
+pub(crate) struct Geometry {
+    ranges: Arc<[Range]>,
+    targets_by_note: Option<Arc<[u8]>>,
+}
+impl Geometry {
+    pub(crate) fn new(ranges: &[(i32, i32, i32)], notes: &[(i32, i32)]) -> Self {
         let ranges: Vec<_> = ranges
             .iter()
             .map(|&(start, end, mission)| Range {
@@ -530,6 +529,40 @@ impl Controller {
                     .collect(),
             })
             .collect();
+        let n = ranges.len();
+        let last_note = notes.iter().map(|&(id, _)| id).max().unwrap_or(0);
+        let targets_by_note = (n <= u8::BITS as usize && last_note >= 0
+            && last_note as usize <= notes.len().saturating_mul(2)
+            && notes.iter().all(|&(id, _)| id >= 0)).then(|| {
+                let mut targets = vec![0u8; last_note as usize + 1];
+                for (range, settings) in ranges.iter().enumerate() {
+                    for &id in &settings.targets {
+                        targets[id as usize] |= 1 << range;
+                    }
+                }
+                Arc::from(targets)
+            });
+        Self { ranges: ranges.into(), targets_by_note }
+    }
+}
+impl Controller {
+    pub fn new(
+        ranges: &[(i32, i32, i32)],
+        notes: &[(i32, i32)],
+        tables: &GekisoTables,
+        rush_percent: i32,
+        last_note_delay: i32,
+    ) -> Result<Self, String> {
+        Self::with_geometry(Geometry::new(ranges, notes), tables, rush_percent, last_note_delay)
+    }
+    pub(crate) fn with_geometry(
+        geometry: Geometry,
+        tables: &GekisoTables,
+        rush_percent: i32,
+        last_note_delay: i32,
+    ) -> Result<Self, String> {
+        let Geometry { ranges, targets_by_note } = geometry;
+        let n = ranges.len();
         let states = ranges
             .iter()
             .map(|r| {
@@ -549,21 +582,8 @@ impl Controller {
                 s
             })
             .collect();
-        let n = ranges.len();
-        let last_note = notes.iter().map(|&(id, _)| id).max().unwrap_or(0);
-        let targets_by_note = (n <= u8::BITS as usize && last_note >= 0
-            && last_note as usize <= notes.len().saturating_mul(2)
-            && notes.iter().all(|&(id, _)| id >= 0)).then(|| {
-                let mut targets = vec![0u8; last_note as usize + 1];
-                for (range, settings) in ranges.iter().enumerate() {
-                    for &id in &settings.targets {
-                        targets[id as usize] |= 1 << range;
-                    }
-                }
-                Arc::from(targets)
-            });
         Ok(Self {
-            ranges: ranges.into(),
+            ranges,
             targets_by_note,
             states,
             machine: Lottery::new(tables)?,

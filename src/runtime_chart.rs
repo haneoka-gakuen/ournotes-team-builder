@@ -117,8 +117,9 @@ struct SsNote {
     visible: bool,
     nodes: Vec<SsNote>,
 }
-fn read_note(v: &Value) -> SsNote {
-    let kind = match v["type"].as_str() {
+fn read_note(v: &Value, packed: bool) -> SsNote {
+    let get = |name: &str, index: usize| if packed { &v[index] } else { &v[name] };
+    let kind = match get("type", 0).as_str() {
         Some("flick") => 1,
         Some("trace") => 2,
         Some("long") => 3,
@@ -126,30 +127,34 @@ fn read_note(v: &Value) -> SsNote {
         Some("node") => 5,
         _ => 0,
     };
-    let auto = v["pos"] == "auto";
+    let position = get("pos", 2);
+    let auto = position == "auto";
     let easing = |v: &Value| match v.as_str() {
         Some("in") => 1,
         Some("out") => 2,
         _ => 0,
     };
-    let (ease_l, ease_r) = if v["ease"].is_array() {
-        (easing(&v["ease"][0]), easing(&v["ease"][1]))
+    let ease = get("ease", 6);
+    let (ease_l, ease_r) = if ease.is_array() {
+        (easing(&ease[0]), easing(&ease[1]))
     } else {
-        let e = easing(&v["ease"]);
+        let e = easing(ease);
         (e, e)
     };
+    let size = get("size", 3);
+    let visible = get("visible", 7);
     SsNote {
         kind,
-        t: integer(&v["t"]),
-        pos: if auto { 0.0 } else { f(number(&v["pos"])) },
+        t: integer(get("t", 1)),
+        pos: if auto { 0.0 } else { f(number(position)) },
         auto,
-        size: if v["size"].is_null() {
+        size: if size.is_null() {
             f(6.0)
         } else {
-            f(number(&v["size"]))
+            f(number(size))
         },
-        critical: truth(&v["crit"]),
-        direction: match v["dir"].as_str() {
+        critical: truth(get("crit", 4)),
+        direction: match get("dir", 5).as_str() {
             Some("left") => 1,
             Some("right") => 2,
             Some("down") => 3,
@@ -157,12 +162,12 @@ fn read_note(v: &Value) -> SsNote {
         },
         ease_l,
         ease_r,
-        visible: if v["visible"].is_null() {
+        visible: if visible.is_null() {
             true
         } else {
-            truth(&v["visible"])
+            truth(visible)
         },
-        nodes: list(&v["node"]).iter().map(read_note).collect(),
+        nodes: list(get("node", 8)).iter().map(|node| read_note(node, packed)).collect(),
     }
 }
 #[derive(Clone, Copy)]
@@ -874,7 +879,8 @@ pub fn convert(root: &Value) -> Result<Source, String> {
         .iter()
         .map(|p| (integer(&p[0]), integer(&p[1])))
         .collect();
-    let notes: Vec<_> = list(&score["notes"]).iter().map(read_note).collect();
+    let packed = root["_engineNoteTuples"] == true;
+    let notes: Vec<_> = list(&score["notes"]).iter().map(|note| read_note(note, packed)).collect();
     let tc = TickConverter::new(signatures.clone(), bpms.clone());
     let infos = build_infos(&notes, &tc)?;
     bpms.sort_by_key(|b| b.0);

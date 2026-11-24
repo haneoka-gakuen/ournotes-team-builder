@@ -3021,7 +3021,7 @@ impl Engine {
                 floor: f64::NEG_INFINITY, skip_rank: self.master.params.skip_rank,
                 observations: 120 * master::int(&goal["gekiso"]["luckSamples"]).max(1) as usize,
             });
-            let output = search::search(search::Input {
+            let output = search::search_current(search::Input {
                 master: &self.master, player: &player, members: &cards.members, snaps: &cards.snaps,
                 music: Some(&music), objective: &mut objective, constraints, k, deadline, now,
                 seeds: seed_teams(request, song, &cards.members, &cards.snaps), shard, owns: None,
@@ -4535,7 +4535,7 @@ impl Engine {
             let opponents=if section_scene {self.section_opponents(&request["sectionArena"],&chart,source,id,&seeds)?}else{None};
             if selected.iter().any(|&index| index >= chart.notes.len()) { return Err("invalid-mistake-index".into()); }
             let changed: BTreeMap<_,_> = selected.iter().map(|&index| (chart.notes[index].id, live::native_judgement(chart.notes[index].judgement_type, grade))).collect();
-            for frame in &mut chart.play.frames { for note in &mut frame.judged { if let Some(&grade) = changed.get(&note.note_id) { note.judgement = grade as i32; } } }
+            chart.change_play_judgements(|id| changed.get(&id).map(|&grade| grade as i32));
             let order = &live::orders()[index];
             let deck: Vec<_> = members.iter().zip(&snaps).map(|(member,snap)| Performer::from_member(&self.master, member, snap.as_ref())).collect();
             let events: Vec<_> = chart.full.events.iter().map(|&(event,time)| (order[event], time)).collect();

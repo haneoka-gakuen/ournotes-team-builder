@@ -112,7 +112,13 @@ struct Row {
 struct Rows {
     rows: Vec<Row>,
     index: HashMap<u64, usize>,
-    dense: Option<(Vec<u32>, Vec<u32>)>,
+    dense: Option<DenseIndex>,
+}
+struct DenseIndex {
+    high: Vec<u32>,
+    touched: Vec<u32>,
+    residues: Vec<u32>,
+    modulus: usize,
 }
 thread_local! { static INDEX_POOL: RefCell<Vec<(Vec<u32>, Vec<u32>)>> = const { RefCell::new(Vec::new()) }; }
 impl Rows {
@@ -123,45 +129,60 @@ impl Rows {
             dense: None,
         }
     }
-    fn dense() -> Self {
+    fn dense(modulus: usize) -> Self {
         let mut rows = Self::new();
-        rows.dense = Some(INDEX_POOL.with(|pool| {
+        let (high, touched) = INDEX_POOL.with(|pool| {
             pool.borrow_mut()
                 .pop()
                 .unwrap_or_else(|| (vec![0; HIGH as usize + 1], Vec::new()))
-        }));
+        });
+        rows.dense = Some(DenseIndex { high, touched, residues: Vec::new(), modulus });
         rows
     }
     fn position(&self, key: u64) -> Option<usize> {
-        if let Some((index, _)) = self
-            .dense
-            .as_ref()
-            .filter(|(index, _)| key < index.len() as u64)
-        {
-            let value = index[key as usize];
+        if let Some(index) = &self.dense {
+            let residue = (key >> 18) as usize;
+            let high = index.high[(key & HIGH) as usize];
+            let value = if index.modulus == 0 && residue == 0 {
+                high
+            } else if residue < index.modulus {
+                if high == 0 { 0 } else { index.residues[high as usize - 1 + residue] }
+            } else {
+                return self.index.get(&key).copied();
+            };
             (value != 0).then(|| value as usize - 1)
         } else {
             self.index.get(&key).copied()
         }
     }
     fn put_index(&mut self, key: u64, row: usize) {
-        if let Some((index, touched)) = self
-            .dense
-            .as_mut()
-            .filter(|(index, _)| key < index.len() as u64)
-        {
-            index[key as usize] = row as u32 + 1;
-            touched.push(key as u32);
-        } else {
-            self.index.insert(key, row);
+        if let Some(index) = &mut self.dense {
+            let residue = (key >> 18) as usize;
+            let high = (key & HIGH) as usize;
+            if index.modulus == 0 && residue == 0 {
+                index.high[high] = row as u32 + 1;
+                index.touched.push(high as u32);
+                return;
+            }
+            if residue < index.modulus {
+                if index.high[high] == 0 {
+                    index.high[high] = index.residues.len() as u32 + 1;
+                    index.residues.resize(index.residues.len() + index.modulus, 0);
+                    index.touched.push(high as u32);
+                }
+                index.residues[index.high[high] as usize - 1 + residue] = row as u32 + 1;
+                return;
+            }
         }
+        self.index.insert(key, row);
     }
     fn clear_index(&mut self) {
-        if let Some((index, touched)) = &mut self.dense {
+        if let Some(index) = &mut self.dense {
             // Unary transforms change row keys after these entries were written.
-            for key in touched.drain(..) {
-                index[key as usize] = 0;
+            for key in index.touched.drain(..) {
+                index.high[key as usize] = 0;
             }
+            index.residues.clear();
         }
         self.index.clear();
     }
@@ -200,11 +221,11 @@ impl Rows {
 impl Drop for Rows {
     fn drop(&mut self) {
         self.clear_index();
-        if let Some(buffers) = self.dense.take() {
+        if let Some(index) = self.dense.take() {
             INDEX_POOL.with(|pool| {
                 let mut pool = pool.borrow_mut();
                 if pool.len() < 2 {
-                    pool.push(buffers);
+                    pool.push((index.high, index.touched));
                 }
             });
         }
@@ -234,15 +255,19 @@ struct Engine<'a> {
     draws: HashMap<(usize, i32, i32), Vec<(f64, i32)>>,
     transitions: LotTransitions,
     last_transition: Option<(u64, i32, usize)>,
+    overflow_blocks: Vec<(usize, usize, usize)>,
     lot_tables: [Vec<(i32, i32)>; 5],
     observed: [Option<[f64; 3]>; 2],
+    unique: bool,
+    residues_valid: bool,
 }
 impl<'a> Engine<'a> {
     fn new(input: &'a Input) -> Self {
         let unit = gauge_unit(input);
         let maxima = [input.maximum / unit, input.rush_maximum / unit];
         let width = maxima[0].max(maxima[1]);
-        let dense = input.modulus == 0 && input.initial == 0;
+        let dense = input.initial == 0 || input.initial < input.modulus;
+        let dense = dense && input.modulus <= 100;
         let pool = POOL.with(|p| {
             let mut p = p.borrow_mut();
             if p.0 == width {
@@ -265,14 +290,17 @@ impl<'a> Engine<'a> {
             unit,
             maxima,
             width,
-            rows: if dense { Rows::dense() } else { Rows::new() },
-            spare: if dense { Rows::dense() } else { Rows::new() },
+            rows: if dense { Rows::dense(input.modulus) } else { Rows::new() },
+            spare: if dense { Rows::dense(input.modulus) } else { Rows::new() },
             pool,
             draws: HashMap::default(),
             transitions: LotTransitions::default(),
             last_transition: None,
+            overflow_blocks: Vec::new(),
             lot_tables,
             observed: [None; 2],
+            unique: true,
+            residues_valid: false,
         }
     }
     fn maximum(&self, r: usize) -> usize {
@@ -289,37 +317,50 @@ impl<'a> Engine<'a> {
         }
         from.clear_index();
         self.spare = from;
+        self.unique = true;
     }
     fn unary(&mut self, mut f: impl FnMut(u64) -> u64) {
         self.observed = [None; 2];
         // Keys are only looked up in the destination of a pass. Preserve source
         // row order and defer merging, just as the website's pending transforms.
         for row in &mut self.rows.rows {
-            row.key = (row.key & !HIGH) + (f((row.key & HIGH) << 8) >> 8);
+            let next = (row.key & !HIGH) + (f((row.key & HIGH) << 8) >> 8);
+            self.unique &= next == row.key;
+            row.key = next;
         }
     }
     fn axpy(&mut self, key: u64, row: &Row, scale: f64, low: usize, high: usize) {
         if scale <= 0.0 {
             return;
         }
-        let into = self.rows.at(key, self.width, &mut self.pool);
-        for g in low..high {
-            into.values[g] += row.values[g] * scale;
+        if low > high {
+            let into = self.rows.at(key, self.width, &mut self.pool);
+            into.low = into.low.min(low);
+            into.high = into.high.max(high);
+            return;
         }
-        into.low = into.low.min(low);
-        into.high = into.high.max(high);
+        self.block(key, row, low, high, 0, scale);
     }
     /// Adds `scale ×` gauge values [a, b) of `row` to row `key` at gauge `g + offset`.
     fn block(&mut self, key: u64, row: &Row, a: usize, b: usize, offset: i64, scale: f64) {
         let into = self.rows.at(key, self.width, &mut self.pool);
         let from = (a as i64 + offset) as usize;
         let to = (b as i64 + offset) as usize;
-        if scale == 1.0 {
-            for (out, value) in into.values[from..to].iter_mut().zip(&row.values[a..b]) {
+        let fresh = into.low >= into.high || to <= into.low || from >= into.high;
+        let output = &mut into.values[from..to];
+        let values = &row.values[a..b];
+        if fresh && scale == 1.0 {
+            output.copy_from_slice(values);
+        } else if fresh {
+            for (out, value) in output.iter_mut().zip(values) {
+                *out = value * scale;
+            }
+        } else if scale == 1.0 {
+            for (out, value) in output.iter_mut().zip(values) {
                 *out += value;
             }
         } else {
-            for (out, value) in into.values[from..to].iter_mut().zip(&row.values[a..b]) {
+            for (out, value) in output.iter_mut().zip(values) {
                 *out += value * scale;
             }
         }
@@ -334,6 +375,12 @@ impl<'a> Engine<'a> {
         }
         let maximum = self.maximum(rush((key & HIGH) << 8)) as i64;
         let l = key & 7;
+        if add >= 0 && row.low < row.high && row.high as i64 + i64::from(add) <= maximum
+            && (buff.is_none() || l == 0)
+        {
+            self.block(key, row, row.low, row.high, i64::from(add), scale);
+            return;
+        }
         let mut overflow = (row.low as i64 + add as i64) / maximum;
         loop {
             let a = (row.low as i64).max(overflow * maximum - add as i64);
@@ -476,6 +523,8 @@ impl<'a> Engine<'a> {
         buff: i32,
     ) {
         let list = self.lot_rows(key & HIGH, buff);
+        let mut overflow_maximum = 0;
+        let mut overflow_blocks = std::mem::take(&mut self.overflow_blocks);
         for k in 0..self.transitions.lists[list].len() {
             let (next, chance, after) = self.transitions.lists[list][k];
             let to = (key & !HIGH) + (next | (key & CARRIED));
@@ -492,26 +541,30 @@ impl<'a> Engine<'a> {
             if split > a {
                 self.block(to, row, a, split, offset, q);
             }
-            let mut start = split;
-            while start < b {
-                let overflow = (start as i64 + offset) as usize / after;
-                let end = b.min((((overflow + 1) * after) as i64 - offset) as usize);
-                let values = &row.values[start..end];
-                if let Some(first) = values.iter().position(|&value| value != 0.0) {
-                    let last = values.iter().rposition(|&value| value != 0.0).unwrap();
-                    let l = to & 7;
-                    self.block(
-                        to - l + (l + overflow as u64).min(7),
-                        row,
-                        start + first,
-                        start + last + 1,
-                        offset - (overflow * after) as i64,
-                        q,
-                    );
+            if split < b {
+                if overflow_maximum != after {
+                    overflow_maximum = after;
+                    overflow_blocks.clear();
+                    let mut start = split;
+                    while start < b {
+                        let overflow = (start as i64 + offset) as usize / after;
+                        let end = b.min((((overflow + 1) * after) as i64 - offset) as usize);
+                        let values = &row.values[start..end];
+                        if let Some(first) = values.iter().position(|&value| value != 0.0) {
+                            let last = values.iter().rposition(|&value| value != 0.0).unwrap();
+                            overflow_blocks.push((start + first, start + last + 1, overflow));
+                        }
+                        start = end;
+                    }
                 }
-                start = end;
+                let lots = to & 7;
+                for &(start, end, overflow) in &overflow_blocks {
+                    self.block(to - lots + (lots + overflow as u64).min(7), row,
+                        start, end, offset - (overflow * after) as i64, q);
+                }
             }
         }
+        self.overflow_blocks = overflow_blocks;
     }
     fn consume(&mut self, row: &Row, buff: i32) {
         self.consume_block(row.key, row, row.low, row.high, 0, 1.0, buff);
@@ -602,6 +655,13 @@ impl<'a> Engine<'a> {
     }
     fn note(&mut self, n: &Note, state: i32, points: &[(f64, i32)]) {
         let buff = (state <= 5).then_some(n.buff);
+        if self.unique && points == [(1.0, 0)] && self.rows.rows.iter().all(|row| {
+            let key = row.key & HIGH;
+            row.low < row.high && row.high <= self.maximum(rush(key << 8))
+                && (buff.is_none() || key & 7 == 0)
+        }) {
+            return;
+        }
         self.pass(|e, row| {
             for &(p, add) in points {
                 e.shift(row.key, &row, p, add, buff);
@@ -612,6 +672,23 @@ impl<'a> Engine<'a> {
     fn observe(&mut self, j: &Judged, at_frame: bool, out: &mut Output) {
         let bit = if at_frame { SKILL } else { SKILL_PREV };
         if self.input.modulus > 0 {
+            let nonnegative = j.scores.iter().all(|&score| score >= 0);
+            if self.unique && self.residues_valid && nonnegative {
+                // The lottery state is unchanged. Within each state the
+                // residues are translated bijectively in their existing order.
+                let modulus = self.input.modulus as u64;
+                let shifts = j.scores.map(|score| score as u64 % modulus);
+                for row in &mut self.rows.rows {
+                    let high = row.key & HIGH;
+                    let state = high << 8;
+                    let mask = usize::from(state & BONUS != 0) + 2 * usize::from(state & bit != 0);
+                    let sum = (row.key >> 18) + shifts[mask];
+                    let residue = if sum >= modulus { sum - modulus } else { sum };
+                    row.key = (residue << 18) + high;
+                }
+                return;
+            }
+            self.residues_valid &= nonnegative;
             self.pass(|e, mut row| {
                 let high = row.key & HIGH;
                 let s = high << 8;
@@ -657,6 +734,8 @@ impl<'a> Engine<'a> {
     }
     fn reset(&mut self, initial: usize) {
         self.observed = [None; 2];
+        self.unique = true;
+        self.residues_valid = self.input.modulus <= 100 && initial < self.input.modulus;
         for row in self.rows.rows.drain(..) {
             release(row, &mut self.pool);
         }

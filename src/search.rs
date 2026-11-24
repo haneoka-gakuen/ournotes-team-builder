@@ -42,6 +42,7 @@ pub struct JointTarget {
 }
 pub trait Objective {
     fn prefer_leader(&self, leader: usize) -> f64 { self.prefer_member(leader) }
+    fn retain_budget_bound(&self) -> bool { true }
     fn has_team_filter(&self) -> bool {
         false
     }
@@ -161,6 +162,11 @@ pub trait Objective {
     fn snap_program_identity(&self) -> Option<usize> { None }
     fn snap_dominance(&mut self, _member: usize, _snap: i32) -> Vec<f64> {
         Vec::new()
+    }
+    /// Snapshots in one class have the same score program for this member,
+    /// so increasing the total power cannot reduce their score.
+    fn snap_program_class(&mut self, _member: usize, _snap: i32) -> Option<(u32, u8)> {
+        None
     }
     fn preserve_snap_options(&self) -> bool {
         false
@@ -304,6 +310,9 @@ pub trait Objective {
     fn bonus_floor(&mut self, _limit: f64) -> Option<f64> {
         None
     }
+    fn assignment_proposal(&mut self) -> Option<[i32; 5]> {
+        None
+    }
     fn prefer_snap(&self, _member: usize, _snap: i32) -> f64 {
         0.0
     }
@@ -428,6 +437,25 @@ pub struct Input<'a, O: Objective + ?Sized> {
     pub on_candidate: Option<CandidateListener<'a>>,
     pub progress: Option<&'a mut dyn FnMut(usize, usize)>,
 }
+#[cfg(target_arch = "wasm32")]
+impl<'a, O: Objective + 'a> Input<'a, O> {
+    fn erase(self) -> Input<'a, dyn Objective + 'a> {
+        let Self {
+            master, player, members, snaps, music,
+            objective, constraints, k, deadline, now,
+            seeds, shard, owns, floor, floor_exclusive,
+            streaming, disable_snap_dominance, member_power_percent, snap_power_percent, on_candidate,
+            progress,
+        } = self;
+        Input {
+            master, player, members, snaps, music,
+            objective, constraints, k, deadline, now,
+            seeds, shard, owns, floor, floor_exclusive,
+            streaming, disable_snap_dominance, member_power_percent, snap_power_percent, on_candidate,
+            progress,
+        }
+    }
+}
 struct Frontier {
     k: usize,
     best: HashMap<String, f64>,
@@ -530,6 +558,14 @@ struct Assignment {
     max_bonus: Vec<f64>,
     set_low: f64,
     exact_low: f64,
+    programs: Option<ProgramAssignments>,
+}
+struct ProgramAssignments {
+    base: Totals,
+    ids: [Vec<(u32, u8)>; 5],
+    choices: [HashMap<u32, Vec<i32>>; 5],
+    visited: HashSet<([u32; 5], u8)>,
+    matrix: Vec<Vec<f64>>,
 }
 struct ColumnCut {
     constant: f64,
@@ -2606,6 +2642,20 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         self.pools[from] = table;
         result
     }
+    fn assignment_totals(&self, members: &[usize], picks: &[i32], mut totals: Totals) -> Totals {
+        for (&member, &snap) in members.iter().zip(picks) {
+            let column = if snap < 0 { self.width - 1 } else { snap as usize };
+            let index = member * self.width + column;
+            totals.power += self.snap_power[index];
+            totals.skill += self.skill[index];
+            totals.skill_low += self.skill_low[index];
+            if snap >= 0 {
+                totals.bonus += self.snap_bonus[snap as usize];
+            }
+        }
+        totals
+    }
+
     fn candidate(
         &mut self,
         a: &mut Assignment,
@@ -2813,6 +2863,10 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             return Ok(());
         }
         self.input.objective.prepare_assignment(&team, &options);
+        if !self.input.objective.retain_budget_bound() && self.expired() {
+            self.interrupt_evaluation();
+            return Ok(());
+        }
         let mut used = vec![false; self.input.snaps.len()];
         for (&member, &snap) in &self.input.constraints.bindings {
             if snap >= 0 && !team.contains(&member) {
@@ -2900,6 +2954,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             max_bonus,
             set_low: f64::NEG_INFINITY,
             exact_low,
+            programs: None,
         };
         let base_total = a.base_power.iter().fold(0.0, |sum, v| sum + v);
         self.input.objective.prepare_assignment_power(base_total);
@@ -2935,6 +2990,14 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             },
         );
         if upper < self.assignment_limit(&a) || self.cannot_improve_set(&a, upper) {
+            return Ok(());
+        }
+        let proposed = self.try_assignment_proposal(&mut a, Totals {
+            power: base_total,
+            bonus: member_bonus,
+            ..Totals::default()
+        })?;
+        if self.timed_out {
             return Ok(());
         }
         if !self.team_filter
@@ -2980,31 +3043,16 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                 .collect();
             self.pools[0] = table;
             if upper > NONE / 2.0 {
-                let mut totals = Totals {
+                let totals = self.assignment_totals(&a.team, &picks, Totals {
                     power: base_total,
                     bonus: member_bonus,
                     ..Totals::default()
-                };
-                for (slot, &member) in a.team.iter().enumerate() {
-                    let col = if picks[slot] < 0 {
-                        self.width - 1
-                    } else {
-                        picks[slot] as usize
-                    };
-                    totals.power += self.snap_power[member * self.width + col];
-                    totals.skill += self.skill[member * self.width + col];
-                    totals.skill_low += self.skill_low[member * self.width + col];
-                    totals.bonus += if picks[slot] < 0 {
-                        0.0
-                    } else {
-                        self.snap_bonus[picks[slot] as usize]
-                    };
-                }
+                });
                 self.candidate(&mut a, picks, totals)?;
                 return Ok(());
             }
         }
-        if let Some(base) = self.input.objective.product_base() {
+        if let Some(base) = (!proposed).then(|| self.input.objective.product_base()).flatten() {
             if a.required_snaps.is_empty() {
                 let mut t = std::mem::take(&mut self.pools[0]);
                 self.tables(&mut t, &a, 0);
@@ -3031,23 +3079,11 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                     .collect();
                 self.pools[0] = t;
                 if incumbent > NONE / 2.0 {
-                    let mut totals = Totals {
+                    let totals = self.assignment_totals(&a.team, &picks, Totals {
                         power: base_total,
                         bonus: member_bonus,
                         ..Totals::default()
-                    };
-                    for (slot, &i) in a.team.iter().enumerate() {
-                        let j = picks[slot];
-                        let col = if j < 0 { self.width - 1 } else { j as usize };
-                        totals.power += self.snap_power[i * self.width + col];
-                        totals.skill += self.skill[i * self.width + col];
-                        totals.skill_low += self.skill_low[i * self.width + col];
-                        totals.bonus += if j < 0 {
-                            0.0
-                        } else {
-                            self.snap_bonus[j as usize]
-                        };
-                    }
+                    });
                     if self
                         .input
                         .constraints
@@ -3144,6 +3180,10 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                 &a.options,
                 slot == domains.len(),
             );
+            if !self.input.objective.retain_budget_bound() && self.expired() {
+                self.interrupt_evaluation();
+                return Ok(());
+            }
             if let Some(floor)=self.input.objective.ranked_bounds().then(||self.rank_limit()).flatten() {
                 if let Some(upper)=self.input.objective.domain_rank_upper() {
                     if self.rank_pruned(upper,floor) {return Ok(());}
@@ -3173,6 +3213,10 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                 0,
                 order_limit,
             );
+            if !self.input.objective.retain_budget_bound() && self.expired() {
+                self.interrupt_evaluation();
+                return Ok(());
+            }
             if bound.is_some_and(|upper| {
                 upper < self.assignment_limit(a) || self.cannot_improve_set(a, upper)
             }) {
@@ -3207,7 +3251,31 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         }
         Ok(())
     }
+    fn try_assignment_proposal(&mut self, a: &mut Assignment, totals: Totals) -> Result<bool, String> {
+        if let Some(picks) = self.input.objective.assignment_proposal() {
+            let feasible = picks.iter().enumerate().all(|(slot, &snap)| {
+                a.options[slot].contains(&snap)
+                    && (snap < 0 || !a.used[snap as usize] && !picks[..slot].contains(&snap))
+            }) && a.required_snaps.iter().all(|&snap| picks.contains(&(snap as i32)))
+                && self.input.constraints.skill_roles.as_ref().is_none_or(|roles|
+                    roles.feasible(&a.team, &picks, 5, &a.options));
+            if feasible {
+                let score_totals = self.assignment_totals(&a.team, &picks, totals);
+                if self.input.constraints.min_bonus.is_none_or(|value| score_totals.bonus >= value)
+                    && self.input.constraints.max_bonus.is_none_or(|value| score_totals.bonus <= value)
+                {
+                    self.candidate(a, picks.to_vec(), score_totals)?;
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
     fn walk_domain(&mut self, a: &mut Assignment, totals: Totals) -> Result<(), String> {
+        self.try_assignment_proposal(a, totals)?;
+        if self.timed_out {
+            return Ok(());
+        }
         for (allowed, choices) in a.allowed.iter_mut().zip(&a.options) {
             allowed.fill(false);
             for &snap in choices {
@@ -3239,16 +3307,137 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         };
         a.power_order = ordered(&self.snap_power);
         a.skill_order = ordered(&self.skill);
+        a.programs = self.program_assignments(a, totals);
         self.snap_walk(a, 0, totals)
+    }
+    fn program_assignments(&mut self, a: &Assignment, base: Totals) -> Option<ProgramAssignments> {
+        if self.team_filter || self.any_snap_bonus || !a.required_snaps.is_empty()
+            || self.input.constraints.skill_roles.is_some() || self.input.disable_snap_dominance
+            || a.options.iter().all(|row| row.len() <= 1)
+            || !(0.0..=i32::MAX as f64).contains(&base.power)
+        {
+            return None;
+        }
+        let mut ids: [Vec<(u32, u8)>; 5] = std::array::from_fn(|_| vec![(u32::MAX, 0); self.width]);
+        let mut choices: [HashMap<u32, Vec<i32>>; 5] = std::array::from_fn(|_| HashMap::default());
+        let mut duplicates = false;
+        for (slot, &member) in a.team.iter().enumerate() {
+            for &snap in &a.power_order[slot] {
+                if snap >= 0 && a.used[snap as usize] { continue; }
+                let program = self.input.objective.snap_program_class(member, snap)?;
+                let column = if snap < 0 { self.width - 1 } else { snap as usize };
+                if !(0.0..=i32::MAX as f64).contains(&self.snap_power[member * self.width + column]) {
+                    return None;
+                }
+                ids[slot][(snap + 1) as usize] = program;
+                let group = choices[slot].entry(program.0).or_default();
+                duplicates |= !group.is_empty();
+                group.push(snap);
+            }
+        }
+        duplicates.then(|| ProgramAssignments {
+            base, ids, choices, visited: HashSet::default(),
+            matrix: vec![vec![NONE; self.width + 4]; 5],
+        })
+    }
+    fn program_candidate(&mut self, a: &mut Assignment, fixed: usize, totals: Totals, forced_quota: Option<u8>) -> Result<(), String> {
+        let Some(programs) = &mut a.programs else {
+            return self.candidate(a, a.assigned.clone(), totals);
+        };
+        let key: [u32; 5] = std::array::from_fn(|slot| {
+            if slot < fixed {
+                programs.ids[slot][(a.assigned[slot] + 1) as usize].0
+            } else {
+                *programs.choices[slot].keys().next().unwrap()
+            }
+        });
+        let quota = |slot: usize, snap: i32| programs.ids[slot][(snap + 1) as usize].1;
+        let threshold = forced_quota.unwrap_or_else(|| (0..5).map(|slot| {
+            if slot < fixed { quota(slot, a.assigned[slot]) }
+            else { quota(slot, programs.choices[slot][&key[slot]][0]) }
+        }).max().unwrap_or(0));
+        let key_id = (key, threshold);
+        if programs.visited.len() >= 4096 { programs.visited.clear(); }
+        if !programs.visited.insert(key_id) { return Ok(()); }
+        let powers = &self.snap_power;
+        let width = self.width;
+        let column = |snap: i32| if snap < 0 { width - 1 } else { snap as usize };
+        let choices: [&Vec<i32>; 5] = std::array::from_fn(|slot| &programs.choices[slot][&key[slot]]);
+        let independent: [i32; 5] = std::array::from_fn(|slot| {
+            *choices[slot].iter().find(|&&snap| quota(slot, snap) <= threshold).unwrap()
+        });
+        let independently_best: f64 = a.team.iter().zip(independent)
+            .map(|(&member, snap)| powers[member * width + column(snap)]).sum();
+        if fixed == 5 && programs.base.power + independently_best <= totals.power {
+            return self.candidate(a, a.assigned.clone(), totals);
+        }
+        let attains = |picks: &[i32]| picks.iter().enumerate().any(|(slot, &snap)| quota(slot, snap) == threshold);
+        let picks = if attains(&independent) && independent.iter().enumerate()
+            .all(|(slot, &snap)| snap < 0 || !independent[..slot].contains(&snap))
+        {
+            independent.to_vec()
+        } else {
+            for (slot, row) in programs.matrix.iter_mut().enumerate() {
+                row.fill(NONE);
+                let offset = a.team[slot] * width;
+                for &snap in choices[slot] {
+                    if quota(slot, snap) > threshold { continue; }
+                    let column = column(snap);
+                    row[if snap < 0 { column + slot } else { column }] = powers[offset + column];
+                }
+            }
+            let mut selected = [0; 5];
+            let mut gain = self.matching.maximum(&programs.matrix, width + 4, Some(&mut selected));
+            if gain <= NONE / 2.0 {
+                programs.visited.remove(&key_id);
+                return if fixed == 5 { self.candidate(a, a.assigned.clone(), totals) } else { Ok(()) };
+            }
+            let physical = |columns: [usize; 5]| columns.map(|col| if col < width - 1 { col as i32 } else { -1 });
+            if !attains(&physical(selected)) {
+                gain = NONE;
+                for (slot, choices) in choices.iter().enumerate() {
+                    if !choices.iter().any(|&snap| quota(slot, snap) == threshold) { continue; }
+                    let mut row = programs.matrix[slot].clone();
+                    for &snap in *choices {
+                        if quota(slot, snap) == threshold { continue; }
+                        let column = column(snap);
+                        row[if snap < 0 { column + slot } else { column }] = NONE;
+                    }
+                    std::mem::swap(&mut row, &mut programs.matrix[slot]);
+                    let mut next = [0; 5];
+                    let value = self.matching.maximum(&programs.matrix, width + 4, Some(&mut next));
+                    std::mem::swap(&mut row, &mut programs.matrix[slot]);
+                    if value > gain { gain = value; selected = next; }
+                }
+                if gain <= NONE / 2.0 {
+                    programs.visited.remove(&key_id);
+                    return if fixed == 5 { self.candidate(a, a.assigned.clone(), totals) } else { Ok(()) };
+                }
+            }
+            physical(selected).to_vec()
+        };
+        let mut best = programs.base;
+        for (&member, &snap) in a.team.iter().zip(&picks) {
+            let index = member * width + column(snap);
+            best.power += powers[index];
+            best.skill += self.skill[index];
+            best.skill_low += self.skill_low[index];
+        }
+        // The matching uses the same programs and physical snapshot constraints.
+        if fixed < 5 || best.power > totals.power {
+            self.candidate(a, picks, best)
+        } else {
+            self.candidate(a, a.assigned.clone(), totals)
+        }
     }
     fn snap_walk(&mut self, a: &mut Assignment, slot: usize, totals: Totals) -> Result<(), String> {
         if !self.timed_out {
             self.stats.snap_nodes += 1;
             if self.stats.snap_nodes & 1023 == 0 {
                 self.report_pending();
-                if self.expired() {
-                    self.timed_out = true;
-                }
+            }
+            if self.stats.snap_nodes & 63 == 0 && self.expired() {
+                self.timed_out = true;
             }
         }
         if self.timed_out {
@@ -3273,6 +3462,15 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         }
         let required_left = a.required_snaps.iter().filter(|&&j| !a.used[j]).count();
         if slot == 5 {
+            if let Some(programs) = &a.programs {
+                let classes: [(u32, u8); 5] = std::array::from_fn(|i| {
+                    programs.ids[i][(a.assigned[i] + 1) as usize]
+                });
+                let quota = classes.iter().map(|class| class.1).max().unwrap();
+                if programs.visited.contains(&(classes.map(|class| class.0), quota)) {
+                    return Ok(());
+                }
+            }
             if required_left > 0
                 || self
                     .input
@@ -3288,7 +3486,7 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             {
                 return Ok(());
             }
-            return self.candidate(a, a.assigned.clone(), totals);
+            return self.program_candidate(a, 5, totals, None);
         }
         let mut count = 5 - slot;
         let mut unused_bonus = 0.0;
@@ -3346,6 +3544,28 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                 && self.remaining_bound(a, slot, totals) < self.assignment_limit(a))
             || 5 - slot < required_left
         {
+            return Ok(());
+        }
+        if let Some(programs) = a.programs.as_ref().filter(|programs| {
+            programs.choices[slot..].iter().all(|choices| choices.len() == 1)
+        }) {
+            let fixed = (0..slot).map(|index| programs.ids[index][(a.assigned[index] + 1) as usize].1).max().unwrap_or(0);
+            let mut minimum = fixed;
+            let mut quotas = vec![fixed];
+            for (index, groups) in programs.choices.iter().enumerate().skip(slot) {
+                let mut lower = u8::MAX;
+                for &snap in groups.values().next().unwrap() {
+                    let quota = programs.ids[index][(snap + 1) as usize].1;
+                    lower = lower.min(quota);
+                    quotas.push(quota);
+                }
+                minimum = minimum.max(lower);
+            }
+            quotas.sort_unstable();
+            quotas.dedup();
+            for quota in quotas.into_iter().rev().filter(|&quota| quota >= minimum) {
+                self.program_candidate(a, slot, totals, Some(quota))?;
+            }
             return Ok(());
         }
         let floor = if self.any_snap_bonus {
@@ -3448,6 +3668,25 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             }
             if j >= 0 && a.used[j as usize] {
                 continue;
+            }
+            if let Some(programs) = &a.programs {
+                let (program, quota) = programs.ids[slot][(j + 1) as usize];
+                let power_of = |snap: i32| self.snap_power[member * self.width
+                    + if snap < 0 { self.width - 1 } else { snap as usize }];
+                let own = power_of(j);
+                let remaining = 5 - slot;
+                // All earlier snapshots in this group run the same scoring
+                // program. Among these stronger choices at least one stays
+                // free after the other unfinished slots are filled.
+                if programs.choices[slot].get(&program).is_some_and(|choices| {
+                    choices.len() > remaining && choices.iter().copied()
+                        .take_while(|&snap| power_of(snap) > own)
+                        .filter(|&snap| programs.ids[slot][(snap + 1) as usize].1 == quota
+                            && (snap < 0 || !a.used[snap as usize]))
+                        .take(remaining).count() == remaining
+                }) {
+                    continue;
+                }
             }
             if j >= 0
                 && self.conditional_dominance
@@ -3698,6 +3937,10 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
             }
             if self.expired() {
                 self.timed_out = true;
+            }
+            if self.timed_out && (self.unexplored == f64::INFINITY || !self.input.objective.retain_budget_bound()) {
+                self.unexplored = f64::INFINITY;
+                break;
             }
             self.stats.leaders += 1;
             if self.any_snap_bonus {
@@ -4075,6 +4318,9 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
     }
 }
 pub fn search<O: Objective + ?Sized>(input: Input<'_, O>) -> Result<Output, String> {
+    run_search_at(input, crate::cancellation_generation())
+}
+pub(crate) fn search_current<O: Objective>(input: Input<'_, O>) -> Result<Output, String> {
     search_at(input, crate::cancellation_generation())
 }
 fn feasible<O: Objective + ?Sized>(input: &Input<'_, O>) -> bool {
@@ -4131,7 +4377,18 @@ fn feasible<O: Objective + ?Sized>(input: &Input<'_, O>) -> bool {
             .iter()
             .all(|&i| i < input.snaps.len() && !c.excluded_snaps.contains(&i))
 }
-pub(crate) fn search_at<O: Objective + ?Sized>(
+pub(crate) fn search_at<O: Objective>(
+    input: Input<'_, O>,
+    generation: u64,
+) -> Result<Output, String> {
+    // Browser downloads share one search traversal across objective types.
+    // The simulator and scoring models still compile in their concrete types.
+    #[cfg(target_arch = "wasm32")]
+    let input = input.erase();
+    run_search_at(input, generation)
+}
+
+fn run_search_at<O: Objective + ?Sized>(
     input: Input<'_, O>,
     generation: u64,
 ) -> Result<Output, String> {
