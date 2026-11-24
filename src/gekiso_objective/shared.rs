@@ -45,6 +45,25 @@ struct SongObjective<'k, 'a> {
     skill_choices: Vec<Vec<(i32, f64)>>,
 }
 
+impl SongObjective<'_, '_> {
+    fn cached_leaf_upper(&self, members: &[usize], assigned: &[i32]) -> Option<f64> {
+        let kernel = &self.adapter.kernel;
+        let cached = if kernel.chart.luck {
+            !kernel.nominal_mean_coefficients.is_empty() || !kernel.nominal_mean_cache.is_empty()
+        } else {
+            !kernel.shared_mean_coefficients.is_empty()
+        };
+        if !cached || !self.exact_prepared_power {
+            return None;
+        }
+        let power: i64 = assigned.iter().enumerate().map(|(slot, &snap)| {
+            let column = if snap < 0 { kernel.snaps.len() } else { snap as usize };
+            self.slots[slot][column] as i64
+        }).sum();
+        kernel.cached_formation_mean(members, assigned, power)
+    }
+}
+
 struct PowerBasis {
     bases: Arc<Vec<power::SlotBase>>,
     snaps: Arc<Vec<f64>>,
@@ -164,7 +183,7 @@ struct SharedPowerBound {
     prices_offsets: bool,
     prices: Vec<SharedPrice>,
     plain_score: Option<PlainScoreBound>,
-    tail: Option<Vec<TailOffer>>,
+    tail: [Option<Vec<TailOffer>>; 2],
 }
 pub(super) struct SharedPrice {
     base: f64,
@@ -334,6 +353,7 @@ struct Combined<'k, 'a> {
     window_converters: Option<Vec<bool>>,
     conversion_mask: Option<Vec<bool>>,
     open_converters: [bool; 5],
+    final_snapshot_upper: Option<([i32; 4], f64)>,
     window_options: [bool; 5],
     window_budgets: Vec<WindowBudget>,
     dominance_profiles: Option<(Vec<u32>, HashMap<Vec<u32>, u32>)>,
@@ -661,6 +681,7 @@ impl<'k, 'a> Combined<'k, 'a> {
             window_converters,
             conversion_mask,
             open_converters: [true; 5],
+            final_snapshot_upper: None,
             window_options: [false; 5],
             window_budgets: Vec::new(),
             dominance_profiles,
@@ -865,12 +886,7 @@ impl<'k, 'a> Combined<'k, 'a> {
         for index in order {
             let cached = cutoff.and_then(|_| {
                 let power = powers[if same_power { 0 } else { index }].total;
-                let kernel = &self.songs[index].adapter.kernel;
-                if kernel.chart.luck {
-                    kernel.cached_nominal_mean(team, power as i32)
-                } else {
-                    kernel.cached_shared_mean(team, power as f64)
-                }
+                self.songs[index].adapter.kernel.cached_formation_mean(&team.members, &team.snaps, power)
             });
             if let Some(upper) = cached {
                 if let Some(upper) = accept(index, ChartSettlement::Upper(upper), &mut pending) {
@@ -1239,14 +1255,16 @@ impl<'k, 'a> Combined<'k, 'a> {
                 let offset_choices = std::array::from_fn(|slot| {
                     Self::best_offers(&self.joint_options[slot], |snap| offsets[slot][(snap + 1) as usize])
                 });
-                let tail = if tail_is_monotone && self.joint_options[4].len() >= 4 {
-                    let offers: Vec<_> = self.joint_options[4].iter().map(|&snap| {
+                let tail = std::array::from_fn(|offset| {
+                    let slot = 3 + offset;
+                    if !tail_is_monotone { return None; }
+                    let offers: Vec<_> = self.joint_options[slot].iter().map(|&snap| {
                         let physical = if snap < 0 { width - 1 } else { snap as usize };
                         let index = (snap + 1) as usize;
-                        TailOffer { snap, values: [song.slots[4][physical], profiles[index][4], offsets[4][index]] }
+                        TailOffer { snap, values: [song.slots[slot][physical], profiles[index][slot], offsets[slot][index]] }
                     }).collect();
                     tail_frontier(&offers)
-                } else { None };
+                });
                 groups.push(SharedPowerBound { songs: indices, bound, base_power, coefficient: base,
                     profiles, profile_choices, offset, offsets, offset_choices, prices_offsets, prices, plain_score, tail });
             }
@@ -1318,6 +1336,51 @@ impl<'k, 'a> Combined<'k, 'a> {
         Some(total)
     }
 
+    fn filter_final_snapshots(&mut self, members: &[usize], prefix: &[i32], limit: f64, choices: &mut Vec<i32>) {
+        self.final_snapshot_upper = None;
+        if self.songs.len() < 16 || self.songs.iter().any(|song| {
+            !song.exact_prepared_power || !song.adapter.kernel.seeds.is_empty()
+                || song.adapter.deterministic.is_none()
+        }) {
+            return;
+        }
+        let last_column = self.songs[0].adapter.kernel.snaps.len();
+        let column = |snap: i32| if snap < 0 { last_column } else { snap as usize };
+        let ancestor = self.inherited_ceiling(members, prefix, 4);
+        let mut sums = vec![0.0_f64; choices.len()];
+        let mut powers = vec![0.0; choices.len()];
+        let mut bounds = vec![f64::INFINITY; choices.len()];
+        for (index, song) in self.songs.iter().enumerate() {
+            if index % 16 == 0 && crate::clock::preparation_expired() {
+                return;
+            }
+            let fixed = prefix[..4].iter().enumerate().fold(0.0_f64, |sum, (slot, &snap)|
+                (sum + song.slots[slot][column(snap)]).next_up());
+            for (power, &snap) in powers.iter_mut().zip(choices.iter()) {
+                *power = (fixed + song.slots[4][column(snap)]).next_up();
+            }
+            bounds.fill(ancestor.map_or(f64::INFINITY, |value| value.scores[index]));
+            song.adapter.deterministic.as_ref().unwrap()
+                .final_snapshot_mean_bounds(members, prefix, choices, &powers, &mut bounds);
+            if let Some(scoped) = &song.adapter.combo_bound {
+                scoped.lock().unwrap_or_else(|e| e.into_inner())
+                    .final_snapshot_mean_bounds(members, prefix, choices, &powers, &mut bounds);
+            }
+            for (sum, &bound) in sums.iter_mut().zip(&bounds) {
+                *sum = (*sum + bound).next_up();
+            }
+        }
+        let count = self.songs.len() as f64;
+        let mut rows = sums.into_iter().map(|sum| (sum / count).next_up());
+        let mut maximum = limit.next_down();
+        choices.retain(|_| {
+            let upper = rows.next().unwrap();
+            maximum = if upper.is_nan() { f64::INFINITY } else { maximum.max(upper) };
+            !(upper < limit)
+        });
+        self.final_snapshot_upper = Some((prefix[..4].try_into().unwrap(), maximum));
+    }
+
     fn inherited_ceiling(&self, members: &[usize], assigned: &[i32], from: usize) -> Option<&PrefixCeilings> {
         if self.roster != members { return None; }
         self.prefix_ceilings.iter().enumerate().take(from).rev().find_map(|(depth, record)| {
@@ -1387,32 +1450,55 @@ impl<'k, 'a> Combined<'k, 'a> {
         let sum_bounds = |values: &[f64]| values.iter().fold(0.0_f64, |sum, value| (sum + value).next_up());
         let mut sum = sum_bounds(&bounds);
         if refined && (sum / count).next_up() >= limit {
-            let team = (from == 5).then(|| Team { members: members.to_vec(), snaps: assigned.to_vec() });
+            let mut team = None;
             let deadline = crate::clock::preparation_deadline();
             'refine: for expensive in [false, true] {
-                // For a complete assignment the direct score ceilings
-                // already include its power and all fixed slot profiles.
-                if !expensive && team.is_some() { continue; }
-                for &index in &self.refinement_order {
-                    if crate::clock::deadline_expired(deadline) { break 'refine; }
+                if !expensive && from == 5 { continue; }
+                for (position, &index) in self.refinement_order.iter().enumerate() {
                     let song = &mut self.songs[index];
+                    let fast_leaf = from == 5 && song.adapter.deterministic.is_some()
+                        && song.adapter.kernel.seeds.is_empty() && song.adapter.assignment.is_none()
+                        && song.adapter.combo_attempted;
+                    // A prepared leaf in this path only reads existing score tables.
+                    if (!fast_leaf || position % 8 == 0) && crate::clock::deadline_expired(deadline) {
+                        break 'refine;
+                    }
                     let previous = bounds[index];
-                    let others = if sum.is_finite() && previous.is_finite() {
-                        (sum - previous).next_up()
-                    } else { bounds.iter().enumerate().filter(|(i, _)| *i != index)
-                        .fold(0.0_f64, |sum, (_, value)| (sum + value).next_up()) };
-                    let target = if limit.is_finite() { (limit * count - others).max(0.0) } else { 0.0 };
-                    let t = totals[index];
-                    let value = if expensive {
-                        song.adapter.assignment_order_bound(members, t, assigned, from, target)
-                    } else { song.adapter.shared_joint_upper(members, assigned, from, t, target) };
-                    if let Some(upper) = value { bounds[index] = bounds[index].min(upper); }
-                    if expensive && !crate::clock::deadline_expired(deadline) {
-                        if let Some(upper) = song.adapter.assignment_bound(members, t, assigned, from) {
-                            bounds[index] = bounds[index].min(upper);
-                        }
-                        if let Some(team) = &team {
-                            if let Some(upper) = song.adapter.leaf_bound(team, t) { bounds[index] = bounds[index].min(upper); }
+                    let known = (from == 5).then(|| song.cached_leaf_upper(members, assigned)).flatten();
+                    if let Some(upper) = known {
+                        bounds[index] = previous.min(upper);
+                    } else {
+                        let others = if sum.is_finite() && previous.is_finite() {
+                            (sum - previous).next_up()
+                        } else { bounds.iter().enumerate().filter(|(i, _)| *i != index)
+                            .fold(0.0_f64, |sum, (_, value)| (sum + value).next_up()) };
+                        let target = if limit.is_finite() { (limit * count - others).max(0.0) } else { 0.0 };
+                        let t = totals[index];
+                        let adapter = &mut song.adapter;
+                        let reuses_direct_bound = expensive && from > 0
+                            && adapter.deterministic.is_some() && adapter.kernel.seeds.is_empty();
+                        let value = if reuses_direct_bound {
+                            // The initial pass already included the direct deterministic ceiling.
+                            adapter.refine_cutoff = target;
+                            Some(adapter.refine_deterministic_order_bound(members, t, assigned, from, target, previous))
+                        } else if expensive {
+                            adapter.assignment_order_bound(members, t, assigned, from, target)
+                        } else {
+                            adapter.shared_joint_upper(members, assigned, from, t, target)
+                        };
+                        if let Some(upper) = value { bounds[index] = bounds[index].min(upper); }
+                        if expensive && (!reuses_direct_bound || adapter.assignment.is_some())
+                            && !crate::clock::deadline_expired(deadline)
+                        {
+                            if let Some(upper) = adapter.assignment_bound(members, t, assigned, from) {
+                                bounds[index] = bounds[index].min(upper);
+                            }
+                            if from == 5 && !reuses_direct_bound {
+                                let team = team.get_or_insert_with(|| Team {
+                                    members: members.to_vec(), snaps: assigned.to_vec(),
+                                });
+                                if let Some(upper) = adapter.leaf_bound(team, t) { bounds[index] = bounds[index].min(upper); }
+                            }
                         }
                     }
                     sum = if sum.is_finite() && previous.is_finite() && bounds[index].is_finite() {
@@ -1765,6 +1851,7 @@ impl Objective for Combined<'_, '_> {
         Some((upper / count).next_up())
     }
     fn prepare_assignment(&mut self, members: &[usize], options: &[Vec<i32>]) {
+        self.final_snapshot_upper = None;
         if let Some(mask) = &self.conversion_mask {
             let width = self.songs[0].adapter.kernel.snaps.len() + 1;
             self.open_converters = std::array::from_fn(|slot| {
@@ -1922,20 +2009,23 @@ impl Objective for Combined<'_, '_> {
         self.upper(members, assigned, from, false, f64::INFINITY, t.power)
     }
     fn assignment_options(
-        &self,
+        &mut self,
         members: &[usize],
         assigned: &[i32],
         from: usize,
         limit: f64,
     ) -> Option<Vec<i32>> {
-        if !(3..=4).contains(&from) || self.roster != members || !limit.is_finite() || limit <= 0.0
+        if !(2..=4).contains(&from) || self.roster != members || !limit.is_finite() || limit <= 0.0
             || !self.joint_uncovered.is_empty() || self.joint_options[from].len() < 4
         {
             return None;
         }
         let [group] = self.joint.as_deref()? else { return None; };
-        let last = group.tail.as_deref();
-        if from == 3 && last.is_none() { return None; }
+        let [penultimate, last] = group.tail.each_ref().map(Option::as_deref);
+        if from < 4 && last.is_none() { return None; }
+        if from == 2 && !penultimate.zip(last).is_some_and(|(a, b)| a.len() * b.len() <= 192) {
+            return None;
+        }
         let song = &self.songs[group.songs[0]];
         let width = song.adapter.kernel.snaps.len() + 1;
         let values = |slot: usize, snap: i32| {
@@ -1960,14 +2050,24 @@ impl Objective for Combined<'_, '_> {
         })) {
             return Some(Vec::new());
         }
-        Some(self.joint_options[from].iter().copied().filter(|&snap| {
+        let mut choices: Vec<i32> = self.joint_options[from].iter().copied().filter(|&snap| {
             if !available(snap) { return false; }
             let prefix = extend(prefix, values(from, snap));
             if from == 4 { return can_beat(prefix); }
-            last.unwrap().iter().any(|row| {
-                available(row.snap) && (row.snap < 0 || row.snap != snap) && can_beat(extend(prefix, row.values))
+            let last_can_beat = |prefix, other| last.unwrap().iter().any(|row| {
+                available(row.snap) && (row.snap < 0 || row.snap != snap && row.snap != other)
+                    && can_beat(extend(prefix, row.values))
+            });
+            if from == 3 { return last_can_beat(prefix, -1); }
+            penultimate.unwrap().iter().any(|row| {
+                available(row.snap) && (row.snap < 0 || row.snap != snap)
+                    && last_can_beat(extend(prefix, row.values), row.snap)
             })
-        }).collect())
+        }).collect();
+        if from == 4 && choices.len() > 1 {
+            self.filter_final_snapshots(members, assigned, limit, &mut choices);
+        }
+        Some(choices)
     }
 
     fn assignment_order_bound(
@@ -1979,6 +2079,15 @@ impl Objective for Combined<'_, '_> {
         limit: f64,
     ) -> Option<f64> {
         let mut coarse = self.bound(t);
+        if from == 4 && self.roster == members {
+            if let Some((prefix, upper)) = self.final_snapshot_upper {
+                if prefix == assigned[..4] {
+                    // The tail scan covered every candidate excluded by the
+                    // earlier cutoff or priced with the same last snapshot.
+                    return Some(coarse.min(upper));
+                }
+            }
+        }
         if let Some(record) = self.inherited_ceiling(members, assigned, from) { coarse = coarse.min(record.mean); }
         if coarse < limit || crate::clock::preparation_expired() { return Some(coarse); }
         if self.joint.is_none() && from == 0 && self.ordered_snapshot_programs
@@ -2556,7 +2665,7 @@ impl Kernel<'_> {
                 }) { return None; }
                 // JUST converters cannot change any of this chart's raw grades.
                 // Keep the normalized actor for its remaining score program.
-                self.bound_actor_of(member, snap);
+                self.prepare_bound_actor(member, snap);
             }
         }
         let slots = &self.slots;
@@ -2568,7 +2677,7 @@ impl Kernel<'_> {
             let index = start + column;
             let physical = if snap < 0 { width - 1 } else { snap as usize };
             (column, crate::just_bound::Choice {
-                actor: actors[index].as_ref().unwrap(), slot: &slots[index], index, power: power[start + physical],
+                actor: actors[index].as_deref().unwrap(), slot: &slots[index], index, power: power[start + physical],
             })
         }).collect());
         self.just_bounds.assignment_mean_rows(self.master, self.chart, &rows, width).ok().flatten()
@@ -2650,17 +2759,25 @@ impl Kernel<'_> {
         ((coefficient * cap).next_up() < i32::MAX as f64).then_some((base, rows))
     }
 
-    fn cached_nominal_mean(&self, team: &Team, power: i32) -> Option<f64> {
+    fn cached_formation_mean(&self, members: &[usize], assigned: &[i32], power: i64) -> Option<f64> {
+        if self.chart.luck {
+            self.cached_nominal_mean(members, assigned, power as i32)
+        } else {
+            self.cached_shared_mean(members, assigned, power as f64)
+        }
+    }
+
+    fn cached_nominal_mean(&self, members: &[usize], snaps: &[i32], power: i32) -> Option<f64> {
         if !self.chart.luck || !self.owner_local || !self.healthy || !self.seeds.is_empty()
-            || self.nominal_mean_members.as_slice() != team.members
+            || self.nominal_mean_members.as_slice() != members
             || self.nominal_mean_coefficients.is_empty() && self.nominal_mean_cache.is_empty()
         {
             return None;
         }
         let mut shapes = [0; 5];
-        for (slot, (&member, &snap)) in team.members.iter().zip(&team.snaps).enumerate() {
+        for (slot, (&member, &snap)) in members.iter().zip(snaps).enumerate() {
             let index = self.slot_index(member, snap);
-            let shape = if self.nominal_uses_bound_shape(member, &team.members) {
+            let shape = if self.nominal_uses_bound_shape(member, members) {
                 self.bound_shape_ids[index]
             } else { self.shape_ids[index] };
             if shape == u32::MAX { return None; }
@@ -2757,14 +2874,14 @@ impl Kernel<'_> {
         ((power * coefficient).next_up() * (1.0 + 3e-12) + (self.chart.notes.len() + 4) as f64).next_up()
     }
 
-    fn cached_shared_mean(&self, team: &Team, power: f64) -> Option<f64> {
+    fn cached_shared_mean(&self, members: &[usize], snaps: &[i32], power: f64) -> Option<f64> {
         if !self.healthy || !self.steady_life || !self.owner_local || self.chart.luck
             || !self.seeds.is_empty() || self.shared_mean_coefficients.is_empty()
         {
             return None;
         }
         let shapes = std::array::from_fn(|slot| {
-            self.shape_ids[self.slot_index(team.members[slot], team.snaps[slot])]
+            self.shape_ids[self.slot_index(members[slot], snaps[slot])]
         });
         self.shared_mean_coefficients.get(&shapes).map(|&coefficient| {
             self.shared_coefficient_upper(power, coefficient)

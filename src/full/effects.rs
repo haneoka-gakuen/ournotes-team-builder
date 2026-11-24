@@ -487,7 +487,14 @@ impl ConditionUpdater {
     pub(crate) fn inputs_only(&self, recorded: bool) -> bool {
         self.sorted.iter().all(|&index| {
             let effect = &self.effects[index];
-            [&effect.trigger, &effect.condition, &effect.release, &effect.reset].into_iter().flatten().all(|checker| checker.inputs_only(recorded))
+            // A one-shot condition is evaluated only after its trigger hits.
+            // A range event wakes the replay before that condition can draw RNG.
+            let range_condition = effect.trigger_type == ONE_SHOT
+                && effect.trigger.as_ref().and_then(Checker::idle_input) == Some(IdleInput::Range);
+            [&effect.trigger, &effect.release, &effect.reset].into_iter().flatten()
+                .all(|checker| checker.inputs_only(recorded))
+                && effect.condition.as_ref().is_none_or(|checker|
+                    checker.inputs_only(recorded || range_condition))
                 && !matches!(effect.cumulative, Some(Cumulative::Elapsed { .. }))
         })
     }

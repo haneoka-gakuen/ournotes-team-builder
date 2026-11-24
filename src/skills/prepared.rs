@@ -135,6 +135,7 @@ pub(crate) struct Played {
 }
 pub(crate) struct Prepared {
     pub(crate) slots: Arc<Vec<Slot>>,
+    raw_slot_classes: OnceLock<(Vec<usize>, usize)>,
     // Ordinary scoring prepares projections lazily; Gekiso keeps the raw programs.
     played: Mutex<Vec<(PlayKey, Weak<Played>)>>,
     gekiso: Mutex<Vec<GekisoView>>,
@@ -142,6 +143,25 @@ pub(crate) struct Prepared {
     bytes: usize,
 }
 impl Prepared {
+    pub(crate) fn raw_slot_classes(&self) -> (&[usize], usize) {
+        let (classes, count) = self.raw_slot_classes.get_or_init(|| {
+            let mut ids = rustc_hash::FxHashMap::<Vec<u64>, usize>::default();
+            let mut signature = Vec::new();
+            let classes = self.slots.iter().map(|slot| {
+                slot.write_signature(&mut signature);
+                if let Some(&id) = ids.get(&signature) {
+                    id
+                } else {
+                    let id = ids.len();
+                    ids.insert(signature.clone(), id);
+                    id
+                }
+            }).collect();
+            (classes, ids.len())
+        });
+        (classes, *count)
+    }
+
     pub(crate) fn for_play(&self, input: &Input) -> Arc<Played> {
         let ap = input.judgements.is_none();
         let perfect;
@@ -494,7 +514,7 @@ pub(crate) fn prepare(master: &Master, members: &[Member], snaps: &[Snap]) -> Ar
     let mut unsupported = Vec::new();
     let mut bytes = size_of::<Prepared>()
         + key.bytes()
-        + slots.capacity() * (size_of::<Slot>() + size_of::<usize>());
+        + slots.capacity() * (size_of::<Slot>() + 2 * size_of::<usize>());
     for member in members {
         for snap in std::iter::once(None).chain(snaps.iter().map(Some)) {
             let slot = resolve(master, member, snap, &mut unsupported);
@@ -514,6 +534,7 @@ pub(crate) fn prepare(master: &Master, members: &[Member], snaps: &[Snap]) -> Ar
     }
     let table = Arc::new(Prepared {
         slots: Arc::new(slots),
+        raw_slot_classes: OnceLock::new(),
         played: Mutex::new(Vec::new()),
         gekiso: Mutex::new(Vec::new()),
         converter_limits: OnceLock::new(),

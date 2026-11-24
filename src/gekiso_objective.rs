@@ -948,8 +948,8 @@ pub struct Kernel<'a> {
     shapes: HashMap<(Vec<u64>, Performer), u32>,
     shape_ids: Vec<u32>,
     bound_shape_ids: Vec<u32>,
-    bound_actors: Vec<Option<Performer>>,
-    shared_bound_actors: Option<Arc<std::sync::Mutex<HashMap<usize, Performer>>>>,
+    bound_actors: Vec<Option<Arc<Performer>>>,
+    shared_bound_actors: Option<Arc<std::sync::Mutex<HashMap<usize, Arc<Performer>>>>>,
     bound_converters: Vec<bool>,
     raw_actor_keys: Vec<u32>,
     pub bonuses: Vec<i32>,
@@ -1863,7 +1863,7 @@ impl<'a> Kernel<'a> {
             shared_fixed_luck: None,
             fixed_forced_members: None,
             converted_master: None,
-            fixed_choices: vec![None; members.len() * (snaps.len() + 1)],
+            fixed_choices: Vec::new(),
             fixed_combo_traces: HashMap::default(),
             combo_scripts: None,
             last_combo_key: None,
@@ -2984,6 +2984,9 @@ impl<'a> Kernel<'a> {
         self.fixed_combo_traces.get(&key).map(Arc::clone)
     }
     fn fixed_choice(&mut self, member: usize, snap: i32) -> &FixedChoice {
+        if self.fixed_choices.is_empty() {
+            self.fixed_choices.resize_with(self.members.len() * (self.snaps.len() + 1), || None);
+        }
         let index = self.slot_index(member, snap);
         if self.fixed_choices[index].is_none() {
             let mut actor = self.actor_of(member, snap);
@@ -3053,7 +3056,7 @@ impl<'a> Kernel<'a> {
     }
     fn fixed_lottery(&mut self, member: usize, snap: i32) -> bool {
         let index = self.slot_index(member, snap);
-        if let Some(choice) = &self.fixed_choices[index] {
+        if let Some(choice) = self.fixed_choices.get(index).and_then(Option::as_ref) {
             choice.lottery
         } else {
             self.fixed_choice(member, snap).lottery
@@ -3167,30 +3170,31 @@ impl<'a> Kernel<'a> {
         if self.nominal_uses_bound_shape(member, roster) { self.bound_shape_id(member, snap) }
         else { self.shape_id(member, snap) }
     }
-    fn bound_actor_of(&mut self, member: usize, snap: i32) -> Performer {
+    fn prepare_bound_actor(&mut self, member: usize, snap: i32) -> &Performer {
         let index = self.slot_index(member, snap);
-        if let Some(actor) = &self.bound_actors[index] {
-            return actor.clone();
+        if self.bound_actors[index].is_none() {
+            let cached = self.shared_bound_actors.as_ref().and_then(|actors| {
+                actors.lock().unwrap_or_else(|error| error.into_inner()).get(&index).cloned()
+            });
+            let actor = cached.unwrap_or_else(|| {
+                let original = self.actor_of(member, snap);
+                let prepared = Arc::new(self.deck_key(&[original], 0).0.into_iter().next().unwrap_or_default());
+                if let Some(actors) = &self.shared_bound_actors {
+                    actors.lock().unwrap_or_else(|error| error.into_inner()).insert(index, Arc::clone(&prepared));
+                }
+                prepared
+            });
+            self.bound_converters[index] = actor.gekisou_support_skills.iter().any(|&(id, level)| {
+                self.master.gekiso_support_skills[&id].effects.iter()
+                    .any(|row| row.level == level && row.kind == 13005)
+            });
+            self.bound_actors[index] = Some(actor);
         }
-        let cached = self.shared_bound_actors.as_ref().and_then(|actors| {
-            actors.lock().unwrap_or_else(|error| error.into_inner()).get(&index).cloned()
-        });
-        let actor = cached.unwrap_or_else(|| {
-            let actor = self.actor_of(member, snap);
-            let actor = self.deck_key(&[actor], 0).0.into_iter().next().unwrap_or_default();
-            if let Some(actors) = &self.shared_bound_actors {
-                actors.lock().unwrap_or_else(|error| error.into_inner()).insert(index, actor.clone());
-            }
-            actor
-        });
-        self.bound_converters[index] = actor.gekisou_support_skills.iter().any(|&(id, level)| {
-            self.master.gekiso_support_skills[&id]
-                .effects
-                .iter()
-                .any(|r| r.level == level && r.kind == 13005)
-        });
-        self.bound_actors[index] = Some(actor.clone());
-        actor
+        self.bound_actors[index].as_deref().unwrap()
+    }
+
+    fn bound_actor_of(&mut self, member: usize, snap: i32) -> Performer {
+        self.prepare_bound_actor(member, snap).clone()
     }
     fn prepare_numeric_hull(&mut self) -> Option<Arc<Vec<Arc<crate::just_bound::Upper>>>> {
         if self.numeric_hull_ready {
@@ -4887,7 +4891,7 @@ impl Kernel<'_> {
             .iter()
             .zip(&team.snaps)
             .any(|(&member, &snap)| {
-                self.bound_actor_of(member, snap);
+                self.prepare_bound_actor(member, snap);
                 self.bound_converters[self.slot_index(member, snap)]
             })
     }
@@ -7051,6 +7055,59 @@ impl<'k, 'a> Adapter<'k, 'a> {
         }
         if maximum { row.into_iter().fold(f64::NEG_INFINITY, f64::max) } else { mean }
     }
+    fn refine_deterministic_order_bound(
+        &mut self,
+        members: &[usize],
+        t: Totals,
+        assigned: &[i32],
+        from: usize,
+        limit: f64,
+        mut upper: f64,
+    ) -> f64 {
+        if from < 5 && upper > limit {
+            if let Some(joint) = self.shared_joint_upper(members, assigned, from, t, limit) {
+                upper = upper.min(joint);
+            }
+        }
+        if from < 5 && upper > limit {
+            let bound = self.deterministic.as_mut().unwrap();
+            if let Some(partitions) =
+                bound.converter_partitions(members, assigned, from, self.base_power, t.power)
+            {
+                let mut partition_upper = f64::NEG_INFINITY;
+                for part in partitions {
+                    partition_upper = partition_upper
+                        .max(bound.partition_score(&part, self.kernel.criterion));
+                    if partition_upper > limit {
+                        break;
+                    }
+                }
+                if partition_upper <= limit {
+                    return partition_upper;
+                }
+            }
+        }
+        if upper > limit {
+            if let Some(value) = self.scripted_combo_bound(members, assigned, from, t, limit) {
+                upper = upper.min(value);
+            }
+        }
+        if upper > limit && (2..=4).contains(&from) {
+            if let Some(value) =
+                self.fixed_tail_score_ceiling(members, assigned, from, t, limit)
+            {
+                upper = upper.min(value);
+            }
+        }
+        if upper > limit && from < 5 {
+            if let Some(value) = self.numeric_assignment_bound(members, assigned, from, limit)
+            {
+                upper = upper.min(value);
+            }
+        }
+        upper
+    }
+
     fn shared_joint_upper(&mut self, members: &[usize], assigned: &[i32], from: usize, totals: Totals, cutoff: f64) -> Option<f64> {
         let bound = self.deterministic.as_mut()?;
         if self.defer_assignment_prices && !bound.ensure_assignment_prices(members) { return None; }
@@ -9052,7 +9109,7 @@ impl Objective for Adapter<'_, '_> {
         self.base_power = power;
     }
     fn assignment_options(
-        &self,
+        &mut self,
         members: &[usize],
         assigned: &[i32],
         from: usize,
@@ -9236,49 +9293,8 @@ impl Objective for Adapter<'_, '_> {
         let deterministic = self.deterministic.as_mut().map(|bound| {
             bound.score_ceiling(members, assigned, from, t.power, self.kernel.criterion)
         });
-        if let Some(mut upper) = deterministic {
-            if from < 5 && upper > _limit {
-                if let Some(joint) = self.shared_joint_upper(members, assigned, from, t, _limit) {
-                    upper = upper.min(joint);
-                }
-            }
-            if upper > _limit {
-                let bound = self.deterministic.as_mut().unwrap();
-                if let Some(partitions) =
-                    bound.converter_partitions(members, assigned, from, self.base_power, t.power)
-                {
-                    let mut partition_upper = f64::NEG_INFINITY;
-                    for part in partitions {
-                        partition_upper = partition_upper
-                            .max(bound.partition_score(&part, self.kernel.criterion));
-                        if partition_upper > _limit {
-                            break;
-                        }
-                    }
-                    if partition_upper <= _limit {
-                        return Some(partition_upper);
-                    }
-                }
-            }
-            if upper > _limit {
-                if let Some(value) = self.scripted_combo_bound(members, assigned, from, t, _limit) {
-                    upper = upper.min(value);
-                }
-            }
-            if upper > _limit && (2..=4).contains(&from) {
-                if let Some(value) =
-                    self.fixed_tail_score_ceiling(members, assigned, from, t, _limit)
-                {
-                    upper = upper.min(value);
-                }
-            }
-            if upper > _limit && from < 5 {
-                if let Some(value) = self.numeric_assignment_bound(members, assigned, from, _limit)
-                {
-                    upper = upper.min(value);
-                }
-            }
-            return Some(upper);
+        if let Some(upper) = deterministic {
+            return Some(self.refine_deterministic_order_bound(members, t, assigned, from, _limit, upper));
         }
         if self.preserve_snap_options() {
             return None;
@@ -9885,7 +9901,7 @@ impl Objective for Adapter<'_, '_> {
                 for (slot, choices) in chain_options.iter().enumerate() {
                     for choice in choices {
                         let index = self.kernel.slot_index(members[slot], choice.snap);
-                        let mut actor = self.kernel.bound_actors[index].as_ref().unwrap().clone();
+                        let mut actor = self.kernel.bound_actors[index].as_deref().unwrap().clone();
                         actor.gekisou_support_skills.retain(|&(id, level)| {
                             self.kernel.master.gekiso_support_skills[&id]
                                 .effects
@@ -12423,8 +12439,8 @@ impl ReplayObjective<'_> {
 
     fn projection_domains(&mut self, members: &[usize], options: &[Vec<i32>]) -> Option<Vec<Vec<Vec<i32>>>> {
         let varying = options.iter().filter(|row| row.len() > 1).count();
-        if varying < 3 && (!self.chart.luck || varying < 2
-            || options.iter().fold(1usize, |count, row| count.saturating_mul(row.len())) < 128)
+        if varying < 2
+            || varying == 2 && options.iter().fold(1usize, |count, row| count.saturating_mul(row.len())) < 128
         {
             return None;
         }
@@ -12453,7 +12469,12 @@ impl ReplayObjective<'_> {
         if combinations > 512 {
             for (row, choices) in grouped.iter_mut().zip(options) {
                 let largest = row.iter().enumerate().max_by_key(|(_, group)| group.len()).map(|(i, _)| i)?;
-                if row[largest].len() < 2 { return None; }
+                if row[largest].len() < 2 {
+                    if self.chart.luck { return None; }
+                    if row.len() > 1 { *row = vec![choices.clone()]; }
+                    continue;
+                }
+                if row.len() == 1 { continue; }
                 let main = row.swap_remove(largest);
                 if !row.is_empty() {
                     let remainder: Vec<_> = choices.iter().copied().filter(|snap| !main.contains(snap)).collect();

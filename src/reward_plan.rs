@@ -1277,14 +1277,14 @@ impl Objective for Ranked<'_> {
         self.source.objective().assignment_domains(members, options)
     }
     fn assignment_options(
-        &self,
+        &mut self,
         members: &[usize],
         assigned: &[i32],
         from: usize,
         _limit: f64,
     ) -> Option<Vec<i32>> {
         self.source
-            .view()
+            .objective()
             .assignment_options(members, assigned, from, self.raw_floor)
     }
     fn reused_assignment_bound(

@@ -121,7 +121,7 @@ impl Context {
             .sum::<usize>();
         if let Some(trace) = &self.rush_trace {
             bytes += trace.capacity() * std::mem::size_of::<ReplayCommand>();
-            bytes += trace.iter().map(|command| match command { ReplayCommand::Input(notes) => notes.capacity() * std::mem::size_of::<crate::full::play::JudgedNote>(), _ => 0 }).sum::<usize>();
+            bytes += trace.iter().map(|command| match command { ReplayCommand::Input(notes) => std::mem::size_of_val(notes.as_ref()) + 2 * std::mem::size_of::<usize>(), _ => 0 }).sum::<usize>();
         }
         if let Some(nominal) = &self.nominal {
             bytes += std::mem::size_of::<Nominal>()
@@ -1135,31 +1135,29 @@ pub(crate) fn converter_context(master: &Master, view: &Master, chart: &Chart, d
         view, &reduced, chart.prepared_notes(), &[], chart.params(), Some(&chart.setup), (0, false, None),
     )?;
     chart.fixed_life(&mut model);
-    let mut boundaries = vec![false; chart.play.frames.len()];
-    for &(start, finish) in &chart.setup.fevers {
-        for time in [start, finish] {
-            let index = chart.play.frames.partition_point(|frame| frame.time_ms < time);
-            if let Some(value) = boundaries.get_mut(index) { *value = true; }
-        }
-    }
-    let mut judgement = chart.judgements.clone();
     let whole = uses_full_replay(master, chart, &[0]);
-    let frames = if whole { 0..chart.play.frames.len() } else { chart.span.0..chart.span.1 };
+    let key = (view.live.after_ms as i32, whole);
+    let scheduled = {
+        let mut cache = chart.factored.lock().unwrap();
+        if let Some((_, frames)) = cache.converter_frames.as_ref().filter(|(stored, _)| *stored == key) {
+            Arc::clone(frames)
+        } else {
+            let span = if whole { 0..chart.play.frames.len() } else { chart.span.0..chart.span.1 };
+            let frames: Arc<[_]> = model.converter_frames(&chart.play, &chart.setup.fevers, span)?.into();
+            cache.converter_frames = Some((key, Arc::clone(&frames)));
+            frames
+        }
+    };
     let generation = crate::cancellation_generation();
-    let mut wake_until = frames.start;
-    for frame_index in frames {
-        let frame = &chart.play.frames[frame_index];
-        let transition = model.gk.as_ref().unwrap().controller.states.iter()
-            .any(|state| matches!(state.state, gekisou::START | gekisou::END | gekisou::DELAY | gekisou::COMPLETE));
-        if frame.judged.is_empty() && !boundaries[frame_index] && frame_index > wake_until && !transition { continue; }
+    let mut judgement = chart.judgements.clone();
+    for phase in scheduled.iter() {
         if generation != crate::cancellation_generation() { return Err("cancelled".into()); }
-        model.converter_frame(frame.time_ms, &frame.judged, chart.play.dt[frame_index])?;
+        model.converter_frame(&chart.play.frames[phase.index], phase)?;
         for &(id, value, _) in model.converted_inputs() {
             if let Some(index) = chart.score_note_index(id) {
                 judgement[index] = if (1..=6).contains(&value) { value as usize } else { 7 };
             }
         }
-        if !frame.judged.is_empty() { wake_until = frame_index + 2; }
     }
     let n = chart.notes.len();
     Ok(Some(Context { life: whole.then(|| Arc::new(vec![master.live.life_base as i32; n])),

@@ -8,14 +8,16 @@ pub(crate) struct RushTrace {
 }
 
 pub(crate) struct PreparedLotteryNotes {
+    input: Option<Arc<[JudgedNote]>>,
     judged: Vec<gekisou::GkNote>,
     score: Vec<score::NoteCommand>,
 }
 
-pub(super) fn prepare_notes(model: &Model<'_>, input: &[JudgedNote], life: &[i32]) -> Result<PreparedLotteryNotes, String> {
-    let mut judged = Vec::with_capacity(input.len());
+pub(super) fn prepare_notes(model: &Model<'_>, input: Option<&Arc<[JudgedNote]>>, life: &[i32]) -> Result<PreparedLotteryNotes, String> {
+    let notes = input.map(Arc::as_ref).unwrap_or_default();
+    let mut judged = Vec::with_capacity(notes.len());
     let mut score = Vec::new();
-    for input in input {
+    for input in notes {
         let note = model.notes.get(&input.note_id)
             .ok_or_else(|| format!("unknown note {}", input.note_id))?;
         judged.push((note.id, note.op, note.time_ms, input.judgement));
@@ -27,7 +29,7 @@ pub(super) fn prepare_notes(model: &Model<'_>, input: &[JudgedNote], life: &[i32
             });
         }
     }
-    Ok(PreparedLotteryNotes { judged, score })
+    Ok(PreparedLotteryNotes { input: input.cloned(), judged, score })
 }
 fn support_probe(master: &Master) -> Option<Performer> {
     for (&id, skill) in master
@@ -241,8 +243,8 @@ pub(crate) fn rush_windows(
     Ok(Some(traces))
 }
 
-pub(super) fn record_frame(model: &mut Model<'_>, time: i32, input: &[JudgedNote], prepared: &PreparedLotteryNotes, dt: f64) -> Result<(), String> {
-    frame::<true>(model, time, input, Some(prepared), dt, &mut Vec::new(), &mut Vec::new())
+pub(super) fn record_frame(model: &mut Model<'_>, time: i32, prepared: &PreparedLotteryNotes, dt: f64) -> Result<(), String> {
+    frame::<true>(model, time, &[], Some(prepared), dt, &mut Vec::new(), &mut Vec::new())
 }
 
 fn frame<const FACTORED: bool>(
@@ -283,11 +285,11 @@ fn frame<const FACTORED: bool>(
         let prepared = prepared.unwrap();
         model.judged.extend(prepared.judged.iter().map(|&(id, _, time, grade)| (id, grade, time)));
         let replay = model.score.score.replay.as_mut().unwrap();
-        if !input.is_empty() {
-            replay.push(score::ReplayCommand::Input(input.to_vec()));
+        if let Some(input) = &prepared.input {
+            replay.push(score::ReplayCommand::Input(Arc::clone(input)));
         }
         replay.extend(prepared.score.iter().cloned().map(score::ReplayCommand::Note));
-        model.score.score.calculate(time, &model.combo, None)?;
+        model.score.score.record_calculation(time, &model.combo)?;
         &prepared.judged[..]
     } else {
         judged.clear();
@@ -366,7 +368,7 @@ fn frame<const FACTORED: bool>(
     model.life.sync(time);
     if FACTORED {
         model.score.score.replay.as_mut().unwrap().push(score::ReplayCommand::Ordinary(time, phase_life));
-        model.score.score.calculate(time, &model.combo, None)?;
+        model.score.score.record_calculation(time, &model.combo)?;
     }
     let g = model.gk.as_mut().unwrap();
     g.controller.update(
@@ -392,8 +394,8 @@ fn frame<const FACTORED: bool>(
             if FACTORED {
                 let range = &g.controller.ranges[i];
                 let (start, end) = (range.start, range.end);
-                model.score.score.calculate(start, &model.combo, None)?;
-                model.score.score.calculate(end, &model.combo, None)?;
+                model.score.score.record_calculation(start, &model.combo)?;
+                model.score.score.record_calculation(end, &model.combo)?;
                 model.apply_section_rank(i, rank);
             } else {
                 model.previous_rank = Some(rank);

@@ -278,12 +278,9 @@ pub struct Life {
     limits: BTreeMap<i32, i32>,
     limit_counter: i32,
     frames: usize,
-    // The measured WASM hot path uses compact ordered buckets; native keeps its tree.
-    #[cfg(not(target_arch = "wasm32"))]
-    commands: BTreeMap<usize, Rc<Vec<Command>>>,
-    #[cfg(target_arch = "wasm32")]
     commands: Vec<(usize, Rc<Vec<Command>>)>,
     cached_frame: i32,
+    cached_buckets: usize,
     cached: [i32; 3],
     dead_since: Option<i32>,
     has_recovery: bool,
@@ -309,11 +306,9 @@ impl Life {
             limits: BTreeMap::new(),
             limit_counter: 0,
             frames: length,
-            #[cfg(not(target_arch = "wasm32"))]
-            commands: BTreeMap::new(),
-            #[cfg(target_arch = "wasm32")]
             commands: Vec::new(),
             cached_frame: -1,
+            cached_buckets: 0,
             cached: [0; 3],
             dead_since: None,
             has_recovery: false,
@@ -332,31 +327,25 @@ impl Life {
     fn frame_of(&self, time: i32) -> usize {
         (frame(time) as usize).min(self.frames - 1)
     }
-    #[cfg(not(target_arch = "wasm32"))]
     fn add(&mut self, command: Command) {
         if self.dead_since.is_some_and(|time| command.time <= time) {
             self.dead_since = None;
         }
         let frame = self.frame_of(command.time);
-        let commands = Rc::make_mut(self.commands.entry(frame).or_default());
-        let at = commands.partition_point(|c| c.time <= command.time);
-        commands.insert(at, command);
-        if frame as i32 <= self.cached_frame {
-            self.cached_frame = -1;
-            self.cached = [0; 3];
-        }
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    fn add(&mut self, command: Command) {
-        if self.dead_since.is_some_and(|time| command.time <= time) {
-            self.dead_since = None;
-        }
-        let frame = self.frame_of(command.time);
-        let index = match self.commands.binary_search_by_key(&frame, |(at, _)| *at) {
-            Ok(index) => index,
-            Err(index) => {
-                self.commands.insert(index, (frame, Rc::default()));
+        let index = match self.commands.last() {
+            Some((last, _)) if *last == frame => self.commands.len() - 1,
+            Some((last, _)) if *last > frame => {
+                match self.commands.binary_search_by_key(&frame, |(at, _)| *at) {
+                    Ok(index) => index,
+                    Err(index) => {
+                        self.commands.insert(index, (frame, Rc::default()));
+                        index
+                    }
+                }
+            }
+            _ => {
+                let index = self.commands.len();
+                self.commands.push((frame, Rc::default()));
                 index
             }
         };
@@ -365,7 +354,7 @@ impl Life {
         commands.insert(at, command);
         if frame as i32 <= self.cached_frame {
             self.cached_frame = -1;
-            self.cached = [0; 3];
+            self.cached_buckets = 0;
         }
     }
     pub fn note_damage(&mut self, time: i32, judgement: usize) {
@@ -507,7 +496,6 @@ impl Life {
         }
         *state = [life, guard, reduction];
     }
-    #[cfg(not(target_arch = "wasm32"))]
     pub fn at(&mut self, time: i32) -> i32 {
         if let Some(values) = self.frozen { return values[self.frozen_phase].0; }
         if self.dead_since.is_some_and(|dead| dead <= time) { return 0; }
@@ -515,79 +503,31 @@ impl Life {
             return self.initial;
         }
         let frame = self.frame_of(time);
-        let c = self.cached_frame;
-        let full = c >= 0 && frame as i32 <= c;
-        let (mut state, start) = if c < 0 || frame as i32 <= c {
+        let rewind = frame as i32 <= self.cached_frame;
+        let (mut state, mut at) = if rewind || self.cached_frame < 0 {
             ([self.initial, 0, 0], 0)
         } else {
-            (self.cached, (c + 1) as usize)
+            (self.cached, self.cached_buckets)
         };
-        for commands in self.commands.range(start..frame.max(start)).map(|(_, v)| v) {
+        // Cache the state before this frame, including the command cursor.
+        // Late commands invalidate the cursor when they reach that prefix.
+        while let Some((_, commands)) = self.commands.get(at).filter(|(when, _)| *when < frame) {
             for command in commands.iter() {
                 self.step(&mut state, command);
             }
+            at += 1;
         }
-        if !full {
+        if !rewind {
             self.cached_frame = frame as i32 - 1;
+            self.cached_buckets = at;
             self.cached = state;
         }
-        for command in self.commands.get(&frame).into_iter().flat_map(|commands| commands.iter()) {
-            if command.time > time {
-                break;
-            }
-            self.step(&mut state, command);
-        }
-        // Once zero was reached without any recovery, a later change to
-        // maximum LIFE cannot change that history.
-        if !full && !self.has_recovery && state[0] == 0 { self.dead_since = Some(time); }
-        state[0]
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    pub fn at(&mut self, time: i32) -> i32 {
-        if let Some(values) = self.frozen { return values[self.frozen_phase].0; }
-        if self.dead_since.is_some_and(|dead| dead <= time) { return 0; }
-        if self.commands.is_empty() {
-            return self.initial;
-        }
-        let frame = self.frame_of(time);
-        let c = self.cached_frame;
-        let full = c >= 0 && frame as i32 <= c;
-        let (mut state, start) = if c < 0 || frame as i32 <= c {
-            ([self.initial, 0, 0], 0)
-        } else {
-            (self.cached, (c + 1) as usize)
-        };
-        let end = self.commands.partition_point(|(at, _)| *at < frame);
-        let begin = if start == 0 {
-            0
-        } else if start >= frame {
-            end
-        } else {
-            self.commands[..end].partition_point(|(at, _)| *at < start)
-        };
-        for (_, commands) in &self.commands[begin..end] {
-            for command in commands.iter() {
+        if let Some((_, commands)) = self.commands.get(at).filter(|(when, _)| *when == frame) {
+            for command in commands.iter().take_while(|command| command.time <= time) {
                 self.step(&mut state, command);
             }
         }
-        if !full {
-            self.cached_frame = frame as i32 - 1;
-            self.cached = state;
-        }
-        for command in self
-            .commands
-            .get(end)
-            .filter(|(at, _)| *at == frame)
-            .into_iter()
-            .flat_map(|(_, commands)| commands.iter())
-        {
-            if command.time > time {
-                break;
-            }
-            self.step(&mut state, command);
-        }
-        if !full && !self.has_recovery && state[0] == 0 { self.dead_since = Some(time); }
+        if !rewind && !self.has_recovery && state[0] == 0 { self.dead_since = Some(time); }
         state[0]
     }
     pub fn sync(&mut self, time: i32) {

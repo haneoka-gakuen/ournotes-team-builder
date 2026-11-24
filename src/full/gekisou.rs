@@ -503,6 +503,7 @@ pub struct Controller {
     limited: Vec<(i32, i32, i32)>,
     limited_ids: HashSet<i32>,
     pending: Vec<Vec<(i32, i32, i32)>>,
+    pending_ranges: usize,
     lot_result: i32,
     pub lot_results: Vec<i32>,
     pub updates: Vec<usize>,
@@ -616,6 +617,7 @@ impl Controller {
             limited: Vec::new(),
             limited_ids: HashSet::default(),
             pending: vec![Vec::new(); n],
+            pending_ranges: 0,
             lot_result: -1,
             lot_results: Vec::new(),
             updates: Vec::new(),
@@ -793,7 +795,7 @@ impl Controller {
 
     pub(super) fn between_lottery_ranges(&self) -> bool {
         self.playing.is_empty() && self.updates.is_empty() && self.lot_results.is_empty()
-            && self.pending.iter().all(Vec::is_empty)
+            && self.pending_ranges == 0
             && self.states.iter().all(|state| matches!(state.state, WAIT | STANDBY | FINISH))
     }
 
@@ -1109,7 +1111,9 @@ impl Controller {
         }
         if self.ranges[index].mission == MISSION_LUCK {
             if self.states[index].state < START {
-                self.pending[index].push((op, time, judgement));
+                let pending = &mut self.pending[index];
+                self.pending_ranges += usize::from(pending.is_empty());
+                pending.push((op, time, judgement));
             } else {
                 self.update_luck(index, op, time, judgement, env)?;
             }
@@ -1124,23 +1128,40 @@ impl Controller {
         score: i32,
         env: &mut Environment<'_>,
     ) -> Result<(), String> {
-        for index in 0..self.states.len() {
-            if self.states[index].state > STANDBY && !self.pending[index].is_empty() {
-                let pending = std::mem::take(&mut self.pending[index]);
-                for (op, time, judgement) in pending {
-                    self.update_luck(index, op, time, judgement, env)?;
+        if self.pending_ranges != 0 {
+            for index in 0..self.states.len() {
+                if self.states[index].state > STANDBY && !self.pending[index].is_empty() {
+                    self.pending_ranges -= 1;
+                    let pending = std::mem::take(&mut self.pending[index]);
+                    for (op, time, judgement) in pending {
+                        self.update_luck(index, op, time, judgement, env)?;
+                    }
                 }
             }
         }
-        for index in 0..self.states.len() {
-            for &(id, op, time, judgement) in judged {
-                let targeted = if let Some(targets) = &self.targets_by_note {
-                    targets.get(id as usize).is_some_and(|&mask| mask & (1 << index) != 0)
-                } else {
-                    self.ranges[index].targets.contains(&id)
-                };
-                if targeted {
+        match (judged, &self.targets_by_note) {
+            ([], _) => {}
+            (&[(id, op, time, judgement)], Some(targets)) => {
+                let mut ranges = targets.get(id as usize).copied().unwrap_or(0);
+                while ranges != 0 {
+                    let index = ranges.trailing_zeros() as usize;
+                    ranges &= ranges - 1;
                     self.judge(index, op, time, judgement, env)?;
+                }
+            }
+            _ => {
+                // Overlapping ranges settle each frame in range order.
+                for index in 0..self.states.len() {
+                    for &(id, op, time, judgement) in judged {
+                        let targeted = if let Some(targets) = &self.targets_by_note {
+                            targets.get(id as usize).is_some_and(|&mask| mask & (1 << index) != 0)
+                        } else {
+                            self.ranges[index].targets.contains(&id)
+                        };
+                        if targeted {
+                            self.judge(index, op, time, judgement, env)?;
+                        }
+                    }
                 }
             }
         }
@@ -1225,7 +1246,9 @@ impl Controller {
                 self.disable_rush(time, env)?;
             }
         }
-        self.playing.retain(|index| !remove.contains(index));
+        if !remove.is_empty() {
+            self.playing.retain(|index| !remove.contains(index));
+        }
         for &(index, fever) in fever_updates {
             if index >= self.states.len() {
                 return Err("IndexOutOfRangeException: fever without a Gekisou range".into());

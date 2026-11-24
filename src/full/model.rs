@@ -102,6 +102,14 @@ struct CondSkill {
     steady_rows: bool,
     updater: ConditionUpdater,
 }
+pub(crate) struct ConverterFrame {
+    pub(crate) index: usize,
+    states: [u8; 3],
+    playing: i8,
+    updates: [u8; 3],
+    updated: u8,
+}
+
 #[derive(Clone)]
 pub(crate) struct ComboSupportFrame {
     pub time: i32,
@@ -1042,17 +1050,19 @@ impl<'a> Model<'a> {
             record.frames.push(LuckFrame { states: Arc::clone(&previous.states), updates: Vec::new(), playing: previous.playing });
         }
         if self.score.score.factored_record {
-            self.score.score.calculate(time, &self.combo, None)?;
+            self.score.score.record_calculation(time, &self.combo)?;
             self.life.enter_phase(1);
             let first = (self.life.at(time), self.life.maximum());
             self.life.enter_phase(2);
             let second = (self.life.at(time), self.life.maximum());
             self.life.sync(time);
             self.score.score.replay.as_mut().unwrap().push(score::ReplayCommand::Ordinary(time, [first, second]));
-            self.score.score.calculate(time, &self.combo, None)?;
+            self.score.score.record_calculation(time, &self.combo)?;
         } else {
             self.life.sync(time);
-            self.score.score.calculate(time, &self.combo, self.gk.as_ref().map(|g| &g.controller as &dyn score::GekisoCombo))?;
+            if self.score.score.settled_score(time).is_none() {
+                self.score.score.calculate(time, &self.combo, self.gk.as_ref().map(|g| &g.controller as &dyn score::GekisoCombo))?;
+            }
         }
         Ok(())
     }
@@ -1121,14 +1131,14 @@ impl<'a> Model<'a> {
         }
         supported
     }
-    pub(crate) fn prepare_lottery_notes(&self, judged: &[JudgedNote], life: &[i32]) -> Result<lottery::PreparedLotteryNotes, String> {
+    pub(crate) fn prepare_lottery_notes(&self, judged: Option<&Arc<[JudgedNote]>>, life: &[i32]) -> Result<lottery::PreparedLotteryNotes, String> {
         lottery::prepare_notes(self, judged, life)
     }
 
-    pub(crate) fn record_lottery_frame(&mut self, time: i32, judged: &[JudgedNote],
+    pub(crate) fn record_lottery_frame(&mut self, time: i32,
         prepared: &lottery::PreparedLotteryNotes, dt: f64) -> Result<(), String> {
         debug_assert!(self.score.score.record_only && self.score.score.factored_record);
-        lottery::record_frame(self, time, judged, prepared, dt)
+        lottery::record_frame(self, time, prepared, dt)
     }
 
     pub(crate) fn lottery_gap_is_inert(&self, through: Option<i32>) -> bool {
@@ -1158,15 +1168,64 @@ impl<'a> Model<'a> {
         self.record_frame();
     }
     pub(crate) fn converted_inputs(&self) -> &[(i32, i32, i32)] { &self.judged }
-    pub(crate) fn converter_frame(&mut self, time: i32, judged: &[JudgedNote], dt: f64) -> Result<(), String> {
+    pub(crate) fn converter_frames(
+        &mut self,
+        play: &play::Play,
+        fevers: &[(i32, i32)],
+        frames: std::ops::Range<usize>,
+    ) -> Result<Vec<ConverterFrame>, String> {
+        let mut boundaries = vec![false; play.frames.len()];
+        for &(start, finish) in fevers {
+            for time in [start, finish] {
+                let at = play.frames.partition_point(|frame| frame.time_ms < time);
+                if let Some(boundary) = boundaries.get_mut(at) { *boundary = true; }
+            }
+        }
+        let generation = crate::cancellation_generation();
+        let mut wake_until = frames.start;
+        let mut ready = Vec::new();
+        let g = self.gk.as_mut().unwrap();
+        for index in frames {
+            let frame = &play.frames[index];
+            let transition = g.controller.states.iter()
+                .any(|state| matches!(state.state, gekisou::START | gekisou::END | gekisou::DELAY | gekisou::COMPLETE));
+            if frame.judged.is_empty() && !boundaries[index] && index > wake_until && !transition { continue; }
+            if generation != crate::cancellation_generation() { return Err("cancelled".into()); }
+            g.fever_updates = g.fever.update(frame.time_ms);
+            g.controller.before_update(play.dt[index], frame.time_ms, &g.fever_updates, 0, &mut Environment {
+                random: &mut self.random, handle: &mut self.score,
+            })?;
+            let mut updates = [0; 3];
+            for (target, &range) in updates.iter_mut().zip(&g.controller.updates) {
+                *target = range as u8;
+            }
+            ready.push(ConverterFrame {
+                index,
+                states: std::array::from_fn(|i| g.controller.states.get(i).map_or(0, |state| state.state as u8)),
+                playing: g.controller.current_playing as i8,
+                updates,
+                updated: g.controller.updates.len() as u8,
+            });
+            if !frame.judged.is_empty() { wake_until = index + 2; }
+        }
+        Ok(ready)
+    }
+
+    pub(crate) fn converter_frame(&mut self, frame: &play::Frame, phase: &ConverterFrame) -> Result<(), String> {
         debug_assert!(self.rows.iter().all(|row| row.kind == 13005) && self.live.is_empty());
+        let time = frame.time_ms;
+        let judged = &frame.judged;
         self.frame_time = time;
         self.frame_rank = None;
-        let g = self.gk.as_mut().unwrap();
-        g.fever_updates = g.fever.update(time);
-        g.controller.before_update(dt, time, &g.fever_updates, 0, &mut Environment {
-            random: &mut self.random, handle: &mut self.score,
-        })?;
+        // This path compiles LIFE and owner gates and reads the controller
+        // only through mission and range checks for the conversion skills.
+        let controller = &mut self.gk.as_mut().unwrap().controller;
+        controller.current_playing = i32::from(phase.playing);
+        controller.updates.clear();
+        controller.updates.extend(phase.updates[..usize::from(phase.updated)].iter().copied().map(usize::from));
+        for (state, &value) in controller.states.iter_mut().zip(&phase.states) {
+            state.state = i32::from(value);
+        }
         self.frame_events.clear();
         self.judged.clear();
         for input in judged {
@@ -1299,13 +1358,15 @@ impl<'a> Model<'a> {
                     .add_note(n.time_ms, life, n.id, n.op, score_type);
             }
         }
-        if !COUNTS_ONLY {self.score.score.calculate(
-            time,
-            &self.combo,
-            self.gk
-                .as_ref()
-                .map(|g| &g.controller as &dyn score::GekisoCombo),
-        )?;}
+        if factored_record {
+            self.score.score.record_calculation(time, &self.combo)?;
+        } else if !COUNTS_ONLY && self.score.score.settled_score(time).is_none() {
+            self.score.score.calculate(
+                time,
+                &self.combo,
+                self.gk.as_ref().map(|g| &g.controller as &dyn score::GekisoCombo),
+            )?;
+        }
         let input = FrameInput {
             time,
             music_length: self.params.music_length,
@@ -1514,13 +1575,15 @@ impl<'a> Model<'a> {
             .retain(|&index| self.live[index].parent != effects::STAY);
         self.life.sync(time);
         if factored_record { self.score.score.replay.as_mut().unwrap().push(score::ReplayCommand::Ordinary(time, phase_life)); }
-        if !COUNTS_ONLY {self.score.score.calculate(
-            time,
-            &self.combo,
-            self.gk
-                .as_ref()
-                .map(|g| &g.controller as &dyn score::GekisoCombo),
-        )?;}
+        if factored_record {
+            self.score.score.record_calculation(time, &self.combo)?;
+        } else if !COUNTS_ONLY && self.score.score.settled_score(time).is_none() {
+            self.score.score.calculate(
+                time,
+                &self.combo,
+                self.gk.as_ref().map(|g| &g.controller as &dyn score::GekisoCombo),
+            )?;
+        }
         if self.gk.is_some() {
             if let Some(index) = self.after::<COUNTS_ONLY>(time)? {
                 let g = self.gk.as_ref().unwrap();

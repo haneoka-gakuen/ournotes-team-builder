@@ -267,7 +267,7 @@ pub trait Objective {
         None
     }
     fn assignment_options(
-        &self,
+        &mut self,
         _members: &[usize],
         _assigned: &[i32],
         _from: usize,
@@ -3540,10 +3540,15 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         );
         if optimistic < self.assignment_limit(a)
             || self.cannot_improve_set(a, optimistic)
-            || (slot > 0
-                && slot < 5
-                && self.remaining_bound(a, slot, totals) < self.assignment_limit(a))
             || 5 - slot < required_left
+        {
+            return Ok(());
+        }
+        let selected = self.input.objective.assignment_options(
+            &a.team, &a.assigned, slot, self.assignment_limit(a),
+        );
+        if selected.as_ref().is_some_and(Vec::is_empty)
+            || slot > 0 && self.remaining_bound(a, slot, totals) < self.assignment_limit(a)
         {
             return Ok(());
         }
@@ -3590,12 +3595,9 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
         }
         let member = a.team[slot];
         let mut options = std::mem::take(&mut self.option_scratch[slot]);
-        if let Some(selected) = self.input.objective.assignment_options(
-            &a.team,
-            &a.assigned,
-            slot,
-            self.assignment_limit(a),
-        ) {
+        if let Some(selected) = selected.or_else(|| self.input.objective.assignment_options(
+            &a.team, &a.assigned, slot, self.assignment_limit(a),
+        )) {
             options = selected;
         } else {
             options.clone_from(&a.options[slot]);

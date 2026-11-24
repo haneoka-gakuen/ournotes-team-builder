@@ -1929,8 +1929,8 @@ impl BoundPreparation {
         count_times.sort_unstable();
         let mut cumulative_cache = HashMap::default();
         let mut ordinary = Vec::new();
-        let mut ordinary_signature = Vec::new();
-        let mut ordinary_inputs = HashMap::default();
+        let (raw_slot_classes, raw_slot_count) = prepared_skills.raw_slot_classes();
+        let mut ordinary_inputs = vec![None; raw_slot_count];
         let mut ordinary_profiles = HashMap::default();
         let mut ordinary_profile = |slot: &live::Slot| -> Option<(PreparedOrdinary, Vec<u64>)> {
             if slot
@@ -2193,9 +2193,10 @@ impl BoundPreparation {
                     }
                 }
                 score_rows.sort_unstable();
-                let slot = &prepared_skills.slots[member_index * (snaps.len() + 1) + snap_index];
-                slot.write_signature(&mut ordinary_signature);
-                let ordinary_id = if let Some(&id) = ordinary_inputs.get(&ordinary_signature) {
+                let index = member_index * (snaps.len() + 1) + snap_index;
+                let slot = &prepared_skills.slots[index];
+                let class = raw_slot_classes[index];
+                let ordinary_id = if let Some(id) = ordinary_inputs[class] {
                     id
                 } else {
                     let (profile, conversion) = ordinary_profile(slot)?;
@@ -2205,7 +2206,7 @@ impl BoundPreparation {
                         ordinary.push(profile);
                         next
                     });
-                    ordinary_inputs.insert(ordinary_signature.clone(), id);
+                    ordinary_inputs[class] = Some(id);
                     id
                 };
                 let pulse = if chart.accuracy.great != 0.0 && slot.convert.as_ref().is_some_and(|convert| convert.judgements.contains(&4)) {
@@ -2331,59 +2332,50 @@ impl CumulativeLayout {
         ranges: &[(i32, i32)],
     ) -> Option<Self> {
         let mut plans = Vec::<Vec<Vec<(f64, f64, f64, f64)>>>::new();
+        let actors: Vec<_> = members.iter()
+            .map(|member| Performer::from_member(master, member, None))
+            .filter(|actor| actor.gekisou_skill.is_some())
+            .collect();
         for snap in snaps {
-            let mut variants = Vec::new();
-            for member in members {
-                let p = Performer::from_member(master, member, Some(snap));
-                if p.gekisou_skill.is_none() {
+            if actors.is_empty() { break; }
+            let mut rows = Vec::new();
+            for (id, level) in snap.card.gekiso_support_skills.into_iter().zip(snap.gekiso_skill_levels) {
+                if id == 0 { continue; }
+                let skill = master.gekiso_support_skills.get(&id)?;
+                if skill.mission_type != 4 && !chart.setup.missions.contains(&skill.mission_type) {
                     continue;
                 }
+                rows.extend(skill.effects.iter().filter(|row| row.level == level && row.kind == 13005)
+                    .map(|row| (row, None)));
+            }
+            if rows.is_empty() { continue; }
+            let mut variants = Vec::new();
+            for actor in &actors {
                 let mut plan = Vec::new();
-                for &(id, level) in &p.gekisou_support_skills {
-                    let skill = master.gekiso_support_skills.get(&id)?;
-                    if skill.mission_type != 4
-                        && !chart.setup.missions.contains(&skill.mission_type)
-                    {
+                for (row, prepared) in &mut rows {
+                    if !static_gk_group(master, row.condition_group, actor)? { continue; }
+                    if let Some(program) = *prepared {
+                        plan.push(program);
                         continue;
                     }
-                    for row in skill
-                        .effects
+                    let sets = master.condition_sets.get(&row.trigger_group)?;
+                    if sets.len() != 1 {
+                        return None;
+                    }
+                    let n = sets[0]
                         .iter()
-                        .filter(|r| r.level == level && r.kind == 13005)
-                    {
-                        if !static_gk_group(master, row.condition_group, &p)? {
-                            continue;
-                        }
-                        let sets = master.condition_sets.get(&row.trigger_group)?;
-                        if sets.len() != 1 {
-                            return None;
-                        }
-                        let n = sets[0]
-                            .iter()
-                            .filter_map(|id| master.conditions.get(id))
-                            .filter(|c| c.kind == 1030 && c.positive)
-                            .filter_map(|c| c.values.first().copied())
-                            .filter(|&n| n > 0.0)
-                            .fold(f64::INFINITY, f64::min);
-                        if !n.is_finite() || row.limit_count <= 0 {
-                            return None;
-                        }
-                        let guarded = sets[0]
-                            .iter()
-                            .filter_map(|id| master.conditions.get(id))
-                            .any(|c| {
-                                c.kind == 7020
-                                    && c.positive
-                                    && !c.targets.is_empty()
-                                    && c.targets.iter().all(|id| {
-                                        master
-                                            .targets
-                                            .get(id)
-                                            .is_some_and(|t| [1, 3, 4].contains(&t.mission_type))
-                                    })
-                            });
-                        let range_position = sets[0].iter().position(|id| {
-                            let c = &master.conditions[id];
+                        .filter_map(|id| master.conditions.get(id))
+                        .filter(|c| c.kind == 1030 && c.positive)
+                        .filter_map(|c| c.values.first().copied())
+                        .filter(|&n| n > 0.0)
+                        .fold(f64::INFINITY, f64::min);
+                    if !n.is_finite() || row.limit_count <= 0 {
+                        return None;
+                    }
+                    let guarded = sets[0]
+                        .iter()
+                        .filter_map(|id| master.conditions.get(id))
+                        .any(|c| {
                             c.kind == 7020
                                 && c.positive
                                 && !c.targets.is_empty()
@@ -2394,28 +2386,36 @@ impl CumulativeLayout {
                                         .is_some_and(|t| [1, 3, 4].contains(&t.mission_type))
                                 })
                         });
-                        let count_position = sets[0]
-                            .iter()
-                            .position(|id| master.conditions[id].kind == 1030);
-                        if !guarded
-                            || !range_position
-                                .zip(count_position)
-                                .is_some_and(|(range, count)| {
-                                    range < count
-                                        && sets[0][..range].iter().all(|id| {
-                                            [0, 5000].contains(&master.conditions[id].kind)
-                                        })
-                                })
-                        {
-                            return None;
-                        }
-                        plan.push((
-                            n,
-                            row.limit_count as f64,
-                            if guarded { 0.0 } else { 1.0 },
-                            range_execute_limit(master, row),
-                        ));
+                    let range_position = sets[0].iter().position(|id| {
+                        let c = &master.conditions[id];
+                        c.kind == 7020
+                            && c.positive
+                            && !c.targets.is_empty()
+                            && c.targets.iter().all(|id| {
+                                master
+                                    .targets
+                                    .get(id)
+                                    .is_some_and(|t| [1, 3, 4].contains(&t.mission_type))
+                            })
+                    });
+                    let count_position = sets[0]
+                        .iter()
+                        .position(|id| master.conditions[id].kind == 1030);
+                    if !guarded
+                        || !range_position
+                            .zip(count_position)
+                            .is_some_and(|(range, count)| {
+                                range < count
+                                    && sets[0][..range].iter().all(|id| {
+                                        [0, 5000].contains(&master.conditions[id].kind)
+                                    })
+                            })
+                    {
+                        return None;
                     }
+                    let program = (n, row.limit_count as f64, 0.0, range_execute_limit(master, row));
+                    *prepared = Some(program);
+                    plan.push(program);
                 }
                 if !plan.is_empty() && !variants.contains(&plan) {
                     variants.push(plan);
@@ -2454,11 +2454,13 @@ impl CumulativeLayout {
         perfect.sort_unstable();
         convertible.sort_unstable();
         other.sort_unstable();
-        let causal = if other.is_empty() && plans.iter().flatten().flatten().all(|r| r.2 == 0.0) {
+        let has_converters = !convertible.is_empty() && !plans.is_empty();
+        let causal = if has_converters && other.is_empty() && plans.iter().flatten().flatten().all(|r| r.2 == 0.0) {
             let mut budgets = Vec::with_capacity(perfect.len() + 1);
+            let mut options = Vec::with_capacity(plans.len());
             for count in 0..=perfect.len() {
-                let mut options: Vec<_> = plans
-                    .iter()
+                options.clear();
+                options.extend(plans.iter()
                     .map(|variants| {
                         variants
                             .iter()
@@ -2470,8 +2472,7 @@ impl CumulativeLayout {
                                     .sum::<f64>()
                             })
                             .fold(0.0, f64::max)
-                    })
-                    .collect();
+                    }));
                 options.sort_by(|a, b| b.total_cmp(a));
                 let mut row = [0.0; 6];
                 for c in 1..=5 {
@@ -2513,6 +2514,27 @@ impl CumulativeLayout {
         } else {
             None
         };
+        let extra_capacity = |range: usize, lower: i32, upper: i32, p: usize| -> [f64; 6] {
+            if let Some(causal) = &causal {
+                return causal[range].each_ref().map(|times| times.partition_point(|&t| t <= upper) as f64);
+            }
+            if !has_converters {
+                return [0.0; 6];
+            }
+            let available = convertible.partition_point(|&t| t <= upper) - convertible.partition_point(|&t| t < lower);
+            let mut extras: Vec<_> = plans.iter().map(|variants| {
+                variants.iter().map(|plan| plan.iter().map(|&(n, limit, initial, cap)| {
+                    ((p as f64 / n).floor() + initial).min(cap) * limit
+                }).sum::<f64>()).fold(0.0, f64::max)
+            }).collect();
+            extras.sort_by(|a, b| b.total_cmp(a));
+            let mut capacities = [0.0; 6];
+            for c in 1..=5 {
+                capacities[c] = (capacities[c - 1] + extras.get(c - 1).copied().unwrap_or(0.0))
+                    .min(available as f64);
+            }
+            capacities
+        };
         let counts = chart
             .times
             .iter()
@@ -2526,34 +2548,7 @@ impl CumulativeLayout {
                 let p = perfect.partition_point(|&t| t <= end)
                     - perfect.partition_point(|&t| t < start);
                 let o = other.partition_point(|&t| t <= end) - other.partition_point(|&t| t < start);
-                let available = convertible.partition_point(|&t| t <= end)
-                    - convertible.partition_point(|&t| t < start);
-                let mut extras: Vec<_> = plans
-                    .iter()
-                    .map(|variants| {
-                        variants
-                            .iter()
-                            .map(|plan| {
-                                plan.iter()
-                                    .map(|&(n, limit, initial, cap)| {
-                                        ((p as f64 / n).floor() + initial).min(cap) * limit
-                                    })
-                                    .sum::<f64>()
-                            })
-                            .fold(0.0, f64::max)
-                    })
-                    .collect();
-                extras.sort_by(|a, b| b.total_cmp(a));
-                let mut capacities = [0.0; 6];
-                for c in 1..=5 {
-                    capacities[c] = (capacities[c - 1] + extras.get(c - 1).copied().unwrap_or(0.0))
-                        .min(available as f64);
-                }
-                if let Some(causal) = &causal {
-                    for (c, value) in capacities.iter_mut().enumerate() {
-                        *value = causal[range][c].partition_point(|&t| t <= end) as f64;
-                    }
-                }
+                let capacities = extra_capacity(range, start, end, p);
                 Some(CounterFrame {
                     just: j as f64,
                     combo: (j + p + o) as f64,
@@ -2569,34 +2564,7 @@ impl CumulativeLayout {
             let j = just.partition_point(|&t| t <= to) - just.partition_point(|&t| t < start);
             let p = perfect.partition_point(|&t| t <= to) - perfect.partition_point(|&t| t < start);
             let o = other.partition_point(|&t| t <= to) - other.partition_point(|&t| t < start);
-            let available = convertible.partition_point(|&t| t <= to)
-                - convertible.partition_point(|&t| t < start);
-            let mut extras: Vec<_> = plans
-                .iter()
-                .map(|variants| {
-                    variants
-                        .iter()
-                        .map(|plan| {
-                            plan.iter()
-                                .map(|&(n, limit, initial, cap)| {
-                                    ((p as f64 / n).floor() + initial).min(cap) * limit
-                                })
-                                .sum::<f64>()
-                        })
-                        .fold(0.0, f64::max)
-                })
-                .collect();
-            extras.sort_by(|a, b| b.total_cmp(a));
-            let mut capacities = [0.0; 6];
-            for c in 1..=5 {
-                capacities[c] = (capacities[c - 1] + extras.get(c - 1).copied().unwrap_or(0.0))
-                    .min(available as f64);
-            }
-            if let Some(causal) = &causal {
-                for (c, value) in capacities.iter_mut().enumerate() {
-                    *value = causal[i][c].partition_point(|&t| t <= to) as f64;
-                }
-            }
+            let capacities = extra_capacity(i, start, to, p);
             let maximum = (j + p + o) as f64;
             limits.push((chart.setup.missions[i], j as f64, capacities, maximum));
         }
@@ -2979,6 +2947,7 @@ pub(crate) struct DeterministicBound {
     pricing_frontiers: PricingFrontiers,
     sparse_matrix: [Vec<(usize, f64)>; 5],
     snapshot_power: Arc<Vec<f64>>,
+    nonnegative_snapshots: bool,
     snapshot_bonus: Arc<Vec<f64>>,
     converted: f64,
     baseline_gains: Vec<f64>,
@@ -5031,6 +5000,7 @@ impl DeterministicBound {
             pricing_frontiers: vec![vec![None; capacity + 1]; members.len()],
             sparse_matrix: std::array::from_fn(|_| Vec::new()),
             snapshot_power: Arc::new(Vec::new()),
+            nonnegative_snapshots: false,
             snapshot_bonus: Arc::new(Vec::new()),
             base: mul(
                 add(add(all, mul(all, errors[0])), mul(all_max, residual)),
@@ -6092,6 +6062,43 @@ impl DeterministicBound {
         } else { original }
     }
 
+    pub(crate) fn final_snapshot_mean_bounds(
+        &self,
+        members: &[usize],
+        prefix: &[i32],
+        snapshots: &[i32],
+        powers: &[f64],
+        ceilings: &mut [f64],
+    ) {
+        let positions: [usize; 4] = std::array::from_fn(|slot|
+            members[slot] * self.width + (prefix[slot] + 1) as usize);
+        let converters = positions.iter().filter(|&&index| self.converters[index]).count();
+        let counts = [converters.min(self.capacity), (converters + 1).min(self.capacity)];
+        let gains = counts.map(|count| positions.iter().fold(0.0, |sum, &position| {
+            add(sum, up(self.shared_means[self.ids[position][count] as usize]))
+        }));
+        let overlap = positions.iter().fold(0.0_f64, |sum, &position| {
+            (sum + self.conversion_extras[position]).next_down().max(0.0)
+        });
+        let last = members[4] * self.width;
+        for ((&snap, &power), ceiling) in snapshots.iter().zip(powers).zip(ceilings) {
+            let position = last + (snap + 1) as usize;
+            let converter = usize::from(self.converters[position]);
+            let id = self.ids[position][counts[converter]] as usize;
+            let variable = add(gains[converter], up(self.shared_means[id]));
+            let coefficient = up(add(self.base, variable) / self.converted);
+            let coefficient = self.with_normal_error(coefficient, self.assignment_normal_error);
+            let deduction = if self.capacity == 0 {
+                0.0
+            } else {
+                let total = (overlap + self.conversion_extras[position]).next_down().max(0.0);
+                let excess = (total - self.conversion_extra_cap).next_down().max(0.0);
+                (excess / self.converted).next_down().max(0.0)
+            };
+            *ceiling = ceiling.min(mul(power, (coefficient - deduction).next_up().max(0.0)));
+        }
+    }
+
     pub(crate) fn formation_order_ceilings(&self, members: &[usize], snaps: &[i32], power: f64) -> [f64; 120] {
         let positions: [usize; 5] = std::array::from_fn(|slot| {
             members[slot] * self.width + (snaps[slot] + 1) as usize
@@ -6237,6 +6244,24 @@ impl DeterministicBound {
             })
             .count()
             .min(self.capacity);
+        if criterion == Criterion::Mean && from == 4
+            && self.nonnegative_snapshots && base_power.is_finite() && base_power >= 0.0
+        {
+            let mut power = base_power;
+            let mut score = self.base;
+            for (slot, &snap) in assigned[..4].iter().enumerate() {
+                let start = members[slot] * self.width;
+                let column = if snap < 0 { self.width - 1 } else { snap as usize };
+                power = add(power, self.snapshot_power[start + column]);
+                let id = self.ids[start + (snap + 1) as usize][count] as usize;
+                score = add(score, up(self.shared_means[id]));
+            }
+            // With one slot open, the product is monotone in both coordinates.
+            // The frontier may retain used snapshots, which only raises the bound.
+            return self.score_frontiers[members[4]][count][5].iter()
+                .map(|&(points, gain)| up(mul(add(power, points), add(score, gain)) / self.converted))
+                .fold(f64::NEG_INFINITY, f64::max);
+        }
         let ratio = ((self.base + totals.skill) / totals.power.max(1.0)).sqrt();
         if !ratio.is_finite() || ratio <= 0.0 {
             return f64::INFINITY;
@@ -6609,6 +6634,7 @@ impl DeterministicBound {
         mul(part.power, coefficient)
     }
     pub(crate) fn snapshot_power(&mut self, power: Arc<Vec<f64>>) {
+        self.nonnegative_snapshots = power.iter().all(|value| value.is_finite() && *value >= 0.0);
         self.snapshot_power = power;
     }
     pub(crate) fn just_ceiling(&self) -> usize {

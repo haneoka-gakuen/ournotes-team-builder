@@ -95,7 +95,7 @@ pub(crate) struct SourceRow<'a> {
     pub fixed: bool,
 }
 pub(crate) struct Assignment<'a> {
-    pub actors: &'a [Option<Performer>],
+    pub actors: &'a [Option<Arc<Performer>>],
     pub slots: &'a [crate::live::Slot],
     pub powers: &'a [f64],
     pub width: usize,
@@ -1211,7 +1211,7 @@ impl Compiler {
         for &snap in row.snaps {
             let index = row.member * input.width + (snap + 1) as usize;
             let choice = Choice {
-                actor: input.actors[index].as_ref().unwrap(),
+                actor: input.actors[index].as_deref().unwrap(),
                 slot: &input.slots[index],
                 index,
                 power: input.powers[row.member * input.width

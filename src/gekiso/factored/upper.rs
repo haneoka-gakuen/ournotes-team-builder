@@ -21,12 +21,16 @@ pub(crate) struct OrdinaryWindow {
 pub(super) struct ProjectionInputs {
     live: Arc<crate::master::LiveTables>,
     positions: Vec<usize>,
-    score_frames: Option<Vec<usize>>,
+    score_frames: Vec<usize>,
+    monotonic_frames: bool,
+    note_frames: Vec<usize>,
     note_prefix: Vec<f64>,
     combo_range: Vec<bool>,
+    rank_weights: Vec<f64>,
     judge: [Option<f64>; 7],
     combos: [Vec<(usize, f64)>; 2],
     converted: f64,
+    batches: Mutex<BatchProjections>,
 }
 
 impl ProjectionInputs {
@@ -46,6 +50,9 @@ impl ProjectionInputs {
         for (position, &(id, _)) in chart.prepared_notes().chronological().iter().enumerate() {
             positions[id as usize] = position;
         }
+        let rank_weights = chart.range_of.iter().map(|&range| {
+            if range < 0 { 0.0 } else { (chart.range_percent[range as usize] as f64 / 100.0).next_up() }
+        }).collect();
         let judge = std::array::from_fn(|grade| master.live.judge_percent.get(&(grade as i32))
             .map(|value| value / 100.0).filter(|&value| value.is_finite() && value >= 0.0));
         let combos = std::array::from_fn(|kind| {
@@ -59,9 +66,10 @@ impl ProjectionInputs {
             rows
         });
         let frame_count = Rewinds::size(chart.music_length) + 1;
-        let frames = chart.play.frames.iter().map(|frame| Rewinds::frame_at(frame.time_ms, frame_count)).collect::<Vec<_>>();
-        let score_frames = frames.windows(2).all(|pair| pair[0] <= pair[1]).then_some(frames);
-        Some(Self { live: Arc::clone(&master.live), positions, score_frames, note_prefix, combo_range, judge, combos, converted })
+        let score_frames: Vec<_> = chart.play.frames.iter().map(|frame| Rewinds::frame_at(frame.time_ms, frame_count)).collect();
+        let monotonic_frames = score_frames.windows(2).all(|pair| pair[0] <= pair[1]);
+        let note_frames = chart.full.notes.iter().map(|note| Rewinds::frame_at(note.time_ms, frame_count)).collect();
+        Some(Self { live: Arc::clone(&master.live), positions, score_frames, monotonic_frames, note_frames, note_prefix, combo_range, rank_weights, judge, combos, converted, batches: Mutex::default() })
     }
 
     fn for_chart(master: &Master, chart: &Chart) -> Option<Arc<Self>> {
@@ -82,8 +90,20 @@ impl ProjectionInputs {
         let end = rows.partition_point(|&(minimum, _)| minimum <= count);
         end.checked_sub(1).map_or(1.0_f64.next_up(), |index| rows[index].1)
     }
+    fn note_weight(&self, index: usize, grade: i32, alive: bool, normal_combo: i32, gekiso_combo: i32) -> Option<f64> {
+        let judge = self.judge.get(grade as usize).copied().flatten()?;
+        let normal = self.combo(0, normal_combo as usize);
+        let gekiso = if self.combo_range[index] { self.combo(1, gekiso_combo.max(0) as usize) } else { 1.0 };
+        let life = if alive { 1.0 } else { self.live.life_onus };
+        let rounding = (1.0 + f32::EPSILON as f64).powi(32);
+        let product = [judge, normal, gekiso, life, rounding].into_iter()
+            .fold(self.note_prefix[index], |product, term| (product * term).next_up());
+        Some((product / self.converted).next_up())
+    }
+
 }
 
+#[derive(Clone)]
 pub(crate) struct Projection {
     sums: Vec<[[f64; 2]; 5]>,
     base: f64,
@@ -99,6 +119,27 @@ pub(crate) struct Projection {
 }
 impl Projection {
     fn from_draws(master: &Master, chart: &Chart, draws: &[Arc<ScoreTape>]) -> Option<Self> {
+        let inputs = ProjectionInputs::for_chart(master, chart)?;
+        Self::project_draws(chart, &inputs, draws)
+    }
+
+    fn for_batch(master: &Master, chart: &Chart, draws: &[Arc<ScoreTape>]) -> Option<Arc<Self>> {
+        let inputs = ProjectionInputs::for_chart(master, chart)?;
+        if let Some(projection) = inputs.batches.lock().unwrap().get(draws) {
+            return Some(projection);
+        }
+        let projection = Arc::new(Self::project_draws(chart, &inputs, draws)?);
+        inputs.batches.lock().unwrap().insert(draws, Arc::clone(&projection));
+        Some(projection)
+    }
+
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.sums.capacity() * std::mem::size_of::<[[f64; 2]; 5]>()
+            + (self.control_frames.capacity() + self.ordinary_previous.capacity()) * std::mem::size_of::<usize>()
+    }
+
+    fn project_draws(chart: &Chart, inputs: &ProjectionInputs, draws: &[Arc<ScoreTape>]) -> Option<Self> {
         let mut projection = Self {
             sums: vec![[[0.0; 2]; 5]; chart.notes.len() + 1],
             base: 0.0,
@@ -118,9 +159,11 @@ impl Projection {
                 .then(|| vec![0; chart.play.frames.len()])
                 .unwrap_or_default(),
         };
-        let inputs = ProjectionInputs::for_chart(master, chart)?;
+        let share_weights = draws.len() > 1 && !chart.setup.missions.contains(&1)
+            && draws.iter().all(|draw| Arc::ptr_eq(&draw.combos, &draws[0].combos));
+        let mut weights = share_weights.then(|| vec![None; chart.notes.len()]);
         for draw in draws {
-            draw.project(chart, &inputs, &mut projection)?;
+            draw.project(chart, inputs, &mut projection, weights.as_deref_mut())?;
         }
         for index in 1..projection.control_frames.len() {
             projection.control_frames[index] += projection.control_frames[index - 1];
@@ -136,8 +179,8 @@ impl Projection {
         Some(projection)
     }
 
-    fn append(&mut self, other: Self) {
-        for (left, right) in self.sums.iter_mut().zip(other.sums) {
+    fn append(&mut self, other: &Self) {
+        for (left, right) in self.sums.iter_mut().zip(&other.sums) {
             for (left, right) in left.iter_mut().zip(right) {
                 left[0] = (left[0] + right[0]).next_down();
                 left[1] = (left[1] + right[1]).next_up();
@@ -151,12 +194,12 @@ impl Projection {
         self.local_rewinds &= other.local_rewinds;
         self.control_applications = self.control_applications.max(other.control_applications);
         self.rewinds = self.rewinds.max(other.rewinds);
-        for (left, right) in self.ordinary_previous.iter_mut().zip(other.ordinary_previous) {
+        for (left, right) in self.ordinary_previous.iter_mut().zip(other.ordinary_previous.iter().copied()) {
             *left = (*left).max(right);
         }
         // Recover the per-frame maxima before joining the prefix totals.
         let (mut left_before, mut right_before, mut total) = (0, 0, 0);
-        for (left, right) in self.control_frames.iter_mut().zip(other.control_frames) {
+        for (left, right) in self.control_frames.iter_mut().zip(other.control_frames.iter().copied()) {
             total += (*left - left_before).max(right - right_before);
             left_before = *left;
             right_before = right;
@@ -409,9 +452,12 @@ struct FactorHistory {
     note_extremes: [f64; 2],
     luck: i64,
     luck_extremes: [i64; 2],
-    changed: bool,
+    changed: u8,
 }
 impl FactorHistory {
+    const NOTE: u8 = 1;
+    const LUCK: u8 = 2;
+
     fn new(note: f64, luck: i32) -> Self {
         let luck = i64::from(luck);
         Self {
@@ -419,23 +465,27 @@ impl FactorHistory {
             note_extremes: [note.min(0.0), note.max(0.0)],
             luck,
             luck_extremes: [luck.min(0), luck.max(0)],
-            changed: true,
+            changed: u8::from(note != 0.0) * Self::NOTE | u8::from(luck != 0) * Self::LUCK,
         }
     }
 
     fn apply(&mut self, next: Self) {
-        self.note_extremes[0] =
-            self.note_extremes[0].min((self.note[0] + next.note_extremes[0]).next_down());
-        self.note_extremes[1] =
-            self.note_extremes[1].max((self.note[1] + next.note_extremes[1]).next_up());
-        self.note = [
-            (self.note[0] + next.note[0]).next_down(),
-            (self.note[1] + next.note[1]).next_up(),
-        ];
-        self.luck_extremes[0] = self.luck_extremes[0].min(self.luck + next.luck_extremes[0]);
-        self.luck_extremes[1] = self.luck_extremes[1].max(self.luck + next.luck_extremes[1]);
-        self.luck += next.luck;
-        self.changed = true;
+        if next.changed & Self::NOTE != 0 {
+            self.note_extremes[0] =
+                self.note_extremes[0].min((self.note[0] + next.note_extremes[0]).next_down());
+            self.note_extremes[1] =
+                self.note_extremes[1].max((self.note[1] + next.note_extremes[1]).next_up());
+            self.note = [
+                (self.note[0] + next.note[0]).next_down(),
+                (self.note[1] + next.note[1]).next_up(),
+            ];
+        }
+        if next.changed & Self::LUCK != 0 {
+            self.luck_extremes[0] = self.luck_extremes[0].min(self.luck + next.luck_extremes[0]);
+            self.luck_extremes[1] = self.luck_extremes[1].max(self.luck + next.luck_extremes[1]);
+            self.luck += next.luck;
+        }
+        self.changed |= next.changed;
     }
 }
 
@@ -457,7 +507,7 @@ impl FactorTimeline {
 
     fn flush(&mut self, block: usize) {
         let pending = std::mem::take(&mut self.pending[block]);
-        if pending.changed {
+        if pending.changed != 0 {
             let start = block * Self::BLOCK;
             let end = (start + Self::BLOCK).min(self.notes.len());
             for note in &mut self.notes[start..end] {
@@ -591,12 +641,8 @@ impl Rewinds {
         (core::frame(time) as usize + 1).min(len - 2)
     }
 
-    fn input(&mut self, time: i32, factor: bool) {
-        let frame = self.frame(time);
+    fn input_frame(&mut self, frame: usize) {
         self.first_input = self.first_input.min(frame);
-        if factor {
-            self.factors.push(frame);
-        }
     }
 
     fn calculate(&mut self, time: i32) {
@@ -614,8 +660,8 @@ impl Rewinds {
         self.first_input = usize::MAX;
     }
 
-    fn ordinary(&mut self, time: i32, frame: usize, projection: &mut Projection) {
-        self.local &= self.previous <= self.frame(time);
+    fn ordinary(&mut self, score_frame: usize, frame: usize, projection: &mut Projection) {
+        self.local &= self.previous <= score_frame;
         if let Some(before) = projection.ordinary_previous.get_mut(frame) {
             *before = (*before).max(self.previous);
         }
@@ -656,12 +702,20 @@ impl Rewinds {
     }
 }
 
+#[derive(Clone, Copy)]
+struct NoteWeight {
+    grade: i32,
+    alive: bool,
+    value: f64,
+}
+
 impl ScoreTape {
     fn project(
         &self,
         chart: &Chart,
         inputs: &ProjectionInputs,
         projection: &mut Projection,
+        mut weights: Option<&mut [Option<NoteWeight>]>,
     ) -> Option<()> {
         let positions = &inputs.positions;
         let mut notes = vec![NoteUpper::default(); chart.full.notes.len() + 1];
@@ -698,7 +752,7 @@ impl ScoreTape {
                     let grade = i32::from(self.bytes[at]);
                     at += 1;
                     let chart_note = &chart.full.notes[(id - 1) as usize];
-                    rewinds.input(chart_note.time_ms, false);
+                    rewinds.input_frame(inputs.note_frames[(id - 1) as usize]);
                     let note = &mut notes[id as usize];
                     if note.score.replace((grade, life)).is_some() {
                         return None;
@@ -722,7 +776,9 @@ impl ScoreTape {
                     if combo != 0 || judgement != 0 || judge != 0 {
                         return None;
                     }
-                    rewinds.input(time, note != 0);
+                    let score_frame = rewinds.frame(time);
+                    rewinds.input_frame(score_frame);
+                    if note != 0 { rewinds.factors.push(score_frame); }
                     if note == 0 && luck == 0 {
                         continue;
                     }
@@ -738,10 +794,9 @@ impl ScoreTape {
                             let size = frames.as_ref().map_or(rewinds.counts.len(), Vec::len);
                             (FactorMagnitude::new(size), frames)
                         });
-                        let frame = rewinds.frame(time);
                         let index = match frames {
-                            Some(frames) => frames.binary_search(&frame).ok()?,
-                            None => frame,
+                            Some(frames) => frames.binary_search(&score_frame).ok()?,
+                            None => score_frame,
                         };
                         magnitude.push(index, delta);
                     }
@@ -802,21 +857,17 @@ impl ScoreTape {
                 }
                 5 | 6 => {
                     let position = frame - usize::from(op == 6);
-                    if let Some(frames) = &inputs.score_frames {
-                        rewinds.calculate_frame(frames[position]);
-                    } else {
-                        rewinds.calculate(chart.play.frames[position].time_ms);
-                    }
+                    rewinds.calculate_frame(inputs.score_frames[position]);
                 }
                 7 => {
                     let count =
                         u16::from_le_bytes(self.bytes[at..at + 2].try_into().unwrap()) as usize;
                     at += 2;
                     let end = frame + count;
-                    if let Some(frames) = &inputs.score_frames {
+                    if inputs.monotonic_frames {
                         // Only the first calculation can revisit pending input.
                         // The remaining frames advance monotonically.
-                        let covered = &frames[frame..end];
+                        let covered = &inputs.score_frames[frame..end];
                         rewinds.calculate_frame(*covered.first()?);
                         if !projection.ordinary_previous.is_empty() {
                             for (maximum, &position) in projection.ordinary_previous[frame..end].iter_mut().zip(covered) {
@@ -826,9 +877,9 @@ impl ScoreTape {
                         rewinds.previous = *covered.last()?;
                         rewinds.before_previous = rewinds.previous;
                     } else {
-                        for (position, row) in chart.play.frames.iter().enumerate().take(end).skip(frame) {
-                            rewinds.calculate(row.time_ms);
-                            rewinds.ordinary(row.time_ms, position, projection);
+                        for (position, &score_frame) in inputs.score_frames.iter().enumerate().take(end).skip(frame) {
+                            rewinds.calculate_frame(score_frame);
+                            rewinds.ordinary(score_frame, position, projection);
                             rewinds.before_previous = rewinds.previous;
                         }
                     }
@@ -862,7 +913,7 @@ impl ScoreTape {
                     }
                 }
                 16..=31 => {
-                    rewinds.ordinary(chart.play.frames[frame].time_ms, frame, projection);
+                    rewinds.ordinary(inputs.score_frames[frame], frame, projection);
                     at += (op & 15).count_ones() as usize * 4;
                     frame += 1;
                 }
@@ -877,7 +928,6 @@ impl ScoreTape {
         if let Some((magnitude, _)) = magnitude {
             projection.control_magnitude = projection.control_magnitude.max(magnitude.upper());
         }
-        let rounding = (1.0 + f32::EPSILON as f64).powi(32);
         for (index, note) in chart.notes.iter().enumerate() {
             let id = note.id as usize;
             let state = notes[id];
@@ -889,21 +939,25 @@ impl ScoreTape {
                 return None;
             }
             projection.minimum = projection.minimum.min(factor.note_extremes[0]);
-            let judge = inputs.judge.get(grade as usize).copied().flatten()?;
-            let combo = self.combos.values[id];
-            let combo = if combo >= 0 {
-                combo
+            let alive = life > 0;
+            let mut saved = weights.as_deref_mut().map(|weights| &mut weights[index]);
+            let base = if let Some(weight) = saved.as_ref().and_then(|slot| **slot)
+                .filter(|weight| weight.grade == grade && weight.alive == alive)
+            {
+                weight.value
             } else {
-                self.combos.changes[(-combo - 1) as usize]
-                    .iter()
-                    .map(|&(_, count)| count)
-                    .max()?
-            };
-            let combo = inputs.combo(0, combo as usize);
-            let gekiso = if inputs.combo_range[index] {
-                inputs.combo(1, state.gekiso.max(0) as usize)
-            } else {
-                1.0
+                let combo = self.combos.values[id];
+                let combo = if combo >= 0 {
+                    combo
+                } else {
+                    self.combos.changes[(-combo - 1) as usize]
+                        .iter()
+                        .map(|&(_, count)| count)
+                        .max()?
+                };
+                let value = inputs.note_weight(index, grade, alive, combo, state.gekiso)?;
+                if let Some(saved) = saved.take() { *saved = Some(NoteWeight { grade, alive, value }); }
+                value
             };
             let rush = |points: i64| ((100 + points).clamp(100, 200) as f64 / 100.0).next_up();
             let peak_luck = rush(factor.luck_extremes[1]);
@@ -912,16 +966,7 @@ impl ScoreTape {
             } else {
                 peak_luck
             };
-            let life = if life > 0 { 1.0 } else { inputs.live.life_onus };
-            let range = chart.range_of[index];
-            let rank = if range < 0 {
-                0.0
-            } else {
-                (chart.range_percent[range as usize] as f64 / 100.0).next_up()
-            };
-            let product = [judge, combo, gekiso, life, rounding].into_iter()
-                .fold(inputs.note_prefix[index], |product, term| (product * term).next_up());
-            let base = (product / inputs.converted).next_up();
+            let rank = inputs.rank_weights[index];
             let performance = (base * final_luck).next_up();
             let peak = (1.0 + factor.note_extremes[1].max(0.0)).next_up();
             let (rank_luck, rank_factor) = match state.rank {
@@ -952,6 +997,47 @@ impl ScoreTape {
             .next_up();
         }
         Some(())
+    }
+}
+
+#[derive(Default)]
+struct BatchProjections {
+    entries: std::collections::VecDeque<BatchProjection>,
+    bytes: usize,
+}
+struct BatchProjection {
+    inputs: Vec<std::sync::Weak<ScoreTape>>,
+    projection: Arc<Projection>,
+    bytes: usize,
+}
+
+impl BatchProjections {
+    fn get(&mut self, draws: &[Arc<ScoreTape>]) -> Option<Arc<Projection>> {
+        let index = self.entries.iter().position(|entry| {
+            entry.inputs.len() == draws.len() && entry.inputs.iter().zip(draws)
+                .all(|(input, draw)| input.as_ptr() == Arc::as_ptr(draw))
+        })?;
+        let entry = self.entries.remove(index).unwrap();
+        let projection = Arc::clone(&entry.projection);
+        self.entries.push_back(entry);
+        Some(projection)
+    }
+
+    fn insert(&mut self, draws: &[Arc<ScoreTape>], projection: Arc<Projection>) {
+        const LIMIT: usize = 768 * 1024;
+        let bytes = projection.retained_bytes() + std::mem::size_of::<BatchProjection>()
+            + draws.len() * std::mem::size_of::<std::sync::Weak<ScoreTape>>();
+        if bytes > LIMIT { return; }
+        while self.bytes + bytes > LIMIT || self.entries.len() >= 8 {
+            let Some(entry) = self.entries.pop_front() else { break; };
+            self.bytes -= entry.bytes;
+        }
+        self.bytes += bytes;
+        self.entries.push_back(BatchProjection {
+            inputs: draws.iter().map(Arc::downgrade).collect(),
+            projection,
+            bytes,
+        });
     }
 }
 
@@ -1062,7 +1148,7 @@ fn mean_with_profiles(
         let mut certified = None;
         let mut projected = 0.0_f64;
         let mut processed = 0usize;
-        let mut projected_draws: Option<Projection> = None;
+        let mut projected_draws: Option<Arc<Projection>> = None;
         let mut batch = Vec::with_capacity(BATCH);
         let mut active = sample_caps.as_ref().is_some_and(|(limit, _, tail, _)| {
             (*limit * 120.0 * 2.0) >= combined + tail[index]
@@ -1095,7 +1181,7 @@ fn mean_with_profiles(
             if batch.len() < BATCH {
                 return Ok(true);
             }
-            let Some((bounds, score)) = Projection::from_draws(master, chart, &batch)
+            let Some((bounds, score)) = Projection::for_batch(master, chart, &batch)
                 .and_then(|bounds| bounds.mean(ordinary, BATCH, power, orders).map(|score| (bounds, score)))
             else {
                 active = false;
@@ -1115,7 +1201,7 @@ fn mean_with_profiles(
                 return Ok(false);
             }
             if let Some(projected) = &mut projected_draws {
-                projected.append(bounds);
+                Arc::make_mut(projected).append(&bounds);
             } else {
                 projected_draws = Some(bounds);
             }
@@ -1137,8 +1223,8 @@ fn mean_with_profiles(
         let Some(projection) = scene.projection.get_or_init(|| {
             let tail = Projection::from_draws(master, chart, &scene.draws[processed..])?;
             if let Some(mut prefix) = projected_draws {
-                prefix.append(tail);
-                Some(Arc::new(prefix))
+                Arc::make_mut(&mut prefix).append(&tail);
+                Some(prefix)
             } else {
                 Some(Arc::new(tail))
             }

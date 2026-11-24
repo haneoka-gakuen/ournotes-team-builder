@@ -27,8 +27,14 @@ struct Scene {
     projection: std::sync::OnceLock<Option<Arc<upper::Projection>>>,
 }
 struct FixedFrame {
-    judged: Vec<crate::full::play::JudgedNote>,
+    judged: Option<Arc<[crate::full::play::JudgedNote]>>,
     life: [(i32, i32); 2],
+}
+
+impl FixedFrame {
+    fn judged(&self) -> &[crate::full::play::JudgedNote] {
+        self.judged.as_deref().unwrap_or_default()
+    }
 }
 
 struct SamplePrefix<'a> {
@@ -369,7 +375,7 @@ impl ScoreTape {
         for (index, command) in trace.iter().enumerate() {
             match command {
                 ReplayCommand::Input(input) => {
-                    for (raw, converted) in chart.play.frames[frame].judged.iter().zip(input) {
+                    for (raw, converted) in chart.play.frames[frame].judged.iter().zip(input.iter()) {
                         if !matches!(converted.judgement, 0 | 7) {
                             delivered.push((raw.time_ms, index + 1, converted.judgement));
                         }
@@ -421,7 +427,7 @@ impl ScoreTape {
                     ReplayCommand::Input(inputs) if !inputs.is_empty() => {
                         input_index += 1;
                         let mut earliest = i32::MAX;
-                        for (raw, note) in chart.play.frames[frame].judged.iter().zip(inputs) {
+                        for (raw, note) in chart.play.frames[frame].judged.iter().zip(inputs.iter()) {
                             if matches!(note.judgement, 0 | 7) { continue; }
                             combo.add(raw.time_ms, note.judgement);
                             earliest = earliest.min(raw.time_ms);
@@ -503,6 +509,7 @@ pub(super) struct Cache {
     projection_inputs: Option<Arc<upper::ProjectionInputs>>,
     sampled_inputs: SharedSamples,
     measured_ordinary: Option<MeasuredOrdinary>,
+    pub(super) converter_frames: Option<((i32, bool), Arc<[crate::full::model::ConverterFrame]>)>,
 }
 pub(super) fn just_context(master: &Master, chart: &Chart, deck: &[Performer]) -> Option<Context> {
     if chart.setup.missions.iter().any(|&mission| mission != 3)
@@ -1447,6 +1454,59 @@ fn sampled_control(control: &Master, chart: &Chart, reduced: &[Performer], runs:
     })
 }
 
+fn remember_scene(
+    master: &Master,
+    chart: &Chart,
+    key: Key,
+    draws: Vec<Arc<ScoreTape>>,
+    unique: &HashMap<Arc<ScoreTape>, ()>,
+    fixed_inputs: bool,
+    complete: bool,
+) -> Arc<Scene> {
+    let mut combos = HashSet::default();
+    let projection_bytes = if complete && uses_full_replay(master, chart, &key.seeds) {
+        (chart.notes.len() + 1) * std::mem::size_of::<[[f64; 2]; 5]>()
+            + if chart.luck {
+                (chart.play.frames.len() + (core::frame(chart.music_length) + 50).max(1) as usize + 2)
+                    * std::mem::size_of::<usize>()
+            } else { 0 }
+    } else { 0 };
+    let bytes = unique
+        .keys()
+        .map(|draw| draw.retained_bytes(&mut combos))
+        .sum::<usize>()
+        + draws.capacity() * std::mem::size_of::<Arc<ScoreTape>>()
+        + std::mem::size_of::<Entry>()
+        + std::mem::size_of_val(key.program.as_ref())
+        + std::mem::size_of_val(key.seeds.as_ref())
+        + std::mem::size_of_val(key.ranks.as_ref())
+        + key.events.capacity() * std::mem::size_of::<(usize, i32)>()
+        + projection_bytes;
+    let context = Arc::new(Scene { draws, shared_inputs: fixed_inputs, projection: std::sync::OnceLock::new() });
+    const LIMIT: usize = 2 * 1024 * 1024;
+    if bytes <= LIMIT {
+        let mut cache = chart.factored.lock().unwrap();
+        if let Some(index) = cache.entries.iter().position(|entry| entry.key == key) {
+            cache.bytes -= cache.entries.remove(index).unwrap().bytes;
+        }
+        while cache.bytes + bytes > LIMIT || cache.entries.len() >= 64 {
+            if let Some(entry) = cache.entries.pop_front() {
+                cache.bytes -= entry.bytes;
+            } else {
+                break;
+            }
+        }
+        cache.bytes += bytes;
+        cache.entries.push_back(Entry {
+            key,
+            context: Arc::clone(&context),
+            bytes,
+            _master: master.clone(),
+        });
+    }
+    context
+}
+
 fn context<'a>(
     master: &Master,
     control: &'a Master,
@@ -1480,13 +1540,15 @@ fn context<'a>(
             context
         })
     };
-    if let Some(cached) = cached {
+    let total_draws = if chart.luck { key.seeds.len() } else { 1 };
+    if let Some(cached) = &cached {
+        // Observe cached draws in seed order before generating the tail.
         if let Some(observe) = &mut observe {
             for draw in &cached.draws {
                 if !observe(draw, cached.shared_inputs)? { return Ok(None); }
             }
         }
-        return Ok(Some(cached));
+        if cached.draws.len() == total_draws { return Ok(Some(Arc::clone(cached))); }
     }
     let combo = chart.setup.missions.contains(&1);
     let make_model = |seed| -> Result<Model<'a>, String> {
@@ -1508,15 +1570,17 @@ fn context<'a>(
         program: Arc::clone(program),
         ..key.clone()
     });
-    let mut base = None;
+    let mut draws = cached.as_ref().map_or_else(Vec::new, |scene| scene.draws.clone());
+    let retained = draws.len();
+    let sample_start = retained.max(1);
+    let mut base = if retained > 0 && !fixed_inputs { Some(make_model(runs[0])?) } else { None };
     let mut sampled = None;
     let mut lottery_record = false;
     let mut prepared: Option<Vec<FixedFrame>> = None;
     let mut prepared_next = Vec::new();
     let mut lottery_notes = Vec::new();
     let mut note_life = if fixed_inputs { vec![0; chart.full.notes.len() + 1] } else { Vec::new() };
-    let mut draws: Vec<Arc<ScoreTape>> = Vec::new();
-    let mut unique = HashMap::<Arc<ScoreTape>, ()>::default();
+    let mut unique: HashMap<_, _> = draws.iter().map(|draw| (Arc::clone(draw), ())).collect();
     let mut sample_input = None;
     let mut capture = Vec::new();
     let shared_prefix_at = (fixed_inputs && runs.len() >= 8)
@@ -1526,7 +1590,9 @@ fn context<'a>(
     let mut quiet_gaps: Vec<LotteryGap> = Vec::new();
     let generation = crate::cancellation_generation();
     for (run, seed) in runs.iter().copied().enumerate() {
-        if run == 1 {
+        // The first control run supplies exact LIFE and delivered inputs.
+        if run < retained && (!fixed_inputs || run != 0) { continue; }
+        if run == sample_start {
             if let Some(sampled_control) = sampled_control {
                 let mut replay = Model::with_prepared_notes(control, &sampled_control.actors, chart.prepared_notes(), &key.events,
                     chart.params(), Some(&chart.setup), (runs[0], false, None))?;
@@ -1539,7 +1605,7 @@ fn context<'a>(
                 if lottery_record {
                     quiet_intervals = lottery_gaps(chart);
                     lottery_notes = prepared.as_ref().unwrap().iter().map(|frame| {
-                        replay.prepare_lottery_notes(&frame.judged, &note_life)
+                        replay.prepare_lottery_notes(frame.judged.as_ref(), &note_life)
                     }).collect::<Result<_, _>>()?;
                 }
                 sampled = Some(replay);
@@ -1581,7 +1647,7 @@ fn context<'a>(
                 let through = |end: usize| {
                     (end < chart.play.frames.len()).then(|| chart.play.frames[end - 1].time_ms)
                 };
-                if run == 1 {
+                if run == sample_start {
                     if let Some((from, end, start)) = gap_start.filter(|&(_, end, _)| index >= end) {
                         gap_start = None;
                         if index == end {
@@ -1611,7 +1677,7 @@ fn context<'a>(
             }
             // The remaining seeds use this same fixed-input model. Replacing
             // its random streams is exact before the first random draw.
-            if run == 1 && shared_prefix.is_none() && current.random.draws == 0
+            if run == sample_start && shared_prefix.is_none() && current.random.draws == 0
                 && shared_prefix_at.is_some_and(|at| index >= at)
             {
                 let commands = current.score.score.replay.take().unwrap();
@@ -1638,10 +1704,10 @@ fn context<'a>(
                 if let Some(prepared) = fixed {
                     if lottery_record {
                         current.record_lottery_frame(
-                            frame.time_ms, &prepared[index].judged, &lottery_notes[index], chart.play.dt[index],
+                            frame.time_ms, &lottery_notes[index], chart.play.dt[index],
                         )?;
                     } else {
-                        current.frame(frame.time_ms, &prepared[index].judged, chart.play.dt[index])?;
+                        current.frame(frame.time_ms, prepared[index].judged(), chart.play.dt[index])?;
                     }
                 } else {
                     current.frame(frame.time_ms, &frame.judged, chart.play.dt[index])?;
@@ -1662,11 +1728,11 @@ fn context<'a>(
         }
         if run == 0 && fixed_inputs {
             let mut inputs = Vec::with_capacity(chart.play.frames.len());
-            let mut judged = Vec::new();
+            let mut judged = None;
             for command in &trace {
                 match command {
-                    ReplayCommand::Input(notes) => judged = notes.clone(),
-                    ReplayCommand::Ordinary(_, life) => inputs.push(FixedFrame { judged: std::mem::take(&mut judged), life: *life }),
+                    ReplayCommand::Input(notes) => judged = Some(Arc::clone(notes)),
+                    ReplayCommand::Ordinary(_, life) => inputs.push(FixedFrame { judged: judged.take(), life: *life }),
                     ReplayCommand::Note(note) => note_life[note.id as usize] = note.life,
                     _ => {}
                 }
@@ -1685,22 +1751,30 @@ fn context<'a>(
                 if let ReplayCommand::Note(note) = command { note.life = note_life[note.id as usize]; }
             }
         }
-        let shared_combos = if fixed_inputs { draws.first().map(|first| &first.combos) } else { None };
-        let draw = Arc::new(ScoreTape::new(&trace, chart, control.live.life_base as i32, shared_combos));
+        if run >= retained {
+            let shared_combos = if fixed_inputs { draws.first().map(|first| &first.combos) } else { None };
+            let draw = Arc::new(ScoreTape::new(&trace, chart, control.live.life_base as i32, shared_combos));
+            if let Some((stored, _)) = unique.get_key_value(&draw) {
+                draws.push(Arc::clone(stored));
+            } else {
+                unique.insert(Arc::clone(&draw), ());
+                draws.push(draw);
+            }
+            if let Some(observe) = &mut observe {
+                if !observe(draws.last().unwrap(), fixed_inputs)? {
+                    if chart.luck && total_draws >= 8 {
+                        let complete = draws.len() == total_draws;
+                        remember_scene(master, chart, key, draws, &unique, fixed_inputs, complete);
+                    }
+                    return Ok(None);
+                }
+            }
+        }
         if let Some(prefixes) = samples.prefixes.as_mut().filter(|_| run == 0) {
             prefixes.retain_trace(trace);
         } else {
             trace.clear();
             capture = trace;
-        }
-        if let Some((stored, _)) = unique.get_key_value(&draw) {
-            draws.push(Arc::clone(stored));
-        } else {
-            unique.insert(Arc::clone(&draw), ());
-            draws.push(draw);
-        }
-        if let Some(observe) = &mut observe {
-            if !observe(draws.last().unwrap(), fixed_inputs)? { return Ok(None); }
         }
         if run == 0 && fixed_inputs {
             let mut input = Vec::with_capacity(chart.play.frames.len() * 16 + chart.full.notes.len() * 5);
@@ -1709,7 +1783,7 @@ fn context<'a>(
                     input.extend_from_slice(&life.to_le_bytes());
                     input.extend_from_slice(&maximum.to_le_bytes());
                 }
-                input.extend(frame.judged.iter().map(|note| note.judgement as u8));
+                input.extend(frame.judged().iter().map(|note| note.judgement as u8));
             }
             for life in &note_life { input.extend_from_slice(&life.to_le_bytes()); }
             let cached = samples.get(&input).or_else(|| {
@@ -1719,11 +1793,17 @@ fn context<'a>(
                 Some(entry)
             });
             if let Some(cached) = cached {
-                for draw in &cached.draws {
+                for draw in cached.draws.iter().skip(retained.saturating_sub(1)) {
                     if let Some((stored, _)) = unique.get_key_value(draw) { draws.push(Arc::clone(stored)); }
                     else { unique.insert(Arc::clone(draw), ()); draws.push(Arc::clone(draw)); }
                     if let Some(observe) = &mut observe {
-                        if !observe(draws.last().unwrap(), fixed_inputs)? { return Ok(None); }
+                        if !observe(draws.last().unwrap(), fixed_inputs)? {
+                            if total_draws >= 8 {
+                                let complete = draws.len() == total_draws;
+                                remember_scene(master, chart, key, draws, &unique, fixed_inputs, complete);
+                            }
+                            return Ok(None);
+                        }
                     }
                 }
                 break;
@@ -1738,46 +1818,9 @@ fn context<'a>(
             chart.factored.lock().unwrap().sampled_inputs.insert(key, entry, master);
         }
     }
-    let mut combos = HashSet::default();
-    let projection_bytes = if uses_full_replay(master, chart, &key.seeds) {
-        (chart.notes.len() + 1) * std::mem::size_of::<[[f64; 2]; 5]>()
-            + if chart.luck {
-                (chart.play.frames.len() + (core::frame(chart.music_length) + 50).max(1) as usize + 2)
-                    * std::mem::size_of::<usize>()
-            } else { 0 }
-    } else { 0 };
-    let bytes = unique
-        .keys()
-        .map(|draw| draw.retained_bytes(&mut combos))
-        .sum::<usize>()
-        + draws.capacity() * std::mem::size_of::<Arc<ScoreTape>>()
-        + std::mem::size_of::<Entry>()
-        + std::mem::size_of_val(key.program.as_ref())
-        + std::mem::size_of_val(key.seeds.as_ref())
-        + std::mem::size_of_val(key.ranks.as_ref())
-        + key.events.capacity() * std::mem::size_of::<(usize, i32)>()
-        + projection_bytes;
-    let context = Arc::new(Scene { draws, shared_inputs: fixed_inputs, projection: std::sync::OnceLock::new() });
-    const LIMIT: usize = 2 * 1024 * 1024;
-    if bytes <= LIMIT {
-        let mut cache = chart.factored.lock().unwrap();
-        while cache.bytes + bytes > LIMIT || cache.entries.len() >= 64 {
-            if let Some(entry) = cache.entries.pop_front() {
-                cache.bytes -= entry.bytes;
-            } else {
-                break;
-            }
-        }
-        cache.bytes += bytes;
-        cache.entries.push_back(Entry {
-            key,
-            context: Arc::clone(&context),
-            bytes,
-            _master: master.clone(),
-        });
-    }
-    Ok(Some(context))
+    Ok(Some(remember_scene(master, chart, key, draws, &unique, fixed_inputs, true)))
 }
+
 type OrdinaryTape = Arc<Vec<(usize, FactorCommand)>>;
 type OrdinaryOrders = [Option<OrdinaryTape>; 120];
 struct MeasuredOrdinary {

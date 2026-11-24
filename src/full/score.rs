@@ -422,7 +422,7 @@ pub(crate) enum ReplayCommand {
     Factor(FactorCommand),
     Calculate(i32),
     Rush(i32, i32),
-    Input(Vec<super::play::JudgedNote>),
+    Input(Arc<[super::play::JudgedNote]>),
     Ordinary(i32, [(i32, i32); 2]),
     IdleFrames(usize),
     Rank(usize, i32, i32),
@@ -656,6 +656,18 @@ impl<'a> Incremental<'a> {
         // Idle frames contain no commands to apply or undo. Leaving the cursor
         // at the last calculation also keeps the next rewind over real work.
         (self.idle_ready() && self.previous <= core::frame(time).max(0)).then_some(self.score)
+    }
+
+    #[inline]
+    pub(super) fn record_calculation(&mut self, time: i32, combo: &Combo) -> Result<(), String> {
+        debug_assert!(self.record_only);
+        if self.pending_fixed.is_some() {
+            self.calculate(time, combo, None)?;
+        } else {
+            self.replay.as_mut().unwrap().push(ReplayCommand::Calculate(time));
+            self.added = -1;
+        }
+        Ok(())
     }
 
     pub fn calculate(
