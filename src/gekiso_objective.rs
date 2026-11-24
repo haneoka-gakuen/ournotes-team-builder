@@ -3150,18 +3150,22 @@ impl<'a> Kernel<'a> {
         self.bound_shape_ids[index]
     }
 
-    fn nominal_roster_shape_id(&mut self, member: usize, snap: i32, roster: &[usize]) -> u32 {
+    fn nominal_uses_bound_shape(&self, member: usize, roster: &[usize]) -> bool {
         if self.fixed_nominal_actor_order.get(member) == Some(&true)
             || !self.owner_local || !self.healthy || !self.chart.luck || !self.seeds.is_empty()
         {
-            return self.shape_id(member, snap);
+            return false;
         }
         let actor = &self.gk_members[member];
-        let stable = actor.gekisou_skill.is_some() && roster.iter().all(|&peer| {
+        actor.gekisou_skill.is_some() && roster.iter().all(|&peer| {
             peer == member || (actor.gekisou_skill, actor.mission_only.unwrap_or(0))
                 != (self.gk_members[peer].gekisou_skill, self.gk_members[peer].mission_only.unwrap_or(0))
-        });
-        if stable { self.bound_shape_id(member, snap) } else { self.shape_id(member, snap) }
+        })
+    }
+
+    fn nominal_roster_shape_id(&mut self, member: usize, snap: i32, roster: &[usize]) -> u32 {
+        if self.nominal_uses_bound_shape(member, roster) { self.bound_shape_id(member, snap) }
+        else { self.shape_id(member, snap) }
     }
     fn bound_actor_of(&mut self, member: usize, snap: i32) -> Performer {
         let index = self.slot_index(member, snap);
@@ -12418,7 +12422,10 @@ impl ReplayObjective<'_> {
     }
 
     fn projection_domains(&mut self, members: &[usize], options: &[Vec<i32>]) -> Option<Vec<Vec<Vec<i32>>>> {
-        if options.iter().filter(|row| row.len() > 1).count() < 3 {
+        let varying = options.iter().filter(|row| row.len() > 1).count();
+        if varying < 3 && (!self.chart.luck || varying < 2
+            || options.iter().fold(1usize, |count, row| count.saturating_mul(row.len())) < 128)
+        {
             return None;
         }
         let mut combinations = 1usize;
@@ -12477,6 +12484,12 @@ impl ReplayObjective<'_> {
             Some(longest)
         }).collect::<Option<Vec<_>>>()?;
         Some(Team { members: members.to_vec(), snaps })
+    }
+
+    fn prepare_projection(&mut self, members: &[usize], options: &[Vec<i32>]) {
+        self.projection_domain = self.projection_team(members, options).map(|team| ProjectionAssignment {
+            team, options: options.to_vec(), ceiling: None, attempted: false,
+        });
     }
 
     fn combo_domains(&mut self, members: &[usize], options: &[Vec<i32>]) -> Option<Vec<Vec<Vec<i32>>>> {
@@ -12660,8 +12673,13 @@ impl ReplayObjective<'_> {
         if key.0 >= *self.chart.times.last()? { return None; }
         let index = if let Some(index) = state.bounds.iter().position(|item| item.0 == key) {
             index
+        } else if state.bounds.len() >= 4 {
+            // A later death and a larger guard allowance still cover the
+            // requested replay. Reuse the closest such bound after the cache fills.
+            state.bounds.iter().enumerate().filter(|(_, (known, bound, _))| {
+                bound.is_some() && known.0 >= key.0 && known.1 == key.1 && known.2 == key.2 && known.3 >= key.3
+            }).min_by_key(|(_, (known, _, _))| (known.0, known.3)).map(|(index, _)| index)?
         } else {
-            if state.bounds.len() >= 4 { return None; }
             let (combo, grades) = if key.1 {
                 (state.plain_combo.as_deref().unwrap(), Some(self.chart.judgements.as_slice()))
             } else {
@@ -12933,7 +12951,12 @@ impl Objective for ReplayObjective<'_> {
         self.combined_health(self.global_health, totals.power, upper)
     }
     fn cheap_assignment_bound(&mut self, members: &[usize], totals: Totals, assigned: &[i32], from: usize) -> f64 {
-        let upper = self.bound(totals);
+        let raw = self.unpenalized_bound(totals);
+        let mut upper = self.combined_health(self.global_health, totals.power, raw);
+        if members == self.health_roster && self.health_proof.is_some() {
+            // The prepared LIFE ceiling covers every snapshot in this domain.
+            upper = upper.min(self.combined_health(self.health_proof, totals.power, raw));
+        }
         self.projected_upper(members, assigned, from, totals.power).map_or(upper, |projected| upper.min(projected))
     }
     fn leaf_bound(&mut self, team: &Team, totals: Totals) -> Option<f64> {
@@ -13030,6 +13053,13 @@ impl Objective for ReplayObjective<'_> {
     }
     fn prepare_assignment(&mut self, members: &[usize], options: &[Vec<i32>]) {
         self.projection_domain = None;
+        if self.chart.luck && self.supports_projection_domains()
+            && options.iter().fold(1usize, |size, row| size.saturating_mul(row.len())) >= 128
+        {
+            // A homogeneous domain can share one set of lottery draws even
+            // when no earlier partition was necessary.
+            self.prepare_projection(members, options);
+        }
         let mut program_combo_upper = None;
         if let Some(state) = &mut self.life_bounds {
             if state.roster != members || state.options != options {
@@ -13113,10 +13143,10 @@ impl Objective for ReplayObjective<'_> {
     fn partial_refined_assignment_domains(&self) -> bool { false }
     fn prepare_assignment_domain(&mut self, members: &[usize], options: &[Vec<i32>], complete: bool) {
         self.prepare_assignment(members, options);
-        if complete && self.supports_projection_domains() && (self.split_projection || !self.chart.luck) {
-            self.projection_domain = self.projection_team(members, options).map(|team| ProjectionAssignment {
-                team, options: options.to_vec(), ceiling: None, attempted: false,
-            });
+        if complete && self.projection_domain.is_none()
+            && self.supports_projection_domains() && (self.split_projection || !self.chart.luck)
+        {
+            self.prepare_projection(members, options);
         }
     }
     fn assignment_order_bound(

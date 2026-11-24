@@ -1,8 +1,8 @@
 //! Scoring-equivalent Gekiso supports, resolved against their owner's traits.
 use crate::{
     full::conditions::{performer_matches, Performer},
-    master::{Master, SkillEffect},
-    power::Snap,
+    master::{GekisoSkill, Master, SkillEffect},
+    power::{Member, Snap},
 };
 use rustc_hash::FxHashMap as HashMap;
 
@@ -73,41 +73,25 @@ pub(crate) struct JustCounters {
     members: std::collections::BTreeSet<(i32, i32)>,
 }
 impl JustCounters {
-    pub fn for_formation(
+    pub fn for_formation<'a>(
         master: &Master,
-        members: &[crate::power::Member],
-        snaps: &[crate::power::Snap],
+        members: impl Iterator<Item = &'a Member> + Clone,
+        snaps: impl Iterator<Item = &'a Snap>,
     ) -> Self {
-        let member_ids: std::collections::BTreeSet<_> =
-            members.iter().map(|m| m.card.gekiso_skill_id).collect();
-        let support_ids: std::collections::BTreeSet<_> = snaps
-            .iter()
-            .flat_map(|s| s.card.gekiso_support_skills)
-            .collect();
-        let mut active = master.clone();
-        active.gekiso_skills = std::sync::Arc::new(
-            master
-                .gekiso_skills
-                .iter()
-                .filter(|(id, _)| member_ids.contains(id))
-                .map(|(&id, row)| (id, row.clone()))
-                .collect(),
-        );
-        active.gekiso_support_skills = std::sync::Arc::new(
-            master
-                .gekiso_support_skills
-                .iter()
-                .filter(|(id, _)| support_ids.contains(id))
-                .map(|(&id, row)| (id, row.clone()))
-                .collect(),
-        );
-        Self::new(&active, members)
+        let selected = members.clone().filter_map(|member| master.gekiso_skills.get(&member.card.gekiso_skill_id))
+            .chain(snaps.flat_map(|snap| snap.card.gekiso_support_skills)
+                .filter_map(|id| master.gekiso_support_skills.get(&id)));
+        Self::for_skills(master, members, selected)
     }
-    pub fn new(master: &Master, members: &[crate::power::Member]) -> Self {
-        let reads_counter = master
-            .gekiso_skills
-            .values()
-            .chain(master.gekiso_support_skills.values())
+    pub fn new(master: &Master, members: &[Member]) -> Self {
+        Self::for_skills(master, members.iter(), master.gekiso_skills.values().chain(master.gekiso_support_skills.values()))
+    }
+    fn for_skills<'a, 'b>(
+        master: &Master,
+        members: impl Iterator<Item = &'a Member>,
+        skills: impl Iterator<Item = &'b GekisoSkill>,
+    ) -> Self {
+        let reads_counter = skills
             .flat_map(|s| &s.effects)
             .any(|row| {
                 master

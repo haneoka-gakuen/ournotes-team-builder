@@ -9,9 +9,9 @@ pub(super) mod upper;
 #[derive(Clone, PartialEq, Eq)]
 struct Key {
     tables: [usize; 12],
-    program: Vec<u64>,
-    seeds: Vec<i32>,
-    ranks: Vec<i32>,
+    program: Arc<[u64]>,
+    seeds: Arc<[i32]>,
+    ranks: Arc<[i32]>,
     music_type: i32,
     events: Vec<(usize, i32)>,
 }
@@ -38,17 +38,116 @@ struct SamplePrefix<'a> {
     quiet: usize,
     commands: Vec<ReplayCommand>,
 }
+struct LotteryGap {
+    from: (usize, usize, usize),
+    to: (usize, usize, usize),
+    commands: Vec<ReplayCommand>,
+}
+
+fn lottery_gaps(chart: &Chart) -> Vec<(i32, usize)> {
+    let ranges = &chart.setup.fevers;
+    if ranges.windows(2).any(|pair| pair[0].1 >= pair[1].0) { return Vec::new(); }
+    ranges.iter().enumerate().filter_map(|(index, &(_, end))| {
+        let start = end.saturating_add(chart.delivery_radius_ms);
+        let barrier = ranges.get(index + 1).map_or(i32::MAX, |&(next, _)| {
+            chart.full.events.iter().filter_map(|&(_, at)| (at > start).then_some(at))
+                .fold(next.saturating_sub(chart.delivery_radius_ms.max(4000)), i32::min)
+        });
+        let end = chart.play.frames.partition_point(|frame| frame.time_ms < barrier);
+        (barrier > start).then_some((start, end))
+    }).collect()
+}
+struct ControlCheckpoint<'a> {
+    model: Model<'a>,
+    at: usize,
+    until: usize,
+    quiet: usize,
+    commands: usize,
+}
+
+struct ControlPrefixes<'a> {
+    boundaries: Vec<(usize, u8)>,
+    previous_order: [usize; 5],
+    checkpoints: Vec<ControlCheckpoint<'a>>,
+    trace: Vec<ReplayCommand>,
+}
+
+impl<'a> ControlPrefixes<'a> {
+    fn new(chart: &Chart) -> Option<Self> {
+        let mut events = chart.full.events.clone();
+        if events.iter().any(|&(event, _)| event >= 5) { return None; }
+        events.sort_unstable_by_key(|&(_, time)| time);
+        let mut boundaries = Vec::new();
+        let mut fired = 0u8;
+        for (event, time) in events {
+            let at = chart.play.frames.partition_point(|frame| frame.time_ms < time);
+            if at > 0 && at < chart.play.frames.len()
+                && boundaries.last().is_none_or(|&(previous, _)| previous != at)
+            {
+                boundaries.push((at, fired));
+            }
+            fired |= 1 << event;
+        }
+        (!boundaries.is_empty()).then_some(Self {
+            boundaries,
+            previous_order: [0; 5],
+            checkpoints: Vec::new(),
+            trace: Vec::new(),
+        })
+    }
+
+    fn resume(
+        &mut self,
+        order: &[usize; 5],
+        events: &[(usize, i32)],
+        capture: &mut Vec<ReplayCommand>,
+    ) -> Option<(Model<'a>, usize, usize, usize)> {
+        let changed = order.iter().zip(self.previous_order).enumerate().fold(0u8, |mask, (i, (&a, b))| {
+            mask | (u8::from(a != b) << i)
+        });
+        self.previous_order = *order;
+        let common = self.boundaries.iter().take_while(|&&(_, fired)| fired & changed == 0).count();
+        self.checkpoints.truncate(common);
+        let mut trace = std::mem::take(&mut self.trace);
+        trace.truncate(self.checkpoints.last().map_or(0, |prefix| prefix.commands));
+        *capture = trace;
+        let prefix = self.checkpoints.last()?;
+        let mut model = prefix.model.clone();
+        model.set_event_members(events);
+        Some((model, prefix.at, prefix.until, prefix.quiet))
+    }
+
+    fn capture(&mut self, model: &mut Model<'a>, at: usize, until: usize, quiet: usize) {
+        if self.boundaries.get(self.checkpoints.len()).is_none_or(|&(next, _)| next != at) { return; }
+        let trace = model.score.score.replay.take().unwrap();
+        self.checkpoints.push(ControlCheckpoint {
+            model: model.clone(), at, until, quiet, commands: trace.len(),
+        });
+        model.score.score.replay = Some(trace);
+    }
+
+    fn retain_trace(&mut self, mut trace: Vec<ReplayCommand>) {
+        trace.truncate(self.checkpoints.last().map_or(0, |prefix| prefix.commands));
+        self.trace = trace;
+    }
+}
+
 struct SampleEntry {
     input: Vec<u8>,
     draws: Vec<Arc<ScoreTape>>,
     bytes: usize,
 }
 #[derive(Default)]
-struct SampleCache {
+struct SampleCache<'a> {
     entries: std::collections::VecDeque<Arc<SampleEntry>>,
     bytes: usize,
+    prefixes: Option<ControlPrefixes<'a>>,
 }
-impl SampleCache {
+impl SampleCache<'_> {
+    fn for_groups(chart: &Chart, groups: usize) -> Self {
+        let share = groups > 1 && !chart.luck && chart.accuracy.miss_every > 0;
+        Self { prefixes: share.then(|| ControlPrefixes::new(chart)).flatten(), ..Self::default() }
+    }
     fn get(&mut self, input: &[u8]) -> Option<Arc<SampleEntry>> {
         let index = self.entries.iter().position(|entry| entry.input == input)?;
         let entry = self.entries.remove(index).unwrap();
@@ -126,17 +225,12 @@ impl ScoreTape {
         let mut event = 0;
         let mut life = [base; 4];
         let put = |bytes: &mut Vec<u8>, value: i32| bytes.extend_from_slice(&value.to_le_bytes());
-        let commands: Vec<_> = trace.iter().filter(|command| match command {
-            ReplayCommand::Rush(..) => false,
-            ReplayCommand::Input(notes) => !notes.is_empty(),
-            _ => true,
-        }).collect();
         let mut at = 0;
-        while at < commands.len() {
+        while at < trace.len() {
             let mut idle = 0;
             while idle < u16::MAX as usize {
                 let [ReplayCommand::Calculate(before), ReplayCommand::Ordinary(time, values),
-                     ReplayCommand::Calculate(after), ..] = &commands[at + idle * 3..] else { break; };
+                     ReplayCommand::Calculate(after), ..] = &trace[at + idle * 3..] else { break; };
                 let current = frame + idle;
                 if before != time || after != time
                     || chart.play.frames.get(current).is_none_or(|row| row.time_ms != *time)
@@ -157,7 +251,7 @@ impl ScoreTape {
                 frame += idle;
                 continue;
             }
-            let command = commands[at];
+            let command = &trace[at];
             at += 1;
             match command {
                 ReplayCommand::Input(input) => {
@@ -668,6 +762,26 @@ pub(super) fn sample_ceiling(
         / seeds.len() as f64).next_up();
     Ok(Some(mean))
 }
+fn dormant_ordinary_control(master: &Master, row: &SkillEffect, actor: &Performer) -> bool {
+    if row.condition_group == 0 || row.trigger_type != 1 || row.cumulative_id != 0
+        || row.release_group != 0 || row.reset_group != 0
+    {
+        return false;
+    }
+    let Some([owner_set]) = master.condition_sets.get(&row.condition_group).map(Vec::as_slice)
+        else { return false; };
+    let [owner] = owner_set.as_slice() else { return false; };
+    let Some([trigger_set]) = master.condition_sets.get(&row.trigger_group).map(Vec::as_slice)
+        else { return false; };
+    let [trigger] = trigger_set.as_slice() else { return false; };
+    // Match the full model's inactive owner condition. The same-member
+    // trigger has no RNG draw or other state change when the effect is off.
+    master.conditions[owner].kind == 5000
+        && matches!(master.conditions[trigger].kind, 4010 | 5020)
+        && master.conditions[trigger].positive
+        && crate::rewards::static_gk_group(master, row.condition_group, actor) == Some(false)
+}
+
 fn ordinary(master: &Master, actor: &Performer) -> Option<(bool, bool)> {
     if let Some((id, level)) = actor.live_skill {
         if master
@@ -697,6 +811,7 @@ fn ordinary(master: &Master, actor: &Performer) -> Option<(bool, bool)> {
                     return None;
                 }
             } else {
+                if dormant_ordinary_control(master, row, actor) { continue; }
                 retained = true;
                 ordered |= [
                     row.trigger_group,
@@ -726,6 +841,7 @@ fn recovery_program(master: &Master, actor: &Performer) -> Option<Vec<i32>> {
         rows.sort_unstable_by_key(|row| row.id);
         for row in rows {
             if (2000..=2005).contains(&row.kind) || row.kind == 15000 { continue; }
+            if dormant_ordinary_control(master, row, actor) { continue; }
             if row.kind != 3001 || row.value < 0 || row.seconds != 0.0 || row.trigger_type != 1
                 || row.cumulative_id != 0 || row.release_group != 0 || row.reset_group != 0 || row.execute_limit != 0 { return None; }
             let trigger = master.condition_sets.get(&row.trigger_group)?;
@@ -749,6 +865,7 @@ fn control_classes(master: &Master, chart: &Chart, deck: &[Performer], ordinary:
         let program = recovery_program(master, actor);
         for &(id, level) in &actor.support_skills {
             for row in master.support_skills[&id].iter().filter(|row| row.level == level) {
+                if dormant_ordinary_control(master, row, actor) { continue; }
                 if matches!(row.kind, 3000..=3004) && (row.kind != 3001 || program.is_none()) { return classes; }
             }
         }
@@ -779,7 +896,8 @@ fn ignore_dead_heal_order(master: &Master, chart: &Chart, deck: &[Performer], se
     let healer = |row: &SkillEffect| row.kind == 3001 && deferred(row) && ordinary_row(master, row);
     let normal: Vec<Vec<_>> = deck.iter().map(|actor| actor.support_skills.iter().flat_map(|&(id, level)|
         master.support_skills[&id].iter().filter(move |row| row.level == level))
-        .filter(|row| !(2000..=2005).contains(&row.kind) && row.kind != 15000).collect()).collect();
+        .filter(|row| !(2000..=2005).contains(&row.kind) && row.kind != 15000
+            && !dormant_ordinary_control(master, row, actor)).collect()).collect();
     let candidates: Vec<_> = normal.iter().enumerate().filter(|(index, rows)| flags[*index].1 && !rows.is_empty() && rows.iter().all(|row| healer(row)))
         .map(|(index, _)| index).collect();
     if candidates.is_empty() || normal.iter().flatten().any(|row| matches!(row.kind, 3000..=3004) && !healer(row)) { return Ok(()); }
@@ -1262,16 +1380,25 @@ fn control_program(master: &Master, chart: &Chart, deck: &[Performer]) -> Vec<u6
 
 type DrawObserver<'a> = dyn FnMut(&Arc<ScoreTape>, bool) -> Result<bool, String> + 'a;
 
-fn context(
+struct ControlDeck {
+    actors: Vec<Performer>,
+    key: Key,
+    sampled: OnceLock<Option<SampledControl>>,
+}
+
+struct SampledControl {
+    actors: Vec<Performer>,
+    program: Option<Arc<[u64]>>,
+}
+
+fn control_deck(
     master: &Master,
     control: &Master,
     chart: &Chart,
     deck: &[Performer],
     seeds: &[i32],
-    (ordinary, order): (&[(bool, bool)], &[usize; 5]),
-    samples: &mut SampleCache,
-    mut observe: Option<&mut DrawObserver<'_>>,
-) -> Result<Option<Arc<Scene>>, String> {
+    ordinary: &[(bool, bool)],
+) -> ControlDeck {
     let mut reduced: Vec<_> = deck.iter().map(Performer::gekiso_only).collect();
     for (i, actor) in reduced.iter_mut().enumerate() {
         if ordinary[i].0 {
@@ -1286,10 +1413,50 @@ fn context(
     omit_unused_just_points(control, chart, &mut reduced);
     let key = Key {
         tables: tables(master),
-        program: control_program(control, chart, &reduced),
-        seeds: seeds.to_vec(),
-        ranks: chart.setup.ranks.clone(),
+        program: control_program(control, chart, &reduced).into(),
+        seeds: seeds.into(),
+        ranks: chart.setup.ranks.as_slice().into(),
         music_type: chart.music_type,
+        events: Vec::new(),
+    };
+    ControlDeck { actors: reduced, key, sampled: OnceLock::new() }
+}
+
+fn sampled_control(control: &Master, chart: &Chart, reduced: &[Performer], runs: &[i32]) -> Option<SampledControl> {
+    if chart.setup.missions.contains(&1) || runs.len() <= 1 { return None; }
+    let fixed_inputs = reduced.iter().all(|actor| {
+        actor.support_skills.iter().all(|&(id, level)| control.support_skills[&id]
+            .iter().filter(|row| row.level == level).all(|row|
+                (matches!(row.kind, 3000..=3004 | 12006 | 15000)) && ordinary_row(control, row)))
+            && actor.gekisou_skill.into_iter().filter_map(|(id, level)|
+                control.gekiso_skills.get(&id).map(|skill| (skill, level)))
+                .chain(actor.gekisou_support_skills.iter().filter_map(|&(id, level)|
+                    control.gekiso_support_skills.get(&id).map(|skill| (skill, level))))
+                .filter(|(skill, _)| skill.mission_type == 4 || chart.setup.missions.contains(&skill.mission_type))
+                .flat_map(|(skill, level)| skill.effects.iter().filter(move |row| row.level == level))
+                .all(|row| (2000..=2005).contains(&row.kind)
+                    || (11000..=11005).contains(&row.kind)
+                    || fixed_damage_reduction(control, row)
+                    || matches!(row.kind, 4004 | 12000 | 12002 | 12003 | 12004 | 13000 | 13002 | 13003 | 13004))
+    });
+    fixed_inputs.then(|| {
+        let mut actors = reduced.to_vec();
+        for actor in &mut actors { actor.support_skills.clear(); }
+        let program = (chart.luck && runs.len() >= 8).then(|| control_program(control, chart, &actors).into());
+        SampledControl { actors, program }
+    })
+}
+
+fn context<'a>(
+    master: &Master,
+    control: &'a Master,
+    chart: &Chart,
+    deck: &ControlDeck,
+    order: &[usize; 5],
+    samples: &mut SampleCache<'a>,
+    mut observe: Option<&mut DrawObserver<'_>>,
+) -> Result<Option<Arc<Scene>>, String> {
+    let key = Key {
         events: chart
             .full
             .events
@@ -1302,6 +1469,7 @@ fn context(
                     .ok_or_else(|| format!("ordinary skill event {event} out of range"))
             })
             .collect::<Result<_, _>>()?,
+        ..deck.key.clone()
     };
     let cached = {
         let mut cache = chart.factored.lock().unwrap();
@@ -1320,50 +1488,27 @@ fn context(
         }
         return Ok(Some(cached));
     }
-    let mut model = Model::with_prepared_notes(
-        control,
-        &reduced,
-        chart.prepared_notes(),
-        &key.events,
-        chart.params(),
-        Some(&chart.setup),
-        (seeds.first().copied().unwrap_or(0), false, None),
-    )?;
-    model.score.score.replay = Some(Vec::new());
-    model.score.score.factored_record = true;
-    model.score.score.record_only = true;
-    model.score.score.calculator.factors_only = true;
     let combo = chart.setup.missions.contains(&1);
-    if combo { model.gk.as_mut().unwrap().controller.record_combo_history(); }
-    let runs = if chart.luck {
-        seeds.to_vec()
-    } else {
-        vec![seeds.first().copied().unwrap_or(0)]
+    let make_model = |seed| -> Result<Model<'a>, String> {
+        let mut model = Model::with_prepared_notes(
+            control, &deck.actors, chart.prepared_notes(), &key.events, chart.params(),
+            Some(&chart.setup), (seed, false, None),
+        )?;
+        model.score.score.factored_record = true;
+        model.score.score.record_only = true;
+        model.score.score.calculator.factors_only = true;
+        if combo { model.gk.as_mut().unwrap().controller.record_combo_history(); }
+        Ok(model)
     };
-    let fixed_inputs = !combo && runs.len() > 1 && reduced.iter().all(|actor| {
-        actor.support_skills.iter().all(|&(id, level)| control.support_skills[&id]
-            .iter().filter(|row| row.level == level).all(|row|
-                (matches!(row.kind, 3000..=3004 | 12006 | 15000)) && ordinary_row(control, row)))
-            && actor.gekisou_skill.into_iter().filter_map(|(id, level)|
-                control.gekiso_skills.get(&id).map(|skill| (skill, level)))
-                .chain(actor.gekisou_support_skills.iter().filter_map(|&(id, level)|
-                    control.gekiso_support_skills.get(&id).map(|skill| (skill, level))))
-                .filter(|(skill, _)| skill.mission_type == 4 || chart.setup.missions.contains(&skill.mission_type))
-                .flat_map(|(skill, level)| skill.effects.iter().filter(move |row| row.level == level))
-                .all(|row| (2000..=2005).contains(&row.kind)
-                    || (11000..=11005).contains(&row.kind)
-                    || fixed_damage_reduction(control, row)
-                    || matches!(row.kind, 4004 | 12000 | 12002 | 12003 | 12004 | 13000 | 13002 | 13003 | 13004))
-    });
-    let sampled_actors = fixed_inputs.then(|| {
-        let mut actors = reduced.clone();
-        for actor in &mut actors { actor.support_skills.clear(); }
-        actors
-    });
-    let shared_key = sampled_actors.as_ref().filter(|_| chart.luck && runs.len() >= 8).map(|actors| Key {
-        program: control_program(control, chart, actors),
+    let one_seed = [key.seeds.first().copied().unwrap_or(0)];
+    let runs = if chart.luck { &key.seeds[..] } else { &one_seed[..] };
+    let sampled_control = deck.sampled.get_or_init(|| sampled_control(control, chart, &deck.actors, runs)).as_ref();
+    let fixed_inputs = sampled_control.is_some();
+    let shared_key = sampled_control.and_then(|sampled| sampled.program.as_ref()).map(|program| Key {
+        program: Arc::clone(program),
         ..key.clone()
     });
+    let mut base = None;
     let mut sampled = None;
     let mut lottery_record = false;
     let mut prepared: Option<Vec<FixedFrame>> = None;
@@ -1373,16 +1518,16 @@ fn context(
     let mut unique = HashMap::<Arc<ScoreTape>, ()>::default();
     let mut sample_input = None;
     let mut capture = Vec::new();
-    let shared_prefix_at = chart.setup.fevers.iter().zip(&chart.setup.missions)
-        .filter_map(|(&(start, _), &mission)| (mission == 2).then_some(start))
-        .min().map(|time| chart.play.frames.partition_point(|frame| frame.time_ms < time))
-        .filter(|&index| fixed_inputs && runs.len() >= 8 && index >= 120);
+    let shared_prefix_at = (fixed_inputs && runs.len() >= 8)
+        .then(|| chart.lottery_prefix_frame()).flatten();
     let mut shared_prefix: Option<SamplePrefix<'_>> = None;
+    let mut quiet_intervals = Vec::new();
+    let mut quiet_gaps: Vec<LotteryGap> = Vec::new();
     let generation = crate::cancellation_generation();
     for (run, seed) in runs.iter().copied().enumerate() {
         if run == 1 {
-            if let Some(actors) = &sampled_actors {
-                let mut replay = Model::with_prepared_notes(control, actors, chart.prepared_notes(), &key.events,
+            if let Some(sampled_control) = sampled_control {
+                let mut replay = Model::with_prepared_notes(control, &sampled_control.actors, chart.prepared_notes(), &key.events,
                     chart.params(), Some(&chart.setup), (runs[0], false, None))?;
                 replay.score.score.replay = Some(Vec::new());
                 replay.score.score.factored_record = true;
@@ -1390,24 +1535,73 @@ fn context(
                 replay.score.score.calculator.factors_only = true;
                 lottery_record = chart.setup.missions.iter().all(|&mission| mission == 2)
                     && replay.prepare_lottery_record();
+                if lottery_record { quiet_intervals = lottery_gaps(chart); }
                 sampled = Some(replay);
             }
         }
-        let (mut current, mut index, mut until, mut quiet) = if let Some(prefix) = &shared_prefix {
+        let resume = if run == 0 {
+            samples.prefixes.as_mut().and_then(|prefixes| prefixes.resume(order, &key.events, &mut capture))
+        } else { None };
+        let resumed = resume.is_some();
+        let (mut current, mut index, mut until, mut quiet) = if let Some(resume) = resume {
+            resume
+        } else if let Some(prefix) = &shared_prefix {
             capture.extend_from_slice(&prefix.commands);
             (prefix.model.clone(), prefix.at, prefix.until, prefix.quiet)
-        } else {
-            let initial = if run > 0 { sampled.as_ref().unwrap_or(&model) } else { &model };
+        } else if let Some(initial) = sampled.as_ref().or(base.as_ref()) {
             (initial.clone(), 0, 0, 0)
+        } else {
+            let initial = make_model(seed)?;
+            if runs.len() > 1 && !fixed_inputs { base = Some(initial.clone()); }
+            (initial, 0, 0, 0)
         };
-        current.random = Random::new(seed);
+        if !resumed { current.random = Random::new(seed); }
         current.score.score.replay = Some(std::mem::take(&mut capture));
         let sparse = current.sparse_inputs();
         let next = sparse.then(|| if run > 0 && fixed_inputs { prepared_next.as_slice() } else { chart.sparse_inputs() });
+        let mut gap_start = None;
         while index < chart.play.frames.len() {
             let frame = &chart.play.frames[index];
             if index % 64 == 0 && generation != crate::cancellation_generation() {
                 return Err("cancelled".into());
+            }
+            if run == 0 {
+                if let Some(prefixes) = &mut samples.prefixes {
+                    prefixes.capture(&mut current, index, until, quiet);
+                }
+            }
+            if lottery_record && run > 0 {
+                let position = (index, until.max(index), quiet.min(2));
+                let through = |end: usize| {
+                    (end < chart.play.frames.len()).then(|| chart.play.frames[end - 1].time_ms)
+                };
+                if run == 1 {
+                    if let Some((from, end, start)) = gap_start.filter(|&(_, end, _)| index >= end) {
+                        gap_start = None;
+                        if index == end {
+                            let trace = current.score.score.replay.as_ref().unwrap();
+                            quiet_gaps.push(LotteryGap { from, to: position, commands: trace[start..].to_vec() });
+                        }
+                    }
+                    if gap_start.is_none() {
+                        if let Some(&(_, end)) = quiet_intervals.iter().find(|&&(start, end)| {
+                            frame.time_ms > start && end >= index + 120
+                        }) {
+                            if current.lottery_gap_is_inert(through(end)) {
+                                gap_start = Some((position, end, current.score.score.replay.as_ref().unwrap().len()));
+                            }
+                        }
+                    }
+                } else if let Some(gap) = quiet_gaps.iter().find(|gap| gap.from == position) {
+                    let (end, next_until, next_quiet) = gap.to;
+                    if current.lottery_gap_is_inert(through(end)) {
+                        // No targeted notes, state transitions or ordinary
+                        // events can affect the sampled model in this gap.
+                        current.score.score.replay.as_mut().unwrap().extend_from_slice(&gap.commands);
+                        (index, until, quiet) = (end, next_until, next_quiet);
+                        continue;
+                    }
+                }
             }
             // The remaining seeds use this same fixed-input model. Replacing
             // its random streams is exact before the first random draw.
@@ -1453,6 +1647,11 @@ fn context(
             index += 1;
         }
         let mut trace = current.score.score.replay.take().unwrap();
+        if let Some((from, end, start)) = gap_start.filter(|&(_, end, _)| index == end) {
+            quiet_gaps.push(LotteryGap {
+                from, to: (end, until.max(end), quiet.min(2)), commands: trace[start..].to_vec(),
+            });
+        }
         if run == 0 && fixed_inputs {
             let mut inputs = Vec::with_capacity(chart.play.frames.len());
             let mut judged = Vec::new();
@@ -1480,8 +1679,12 @@ fn context(
         }
         let shared_combos = if fixed_inputs { draws.first().map(|first| &first.combos) } else { None };
         let draw = Arc::new(ScoreTape::new(&trace, chart, control.live.life_base as i32, shared_combos));
-        trace.clear();
-        capture = trace;
+        if let Some(prefixes) = samples.prefixes.as_mut().filter(|_| run == 0) {
+            prefixes.retain_trace(trace);
+        } else {
+            trace.clear();
+            capture = trace;
+        }
         if let Some((stored, _)) = unique.get_key_value(&draw) {
             draws.push(Arc::clone(stored));
         } else {
@@ -1528,7 +1731,7 @@ fn context(
         }
     }
     let mut combos = HashSet::default();
-    let projection_bytes = if uses_full_replay(master, chart, seeds) {
+    let projection_bytes = if uses_full_replay(master, chart, &key.seeds) {
         (chart.notes.len() + 1) * std::mem::size_of::<[[f64; 2]; 5]>()
             + if chart.luck {
                 (chart.play.frames.len() + (core::frame(chart.music_length) + 50).max(1) as usize + 2)
@@ -1541,9 +1744,9 @@ fn context(
         .sum::<usize>()
         + draws.capacity() * std::mem::size_of::<Arc<ScoreTape>>()
         + std::mem::size_of::<Entry>()
-        + key.program.capacity() * 8
-        + key.seeds.capacity() * 4
-        + key.ranks.capacity() * 4
+        + std::mem::size_of_val(key.program.as_ref())
+        + std::mem::size_of_val(key.seeds.as_ref())
+        + std::mem::size_of_val(key.ranks.as_ref())
         + key.events.capacity() * std::mem::size_of::<(usize, i32)>()
         + projection_bytes;
     let context = Arc::new(Scene { draws, shared_inputs: fixed_inputs, projection: std::sync::OnceLock::new() });
@@ -1942,7 +2145,7 @@ fn score_orders<'a, const SETTLE: bool>(
         reuse_ordinary,
         observe,
     };
-    let from = if reuse_ordinary { prefix_end } else { 0 };
+    let from = if reuse_ordinary || !chart.luck { prefix_end } else { 0 };
     let state = if let Some(prior) = prefix.as_ref().filter(|_| from > 0) {
         prior.clone()
     } else {
@@ -1996,7 +2199,7 @@ fn score_orders<'a, const SETTLE: bool>(
             previous_life: [draw.base; 4],
         };
         if from > 0 {
-            tree.select_ordinary_tape(&mut initial, orders[0]);
+            if reuse_ordinary { tree.select_ordinary_tape(&mut initial, orders[0]); }
             tree.advance(&mut initial, 0, from)?;
             *prefix = Some(initial.clone());
         }
@@ -2092,6 +2295,25 @@ fn scoring_profiles(master: &Master, chart: &Chart, deck: &[Performer], seeds: &
     Ok(Some(ordinary))
 }
 
+fn control_order_groups(classes: &[usize], limit: usize) -> Option<Vec<Vec<usize>>> {
+    if classes.iter().all(|&class| class == classes[0]) {
+        return Some(vec![(0..120).collect()]);
+    }
+    let mut groups = Vec::<Vec<usize>>::new();
+    let mut ids = HashMap::default();
+    for (index, order) in live::orders().iter().enumerate() {
+        let key = order.map(|actor| classes[actor]);
+        let next = groups.len();
+        let group = *ids.entry(key).or_insert(next);
+        if group == next {
+            if next == limit { return None; }
+            groups.push(Vec::new());
+        }
+        groups[group].push(index);
+    }
+    Some(groups)
+}
+
 fn settle_profiles(
     master: &Master,
     chart: &Chart,
@@ -2105,33 +2327,29 @@ fn settle_profiles(
     control: Arc<Master>,
     ordinary_master: Arc<Master>,
 ) -> Result<Option<ReplayedScores>, String> {
-    let mut groups = Vec::<Vec<usize>>::new();
-    let mut ids = HashMap::default();
-    for (index, order) in live::orders().iter().enumerate() {
-        let key: Vec<_> = order
-            .iter()
-            .map(|&actor| classes[actor])
-            .collect();
-        let next = groups.len();
-        let group = *ids.entry(key).or_insert(next);
-        if group == next {
-            groups.push(Vec::new());
-        }
-        groups[group].push(index);
-    }
     // Amortize the control pass over the orders in each small group. A
     // sampled COMBO chart can need a different input tape for every draw.
-    let max_combo_groups = if chart.luck { 1 } else { 5 };
-    if chart.setup.missions.contains(&1) && uses_full_replay(master, chart, seeds)
-        && groups.len() > max_combo_groups
-    {
-        return Ok(None);
-    }
+    let max_groups = if chart.setup.missions.contains(&1) && uses_full_replay(master, chart, seeds) {
+        if chart.luck {
+            1
+        } else if chart.accuracy.miss_every > 0 {
+            // Five slots give at most twenty groups with two independent
+            // order-sensitive controls.
+            20
+        } else {
+            5
+        }
+    } else { 120 };
+    let Some(groups) = control_order_groups(&classes, max_groups) else { return Ok(None); };
     let generation = crate::cancellation_generation();
     let mut values = vec![0.0; 120];
     let mut range_values = [[0.0; 3]; 120];
     let mut note_memo = None;
-    let mut sample_cache = SampleCache::default();
+    let mut sample_cache = SampleCache::for_groups(chart, groups.len());
+    let mut group_score_prefix = None;
+    let mut group_score_tape: Option<Arc<ScoreTape>> = None;
+    let share_group_score = sample_cache.prefixes.is_some();
+    let control_deck = control_deck(master, &control, chart, deck, seeds, &ordinary);
     for orders in groups {
         let branch = OrderBranch::for_chart(chart, &orders)?;
         let ordered = (orders.as_slice(), branch.as_ref());
@@ -2166,8 +2384,8 @@ fn settle_profiles(
                 }
                 Ok(true)
             };
-            let Some(scene) = context(master, &control, chart, deck, seeds,
-                (&ordinary, &live::orders()[orders[0]]), &mut sample_cache, Some(&mut stream))?
+            let Some(scene) = context(master, &control, chart, &control_deck,
+                &live::orders()[orders[0]], &mut sample_cache, Some(&mut stream))?
             else { return Ok(None); };
             for order in orders {
                 values[order] /= scene.draws.len() as f64;
@@ -2179,9 +2397,8 @@ fn settle_profiles(
             master,
             &control,
             chart,
-            deck,
-            seeds,
-            (&ordinary, &live::orders()[orders[0]]),
+            &control_deck,
+            &live::orders()[orders[0]],
             &mut sample_cache,
             None,
         )?.unwrap();
@@ -2195,7 +2412,17 @@ fn settle_profiles(
             std::array::from_fn(|_| None)
         };
         let mut sample_prefix = None;
-        let prefix_end = if reuse_ordinary {
+        let prefix_end = if share_group_score && draws[0].ordinary_start() >= 256 {
+            let draw = &draws[0];
+            let end = draw.ordinary_start();
+            if group_score_tape.as_ref().is_none_or(|previous| {
+                previous.ordinary_start() != end || !draw.shares_prefix(previous, end)
+            }) {
+                group_score_prefix = None;
+            }
+            group_score_tape = Some(Arc::clone(draw));
+            end
+        } else if reuse_ordinary {
             // Stop before the first ordinary activation. A different control
             // stream or combo table keeps its own scoring prefix.
             let first = &draws[0];
@@ -2234,6 +2461,7 @@ fn settle_profiles(
                 }
             }
         }
+        let score_prefix = if share_group_score { &mut group_score_prefix } else { &mut sample_prefix };
         for draw in draws {
             if generation != crate::cancellation_generation() {
                 return Err("cancelled".into());
@@ -2243,7 +2471,7 @@ fn settle_profiles(
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     let Some(mut result) = score_orders::<true>(master, chart, deck, draw, power, tail_layout,
                         (&ordinary_master, reuse_ordinary.then_some(&mut ordinary_orders), &mut note_memo),
-                        (prefix_end, &mut sample_prefix), observe)? else {
+                        (prefix_end, score_prefix), observe)? else {
                         return Ok(None);
                     };
                     if let Some(classes) = &classes { classes.expand(&orders, &mut result); }

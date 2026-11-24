@@ -160,62 +160,80 @@ impl NetRandom {
 #[derive(Clone)]
 pub struct Random {
     pub base_seed: i32,
-    streams: [NetRandom; 4],
+    stream_seed: i32,
+    streams: [Option<NetRandom>; 4],
     pub draws: usize,
 }
 impl Random {
     pub fn new(base_seed: i32) -> Self {
         Self {
             base_seed,
-            streams: std::array::from_fn(|i| {
-                NetRandom::new((i as i32).wrapping_mul(-0x61c88647) ^ base_seed)
-            }),
+            stream_seed: base_seed,
+            streams: [None, None, None, None],
             draws: 0,
         }
     }
+    fn stream(&mut self, index: usize) -> &mut NetRandom {
+        let seed = self.stream_seed;
+        self.streams[index].get_or_insert_with(|| {
+            NetRandom::new((index as i32).wrapping_mul(-0x61c88647) ^ seed)
+        })
+    }
     pub fn value(&mut self, stream: usize) -> f64 {
         self.draws += 1;
-        f(self.streams[stream].double())
+        f(self.stream(stream).double())
     }
     pub fn integer(&mut self, stream: usize) -> i32 {
         self.draws += 1;
-        self.streams[stream].integer()
+        self.stream(stream).integer()
     }
 }
 #[derive(Default, Clone)]
 pub struct Combo {
-    times: Vec<i32>,
-    judgements: Vec<i32>,
-    combos: Vec<i32>,
+    notes: Vec<ComboNote>,
+    last_group: usize,
+}
+#[derive(Clone, Copy)]
+struct ComboNote {
+    time: i32,
+    combo: i32,
+    breaks_combo: bool,
 }
 impl Combo {
     pub fn add(&mut self, time: i32, judgement: i32) {
         if judgement == 0 || judgement == 7 {
             return;
         }
-        let at = if self.times.last().is_none_or(|&last| last <= time) { self.times.len() }
-            else { self.times.partition_point(|&t| t <= time) };
-        self.times.insert(at, time);
-        self.judgements.insert(at, judgement);
-        self.combos.insert(at, 0);
-        let mut combo = if at == 0 { 0 } else { self.combos[at - 1] };
-        for i in at..self.times.len() {
-            combo = if self.judgements[i] == 1 || self.judgements[i] == 2 {
-                0
-            } else {
-                combo + 1
-            };
-            self.combos[i] = combo;
+        let breaks_combo = matches!(judgement, 1 | 2);
+        if self.notes.last().is_none_or(|last| last.time <= time) {
+            let previous = self.notes.last();
+            if previous.is_none_or(|last| last.time != time) {
+                self.last_group = self.notes.len();
+            }
+            let combo = if breaks_combo { 0 } else { previous.map_or(1, |last| last.combo + 1) };
+            self.notes.push(ComboNote { time, combo, breaks_combo });
+            return;
+        }
+        let at = self.notes.partition_point(|note| note.time <= time);
+        let mut combo = if breaks_combo { 0 } else {
+            at.checked_sub(1).map_or(1, |previous| self.notes[previous].combo + 1)
+        };
+        self.notes.insert(at, ComboNote { time, combo, breaks_combo });
+        self.last_group += 1;
+        for note in &mut self.notes[at + 1..] {
+            combo = if note.breaks_combo { 0 } else { combo + 1 };
+            // Once the counts converge, the rest of the suffix is unchanged.
+            if combo == note.combo { break; }
+            note.combo = combo;
         }
     }
     pub fn at(&self, time: i32) -> i32 {
-        if self.times.last().is_some_and(|&last| last < time) { return *self.combos.last().unwrap(); }
-        let at = self.times.partition_point(|&t| t < time);
-        if at == 0 {
-            0
-        } else {
-            self.combos[at - 1]
-        }
+        let Some(last) = self.notes.last() else { return 0; };
+        if last.time < time { return last.combo; }
+        let at = if last.time == time { self.last_group } else {
+            self.notes.partition_point(|note| note.time < time)
+        };
+        at.checked_sub(1).map_or(0, |previous| self.notes[previous].combo)
     }
 }
 #[derive(Clone, Copy)]

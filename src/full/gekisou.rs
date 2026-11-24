@@ -791,6 +791,12 @@ impl Controller {
         self.track_counts = false;
     }
 
+    pub(super) fn between_lottery_ranges(&self) -> bool {
+        self.playing.is_empty() && self.updates.is_empty() && self.lot_results.is_empty()
+            && self.pending.iter().all(Vec::is_empty)
+            && self.states.iter().all(|state| matches!(state.state, WAIT | STANDBY | FINISH))
+    }
+
     pub(crate) fn take_combo_history_updates(&mut self) -> impl Iterator<Item = ComboHistoryUpdate> + '_ {
         self.combo_history_updates.iter_mut().flat_map(|updates| updates.drain(..))
     }

@@ -280,6 +280,7 @@ struct Combined<'k, 'a> {
     player: &'a Player,
     same_levels: bool,
     same_power: bool,
+    team_filter: bool,
     min_combo: i32,
     roster: Vec<usize>,
     affine: Option<AffineMean>,
@@ -600,11 +601,13 @@ impl<'k, 'a> Combined<'k, 'a> {
         // ceilings and their resolved replay, so try those refinements first.
         refinement_order.sort_by_key(|&index| !songs[index].adapter.kernel.chart.luck);
         let joint_seed_pending = warm_seed && prefer_joint_seed && ordered_snapshot_programs;
+        let team_filter = songs.iter().any(|song| song.adapter.has_team_filter());
         Self {
             songs,
             player,
             same_levels,
             same_power: equal_power,
+            team_filter,
             min_combo,
             roster: Vec::new(),
             affine,
@@ -673,16 +676,13 @@ impl<'k, 'a> Combined<'k, 'a> {
             }));
         }
         let kernel = &self.songs[0].adapter.kernel;
-        let members: Vec<_> = team
-            .members
-            .iter()
-            .map(|&m| kernel.members[m].clone())
-            .collect();
-        let snaps: Vec<_> = team
-            .snaps
-            .iter()
-            .map(|&s| (s >= 0).then(|| kernel.snaps[s as usize].clone()))
-            .collect();
+        let members = || team.members.iter().map(|&member| &kernel.members[member]);
+        let snaps = || team.snaps.iter().map(|&snap| (snap >= 0).then(|| &kernel.snaps[snap as usize]));
+        let formation = std::cell::OnceCell::new();
+        let owned = || formation.get_or_init(|| (
+            members().cloned().collect::<Vec<_>>(),
+            snaps().map(|snap| snap.cloned()).collect::<Vec<_>>(),
+        ));
         #[derive(Clone, Copy)]
         struct SettledPower {
             total: i64,
@@ -706,8 +706,9 @@ impl<'k, 'a> Combined<'k, 'a> {
                     let total = slots.iter().sum();
                     #[cfg(debug_assertions)]
                     {
+                        let (members, snaps) = owned();
                         let original = power::team_power(
-                            song.adapter.kernel.master, self.player, &members, &snaps, 0, Some(song.music), &[],
+                            song.adapter.kernel.master, self.player, members, snaps, 0, Some(song.music), &[],
                         )?;
                         debug_assert_eq!(slots.as_slice(), original.slots.as_slice(), "prepared slot power");
                         debug_assert_eq!(total, original.total, "prepared total power");
@@ -719,8 +720,9 @@ impl<'k, 'a> Combined<'k, 'a> {
                 if let Some(&power) = power_domains.get(&key) {
                     power
                 } else {
+                    let (members, snaps) = owned();
                     let original = power::team_power(
-                        song.adapter.kernel.master, self.player, &members, &snaps, 0, Some(song.music), &[],
+                        song.adapter.kernel.master, self.player, members, snaps, 0, Some(song.music), &[],
                     )?;
                     let power = SettledPower {
                         total: original.total,
@@ -742,8 +744,8 @@ impl<'k, 'a> Combined<'k, 'a> {
         let counters = (cutoff.is_some() && !refined && self.songs.iter().any(|song| !song.adapter.kernel.chart.luck))
             .then(|| crate::support_aliases::JustCounters::for_formation(
                 kernel.master,
-                &members,
-                &snaps.iter().flatten().cloned().collect::<Vec<_>>(),
+                members(),
+                snaps().flatten(),
             ));
         if cutoff.is_some() && !reused {
             for (index, song) in self.songs.iter_mut().enumerate() {
@@ -835,6 +837,20 @@ impl<'k, 'a> Combined<'k, 'a> {
             }
             None
         };
+        let mut first_pass = Vec::with_capacity(order.len());
+        for index in order {
+            let cached = cutoff.and_then(|_| {
+                let power = powers[if same_power { 0 } else { index }].total;
+                self.songs[index].adapter.kernel.cached_nominal_mean(team, power as i32)
+            });
+            if let Some(upper) = cached {
+                if let Some(upper) = accept(index, ChartSettlement::Upper(upper), &mut pending) {
+                    return Ok(search::Evaluation::Pruned(upper));
+                }
+            } else {
+                first_pass.push((index, None));
+            }
+        }
         let mut visit = |songs: &mut [SongObjective<'_, '_>], order: &[(usize, Option<f64>)],
                          pending: &mut Vec<(usize, f64)>| -> Result<Option<f64>, String> {
             let power = |index| powers[if same_power { 0 } else { index }].total;
@@ -864,8 +880,7 @@ impl<'k, 'a> Combined<'k, 'a> {
             }
             Ok(None)
         };
-        let order: Vec<_> = order.into_iter().map(|index| (index, None)).collect();
-        if let Some(upper) = visit(&mut self.songs, &order, &mut pending)? {
+        if let Some(upper) = visit(&mut self.songs, &first_pass, &mut pending)? {
             return Ok(search::Evaluation::Pruned(upper));
         }
         if !pending.is_empty() {
@@ -1388,13 +1403,13 @@ impl<'k, 'a> Combined<'k, 'a> {
 impl Objective for Combined<'_, '_> {
     fn retain_budget_bound(&self) -> bool { false }
 
-    fn filter_member_dominates(&self, better: usize, worse: usize) -> bool { self.songs.iter().all(|song| song.adapter.filter_member_dominates(better, worse)) }
-    fn filter_permutation_invariant(&self) -> bool { self.songs.iter().all(|song| song.adapter.filter_permutation_invariant()) }
+    fn filter_member_dominates(&self, better: usize, worse: usize) -> bool { !self.team_filter || self.songs.iter().all(|song| song.adapter.filter_member_dominates(better, worse)) }
+    fn filter_permutation_invariant(&self) -> bool { !self.team_filter || self.songs.iter().all(|song| song.adapter.filter_permutation_invariant()) }
 
     fn filter_snap_dominates(&self, member: usize, better: i32, worse: i32) -> bool {
-        self.songs.iter().all(|song| song.adapter.filter_snap_dominates(member, better, worse))
+        !self.team_filter || self.songs.iter().all(|song| song.adapter.filter_snap_dominates(member, better, worse))
     }
-    fn has_team_filter(&self) -> bool { self.songs.iter().any(|song| song.adapter.has_team_filter()) }
+    fn has_team_filter(&self) -> bool { self.team_filter }
     fn team_filter_impossible(&self) -> bool { self.songs.iter().any(|song| song.adapter.team_filter_impossible()) }
     fn feasible_assignment(&self, members: &[usize], assigned: &[i32], from: usize, options: &[Vec<i32>]) -> bool {
         self.songs.iter().all(|song| song.adapter.feasible_assignment(members, assigned, from, options))
@@ -1941,19 +1956,11 @@ impl Objective for Combined<'_, '_> {
             return (0.0, coarse);
         }
         let kernel = &self.songs[0].adapter.kernel;
-        let members: Vec<_> = team
-            .members
-            .iter()
-            .map(|&m| kernel.members[m].clone())
-            .collect();
-        let snaps: Vec<_> = team
-            .snaps
-            .iter()
-            .filter(|&&s| s >= 0)
-            .map(|&s| kernel.snaps[s as usize].clone())
-            .collect();
-        let counters =
-            crate::support_aliases::JustCounters::for_formation(kernel.master, &members, &snaps);
+        let counters = crate::support_aliases::JustCounters::for_formation(
+            kernel.master,
+            team.members.iter().map(|&member| &kernel.members[member]),
+            team.snaps.iter().filter(|&&snap| snap >= 0).map(|&snap| &kernel.snaps[snap as usize]),
+        );
         let mut upper = coarse;
         for (index, song) in self.songs.iter_mut().enumerate() {
             let width = song.adapter.kernel.snaps.len() + 1;
@@ -2555,6 +2562,32 @@ impl Kernel<'_> {
         ((coefficient * cap).next_up() < i32::MAX as f64).then_some((base, rows))
     }
 
+    fn cached_nominal_mean(&self, team: &Team, power: i32) -> Option<f64> {
+        if !self.chart.luck || !self.owner_local || !self.healthy || !self.seeds.is_empty()
+            || self.nominal_mean_members.as_slice() != team.members
+            || self.nominal_mean_coefficients.is_empty() && self.nominal_mean_cache.is_empty()
+        {
+            return None;
+        }
+        let mut shapes = [0; 5];
+        for (slot, (&member, &snap)) in team.members.iter().zip(&team.snaps).enumerate() {
+            let index = self.slot_index(member, snap);
+            let shape = if self.nominal_uses_bound_shape(member, &team.members) {
+                self.bound_shape_ids[index]
+            } else { self.shape_ids[index] };
+            if shape == u32::MAX { return None; }
+            shapes[slot] = shape;
+        }
+        self.nominal_mean_cached_score(shapes, power).flatten()
+    }
+
+    fn nominal_mean_cached_score(&self, shapes: [u32; 5], power: i32) -> Option<Option<f64>> {
+        self.nominal_mean_coefficients.get(&shapes)
+            .and_then(|&coefficient| self.nominal_coefficient_upper(power, coefficient))
+            .map(Some)
+            .or_else(|| self.nominal_mean_cache.get(&(shapes, power)).copied())
+    }
+
     fn nominal_mean_upper(&mut self, team: &Team, power: i32) -> Result<Option<f64>, String> {
         if !self.chart.luck || !self.seeds.is_empty() {
             return Ok(None);
@@ -2570,18 +2603,12 @@ impl Kernel<'_> {
         let shapes = std::array::from_fn(|slot| {
             self.nominal_roster_shape_id(team.members[slot], team.snaps[slot], &team.members)
         });
-        if let Some(upper) = self.nominal_mean_coefficients.get(&shapes)
-            .and_then(|&coefficient| self.nominal_coefficient_upper(power, coefficient))
-        {
-            return Ok(Some(upper));
-        }
-        let key = (shapes, power);
-        if let Some(&score) = self.nominal_mean_cache.get(&key) {
+        if let Some(score) = self.nominal_mean_cached_score(shapes, power) {
             return Ok(score);
         }
         let score = self.nominal_formation_upper(team, power, Some(shapes))?;
         if self.nominal_mean_cache.len() >= 256 { self.nominal_mean_cache.clear(); }
-        self.nominal_mean_cache.insert(key, score);
+        self.nominal_mean_cache.insert((shapes, power), score);
         Ok(score)
     }
 

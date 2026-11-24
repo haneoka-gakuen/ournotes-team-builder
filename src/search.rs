@@ -941,18 +941,17 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                 let mut kept = if preserve_options {
                     list.clone()
                 } else {
-                    let values: Vec<Vec<f64>> = list
+                    let values: Vec<_> = list
                         .iter()
                         .map(|&j| {
                             let col = if j < 0 { s } else { j as usize };
-                            let mut value = vec![
+                            let values = [
                                 snap_power[i * width + col],
                                 skill[i * width + col],
                                 skill_low[i * width + col],
                                 if j < 0 { 0.0 } else { snap_bonus[j as usize] },
                             ];
-                            value.extend(input.objective.snap_dominance(i, j));
-                            value
+                            (values, input.objective.snap_dominance(i, j))
                         })
                         .collect();
                     list
@@ -967,12 +966,13 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                                 if b == a || other < 0 {
                                     continue;
                                 }
-                                let (x, y) = (&values[a], &values[b]);
+                                let (x, x_program) = &values[a];
+                                let (y, y_program) = &values[b];
                                 if (input.constraints.max_bonus.is_none() || y[3] == x[3])
+                                    && y.iter().zip(x).all(|(y, x)| y >= x)
                                     && input.objective.filter_snap_dominates(i, other, j)
                                     && input.constraints.skill_roles.as_ref().is_none_or(|roles| roles.mask(i, other) == roles.mask(i, j))
-                                    && y[..4].iter().zip(&x[..4]).all(|(y, x)| y >= x)
-                                    && (y[4..].iter().zip(&x[4..]).all(|(y, x)| y >= x)
+                                    && (y_program.iter().zip(x_program).all(|(y, x)| y >= x)
                                         || input.objective.numeric_snap_dominance(
                                             i,
                                             other,
@@ -980,7 +980,8 @@ impl<'a, O: Objective + ?Sized> Runner<'a, O> {
                                             y[0] - x[0],
                                         ))
                                 {
-                                    let equal = y == x && input.objective.filter_snap_dominates(i, j, other);
+                                    let equal = y == x && y_program == x_program
+                                        && input.objective.filter_snap_dominates(i, j, other);
                                     if !equal || b < a {
                                         if conditional_dominance && j >= 0 {
                                             dominators[i][j as usize].push(other as usize);

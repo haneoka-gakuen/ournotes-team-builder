@@ -181,6 +181,14 @@ fn grade_bit(grade: i32) -> u8 {
 }
 
 impl Chart {
+    fn lottery_prefix_frame(&self) -> Option<usize> {
+        self.setup.fevers.iter().zip(&self.setup.missions)
+            .filter_map(|(&(start, _), &mission)| (mission == 2).then_some(start))
+            .min()
+            .map(|time| self.play.frames.partition_point(|frame| frame.time_ms < time))
+            .filter(|&index| index >= 120)
+    }
+
     pub(crate) fn before_wake(&self, next: usize, wake: i32) -> usize {
         if next == 0 || self.play.frames[next - 1].time_ms < wake { next }
         else { self.play.frames[..next].partition_point(|frame| frame.time_ms < wake) }
@@ -2725,8 +2733,13 @@ impl<const SECTIONS:bool,const COUNTS:bool> ReplayTree<'_,SECTIONS,COUNTS> {
         true
     }
 
-    fn visit_prepared(&self, mut model: Model<'_>, branch: &ReplayBranch, values: &mut [ReplayValue]) -> Result<bool, String> {
-        if self.stopped.load(Ordering::Relaxed) || !self.advance(&mut model, branch.from, branch.until)? {
+    fn visit_prepared(&self, model: Model<'_>, branch: &ReplayBranch, values: &mut [ReplayValue]) -> Result<bool, String> {
+        self.visit_prepared_from(model, branch, branch.from, values)
+    }
+
+    fn visit_prepared_from(&self, mut model: Model<'_>, branch: &ReplayBranch, from: usize, values: &mut [ReplayValue])
+        -> Result<bool, String> {
+        if self.stopped.load(Ordering::Relaxed) || !self.advance(&mut model, from, branch.until)? {
             return Ok(false);
         }
         match &branch.next {
@@ -3122,6 +3135,7 @@ fn replay_selected_orders(
         }
         jobs
     };
+    let lottery_prefix = (runs.len() >= 8).then(|| chart.lottery_prefix_frame()).flatten();
     let batches = crate::parallel::map(&jobs, |orders| -> Result<_, String> {
         let mut totals = vec![(0.0, [0.0; 3]); event_orders.len()];
         let prepared = (full || runs.len() > 1).then(|| {
@@ -3150,15 +3164,29 @@ fn replay_selected_orders(
         let mut memo = None;
         template.score.score.calculator.share_note_memo(&mut memo, chart.full.notes.len());
         let mut template = Some(template);
+        let checkpoint = lottery_prefix.zip(prepared.as_ref())
+            .map(|(frame, plan)| frame.min(plan.until)).filter(|&frame| frame >= 120);
+        let mut shared_prefix: Option<(Model<'_>, usize)> = None;
         for (index, &seed) in runs.iter().enumerate() {
-            let mut model = if index + 1 == runs.len() {
-                template.take().unwrap()
+            let (mut model, mut from) = if let Some((prefix, frame)) = &shared_prefix {
+                (prefix.clone(), *frame)
+            } else if index + 1 == runs.len() {
+                (template.take().unwrap(), 0)
             } else {
-                template.as_ref().unwrap().clone()
+                (template.as_ref().unwrap().clone(), 0)
             };
             model.random = Random::new(seed);
+            if index == 0 {
+                if let Some(frame) = checkpoint {
+                    if !tree.advance(&mut model, 0, frame)? { return Ok(None); }
+                    from = frame;
+                    if model.random.draws == 0 {
+                        shared_prefix = Some((model.clone(), frame));
+                    }
+                }
+            }
             let complete = if let Some(plan) = &prepared {
-                tree.visit_prepared(model, plan, &mut values)?
+                tree.visit_prepared_from(model, plan, from, &mut values)?
             } else {
                 tree.visit(model, orders, 0, 0, &mut values)?
             };

@@ -1011,8 +1011,8 @@ impl<'a> Model<'a> {
                 next = next.min(effect.state.score_wake(effect.act, time));
             }
         }
-        for condition in &self.condition {
-            next = condition.updater.next_score_frame(time, next);
+        for index in self.conditions_with_state() {
+            next = self.condition[index].updater.next_score_frame(time, next);
         }
         next
     }
@@ -1033,7 +1033,7 @@ impl<'a> Model<'a> {
                 && g.previous_lots.is_empty() && g.controller.states.iter().all(|state|
                     [gekisou::WAIT, gekisou::STANDBY, gekisou::PLAYING, gekisou::FINISH].contains(&state.state)
                         && state.luck.lots == 0))
-            && self.condition.iter().all(|condition| condition.updater.frame_settled())
+            && self.conditions_with_state().all(|index| self.condition[index].updater.frame_settled())
     }
     pub(crate) fn idle_frame(&mut self, time: i32) -> Result<(), String> {
         self.frame_time = time;
@@ -1083,6 +1083,12 @@ impl<'a> Model<'a> {
         }
         self.idle_frame(last.time_ms)
     }
+    fn conditions_with_state(&self) -> ConditionIndices {
+        // Scheduled conditions with idle inputs contain only one-shot effects.
+        // Their updater has a pending transition only while marked running.
+        let selected = self.condition_schedule.as_ref().map(|schedule| schedule.inputs.always | schedule.running);
+        ConditionIndices { selected, all: 0..self.condition.len() }
+    }
     fn condition_indices(&mut self) -> ConditionIndices {
         let mut selected = self.condition_schedule.as_ref().map(|schedule| schedule.select(
             &self.frame_events, !self.judged.is_empty(), self.frame_rank, self.gk.as_ref(),
@@ -1118,6 +1124,19 @@ impl<'a> Model<'a> {
     pub(crate) fn record_lottery_frame(&mut self, time: i32, judged: &[JudgedNote], dt: f64) -> Result<(), String> {
         debug_assert!(self.score.score.record_only && self.score.score.factored_record);
         lottery::record_frame(self, time, judged, dt)
+    }
+
+    pub(crate) fn lottery_gap_is_inert(&self, through: Option<i32>) -> bool {
+        self.frame_rank.is_none() && self.previous_rank.is_none()
+            && self.condition_schedule.as_ref().is_some_and(|schedule| {
+                schedule.inputs.ungated == 0 && schedule.running == 0
+            })
+            && self.gk.as_ref().is_some_and(|g| {
+                g.previous_lots.is_empty() && g.controller.between_lottery_ranges()
+            })
+            && through.is_none_or(|through| {
+                self.by_time.get(self.fired).is_none_or(|&event| self.events[event].1 > through)
+            })
     }
 
     pub(crate) fn frame_to_section_rank(

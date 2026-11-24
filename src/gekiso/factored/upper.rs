@@ -132,6 +132,34 @@ impl Projection {
         Some(projection)
     }
 
+    fn append(&mut self, other: Self) {
+        for (left, right) in self.sums.iter_mut().zip(other.sums) {
+            for (left, right) in left.iter_mut().zip(right) {
+                left[0] = (left[0] + right[0]).next_down();
+                left[1] = (left[1] + right[1]).next_up();
+            }
+        }
+        self.base = (self.base + other.base).next_up();
+        self.control_magnitude = self.control_magnitude.max(other.control_magnitude);
+        self.minimum = self.minimum.min(other.minimum);
+        self.control_commands = self.control_commands.max(other.control_commands);
+        self.local_commands = self.local_commands.max(other.local_commands);
+        self.local_rewinds &= other.local_rewinds;
+        self.control_applications = self.control_applications.max(other.control_applications);
+        self.rewinds = self.rewinds.max(other.rewinds);
+        for (left, right) in self.ordinary_previous.iter_mut().zip(other.ordinary_previous) {
+            *left = (*left).max(right);
+        }
+        // Recover the per-frame maxima before joining the prefix totals.
+        let (mut left_before, mut right_before, mut total) = (0, 0, 0);
+        for (left, right) in self.control_frames.iter_mut().zip(other.control_frames) {
+            total += (*left - left_before).max(right - right_before);
+            left_before = *left;
+            right_before = right;
+            *left = total;
+        }
+    }
+
     fn round_base(&self, ordinary: &OrdinaryUpper, measured_rewinds: Option<usize>) -> Option<f64> {
         let commands = ordinary.command_limit;
         let unrestricted = if self.local_rewinds {
@@ -312,25 +340,6 @@ impl FormationProjection {
     }
 }
 
-fn grouped_orders(classes: Vec<usize>) -> Option<Vec<Vec<usize>>> {
-    if classes.iter().all(|&class| class == classes[0]) {
-        return Some(vec![(0..120).collect()]);
-    }
-    let mut groups = Vec::<Vec<usize>>::new();
-    let mut ids = HashMap::default();
-    for (index, order) in live::orders().iter().enumerate() {
-        let key = order.map(|actor| classes[actor]);
-        let next = groups.len();
-        let group = *ids.entry(key).or_insert(next);
-        if group == next {
-            if next == 5 { return None; }
-            groups.push(Vec::new());
-        }
-        groups[group].push(index);
-    }
-    Some(groups)
-}
-
 pub(crate) fn formation_projection(
     master: &Master,
     chart: &Chart,
@@ -344,18 +353,19 @@ pub(crate) fn formation_projection(
     let Some(profiles) = scoring_profiles(master, chart, deck, seeds)? else {
         return Ok(None);
     };
-    let Some(groups) = grouped_orders(control_classes(master, chart, deck, &profiles)) else {
+    let Some(groups) = control_order_groups(&control_classes(master, chart, deck, &profiles), 5) else {
         return Ok(None);
     };
     if groups.len() > 1 && !wide_domain {
         return Ok(None);
     }
     let (control, _) = views(master, chart);
-    let mut samples = SampleCache::default();
+    let control_deck = control_deck(master, &control, chart, deck, seeds, &profiles);
+    let mut samples = SampleCache::for_groups(chart, groups.len());
     let mut components = Vec::with_capacity(groups.len());
     for orders in groups {
-        let Some(scene) = context(master, &control, chart, deck, seeds,
-            (&profiles, &live::orders()[orders[0]]), &mut samples, None)?
+        let Some(scene) = context(master, &control, chart, &control_deck,
+            &live::orders()[orders[0]], &mut samples, None)?
         else { return Ok(None); };
         let Some(projection) = scene.projection
             .get_or_init(|| Projection::from_draws(master, chart, &scene.draws).map(Arc::new))
@@ -981,11 +991,11 @@ fn mean_with_profiles(
     order_ceilings: Option<SampleCeilings<'_>>,
     profiles: Vec<(bool, bool)>,
 ) -> Result<Option<f64>, String> {
-    let Some(groups) = grouped_orders(control_classes(master, chart, deck, &profiles)) else {
+    let Some(groups) = control_order_groups(&control_classes(master, chart, deck, &profiles), 5) else {
         return Ok(None);
     };
     let (control, ordinary_master) = views(master, chart);
-    let mut samples = SampleCache::default();
+    let mut samples = SampleCache::for_groups(chart, groups.len());
     let mut combined = 0.0_f64;
     let sample_count = seeds.len() as f64;
     let sample_caps = if let Some((ceilings, limit)) = order_ceilings
@@ -1007,11 +1017,13 @@ fn mean_with_profiles(
     } else {
         None
     };
+    let control_deck = control_deck(master, &control, chart, deck, seeds, &profiles);
     for (index, orders) in groups.iter().enumerate() {
         const BATCH: usize = 8;
         let mut certified = None;
         let mut projected = 0.0_f64;
         let mut processed = 0usize;
+        let mut projected_draws: Option<Projection> = None;
         let mut batch = Vec::with_capacity(BATCH);
         let mut active = sample_caps.as_ref().is_some_and(|(limit, _, tail, _)| {
             (*limit * 120.0 * 2.0) >= combined + tail[index]
@@ -1044,8 +1056,8 @@ fn mean_with_profiles(
             if batch.len() < BATCH {
                 return Ok(true);
             }
-            let Some(score) = Projection::from_draws(master, chart, &batch)
-                .and_then(|projection| projection.mean(ordinary, BATCH, power, orders))
+            let Some((bounds, score)) = Projection::from_draws(master, chart, &batch)
+                .and_then(|bounds| bounds.mean(ordinary, BATCH, power, orders).map(|score| (bounds, score)))
             else {
                 active = false;
                 return Ok(true);
@@ -1063,6 +1075,11 @@ fn mean_with_profiles(
                 certified = Some(mean);
                 return Ok(false);
             }
+            if let Some(projected) = &mut projected_draws {
+                projected.append(bounds);
+            } else {
+                projected_draws = Some(bounds);
+            }
             Ok(true)
         };
         let observer = sample_caps.is_some().then_some(&mut observe as &mut DrawObserver<'_>);
@@ -1070,19 +1087,23 @@ fn mean_with_profiles(
             master,
             &control,
             chart,
-            deck,
-            seeds,
-            (&profiles, &live::orders()[orders[0]]),
+            &control_deck,
+            &live::orders()[orders[0]],
             &mut samples,
             observer,
         )?
         else {
             return Ok(certified);
         };
-        let Some(projection) = scene
-            .projection
-            .get_or_init(|| Projection::from_draws(master, chart, &scene.draws).map(Arc::new))
-            .as_ref()
+        let Some(projection) = scene.projection.get_or_init(|| {
+            let tail = Projection::from_draws(master, chart, &scene.draws[processed..])?;
+            if let Some(mut prefix) = projected_draws {
+                prefix.append(tail);
+                Some(Arc::new(prefix))
+            } else {
+                Some(Arc::new(tail))
+            }
+        }).as_ref()
         else {
             return Ok(None);
         };
