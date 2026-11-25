@@ -7162,26 +7162,13 @@ impl<'k, 'a> Adapter<'k, 'a> {
         deadline: f64,
         now: &dyn Fn() -> f64,
     ) -> Option<Self> {
-        Self::with_lottery_bound(kernel, level, surrogate, estimate, false, deadline, now)
-    }
-
-    fn with_lottery_bound(
-        kernel: &'k mut Kernel<'a>,
-        level: i32,
-        surrogate: bool,
-        estimate: bool,
-        nominal_lottery_bound: bool,
-        deadline: f64,
-        now: &dyn Fn() -> f64,
-    ) -> Option<Self> {
         let n = kernel.members.len();
         let global_luck =
             (!surrogate && !estimate && kernel.chart.luck && !kernel.seeds.is_empty())
                 .then(|| kernel.global_fixed_luck())
                 .flatten();
         let deterministic =
-            if !surrogate && !estimate && kernel.chart.luck
-                && (!kernel.seeds.is_empty() || nominal_lottery_bound && kernel.healthy) {
+            if !surrogate && !estimate && kernel.chart.luck && !kernel.seeds.is_empty() {
                 crate::rewards::DeterministicBound::with_luck_preparation(
                     kernel.master,
                     kernel.chart,

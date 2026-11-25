@@ -2404,7 +2404,6 @@ pub(crate) fn search_shared(input: SharedInput<'_>) -> Result<search::Output, St
         return Ok(search::Output { hits: ranked(&hits, k), proven: false, bound: None, stats: search::Stats { elapsed_ms: (env.now)()-started, ..Default::default() } });
     }
     let section_charts = sections.map(|_| charts.iter().map(|chart| chart.converted_judgements(&chart.judgements).unwrap()).collect::<Vec<_>>());
-    let shared_lottery_bound = sections.is_none() && charts.len() >= 16;
     let mut windows = Vec::with_capacity(charts.len());
     for chart in charts.iter() {
         let window = env.window_policy.map(|minimum| crate::just_window::Prepared::new(env.master, chart, env.members, env.snaps, minimum, &seeds)).transpose()?;
@@ -2529,7 +2528,7 @@ pub(crate) fn search_shared(input: SharedInput<'_>) -> Result<search::Output, St
             break;
         }
         let prepare = |kernel, now: &dyn Fn() -> f64| {
-            prepare_shared_adapter(kernel, level, same_levels, shared_lottery_bound, deadline, now)
+            prepare_shared_adapter(kernel, level, same_levels, deadline, now)
         };
         #[cfg(not(target_arch = "wasm32"))]
         let parallel = kernels.len() >= 16 && crate::parallel::workers(kernels.len()) > 1;
@@ -2642,13 +2641,12 @@ fn prepare_shared_adapter<'k, 'a>(
     kernel: &'k mut Kernel<'a>,
     level: i32,
     same_levels: bool,
-    lottery_bound: bool,
     deadline: f64,
     now: &dyn Fn() -> f64,
 ) -> Option<Adapter<'k, 'a>> {
     if now() >= deadline { return None; }
     let level = if same_levels { level } else { kernel.maximum_level };
-    Adapter::with_lottery_bound(kernel, level, false, false, lottery_bound, deadline, now)
+    Adapter::new(kernel, level, false, false, deadline, now)
 }
 
 impl Kernel<'_> {
