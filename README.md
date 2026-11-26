@@ -55,6 +55,7 @@ cargo run --release --example bench -- input.json
 | `qualify` | Check a request before running it |
 | `growth` | Rank card upgrades by how much each one gains |
 | `rates` | Report each song's scoring weights, rank thresholds and skill windows |
+| `roomSsReference` | Estimate five players' individual contributions to the multiplayer SS line on one chart |
 | `evaluateAll` | Score one fixed team on each of several songs |
 | `eventGrowthStart`, `eventGrowthStep`, `eventGrowthPage` | Infer character and band growth from recorded event decks |
 
@@ -71,6 +72,19 @@ cargo run --release --locked --example gekiso_room -- examples/gekiso_room/fixtu
 Both seats play one difficulty with a shared judgement profile. Each seat has a fixed ordinary skill order and random seed. The leader occupies the first slot. The remaining slots follow character ID order. Equal mission value, section score, and Perfect count give both players first place. The search checks every legal pair in the supplied small inventories. The maximum applies to that play scenario.
 
 With `--verify`, the example also runs each team through the original single-player simulator with all eight possible first/second-place histories. It finds the unique pair of histories that matches both players' standings, checks the exhaustive maximum, and prints the nine sample pairs when the input supplies them. The [sample and its data sources](examples/gekiso_room/FIXTURE.md) describe the inventories and individual-score comparison.
+
+The result also reports the two-player SS threshold, whether the pair reached it and the remaining points.
+
+### Five-player SS reference
+
+To browse every available song and difficulty from a saved team-builder release, build the chart catalogue and open the generated HTML file. The page shows the shared base score and five final scores. Changing one section placement swaps it with another player's placement in that section.
+
+```sh
+python examples/gekiso_room/catalog.py master.json catalog
+cargo run --release --locked --example gekiso_ss -- master.json catalog/catalog.json --html room-ss.html > room-ss.json
+```
+
+The catalogue records the region, release, chart hashes, scheduled charts and acquisition errors. Pass `--as-of` with an ISO timestamp and UTC offset to reproduce a particular release cutoff. The [engine contract](docs/engine.md#five-player-ss-reference) also supports a selected team from one player's inventory.
 
 ## Build
 

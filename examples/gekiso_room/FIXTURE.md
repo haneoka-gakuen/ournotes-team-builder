@@ -58,6 +58,11 @@ python examples/gekiso_room/build_fixture.py master.json 0013_03.bytes fixture-r
 ```
 
 On Windows, append `.exe` to the executable path.
+
+## Five-player SS reference
+
+The same chart provides a five-player SS reference. The song's multiplayer SS line is 118,563,185. With the default judgement profile, a skill-free reference team at power 3,600,737 has an unbonused full-song score of 14,507,929. The three sections score 1,537,778, 2,126,311 and 2,088,868 before placement awards. At fixed placements 111, 222, 333, 444 and 555 the five players finish at 28,890,321, 25,438,546, 23,712,658, 20,260,886 and 20,260,886. These add to 118,563,297. One point lower in power gives 118,563,008. To reproduce these values, load the fixture's `data` and `chart` in a session and call `roomSsReference` with its `song` and default scenario.
+
 ## Free team selection and rank-triggered skills
 
 Build the native example once with `cargo build --locked --release --example gekiso_room`. The inventory check constructs two six-member boxes. Each box allows two character variants, five possible leaders, and two placements for its required snapshot. A Python enumeration checks the identities of all 20 teams per seat against the native search. The single-seat history verifier checks the maximum across all 400 pairs. Generated inputs, formations and section results go into the output directory.

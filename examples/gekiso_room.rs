@@ -215,6 +215,13 @@ fn run() -> Result<Value, Box<dyn std::error::Error>> {
         "accuracy":input.accuracy, "orderIndices":input.order_indices, "seeds":input.seeds,
         "candidateCounts":[a.len(),b.len()], "pairsEvaluated":solution.evaluated,
         "teams":teams, "room":solution.replay});
+    output["ss"] = match haneoka_team_engine::gekiso::ss_reference::ss_room_threshold(
+        &master, &master.songs[&input.song.song_id], 2,
+    ) {
+        Ok(threshold) => json!({"roomThreshold":threshold, "achieved":solution.replay.total >= threshold,
+            "pointsNeeded":(threshold - solution.replay.total).max(0)}),
+        Err(reason) => json!({"unavailable":reason}),
+    };
     if mode.as_deref() == Some("--verify") {
         output["verification"] = verify(&input, &master, &chart, boxes, &solution)?;
     }

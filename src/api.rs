@@ -18,6 +18,7 @@ mod gekiso_result_cache;
 mod arena;
 mod arena_sections;
 pub mod room_search;
+mod room_ss_reference;
 mod shared;
 mod reward_plan;
 mod planner;
@@ -2854,30 +2855,32 @@ fn seed_teams(
     master::rows(&request["seeds"])
         .into_iter()
         .filter(|h| h["song"] == *song)
-        .filter_map(|hit| {
-            let members = master::rows(&hit["members"])
-                .into_iter()
-                .map(|v| members.iter().position(|m| v.as_str() == Some(&m.key)))
-                .collect::<Option<Vec<_>>>()?;
-            let snaps = master::rows(&hit["snaps"])
-                .into_iter()
-                .map(|v| {
-                    if v.is_null() {
-                        Some(-1)
-                    } else {
-                        snaps
-                            .iter()
-                            .position(|s| v.as_str() == Some(&s.key))
-                            .map(|i| i as i32)
-                    }
-                })
-                .collect::<Option<Vec<_>>>()?;
-            if members.len() != 5 || snaps.len() != 5 {
-                return None;
-            }
-            Some(crate::search::Team { members, snaps })
-        })
+        .filter_map(|hit| team_from_keys(hit, members, snaps))
         .collect()
+}
+
+fn team_from_keys(hit: &Value, members: &[power::Member], snaps: &[power::Snap]) -> Option<crate::search::Team> {
+    let members = master::rows(&hit["members"])
+        .into_iter()
+        .map(|v| members.iter().position(|m| v.as_str() == Some(&m.key)))
+        .collect::<Option<Vec<_>>>()?;
+    let snaps = master::rows(&hit["snaps"])
+        .into_iter()
+        .map(|v| {
+            if v.is_null() {
+                Some(-1)
+            } else {
+                snaps
+                    .iter()
+                    .position(|s| v.as_str() == Some(&s.key))
+                    .map(|i| i as i32)
+            }
+        })
+        .collect::<Option<Vec<_>>>()?;
+    if members.len() != 5 || snaps.len() != 5 {
+        return None;
+    }
+    Some(crate::search::Team { members, snaps })
 }
 
 impl Engine {

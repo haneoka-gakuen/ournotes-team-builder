@@ -99,6 +99,7 @@ pub fn execute(input: &Value) -> Result<Value, String> {
             }
             "growth" => engine.growth(input, started, &clock::milliseconds),
             "rates" => engine.rates(input),
+            "roomSsReference" => engine.room_ss_reference(input),
             "evaluateAll" => engine.evaluate_all(input),
             "sectionMetrics" => engine.section_metrics(input),
             "sample" => engine.sample(input),

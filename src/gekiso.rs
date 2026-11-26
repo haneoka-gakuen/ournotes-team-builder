@@ -1,5 +1,6 @@
 //! Gekiso context simulation, nominal lottery expectation and per-order scores.
 pub mod room;
+pub mod ss_reference;
 pub(crate) mod sections;
 mod factored;
 pub(crate) use factored::upper::{OrdinaryUpper, OrdinaryWindow, SampleCeilings, formation_projection, mean_upper as replay_tape_mean_upper};

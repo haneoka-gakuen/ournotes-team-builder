@@ -23,6 +23,26 @@ pub struct SectionSeat {
     pub bonus: i32,
 }
 
+impl SectionSeat {
+    pub(super) fn finish(
+        model: &mut super::Model<'_>,
+        index: usize,
+        own: Standing,
+        rank: i32,
+    ) -> Self {
+        model.finish_section_frame(index, rank);
+        let bonus = &model.gk.as_ref().unwrap().rank_bonus[index];
+        Self {
+            metric: own.metric,
+            score: own.score,
+            perfect: own.perfect,
+            rank,
+            percent: bonus.percent,
+            bonus: bonus.bonus,
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Section {
@@ -71,25 +91,15 @@ pub fn replay(master: &Master, chart: &Chart, seats: [Seat<'_>; 2]) -> Result<Re
             (Some((i, a)), Some((j, b))) if i == j && i == sections.len() => (i, [a, b]),
             _ => return Err(format!("inconsistent room section at {} ms", frame.time_ms)),
         };
-        let finish = |model: &mut super::Model<'_>, own: Standing, other: Standing| {
-            let rank = 1 + i32::from(other.beats(&own));
-            model.finish_section_frame(index, rank);
-            let bonus = &model.gk.as_ref().unwrap().rank_bonus[index];
-            SectionSeat {
-                metric: own.metric,
-                score: own.score,
-                perfect: own.perfect,
-                rank,
-                percent: bonus.percent,
-                bonus: bonus.bonus,
-            }
-        };
         let [a, b] = standings;
         sections.push(Section {
             index,
             mission: chart.setup.missions[index],
             time_ms: frame.time_ms,
-            seats: [finish(&mut left, a, b), finish(&mut right, b, a)],
+            seats: [
+                SectionSeat::finish(&mut left, index, a, 1 + i32::from(b.beats(&a))),
+                SectionSeat::finish(&mut right, index, b, 1 + i32::from(a.beats(&b))),
+            ],
         });
     }
     if sections.len() != 3 {

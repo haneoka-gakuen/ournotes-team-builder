@@ -65,6 +65,22 @@ Deferred ordinary recovery can share control traces when native prefix replay pr
 
 `sectionMetrics` evaluates a fixed team with the same `request` shape as `evaluateAll`. It returns `metrics`, with each song's three `missions`, total `samples` and three `distributions` of `{points, count}`. All 120 skill orders and seeds 0 through n-1 contribute; a zero or omitted seed count selects 32 samples per order. The count-only replay preserves ordinary conversion, recovery and Gekiso effects. Equivalent orders share replay only when their mission counts are identical. It does not compare opponents or settle total scores.
 
+### Five-player SS reference
+
+After caching the chart in a session, call `roomSsReference` with the selected song and difficulty. Like `evaluateAll`, it can also receive chart data in the call's `charts` array.
+
+```json
+{"op":"roomSsReference","handle":1,"song":{"songId":100013,"difficulty":3}}
+```
+
+By default, five copies of one skill-free reference team play the same difficulty. Eligible notes receive JUST and the others receive PERFECT. The ordinary skill order and LUCK seed are both zero. Each player's default placement is constant across all three sections, from first through fifth. A placement scenario assumes these ranks. The cooperative solver obtains actual ranks by comparing each player's section performance.
+
+For the song view, display `reference.roomThreshold` and `neutralCrossing.baseScore`. Each entry in `neutralCrossing.scores` is a final personal score at the shared integer power `neutralCrossing.power`. The engine replays that power and the preceding power for every seat to verify that the five scores cross the multiplayer SS line. If a crossing is unavailable, the response supplies a null crossing and the reason in `neutralCrossingUnavailable`.
+
+Only the section score earns the placement award. At the crossing, `sectionBonuses[section][rank - 1]` is the integer award for that section and placement. Swapping two players' placements within a section redistributes their scores and preserves the room total for this neutral team. To change ties, submit a new `scenario.rankSchedule`. Each of its five rows contains one player's three placements. In each column, tied positions use competition ranking, for example 1, 1, 3, 4, 5.
+
+For a reference with actual skills, supply both `request` (the owner's members, snaps, player bonuses and constraints) and `team` (five member keys and their five equipped snap keys or nulls, with an optional leader key). A player's allowed difficulties and judgement conditions carry over. The optional `scenario` object accepts `accuracy`, `orderIndex`, `seed` and `rankSchedule`. The engine feeds each assigned placement back into that team's skills for the following section. Each of the five entries in `reference.seats` contains the simulated personal score, its base score after removing the three awards, and the section breakdown. The integer `targetScore` shares divide the SS line in proportion to the simulated scores. These are planning estimates. With skills the base scores can differ by placement, and an actual room can reach SS with many different individual scores. A single LUCK seed describes one outcome.
+
 ## Song rules
 
 `request.songRules` overrides the song type and each of the three Gekiso ranges. Zero keeps the source value, and type 99 selects ALL. Live, Gekiso, rewards, manual evaluation and timelines all use the same overrides.

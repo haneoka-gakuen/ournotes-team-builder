@@ -158,6 +158,11 @@ pub fn score_rank(chart: &Chart, score: f64) -> i32 {
         .unwrap_or(2)
         .max(2)
 }
+/// Room-wide multiplayer grade line from the master table's five-player average.
+pub(crate) fn battle_room_total(battle_required: i32, players: u64) -> i64 {
+    ((5.0 / players as f64).sqrt() * battle_required as f64 * players as f64).trunc() as i64
+}
+
 /// Project room grading onto the player's score once; replay and all reward bounds share it.
 pub(crate) fn reward_chart<'a>(chart: &'a Chart, room: &serde_json::Value) -> Result<std::borrow::Cow<'a, Chart>, String> {
     use std::borrow::Cow;
@@ -174,7 +179,7 @@ pub(crate) fn reward_chart<'a>(chart: &'a Chart, room: &serde_json::Value) -> Re
     for row in &mut projected.ranks {
         let required = if solo { row.required as f64 } else {
             if row.battle_required == 0 { continue; }
-            let total = ((5.0 / players as f64).sqrt() * row.battle_required as f64 * players as f64).trunc();
+            let total = battle_room_total(row.battle_required, players) as f64;
             if let Some(average) = others { total - average * (players - 1) as f64 }
             else { (total / players as f64).ceil() }
         };

@@ -136,9 +136,7 @@ impl Inventory<'_> {
     }
 }
 
-/// Uses the existing inventory request format and resolves growth and account bonuses per seat.
-/// No candidate ranking or pruning based on individual strength is performed.
-pub fn candidates(master: &Master, song_id: i32, seat: &Value) -> Result<Vec<Candidate>, String> {
+fn inventory<'a>(master: &'a Master, song_id: i32, seat: &Value) -> Result<Inventory<'a>, String> {
     let mut cards = super::owned_box(master, seat)?;
     if !cards.unknown.is_empty() {
         return Err(format!(
@@ -185,14 +183,20 @@ pub fn candidates(master: &Master, song_id: i32, seat: &Value) -> Result<Vec<Can
     let unbound_snaps = std::iter::once(-1)
         .chain(available.map(|i| i as i32))
         .collect();
-    let inventory = Inventory {
+    Ok(Inventory {
         master,
         cards,
         limits,
         unbound_snaps,
         player: power::player_state(master, &seat["player"]),
         music: power::music_view(master, song_id, None)?,
-    };
+    })
+}
+
+/// Uses the existing inventory request format and resolves growth and account bonuses per seat.
+/// No candidate ranking or pruning based on individual strength is performed.
+pub fn candidates(master: &Master, song_id: i32, seat: &Value) -> Result<Vec<Candidate>, String> {
+    let inventory = inventory(master, song_id, seat)?;
     let mut candidates = Vec::new();
     inventory.pick_members(
         &mut Team {
@@ -203,6 +207,38 @@ pub fn candidates(master: &Master, song_id: i32, seat: &Value) -> Result<Vec<Can
         &mut candidates,
     )?;
     Ok(candidates)
+}
+
+/// Resolve one selected team from its owner's inventory without generating alternatives.
+pub(super) fn fixed_candidate(
+    master: &Master,
+    song_id: i32,
+    request: &Value,
+    team: &Value,
+) -> Result<Candidate, String> {
+    let inventory = inventory(master, song_id, request)?;
+    let cards = &inventory.cards;
+    if !["members", "snaps"]
+        .iter()
+        .all(|&field| team[field].as_array().is_some_and(|slots| slots.len() == 5))
+    {
+        return Err("selected team must list five member and snap slots".into());
+    }
+    let mut selected = super::team_from_keys(team, &cards.members, &cards.snaps)
+        .ok_or("expected five owned members and five owned or empty snap slots")?;
+    if let Some(leader) = team.get("leader") {
+        let position = selected
+            .members
+            .iter()
+            .position(|&i| Some(cards.members[i].key.as_str()) == leader.as_str())
+            .ok_or("selected leader must be on the team")?;
+        selected.members[..=position].rotate_right(1);
+        selected.snaps[..=position].rotate_right(1);
+    }
+    if !search::valid_seed(&cards.members, &cards.snaps, &inventory.limits, &selected) {
+        return Err("selected team violates formation or inventory constraints".into());
+    }
+    inventory.prepare(&selected)
 }
 
 pub struct Solution {
