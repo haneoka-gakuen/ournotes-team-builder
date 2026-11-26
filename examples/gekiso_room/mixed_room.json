@@ -1,0 +1,434 @@
+{
+  "song": {
+    "songId": 100017,
+    "difficulty": 3
+  },
+  "players": [
+    {
+      "members": [
+        {
+          "key": "A-m51",
+          "cardId": 51,
+          "maximize": true
+        },
+        {
+          "key": "A-m53",
+          "cardId": 53,
+          "maximize": true
+        },
+        {
+          "key": "A-m54",
+          "cardId": 54,
+          "maximize": true
+        },
+        {
+          "key": "A-m72",
+          "cardId": 72,
+          "maximize": true
+        },
+        {
+          "key": "A-m80",
+          "cardId": 80,
+          "maximize": true
+        }
+      ],
+      "snaps": [
+        {
+          "key": "A-s60",
+          "cardId": 60,
+          "maximize": true
+        },
+        {
+          "key": "A-s66",
+          "cardId": 66,
+          "maximize": true
+        },
+        {
+          "key": "A-s71",
+          "cardId": 71,
+          "maximize": true
+        },
+        {
+          "key": "A-s75",
+          "cardId": 75,
+          "maximize": true
+        },
+        {
+          "key": "A-s83",
+          "cardId": 83,
+          "maximize": true
+        }
+      ],
+      "player": {
+        "vipRank": 2,
+        "characterRanks": {
+          "1": 1,
+          "2": 1,
+          "3": 1,
+          "4": 1,
+          "5": 1,
+          "6": 1,
+          "7": 1,
+          "8": 1,
+          "9": 1,
+          "10": 1,
+          "11": 1,
+          "12": 1,
+          "13": 1,
+          "14": 1,
+          "15": 1,
+          "16": 1,
+          "17": 1,
+          "18": 1,
+          "19": 1,
+          "20": 1,
+          "21": 1,
+          "22": 1,
+          "23": 1,
+          "24": 1,
+          "25": 1,
+          "1001": 1
+        }
+      },
+      "unknownPolicy": "min",
+      "allowedDifficulties": [
+        2
+      ],
+      "constraints": {
+        "leader": "A-m72",
+        "requiredMembers": [
+          "A-m72",
+          "A-m51",
+          "A-m53",
+          "A-m54",
+          "A-m80"
+        ],
+        "bindings": [
+          [
+            "A-m53",
+            "A-s60"
+          ],
+          [
+            "A-m54",
+            "A-s66"
+          ],
+          [
+            "A-m80",
+            "A-s83"
+          ]
+        ],
+        "requiredSnaps": [
+          "A-s75",
+          "A-s71",
+          "A-s60",
+          "A-s66",
+          "A-s83"
+        ]
+      },
+      "difficulty": 2,
+      "accuracy": {
+        "just": 0.81,
+        "great": 0.015,
+        "missEvery": 0
+      }
+    },
+    {
+      "members": [
+        {
+          "key": "B-m51",
+          "cardId": 51,
+          "maximize": true
+        },
+        {
+          "key": "B-m53",
+          "cardId": 53,
+          "maximize": true
+        },
+        {
+          "key": "B-m54",
+          "cardId": 54,
+          "maximize": true
+        },
+        {
+          "key": "B-m72",
+          "cardId": 72,
+          "maximize": true
+        },
+        {
+          "key": "B-m80",
+          "cardId": 80,
+          "maximize": true
+        }
+      ],
+      "snaps": [
+        {
+          "key": "B-s60",
+          "cardId": 60,
+          "maximize": true
+        },
+        {
+          "key": "B-s66",
+          "cardId": 66,
+          "maximize": true
+        },
+        {
+          "key": "B-s71",
+          "cardId": 71,
+          "maximize": true
+        },
+        {
+          "key": "B-s75",
+          "cardId": 75,
+          "maximize": true
+        },
+        {
+          "key": "B-s83",
+          "cardId": 83,
+          "maximize": true
+        }
+      ],
+      "player": {
+        "vipRank": 2,
+        "characterRanks": {
+          "1": 1,
+          "2": 1,
+          "3": 1,
+          "4": 1,
+          "5": 1,
+          "6": 1,
+          "7": 1,
+          "8": 1,
+          "9": 1,
+          "10": 1,
+          "11": 1,
+          "12": 1,
+          "13": 1,
+          "14": 1,
+          "15": 1,
+          "16": 1,
+          "17": 1,
+          "18": 1,
+          "19": 1,
+          "20": 1,
+          "21": 1,
+          "22": 1,
+          "23": 1,
+          "24": 1,
+          "25": 1,
+          "1001": 1
+        }
+      },
+      "unknownPolicy": "min",
+      "allowedDifficulties": [
+        3
+      ],
+      "lockedTeam": {
+        "leader": "B-m72",
+        "members": [
+          "B-m72",
+          "B-m51",
+          "B-m53",
+          "B-m54",
+          "B-m80"
+        ],
+        "snaps": [
+          "B-s75",
+          "B-s71",
+          "B-s60",
+          "B-s66",
+          "B-s83"
+        ]
+      },
+      "constraints": {
+        "leader": "B-m72",
+        "requiredMembers": [
+          "B-m72",
+          "B-m51",
+          "B-m53",
+          "B-m54",
+          "B-m80"
+        ],
+        "bindings": [
+          [
+            "B-m72",
+            "B-s75"
+          ],
+          [
+            "B-m51",
+            "B-s71"
+          ],
+          [
+            "B-m53",
+            "B-s60"
+          ],
+          [
+            "B-m54",
+            "B-s66"
+          ],
+          [
+            "B-m80",
+            "B-s83"
+          ]
+        ]
+      },
+      "difficulty": 3,
+      "accuracy": {
+        "just": 0.92,
+        "great": 0,
+        "missEvery": 0
+      }
+    },
+    {
+      "members": [
+        {
+          "key": "C-m51",
+          "cardId": 51,
+          "maximize": true
+        },
+        {
+          "key": "C-m53",
+          "cardId": 53,
+          "maximize": true
+        },
+        {
+          "key": "C-m54",
+          "cardId": 54,
+          "maximize": true
+        },
+        {
+          "key": "C-m72",
+          "cardId": 72,
+          "maximize": true
+        },
+        {
+          "key": "C-m80",
+          "cardId": 80,
+          "maximize": true
+        }
+      ],
+      "snaps": [
+        {
+          "key": "C-s60",
+          "cardId": 60,
+          "maximize": true
+        },
+        {
+          "key": "C-s66",
+          "cardId": 66,
+          "maximize": true
+        },
+        {
+          "key": "C-s71",
+          "cardId": 71,
+          "maximize": true
+        },
+        {
+          "key": "C-s75",
+          "cardId": 75,
+          "maximize": true
+        },
+        {
+          "key": "C-s83",
+          "cardId": 83,
+          "maximize": true
+        }
+      ],
+      "player": {
+        "vipRank": 2,
+        "characterRanks": {
+          "1": 1,
+          "2": 1,
+          "3": 1,
+          "4": 1,
+          "5": 1,
+          "6": 1,
+          "7": 1,
+          "8": 1,
+          "9": 1,
+          "10": 1,
+          "11": 1,
+          "12": 1,
+          "13": 1,
+          "14": 1,
+          "15": 1,
+          "16": 1,
+          "17": 1,
+          "18": 1,
+          "19": 1,
+          "20": 1,
+          "21": 1,
+          "22": 1,
+          "23": 1,
+          "24": 1,
+          "25": 1,
+          "1001": 1
+        }
+      },
+      "unknownPolicy": "min",
+      "allowedDifficulties": [
+        3
+      ],
+      "lockedTeam": {
+        "leader": "C-m72",
+        "members": [
+          "C-m72",
+          "C-m51",
+          "C-m53",
+          "C-m54",
+          "C-m80"
+        ],
+        "snaps": [
+          "C-s75",
+          "C-s71",
+          "C-s60",
+          "C-s66",
+          "C-s83"
+        ]
+      },
+      "constraints": {
+        "leader": "C-m72",
+        "requiredMembers": [
+          "C-m72",
+          "C-m51",
+          "C-m53",
+          "C-m54",
+          "C-m80"
+        ],
+        "bindings": [
+          [
+            "C-m72",
+            "C-s75"
+          ],
+          [
+            "C-m51",
+            "C-s71"
+          ],
+          [
+            "C-m53",
+            "C-s60"
+          ],
+          [
+            "C-m54",
+            "C-s66"
+          ],
+          [
+            "C-m80",
+            "C-s83"
+          ]
+        ]
+      },
+      "difficulty": 3,
+      "accuracy": {
+        "just": 0.95,
+        "great": 0.005,
+        "missEvery": 0
+      }
+    }
+  ],
+  "sampling": {
+    "seed": 20261131,
+    "count": 32,
+    "skillOrders": "uniform"
+  },
+  "objective": "meanScore"
+}

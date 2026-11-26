@@ -1,4 +1,6 @@
 //! Gekiso context simulation, nominal lottery expectation and per-order scores.
+pub mod room;
+pub mod ss_reference;
 pub(crate) mod sections;
 mod factored;
 pub(crate) use factored::upper::{OrdinaryUpper, OrdinaryWindow, SampleCeilings, formation_projection, mean_upper as replay_tape_mean_upper};
@@ -2511,11 +2513,16 @@ pub(crate) fn replay_order_scene(master:&Master,chart:&Chart,deck:&[Performer],p
         .map(|value| value.expect("unlimited replay"))
 }
 
-pub(crate) fn replay_order_until(master:&Master,chart:&Chart,deck:&[Performer],power:i32,order_index:usize,
-    mode:(i32,bool), limit:(Option<&sections::ReplayScene<'_>>,f64))->Result<Option<ReplayedOrder>,String> {
-    let (scene, deadline) = limit;
-    let (seed, trace_combo) = mode;
-    let order = &live::orders()[order_index];
+fn order_model<'a>(
+    master: &'a Master,
+    chart: &Chart,
+    deck: &[Performer],
+    power: i32,
+    order_index: usize,
+    seed: i32,
+) -> Result<Model<'a>, String> {
+    let order = live::orders().get(order_index)
+        .ok_or_else(|| format!("ordinary skill order {order_index} out of range"))?;
     let events = chart
         .full
         .events
@@ -2541,6 +2548,14 @@ pub(crate) fn replay_order_until(master:&Master,chart:&Chart,deck:&[Performer],p
         (seed, false, None),
     )?;
     chart.fixed_life(&mut model);
+    Ok(model)
+}
+
+pub(crate) fn replay_order_until(master:&Master,chart:&Chart,deck:&[Performer],power:i32,order_index:usize,
+    mode:(i32,bool), limit:(Option<&sections::ReplayScene<'_>>,f64))->Result<Option<ReplayedOrder>,String> {
+    let (scene, deadline) = limit;
+    let (seed, trace_combo) = mode;
+    let mut model = order_model(master, chart, deck, power, order_index, seed)?;
     let mut displaced=HashMap::default();
     if let Some(scene)=scene {
         model.just_window=scene.window.cloned();

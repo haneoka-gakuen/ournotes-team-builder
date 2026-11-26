@@ -43,7 +43,7 @@ pub struct Setup {
     /// Placement in each range (1 = first); a missing range is first.
     pub ranks: Vec<i32>,
 }
-#[derive(Clone, Copy, Deserialize, Serialize)]
+#[derive(Clone, Copy, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Accuracy {
     #[serde(default)]

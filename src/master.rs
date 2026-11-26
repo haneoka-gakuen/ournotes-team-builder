@@ -1038,14 +1038,16 @@ pub fn compile(data: &Value) -> Result<Master, String> {
                     .collect(),
                 ranks: rows(&tools["gekisouRankingScoreBonuses"])
                     .iter()
-                    .map(|r| {
+                    .filter_map(|r| {
                         let r = native_view(r);
-                        [
+                        let percent = number(&r["scoreBonusPercent"], f64::NAN);
+                        // Preserve a missing award as an absent row, distinct from a published zero.
+                        percent.is_finite().then(|| [
                             int(&r["missionPattern"]),
                             int(&r["count"]),
                             int(&r["rank"]),
-                            int(&r["scoreBonusPercent"]),
-                        ]
+                            percent as i32,
+                        ])
                     })
                     .collect(),
                 gauge_max: setting("gekisou_luck_gauge_max", 100.0) as i32,

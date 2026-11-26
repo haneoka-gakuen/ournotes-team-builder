@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>五人激奏 SS 参考分 · Haneoka</title>
+<style>
+:root{color-scheme:light dark;--bg:#fcf8fd;--surface:#f0edf3;--fg:#1b1b20;--muted:#555461;--accent:#555994;--band:#e4e2fc;--line:#d9d6df}
+@media(prefers-color-scheme:dark){:root{--bg:#17171c;--surface:#24242c;--fg:#f2eef6;--muted:#c6c3d0;--accent:#c2c4ff;--band:#343650;--line:#46454e}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:1rem/1.65 Roboto,"Noto Sans SC","Microsoft YaHei",system-ui,sans-serif}
+main,footer{max-width:55rem;margin:0 auto;padding:1.25rem}h1,h2,h3,p{margin:.35rem 0 .75rem}h1{font-size:clamp(1.65rem,4vw,2.4rem);letter-spacing:-.035em}h2{font-size:1.45rem;line-height:1.4}h3{font-size:1.06rem}
+label{display:block}input,select,button{font:inherit;color:var(--fg);border:1px solid var(--line);background:var(--bg);border-radius:.6rem;padding:.5rem;min-height:48px}
+button{cursor:pointer;color:var(--accent)}:focus-visible{outline:3px solid var(--accent);outline-offset:1px}
+.filters{display:grid;grid-template-columns:1fr 1.5fr .8fr;gap:.6rem;margin:1.15rem 0 1.7rem}.filters label{color:var(--muted)}.filters select,.filters input{display:block;width:100%;min-width:0}
+.summary{display:grid;grid-template-columns:1.05fr 1fr;gap:1rem;background:var(--band);border-radius:1rem;padding:1rem 1.25rem;margin:1rem 0}.summary strong{display:block;font-size:clamp(1.35rem,3vw,1.9rem);font-variant-numeric:tabular-nums;line-height:1.35}
+.muted,footer{color:var(--muted)}section{margin-top:1.5rem}table{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums;margin:.6rem 0 .85rem}
+th,td{text-align:right;padding:.4rem .55rem;border-bottom:1px solid var(--line)}th:first-child,td:first-child{text-align:left}th{font-weight:600}td select{width:4.4rem;min-width:0;text-align:center}td:last-child{font-weight:650}
+.controls{display:flex;align-items:center;justify-content:space-between;gap:.75rem}.controls h3{margin:0}details{margin-top:1.2rem;border-top:1px solid var(--line);padding:1rem 0}summary{cursor:pointer;color:var(--accent);font-weight:600}a{color:var(--accent)}footer{padding-top:.5rem;font-size:.93rem}
+@media(max-width:38rem){main,footer{padding:1rem .8rem}.filters{grid-template-columns:1fr 6.8rem}.filters label:first-child{grid-column:1/-1}.summary{padding:.9rem .65rem;gap:.45rem}.summary strong{font-size:1.3rem}th,td{padding:.32rem .14rem}td select{width:3rem;padding:.25rem .1rem}th{font-size:.93rem}.controls button{font-size:.93rem}}
+</style>
+<main>
+<h1>五人激奏 SS 参考分</h1>
+<p id="coverage" class="muted"></p>
+<div class="filters">
+  <label>搜索乐曲<input id="query" type="search" placeholder="输入歌名或乐曲 ID"></label>
+  <label>乐曲<select id="song"></select></label>
+  <label>难度<select id="difficulty"></select></label>
+</div>
+<p id="empty" role="status" hidden>没有符合条件的谱面。</p>
+<div id="result" hidden>
+  <h2 id="chart-name"></h2>
+  <div class="summary"><div>五人房 SS 总线<strong id="threshold"></strong></div><div>每人参考基础分<strong id="base"></strong></div></div>
+  <p id="no-crossing" role="status" hidden>这张谱面暂时只有房间 SS 总线，未算出同等练度下的个人参考分。</p>
+  <div id="distribution">
+  <p>假设五人使用相同的无技能参考队，按同一判定演奏。每人的基础分加上自己三段的名次奖励，就是表中的个人结算分。</p>
+  <section>
+    <div class="controls"><h3>按三段名次查看个人分</h3><button type="button" id="reset">重置名次</button></div>
+    <p class="muted">默认每人三段保持同一名次。改动一个名次，会与该段原本占这个名次的玩家互换。</p>
+    <table><thead><tr><th>玩家</th><th>第 1 段</th><th>第 2 段</th><th>第 3 段</th><th>个人结算分</th></tr></thead><tbody id="seats"></tbody></table>
+    <p id="total" role="status"></p>
+  </section>
+  <details><summary>查看区段分与演奏条件</summary>
+    <p id="conditions"></p>
+    <table><thead><tr><th>激奏段</th><th>任务</th><th>区段分</th><th>占全曲基础分</th></tr></thead><tbody id="sections"></tbody></table>
+    <p>这里预设五人各段的名次，名次奖励只乘对应区段分。真正在同一房间演奏时，段内表现完全相同的五人会并列第一。阵容技能、判定和 LUCK 结果都会影响结算分。</p>
+  </details>
+  </div>
+</div>
+<details id="data-info"><summary>查看数据范围</summary><p id="release"></p><p id="omissions"></p></details>
+</main>
+<footer><a href="https://haneoka.org">Team-building algorithm from Haneoka — https://haneoka.org</a></footer>
+<script type="application/json" id="catalog"><!--CATALOG_JSON--></script>
+<script>
+"use strict";
+const data = JSON.parse(document.getElementById("catalog").textContent);
+const el = id => document.getElementById(id);
+const fmt = n => n.toLocaleString("zh-CN");
+const labels = ["EASY","NORMAL","HARD","EXPERT","SPECIAL"];
+const names = ["甲","乙","丙","丁","戊"];
+const region = {intl:"国际服",jp:"日服"}[data.identity.server] || data.identity.server;
+const songs = new Map();
+for (const chart of data.charts) {
+  if (!songs.has(chart.songId)) songs.set(chart.songId, {id:chart.songId, title:chart.title, charts:new Map()});
+  songs.get(chart.songId).charts.set(chart.difficulty,chart);
+}
+const ordered = Array.from(songs.values()).sort((a,b)=>a.title.localeCompare(b.title,"zh-CN"));
+el("coverage").textContent = region+" · "+songs.size+" 首乐曲 · "+data.charts.length+" 张谱面";
+el("release").textContent = "发行版本 "+data.identity.releaseId+(data.asOf?"，收录时间 "+data.asOf:"")+"。";
+const omissions = [...data.missing,...data.errors];
+el("omissions").textContent = omissions.length ? Array.from(new Set(omissions.map(row=>
+  (row.title || row.songId)+" · "+(row.reason==="scheduled"?"尚未开放":row.reason)))).join("。") : "已收录此发行版本全部开放谱面。";
+let current, ranks;
+function resetRanks() {ranks = names.map((_,i)=>[i+1,i+1,i+1]);}
+function newCell(row, text) { const cell = row.insertCell(); cell.textContent = text; return cell; }
+function drawScores() {
+  const cross=current.neutralCrossing;
+  const body=el("seats"); body.replaceChildren();
+  let total=0;
+  for (const [s, name] of names.entries()) {
+    const row=body.insertRow(); newCell(row,name);
+    let score=cross.baseScore;
+    for (let k=0;k<3;k++) {
+      const select=document.createElement("select"); select.setAttribute("aria-label",name+"第 "+(k+1)+" 段名次");
+      for(let r=1;r<=5;r++) select.add(new Option(String(r),String(r)));
+      select.value=String(ranks[s][k]);
+      score+=cross.sectionBonuses[k][ranks[s][k]-1];
+      select.onchange=()=>{
+        const next=Number(select.value),other=ranks.findIndex(rr=>rr[k]===next);
+        ranks[other][k]=ranks[s][k]; ranks[s][k]=next; drawScores();
+        el("seats").rows[s].cells[k+1].querySelector("select").focus();
+      };
+      row.insertCell().append(select);
+    }
+    newCell(row,fmt(score)); total+=score;
+  }
+  el("total").textContent="五人结算合计 "+fmt(total)+" 分，比 SS 总线多 "+fmt(total-current.reference.roomThreshold)+" 分。";
+}
+function selectChart() {
+  const song=songs.get(Number(el("song").value));
+  current=song?.charts.get(Number(el("difficulty").value));
+  el("result").hidden=!current; el("empty").hidden=Boolean(current);
+  if (!current) return;
+  const cross=current.neutralCrossing;
+  el("chart-name").textContent=current.title+" · "+(labels[current.difficulty] || current.difficulty);
+  el("threshold").textContent=fmt(current.reference.roomThreshold);
+  el("base").textContent=cross?fmt(cross.baseScore):"暂缺";
+  el("no-crossing").hidden=Boolean(cross);
+  el("distribution").hidden=!cross;
+  if (!cross) return;
+  el("conditions").textContent="参考队综合力 "+fmt(cross.power)+"，全员同难度，可判 JUST 的音符取 JUST，其余取 PERFECT，无 GREAT 或 Miss。技能顺序和随机种子均为 0。综合力低 1 点时，整房得 "+fmt(cross.lowerRoomScore)+" 分，尚差 "+fmt(current.reference.roomThreshold-cross.lowerRoomScore)+" 分。";
+  const sections=el("sections"); sections.replaceChildren();
+  cross.sectionScores.forEach((score,k)=>{const row=sections.insertRow();newCell(row,String(k+1));newCell(row,["","COMBO","LUCK","JUST"][current.missions[k]]);newCell(row,fmt(score));newCell(row,(100*score/cross.baseScore).toFixed(1)+"%");});
+  resetRanks();drawScores();
+}
+function selectSong() {
+  const difficulty=el("difficulty"),previous=difficulty.value;
+  const song=songs.get(Number(el("song").value));
+  difficulty.replaceChildren();
+  if(song) {
+    for(const level of Array.from(song.charts.keys()).sort((a,b)=>a-b)) difficulty.add(new Option(labels[level]||String(level),String(level)));
+    if(previous!==""&&song.charts.has(Number(previous))) difficulty.value=previous;
+    else if(song.charts.has(3)) difficulty.value="3";
+  }
+  selectChart();
+}
+function filterSongs(initial=false) {
+  const field=el("song"),old=initial?"100013":field.value,query=el("query").value.trim().toLowerCase();
+  field.replaceChildren();
+  for(const song of ordered.filter(s=>(s.title+" "+s.id).toLowerCase().includes(query))) field.add(new Option(song.title,String(song.id)));
+  if(Array.from(field.options).some(o=>o.value===old)) field.value=old;
+  selectSong();
+}
+el("query").oninput=()=>filterSongs();el("song").onchange=selectSong;el("difficulty").onchange=selectChart;
+el("reset").onclick=()=>{resetRanks();drawScores();};filterSongs(true);
+</script></html>

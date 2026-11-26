@@ -17,6 +17,9 @@ use std::sync::{Arc, Mutex};
 mod gekiso_result_cache;
 mod arena;
 mod arena_sections;
+pub mod room_search;
+mod room_ss_reference;
+mod cooperative_room;
 mod shared;
 mod reward_plan;
 mod planner;
@@ -82,6 +85,7 @@ pub struct Engine {
     planner_views: VecDeque<((i32,bool),Box<Engine>)>,
     pub(crate) growth_source: Option<Arc<Value>>,
     pub(crate) event_growth: Option<crate::event_growth::Search>,
+    cooperative_room: Option<Box<cooperative_room::Run>>,
     pub master: Master,
     pub charts: BTreeMap<(i32, i32), Chart>,
     pub sources: BTreeMap<(i32, i32), Source>,
@@ -160,6 +164,7 @@ impl Engine {
             planner_views: VecDeque::new(),
             growth_source: None,
             event_growth: None,
+            cooperative_room: None,
             master,
             charts: BTreeMap::new(),
             sources: BTreeMap::new(),
@@ -695,12 +700,15 @@ fn constraints(
             }).collect(),
     }
 }
-fn search_box(master: &Master, request: &Value) -> Result<power::BoxCards, String> {
+fn owned_box(master: &Master, request: &Value) -> Result<power::BoxCards, String> {
     let members: Vec<MemberInput> =
         serde::Deserialize::deserialize(&request["members"]).map_err(|e| e.to_string())?;
     let snaps: Vec<SnapInput> =
         serde::Deserialize::deserialize(&request["snaps"]).map_err(|e| e.to_string())?;
-    let mut cards = power::resolve_box(master, &members, &snaps, request["unknownPolicy"] != "min");
+    Ok(power::resolve_box(master, &members, &snaps, request["unknownPolicy"] != "min"))
+}
+fn search_box(master: &Master, request: &Value) -> Result<power::BoxCards, String> {
+    let mut cards = owned_box(master, request)?;
     let c = &request["constraints"];
     fn keys(rows: &Value) -> std::collections::BTreeSet<&str> {
         master::rows(rows)
@@ -2850,30 +2858,32 @@ fn seed_teams(
     master::rows(&request["seeds"])
         .into_iter()
         .filter(|h| h["song"] == *song)
-        .filter_map(|hit| {
-            let members = master::rows(&hit["members"])
-                .into_iter()
-                .map(|v| members.iter().position(|m| v.as_str() == Some(&m.key)))
-                .collect::<Option<Vec<_>>>()?;
-            let snaps = master::rows(&hit["snaps"])
-                .into_iter()
-                .map(|v| {
-                    if v.is_null() {
-                        Some(-1)
-                    } else {
-                        snaps
-                            .iter()
-                            .position(|s| v.as_str() == Some(&s.key))
-                            .map(|i| i as i32)
-                    }
-                })
-                .collect::<Option<Vec<_>>>()?;
-            if members.len() != 5 || snaps.len() != 5 {
-                return None;
-            }
-            Some(crate::search::Team { members, snaps })
-        })
+        .filter_map(|hit| team_from_keys(hit, members, snaps))
         .collect()
+}
+
+fn team_from_keys(hit: &Value, members: &[power::Member], snaps: &[power::Snap]) -> Option<crate::search::Team> {
+    let members = master::rows(&hit["members"])
+        .into_iter()
+        .map(|v| members.iter().position(|m| v.as_str() == Some(&m.key)))
+        .collect::<Option<Vec<_>>>()?;
+    let snaps = master::rows(&hit["snaps"])
+        .into_iter()
+        .map(|v| {
+            if v.is_null() {
+                Some(-1)
+            } else {
+                snaps
+                    .iter()
+                    .position(|s| v.as_str() == Some(&s.key))
+                    .map(|i| i as i32)
+            }
+        })
+        .collect::<Option<Vec<_>>>()?;
+    if members.len() != 5 || snaps.len() != 5 {
+        return None;
+    }
+    Some(crate::search::Team { members, snaps })
 }
 
 impl Engine {
