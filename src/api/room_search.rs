@@ -1,4 +1,7 @@
-//! Exhaustive two-seat search for small inventories under one fixed play scenario.
+//! Owned formations for single-chart cooperative Gekiso rooms.
+mod inventory_cursor;
+pub(crate) mod solver;
+pub(super) use inventory_cursor::{Cursor, Visit};
 use crate::{
     full::conditions::Performer,
     gekiso::{room, Chart},
@@ -26,8 +29,7 @@ impl Candidate {
     }
 }
 
-struct Inventory<'a> {
-    master: &'a Master,
+struct Inventory {
     cards: BoxCards,
     limits: Constraints,
     unbound_snaps: Vec<i32>,
@@ -35,70 +37,8 @@ struct Inventory<'a> {
     music: Music,
 }
 
-impl Inventory<'_> {
-    fn pick_members(
-        &self,
-        team: &mut Team,
-        from: usize,
-        out: &mut Vec<Candidate>,
-    ) -> Result<(), String> {
-        if team.members.len() == 5 {
-            if self
-                .limits
-                .required_members
-                .iter()
-                .chain(self.limits.bindings.keys())
-                .all(|member| team.members.contains(member))
-            {
-                self.assign_snaps(team, out)?;
-            }
-            return Ok(());
-        }
-        let leader = team.members.is_empty();
-        for i in from..self.cards.members.len() {
-            let character = self.cards.members[i].card.character_id;
-            if (leader && self.limits.leader.is_some_and(|locked| locked != i as i32))
-                || self.limits.excluded_members.contains(&i)
-                || team
-                    .members
-                    .iter()
-                    .any(|&j| self.cards.members[j].card.character_id == character)
-            {
-                continue;
-            }
-            team.members.push(i);
-            // Distinct character IDs give nonleaders stable slots even across account-specific keys.
-            self.pick_members(team, if leader { 0 } else { i + 1 }, out)?;
-            team.members.pop();
-        }
-        Ok(())
-    }
-
-    fn assign_snaps(&self, team: &mut Team, out: &mut Vec<Candidate>) -> Result<(), String> {
-        let slot = team.snaps.len();
-        if slot == 5 {
-            if search::valid_seed(&self.cards.members, &self.cards.snaps, &self.limits, team) {
-                out.push(self.prepare(team)?);
-            }
-            return Ok(());
-        }
-        let choices = self
-            .limits
-            .bindings
-            .get(&team.members[slot])
-            .map_or(self.unbound_snaps.as_slice(), std::slice::from_ref);
-        for &snap in choices {
-            if snap >= 0 && team.snaps.contains(&snap) {
-                continue;
-            }
-            team.snaps.push(snap);
-            self.assign_snaps(team, out)?;
-            team.snaps.pop();
-        }
-        Ok(())
-    }
-
-    fn prepare(&self, team: &Team) -> Result<Candidate, String> {
+impl Inventory {
+    fn prepare(&self, master: &Master, team: &Team) -> Result<Candidate, String> {
         let members: Vec<_> = team
             .members
             .iter()
@@ -110,7 +50,7 @@ impl Inventory<'_> {
             .map(|&i| usize::try_from(i).ok().map(|i| self.cards.snaps[i].clone()))
             .collect();
         let power = power::team_power(
-            self.master,
+            master,
             &self.player,
             &members,
             &snaps,
@@ -121,7 +61,7 @@ impl Inventory<'_> {
         let deck = members
             .iter()
             .zip(&snaps)
-            .map(|(m, s)| Performer::from_member(self.master, m, s.as_ref()))
+            .map(|(m, s)| Performer::from_member(master, m, s.as_ref()))
             .collect();
         let team = json!({
             "leader": members[0].key,
@@ -136,7 +76,7 @@ impl Inventory<'_> {
     }
 }
 
-fn inventory<'a>(master: &'a Master, song_id: i32, seat: &Value) -> Result<Inventory<'a>, String> {
+fn inventory(master: &Master, song_id: i32, seat: &Value) -> Result<Inventory, String> {
     let mut cards = super::owned_box(master, seat)?;
     if !cards.unknown.is_empty() {
         return Err(format!(
@@ -184,7 +124,6 @@ fn inventory<'a>(master: &'a Master, song_id: i32, seat: &Value) -> Result<Inven
         .chain(available.map(|i| i as i32))
         .collect();
     Ok(Inventory {
-        master,
         cards,
         limits,
         unbound_snaps,
@@ -196,16 +135,15 @@ fn inventory<'a>(master: &'a Master, song_id: i32, seat: &Value) -> Result<Inven
 /// Uses the existing inventory request format and resolves growth and account bonuses per seat.
 /// No candidate ranking or pruning based on individual strength is performed.
 pub fn candidates(master: &Master, song_id: i32, seat: &Value) -> Result<Vec<Candidate>, String> {
-    let inventory = inventory(master, song_id, seat)?;
+    let mut cursor = Cursor::new(master, song_id, seat)?;
     let mut candidates = Vec::new();
-    inventory.pick_members(
-        &mut Team {
-            members: Vec::with_capacity(5),
-            snaps: Vec::with_capacity(5),
-        },
-        0,
-        &mut candidates,
-    )?;
+    loop {
+        match cursor.advance(master)? {
+            Visit::Candidate(candidate) | Visit::Seed(candidate) => candidates.push(candidate),
+            Visit::Advanced => {}
+            Visit::Finished => break,
+        }
+    }
     Ok(candidates)
 }
 
@@ -238,7 +176,7 @@ pub(super) fn fixed_candidate(
     if !search::valid_seed(&cards.members, &cards.snaps, &inventory.limits, &selected) {
         return Err("selected team violates formation or inventory constraints".into());
     }
-    inventory.prepare(&selected)
+    inventory.prepare(master, &selected)
 }
 
 pub struct Solution {

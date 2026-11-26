@@ -138,12 +138,12 @@ pub fn reconcile(a: &Histories, b: &Histories, missions: &[i32]) -> Result<Repla
                         index,
                         mission: missions[index],
                         time_ms: *t,
-                        seats: [*x, *y],
+                        seats: vec![*x, *y],
                     }
                 })
                 .collect();
             result = Some(Replay {
-                scores: [left.score, right.score],
+                scores: vec![left.score, right.score],
                 total: i64::from(left.score) + i64::from(right.score),
                 sections,
             });

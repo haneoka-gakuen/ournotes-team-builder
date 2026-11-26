@@ -65,6 +65,30 @@ Deferred ordinary recovery can share control traces when native prefix replay pr
 
 `sectionMetrics` evaluates a fixed team with the same `request` shape as `evaluateAll`. It returns `metrics`, with each song's three `missions`, total `samples` and three `distributions` of `{points, count}`. All 120 skill orders and seeds 0 through n-1 contribute; a zero or omitted seed count selects 32 samples per order. The count-only replay preserves ordinary conversion, recovery and Gekiso effects. Equivalent orders share replay only when their mission counts are identical. It does not compare opponents or settle total scores.
 
+### Cooperative room search
+
+Use `roomSearchStart` after caching the chart. Supply `song`, two to five `players` and optionally a shared `accuracy`. Each player has the existing `members`, `snaps`, `player`, `unknownPolicy` and `constraints` fields. A seat may specify `allowedDifficulties`, `accuracy`, `orderIndex` and `seed`. All seats play the same difficulty and judgement profile. The skill order and LUCK seed are fixed per seat. The existing room fixture's top-level arrays `orderIndices` and `seeds` are also accepted and must agree with any per-seat values. The default order and seed are zero.
+
+The optional `lockedTeam` supplies five member instance keys, five snapshot keys or nulls, and an optional leader key. Its slot order is preserved with the leader moved to the first slot. Free seats enumerate every legal member set, choice of leader and assignment of distinct owned snapshots. For a free seat the nonleader slots follow character order. The engine checks ownership and constraints against each seat's own box. Once every seat has a legal candidate, it replays a first room, then tests more rooms during inventory enumeration. When a box offers more choices than five unbound snapshot slots and has alternative members, it also seeds the search with legal formations chosen for trained power on this song. Seeds are counted once and only affect which results can be found early.
+
+At each section boundary all players finish the frame before any player receives their rank. Rank is one plus the number of players strictly ahead on mission value, then section score, then PERFECT count. A tie for first leaves the next player third. The assigned rank affects placement bonuses and subsequent skills. The objective is the sum of personal final scores.
+
+```json
+{"op":"roomSearchStep","handle":1,"searchId":1,"budgetMs":16,"maxWork":1000}
+```
+
+Start and step accept a soft time budget in milliseconds (default 16) and an optional maximum number of work units. One unit advances the inventory cursor, replays one room or one single-seat rank history, or handles a search-tree block. Setup, response serialization and a single unit can take longer than the budget. A zero time budget allows one unit. `maxWork: 0` inspects the current state. Stop issuing step calls to pause. Native cancellation can also interrupt a replay and leaves its unfinished unit available to retry. Continue with the returned `searchId` in the same live handle. Starting another room replaces the previous search on success. Repeating a successful step advances another slice. Disposing the handle drops its search.
+
+| Result | Meaning |
+| --- | --- |
+| `teams`, `room`, `ss` | Best known legal formations, personal scores, section metrics, total and the room-sized SS line. The formations and room are null until a full room has been evaluated. |
+| `phase`, `complete`, `stopReason` | Inventory enumeration, bound calculation, Cartesian search or completion. Only a completed search proves the maximum for the supplied scenario. |
+| `candidateCounts`, `totalCombinations` | Counts discovered per seat and the size of their Cartesian product, which is known after enumeration. Large combination and work counters are decimal strings beyond JavaScript's safe integer range. |
+| `evaluated`, `pruned`, `boundReplays` | Distinct rooms played, rooms excluded by proof, and single-seat histories played for bounds. At completion the first two counts sum to the total number of rooms. |
+| `upperBound` | Certified ceiling on the optimal total. Incomplete seat bounds use the native per-player score ceiling. On completion it equals the winner's score. |
+
+Small products are evaluated directly. For larger products the engine compares the cost of building bounds with the cost of replaying the remaining rooms. For a room of size `n`, a bounded candidate replays **all `n³` possible three-section rank histories**, including the effects of rank on later skills. Its greatest final score bounds its contribution with any partners. Summing per-seat ceilings bounds a block of rooms sharing a prefix of selected candidates. A block is skipped only when it cannot improve the incumbent under the deterministic score and enumeration-order tie break. Candidate storage and the resume cursor live in memory. A time-limited result on a large box can remain far from its upper bound.
+
 ### Five-player SS reference
 
 After caching the chart in a session, call `roomSsReference` with the selected song and difficulty. Like `evaluateAll`, it can also receive chart data in the call's `charts` array.

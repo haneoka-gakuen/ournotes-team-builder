@@ -56,6 +56,7 @@ cargo run --release --example bench -- input.json
 | `growth` | Rank card upgrades by how much each one gains |
 | `rates` | Report each song's scoring weights, rank thresholds and skill windows |
 | `roomSsReference` | Estimate five players' individual contributions to the multiplayer SS line on one chart |
+| `roomSearchStart`, `roomSearchStep` | Find the highest combined score for 2–5 owned teams, with locked and freely built seats in the same room |
 | `evaluateAll` | Score one fixed team on each of several songs |
 | `eventGrowthStart`, `eventGrowthStep`, `eventGrowthPage` | Infer character and band growth from recorded event decks |
 
@@ -74,6 +75,17 @@ Both seats play one difficulty with a shared judgement profile. Each seat has a 
 With `--verify`, the example also runs each team through the original single-player simulator with all eight possible first/second-place histories. It finds the unique pair of histories that matches both players' standings, checks the exhaustive maximum, and prints the nine sample pairs when the input supplies them. The [sample and its data sources](examples/gekiso_room/FIXTURE.md) describe the inventories and individual-score comparison.
 
 The result also reports the two-player SS threshold, whether the pair reached it and the remaining points.
+
+### Cooperative Gekiso rooms
+
+Each player supplies their own inventory and account bonuses. Add a `lockedTeam` to keep that player's formation, or leave the seat free to choose its members, leader and snapshots. Every section ranks all players together. The result contains each formation, personal and combined scores, the three section standings and the points needed for SS at the actual room size.
+
+```sh
+python examples/gekiso_room/make_room.py target/room-five.json --seats 5
+cargo run --release --locked --example gekiso_room_search -- target/room-five.json
+```
+
+The example drives the same reusable session operations as a web worker. Use `--steps 1 --budget-ms 16` for one time slice. An application can pause between slices and continue the same search by ID. Partial results keep the best room found so far. See [search conditions and proof](docs/engine.md#cooperative-room-search).
 
 ### Five-player SS reference
 

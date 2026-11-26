@@ -1,8 +1,7 @@
 //! Allocate a five-player SS target in proportion to five fixed-placement replays of one team.
 pub(crate) mod neutral;
 use super::{
-    order_model,
-    room::{Seat, SectionSeat},
+    room::{fixed_replay, Seat, SectionSeat},
     Chart,
 };
 use crate::{
@@ -55,6 +54,28 @@ pub struct Reference {
     pub seats: Vec<SeatReference>,
 }
 
+pub(crate) fn require_bonus(
+    master: &Master,
+    pattern: i32,
+    section: usize,
+    rank: i32,
+) -> Result<(), String> {
+    if master
+        .live
+        .gekiso
+        .ranks
+        .iter()
+        .any(|&[p, s, r, _]| p == pattern && s == (section + 1) as i32 && r == rank)
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "missing placement bonus for section {} rank {rank}",
+            section + 1
+        ))
+    }
+}
+
 fn validate_placements(
     master: &Master,
     missions: &[i32],
@@ -80,18 +101,7 @@ fn validate_placements(
                     section + 1
                 ));
             }
-            if !master
-                .live
-                .gekiso
-                .ranks
-                .iter()
-                .any(|&[p, s, r, _]| p == pattern && s == (section + 1) as i32 && r == rank)
-            {
-                return Err(format!(
-                    "missing placement bonus for section {} rank {rank}",
-                    section + 1
-                ));
-            }
+            require_bonus(master, pattern, section, rank)?;
         }
     }
     Ok(())
@@ -104,37 +114,10 @@ fn replay_seat(
     placements: [i32; 3],
     generation: u64,
 ) -> Result<SeatReference, String> {
-    let mut model = order_model(
-        master,
-        chart,
-        seat.deck,
-        seat.power,
-        seat.order_index,
-        seat.seed,
-    )?;
     let mut sections = Vec::with_capacity(3);
-    for (frame, &dt) in chart.play.frames.iter().zip(&chart.play.dt) {
-        if generation != crate::cancellation_generation() {
-            return Err("cancelled".into());
-        }
-        if let Some((index, standing)) =
-            model.frame_to_section_rank(frame.time_ms, &frame.judged, dt)?
-        {
-            if index != sections.len() || index >= 3 {
-                return Err("unexpected SS reference section".into());
-            }
-            sections.push(SectionSeat::finish(
-                &mut model,
-                index,
-                standing,
-                placements[index],
-            ));
-        }
-    }
-    if sections.len() != 3 {
-        return Err("incomplete SS reference replay".into());
-    }
-    let simulated_score = model.score.score.score;
+    let simulated_score = fixed_replay(master, chart, seat, placements, generation, |s| {
+        sections.push(s)
+    })?;
     let base_score =
         i64::from(simulated_score) - sections.iter().map(|s| i64::from(s.bonus)).sum::<i64>();
     if simulated_score < 0 || base_score < 0 {

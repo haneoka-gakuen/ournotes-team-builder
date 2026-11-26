@@ -15,9 +15,9 @@ use serde_json::{json, Value};
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct SongKey {
-    song_id: i32,
-    difficulty: i32,
+pub(super) struct SongKey {
+    pub(super) song_id: i32,
+    pub(super) difficulty: i32,
 }
 
 #[derive(Default, Deserialize)]
@@ -29,7 +29,7 @@ struct Scenario {
     rank_schedule: Option<RankSchedule>,
 }
 
-fn parse_accuracy(input: Option<&Value>) -> Result<Option<Accuracy>, String> {
+pub(super) fn parse_accuracy(input: Option<&Value>) -> Result<Option<Accuracy>, String> {
     input
         .map(|value| {
             let fields = value

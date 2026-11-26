@@ -19,6 +19,7 @@ mod arena;
 mod arena_sections;
 pub mod room_search;
 mod room_ss_reference;
+mod cooperative_room;
 mod shared;
 mod reward_plan;
 mod planner;
@@ -84,6 +85,7 @@ pub struct Engine {
     planner_views: VecDeque<((i32,bool),Box<Engine>)>,
     pub(crate) growth_source: Option<Arc<Value>>,
     pub(crate) event_growth: Option<crate::event_growth::Search>,
+    cooperative_room: Option<Box<cooperative_room::Run>>,
     pub master: Master,
     pub charts: BTreeMap<(i32, i32), Chart>,
     pub sources: BTreeMap<(i32, i32), Source>,
@@ -162,6 +164,7 @@ impl Engine {
             planner_views: VecDeque::new(),
             growth_source: None,
             event_growth: None,
+            cooperative_room: None,
             master,
             charts: BTreeMap::new(),
             sources: BTreeMap::new(),

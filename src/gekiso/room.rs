@@ -1,4 +1,4 @@
-//! Joint replay of two prepared teams on the same chart and judgement stream.
+//! Joint replay of two to five prepared teams on the same chart and judgement stream.
 use super::{order_model, sections::Standing, Chart};
 use crate::{full::conditions::Performer, master::Master};
 use serde::Serialize;
@@ -10,6 +10,22 @@ pub struct Seat<'a> {
     /// Index in the engine's 120 ordinary skill orders.
     pub order_index: usize,
     pub seed: i32,
+}
+
+impl Seat<'_> {
+    fn start<'a>(self, master: &'a Master, chart: &Chart) -> Result<super::Model<'a>, String> {
+        if self.deck.len() != 5 {
+            return Err("each room seat requires five members".into());
+        }
+        order_model(
+            master,
+            chart,
+            self.deck,
+            self.power,
+            self.order_index,
+            self.seed,
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -49,58 +65,71 @@ pub struct Section {
     pub index: usize,
     pub mission: i32,
     pub time_ms: i32,
-    pub seats: [SectionSeat; 2],
+    pub seats: Vec<SectionSeat>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct Replay {
-    pub scores: [i32; 2],
+    pub scores: Vec<i32>,
     pub total: i64,
     pub sections: Vec<Section>,
 }
 
-pub fn replay(master: &Master, chart: &Chart, seats: [Seat<'_>; 2]) -> Result<Replay, String> {
+pub fn replay<'a>(
+    master: &Master,
+    chart: &Chart,
+    seats: impl AsRef<[Seat<'a>]>,
+) -> Result<Replay, String> {
+    let seats = seats.as_ref();
+    if !(2..=5).contains(&seats.len()) {
+        return Err("a cooperative room requires two to five seats".into());
+    }
     if chart.setup.fevers.len() != 3 || chart.setup.missions.len() != 3 {
         return Err("a room replay requires three Gekiso sections".into());
     }
-    let start = |seat: Seat<'_>| {
-        if seat.deck.len() != 5 {
-            return Err("each room seat requires five members".into());
-        }
-        order_model(
-            master,
-            chart,
-            seat.deck,
-            seat.power,
-            seat.order_index,
-            seat.seed,
-        )
-    };
-    let [mut left, mut right] = [start(seats[0])?, start(seats[1])?];
+    let mut models = seats
+        .iter()
+        .map(|seat| seat.start(master, chart))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut standings = Vec::with_capacity(seats.len());
     let mut sections = Vec::with_capacity(3);
     let generation = crate::cancellation_generation();
-    for (k, frame) in chart.play.frames.iter().enumerate() {
+    for (frame, &dt) in chart.play.frames.iter().zip(&chart.play.dt) {
         if generation != crate::cancellation_generation() {
             return Err("cancelled".into());
         }
-        let dt = chart.play.dt[k];
-        let a = left.frame_to_section_rank(frame.time_ms, &frame.judged, dt)?;
-        let b = right.frame_to_section_rank(frame.time_ms, &frame.judged, dt)?;
-        let (index, standings) = match (a, b) {
-            (None, None) => continue,
-            (Some((i, a)), Some((j, b))) if i == j && i == sections.len() => (i, [a, b]),
-            _ => return Err(format!("inconsistent room section at {} ms", frame.time_ms)),
-        };
-        let [a, b] = standings;
+        let index = sections.len();
+        for model in &mut models {
+            if let Some((range, own)) =
+                model.frame_to_section_rank(frame.time_ms, &frame.judged, dt)?
+            {
+                if range != index || range >= chart.setup.missions.len() {
+                    return Err(format!("inconsistent room section at {} ms", frame.time_ms));
+                }
+                standings.push(own);
+            }
+        }
+        if standings.is_empty() {
+            continue;
+        }
+        if standings.len() != seats.len() {
+            return Err(format!("inconsistent room section at {} ms", frame.time_ms));
+        }
+        let settled = models
+            .iter_mut()
+            .zip(&standings)
+            .map(|(model, own)| {
+                let rank = 1 + standings.iter().filter(|other| other.beats(own)).count() as i32;
+                SectionSeat::finish(model, index, *own, rank)
+            })
+            .collect();
         sections.push(Section {
             index,
             mission: chart.setup.missions[index],
             time_ms: frame.time_ms,
-            seats: [
-                SectionSeat::finish(&mut left, index, a, 1 + i32::from(b.beats(&a))),
-                SectionSeat::finish(&mut right, index, b, 1 + i32::from(a.beats(&b))),
-            ],
+            seats: settled,
         });
+        standings.clear();
     }
     if sections.len() != 3 {
         return Err(format!(
@@ -108,10 +137,66 @@ pub fn replay(master: &Master, chart: &Chart, seats: [Seat<'_>; 2]) -> Result<Re
             sections.len()
         ));
     }
-    let scores = [left.score.score.score, right.score.score.score];
+    let scores: Vec<_> = models
+        .iter()
+        .map(|player| player.score.score.score)
+        .collect();
+    let total = scores.iter().map(|&score| i64::from(score)).sum();
     Ok(Replay {
         scores,
-        total: scores.iter().map(|&score| i64::from(score)).sum(),
+        total,
         sections,
     })
+}
+
+/// Replay one of a candidate's possible rank histories, including its effect on later skills.
+pub(crate) fn score_for_ranks(
+    master: &Master,
+    chart: &Chart,
+    seat: Seat<'_>,
+    ranks: [i32; 3],
+) -> Result<i32, String> {
+    fixed_replay(
+        master,
+        chart,
+        seat,
+        ranks,
+        crate::cancellation_generation(),
+        |_| {},
+    )
+}
+
+pub(super) fn fixed_replay(
+    master: &Master,
+    chart: &Chart,
+    seat: Seat<'_>,
+    ranks: [i32; 3],
+    generation: u64,
+    mut record: impl FnMut(SectionSeat),
+) -> Result<i32, String> {
+    let mut model = seat.start(master, chart)?;
+    let mut settled = 0;
+    for (frame, &dt) in chart.play.frames.iter().zip(&chart.play.dt) {
+        if generation != crate::cancellation_generation() {
+            return Err("cancelled".into());
+        }
+        if let Some((index, standing)) =
+            model.frame_to_section_rank(frame.time_ms, &frame.judged, dt)?
+        {
+            if index != settled || index >= ranks.len() {
+                return Err("unexpected fixed-placement section".into());
+            }
+            record(SectionSeat::finish(
+                &mut model,
+                index,
+                standing,
+                ranks[index],
+            ));
+            settled += 1;
+        }
+    }
+    if settled != ranks.len() {
+        return Err("incomplete fixed-placement replay".into());
+    }
+    Ok(model.score.score.score)
 }
