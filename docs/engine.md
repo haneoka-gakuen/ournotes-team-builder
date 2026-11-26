@@ -67,11 +67,29 @@ Deferred ordinary recovery can share control traces when native prefix replay pr
 
 ### Cooperative room search
 
-Use `roomSearchStart` after caching the chart. Supply `song`, two to five `players` and optionally a shared `accuracy`. Each player has the existing `members`, `snaps`, `player`, `unknownPolicy` and `constraints` fields. A seat may specify `allowedDifficulties`, `accuracy`, `orderIndex` and `seed`. All seats play the same difficulty and judgement profile. The skill order and LUCK seed are fixed per seat. The existing room fixture's top-level arrays `orderIndices` and `seeds` are also accepted and must agree with any per-seat values. The default order and seed are zero.
+Use `roomSearchStart` with a song and two to five players. Cache each played chart through `chart` or include the matching `charts` entries in the start request. Each seat has its own `members`, `snaps`, `player`, `unknownPolicy` and `constraints`. Its `difficulty` and `accuracy` override the song difficulty and room accuracy respectively. If supplied, that seat's `allowedDifficulties` must include the selected difficulty. A seat with no profile inherits the room default (otherwise all JUST where eligible, no GREAT or misses).
+
+Without `sampling`, the room uses each seat's fixed `orderIndex` (0–119) and signed 32-bit LUCK `seed`, both defaulting to zero. Legacy arrays `orderIndices` and `seeds` must agree with any per-seat values.
 
 The optional `lockedTeam` supplies five member instance keys, five snapshot keys or nulls, and an optional leader key. Its slot order is preserved with the leader moved to the first slot. Free seats enumerate every legal member set, choice of leader and assignment of distinct owned snapshots. For a free seat the nonleader slots follow character order. The engine checks ownership and constraints against each seat's own box. Once every seat has a legal candidate, it replays a first room, then tests more rooms during inventory enumeration. When a box offers more choices than five unbound snapshot slots and has alternative members, it also seeds the search with legal formations chosen for trained power on this song. Seeds are counted once and only affect which results can be found early.
 
-At each section boundary all players finish the frame before any player receives their rank. Rank is one plus the number of players strictly ahead on mission value, then section score, then PERFECT count. A tie for first leaves the next player third. The assigned rank affects placement bonuses and subsequent skills. The objective is the sum of personal final scores.
+Each seat runs to its own settlement frame for the same mission. The engine compares mission value, section score and PERFECT count in that order. Rank is one plus the number of seats strictly ahead. The model receives its award on its own frame, then continues on its own chart through the ending. Each section's `timeMs` is the latest settlement time. When frames differ, `seatTimesMs` contains each player's settlement time in seat order.
+
+#### Average room score and SS frequency
+
+Add these fields to compare all candidate formations on common draws.
+
+```json
+{"objective":"ssRate","sampling":{"count":32,"seed":20261131,"skillOrders":"uniform"},"includeSamples":true}
+```
+
+- `count` is 1–4096 and `seed` is an unsigned 32-bit sampling seed. Each seat gets its own signed LUCK seed per play for the native lottery. A counter-based generator with a SplitMix64 finalizer keys the draws by the sampling seed, seat seed, seat index, draw index, stream and random variable. Increasing the count preserves the prefix.
+- `skillOrders:"fixed"` (default) uses each seat's specified order. `"uniform"` draws independently from all 120 orders per seat per play. Both modes use the same LUCK draw schedule.
+- A seat may provide one `accuracy`, or, with sampling, 1–16 equally weighted `accuracyProfiles`. For example, `[{"just":0.9,"great":0.02},{"just":0.7,"great":0.06,"missEvery":90}]` models two performance levels. Profiles are sampled independently per seat and play. Repeated entries add weight. Within a profile, the engine spreads a GREAT quota over eligible notes, assigns JUST among the remaining eligible notes in JUST sections and applies periodic misses.
+- `meanScore` (default) maximizes the sum of room scores across draws, then the number of SS hits. `ssRate` prioritizes SS hits, then the score sum. Both use stable candidate order for a final tie. Equality with the song's threshold for the room size counts as a hit. `ssRate` needs a known threshold.
+- `room`, `teams[].score` and `ss.achieved` describe the first draw of the winning formation. `statistics` holds `sampleCount`, integer `scoreSum`, `meanTotal`, `minTotal`, `maxTotal`, per-seat `meanScores`, `ssHits` and `ssRate`. SS statistics are null when the threshold is unavailable. `seatConditions` records each seat's inputs. Shared `difficulty` or `accuracy` is null when there is no common value. `includeSamples:true` adds every draw's actual seat difficulty, accuracy, order and LUCK seed to the start response.
+- Each formation must finish its entire sample set before it can replace the winner. `sampleProgress.roomReplays` counts completed room replays. `completedForCurrentCombination` counts completed draws for the pending formation. A completed search proves the chosen objective for these formations and draws.
+- To estimate performance after selection, put the winning teams into the original seats' `lockedTeam` fields, retain the performance and order settings and set `sampling.stream:"validation"`. This stream uses fresh draws even with the original sampling seed. All seats must be locked. The result includes `statistics.ssRateWilson95`, a 95% Wilson interval for the modeled hit probability under independent draws. Keep validation outcomes out of team selection. Actual player performance and in-game frequencies can differ. Use a separate handle to preserve an unfinished original search.
 
 ```json
 {"op":"roomSearchStep","handle":1,"searchId":1,"budgetMs":16,"maxWork":1000}
@@ -84,10 +102,10 @@ Start and step accept a soft time budget in milliseconds (default 16) and an opt
 | `teams`, `room`, `ss` | Best known legal formations, personal scores, section metrics, total and the room-sized SS line. The formations and room are null until a full room has been evaluated. |
 | `phase`, `complete`, `stopReason` | Inventory enumeration, bound calculation, Cartesian search or completion. Only a completed search proves the maximum for the supplied scenario. |
 | `candidateCounts`, `totalCombinations` | Counts discovered per seat and the size of their Cartesian product, which is known after enumeration. Large combination and work counters are decimal strings beyond JavaScript's safe integer range. |
-| `evaluated`, `pruned`, `boundReplays` | Distinct rooms played, rooms excluded by proof, and single-seat histories played for bounds. At completion the first two counts sum to the total number of rooms. |
-| `upperBound` | Certified ceiling on the optimal total. Incomplete seat bounds use the native per-player score ceiling. On completion it equals the winner's score. |
+| `evaluated`, `pruned`, `boundReplays` | Distinct formations scored over all draws, formations excluded by proof, and single-seat histories played for bounds. At completion the first two counts sum to the total number of rooms. |
+| `upperBound` | Ceiling for the chosen objective, in room points for meanScore or in [0, 1] for ssRate. At completion it equals the winning objective. |
 
-Small products are evaluated directly. For larger products the engine compares the cost of building bounds with the cost of replaying the remaining rooms. For a room of size `n`, a bounded candidate replays **all `n³` possible three-section rank histories**, including the effects of rank on later skills. Its greatest final score bounds its contribution with any partners. Summing per-seat ceilings bounds a block of rooms sharing a prefix of selected candidates. A block is skipped only when it cannot improve the incumbent under the deterministic score and enumeration-order tie break. Candidate storage and the resume cursor live in memory. A time-limited result on a large box can remain far from its upper bound.
+Multi-draw searches visit every legal combination and score every draw. Single-draw searches evaluate small products directly. For larger single-draw products the engine compares the cost of building bounds with the cost of replaying the remaining rooms. For a room of size `n`, a bounded candidate replays **all `n³` possible three-section rank histories**, including the effects of rank on later skills. Its greatest final score bounds its contribution with any partners. Summing per-seat ceilings bounds a block of rooms sharing a prefix of selected candidates. A block is skipped only when it cannot improve the incumbent under the deterministic score and enumeration-order tie break. Candidate storage and the resume cursor live in memory. A time-limited result on a large box can remain far from its upper bound.
 
 ### Five-player SS reference
 

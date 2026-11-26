@@ -1,4 +1,5 @@
-//! Incremental Cartesian search over one fixed chart, judgement stream and per-seat skill order.
+//! Incremental Cartesian search with the same joint sample set for every room.
+mod samples;
 use super::Candidate;
 use crate::{
     gekiso::{room, Chart},
@@ -6,6 +7,8 @@ use crate::{
 };
 use num_bigint::BigUint;
 use num_traits::ToPrimitive;
+use samples::SampleScores;
+pub(crate) use samples::{Draw, Objective};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 
@@ -18,7 +21,7 @@ enum Phase {
 
 struct Winner {
     indices: Vec<usize>,
-    replay: room::Replay,
+    scores: SampleScores,
 }
 
 struct Bounds {
@@ -31,9 +34,12 @@ struct Bounds {
 }
 
 pub(crate) struct Search {
-    chart: Chart,
-    orders: Vec<usize>,
-    seeds: Vec<i32>,
+    charts: Vec<Chart>,
+    samples: Vec<Vec<Draw>>,
+    objective: Objective,
+    ss: Option<i64>,
+    // The probe or Cartesian cursor stays in place until every sample is included.
+    partial: Option<SampleScores>,
     candidates: Vec<Vec<Candidate>>,
     best: Option<Winner>,
     phase: Phase,
@@ -58,18 +64,30 @@ fn count(n: &BigUint) -> Value {
 }
 
 impl Search {
-    pub(crate) fn new(chart: Chart, orders: Vec<usize>, seeds: Vec<i32>) -> Result<Self, String> {
-        let n = orders.len();
-        if !(2..=5).contains(&n) || seeds.len() != n {
-            return Err("room search requires two to five matching seats, orders and seeds".into());
+    pub(crate) fn new(
+        charts: Vec<Chart>,
+        samples: Vec<Vec<Draw>>,
+        objective: Objective,
+        ss: Option<i64>,
+    ) -> Result<Self, String> {
+        let n = samples.first().ok_or("empty room sample set")?.len();
+        if !(2..=5).contains(&n) || samples.iter().any(|sample| sample.len() != n) {
+            return Err("room samples must describe the same two to five seats".into());
         }
-        if orders.iter().any(|&i| i >= crate::live::orders().len()) {
-            return Err("room skill order out of range".into());
+        for draw in samples.iter().flatten() {
+            if draw.chart >= charts.len() || draw.order >= crate::live::orders().len() {
+                return Err("room sample chart or skill order out of range".into());
+            }
+        }
+        if objective == Objective::SsRate && ss.is_none() {
+            return Err("SS rate requires a room SS threshold".into());
         }
         Ok(Self {
-            chart,
-            orders,
-            seeds,
+            charts,
+            samples,
+            objective,
+            ss,
+            partial: None,
             candidates: (0..n).map(|_| Vec::new()).collect(),
             best: None,
             phase: Phase::Inventory,
@@ -132,7 +150,7 @@ impl Search {
         let remaining = &product - &self.evaluated;
         self.phase = if self.evaluated == product {
             Phase::Complete
-        } else if bound_cost < remaining * n {
+        } else if self.samples.len() == 1 && bound_cost < remaining * n {
             self.bounds = Some(Bounds {
                 scores: vec![Vec::new(); n],
                 seat_max: vec![i32::MIN; n],
@@ -152,24 +170,39 @@ impl Search {
         matches!(self.phase, Phase::Complete)
     }
 
-    fn evaluate(&mut self, master: &Master, indices: &[usize]) -> Result<(), String> {
-        let seats: Vec<_> = indices
+    /// Returns true after scoring all samples of this formation. A cancelled
+    /// replay leaves the previously accumulated samples and both cursors intact.
+    fn evaluate_sample(&mut self, master: &Master, indices: &[usize]) -> Result<bool, String> {
+        let sample_index = self.partial.as_ref().map_or(0, |scores| scores.count);
+        let draws = &self.samples[sample_index];
+        let charts: Vec<_> = draws.iter().map(|draw| &self.charts[draw.chart]).collect();
+        let seats: Vec<_> = draws
             .iter()
             .enumerate()
-            .map(|(s, &i)| self.candidates[s][i].seat(self.orders[s], self.seeds[s]))
+            .map(|(s, draw)| self.candidates[s][indices[s]].seat(draw.order, draw.seed))
             .collect();
-        let replay = room::replay(master, &self.chart, seats)?;
+        let replay = room::replay_mixed(master, &charts, &seats)?;
+        let hit = self.ss.is_some_and(|line| replay.total >= line);
+        if let Some(scores) = &mut self.partial {
+            scores.add(&replay, hit);
+        } else {
+            self.partial = Some(SampleScores::first(replay, hit));
+        }
+        if sample_index + 1 < self.samples.len() {
+            return Ok(false);
+        }
+        let scores = self.partial.take().unwrap();
         self.evaluated += 1u8;
         if self.best.as_ref().is_none_or(|best| {
-            replay.total > best.replay.total
-                || (replay.total == best.replay.total && indices < best.indices.as_slice())
+            let order = scores.cmp(&best.scores, self.objective);
+            order.is_gt() || (order.is_eq() && indices < best.indices.as_slice())
         }) {
             self.best = Some(Winner {
                 indices: indices.to_vec(),
-                replay,
+                scores,
             });
         }
-        Ok(())
+        Ok(true)
     }
 
     fn next_bound(&mut self, master: &Master) -> Result<(), String> {
@@ -179,10 +212,11 @@ impl Search {
         let k = bounds.history;
         let ranks = [k / (n * n), (k / n) % n, k % n].map(|r| (r + 1) as i32);
         let candidate = &self.candidates[s][bounds.scores[s].len()];
+        let draw = &self.samples[0][s];
         let score = room::score_for_ranks(
             master,
-            &self.chart,
-            candidate.seat(self.orders[s], self.seeds[s]),
+            &self.charts[draw.chart],
+            candidate.seat(draw.order, draw.seed),
             ranks,
         )?;
         self.bound_replays += 1u8;
@@ -218,8 +252,10 @@ impl Search {
 
     fn prunable_prefix(&self, bounds: &Bounds, best: &Winner) -> Option<usize> {
         let mut upper: i64 = bounds.seat_max.iter().map(|&v| i64::from(v)).sum();
-        let loses =
-            |v| v < best.replay.total || (v == best.replay.total && self.cursor >= best.indices);
+        let loses = |v| {
+            v < best.scores.first.total
+                || (v == best.scores.first.total && self.cursor >= best.indices)
+        };
         if loses(upper) {
             return Some(0);
         }
@@ -253,8 +289,10 @@ impl Search {
                 None => self.probes.range(self.cursor.clone()..).count(),
             };
             self.pruned += block - seen;
-        } else if !self.probes.contains(&self.cursor) {
-            self.evaluate(master, &self.cursor.clone())?;
+        } else if !self.probes.contains(&self.cursor)
+            && !self.evaluate_sample(master, &self.cursor.clone())?
+        {
+            return Ok(());
         }
         if let Some(indices) = next {
             self.cursor = indices;
@@ -277,7 +315,9 @@ impl Search {
             // Both geometric probes and queued seeds introduce a previously unplayed candidate.
             // A successful room also covers every other seed that happened to be in its lineup.
             debug_assert!(!self.probes.contains(&indices));
-            self.evaluate(master, &indices)?;
+            if !self.evaluate_sample(master, &indices)? {
+                return Ok(());
+            }
             self.unplayed_seeds.retain(|&(s, i)| indices[s] != i);
             self.probes.insert(indices);
             self.pending_probe = None;
@@ -300,11 +340,15 @@ impl Search {
             Phase::Search => "search",
             Phase::Complete => "complete",
         };
-        let upper: i64 = if self.complete() {
-            self.best.as_ref().unwrap().replay.total
+        let upper = if self.complete() {
+            self.best
+                .as_ref()
+                .unwrap()
+                .scores
+                .objective_value(self.objective)
         } else {
             // An open inventory or a partially bounded seat can still produce any native i32 score.
-            (0..self.candidates.len())
+            let score_ceiling: i64 = (0..self.candidates.len())
                 .map(|s| {
                     let cap = self
                         .bounds
@@ -313,7 +357,11 @@ impl Search {
                         .map_or(i32::MAX, |b| b.seat_max[s]);
                     i64::from(cap)
                 })
-                .sum()
+                .sum();
+            match self.objective {
+                Objective::MeanScore => json!(score_ceiling),
+                Objective::SsRate => json!(u8::from(score_ceiling >= self.ss.unwrap())),
+            }
         };
         let teams = self.best.as_ref().map(|best| {
             best.indices
@@ -321,16 +369,21 @@ impl Search {
                 .enumerate()
                 .map(|(s, &i)| {
                     let c = &self.candidates[s][i];
-                    json!({"team":c.team, "power":c.power, "score":best.replay.scores[s]})
+                    json!({"team":c.team, "power":c.power, "score":best.scores.first.scores[s]})
                 })
                 .collect::<Vec<_>>()
         });
+        let current = self.partial.as_ref().map_or(0, |scores| scores.count);
+        let room_replays = &self.evaluated * self.samples.len() + current;
         json!({
             "phase":phase, "complete":self.complete(), "upperBound":upper,
             "candidateCounts":self.candidates.iter().map(Vec::len).collect::<Vec<_>>(),
             "totalCombinations":self.total.as_ref().map(count), "evaluated":count(&self.evaluated),
             "pruned":count(&self.pruned), "boundReplays":count(&self.bound_replays),
-            "teams":teams, "room":self.best.as_ref().map(|best| &best.replay)
+            "teams":teams, "room":self.best.as_ref().map(|best| &best.scores.first),
+            "statistics":self.best.as_ref().map(|best| best.scores.statistics(self.ss)),
+            "sampleProgress":{"sampleCount":self.samples.len(), "completedForCurrentCombination":current,
+                "roomReplays":count(&room_replays)}
         })
     }
 }

@@ -1,4 +1,4 @@
-//! Joint replay of two to five prepared teams on the same chart and judgement stream.
+//! Joint replay of two to five teams, each on its own chart and judgement stream.
 use super::{order_model, sections::Standing, Chart};
 use crate::{full::conditions::Performer, master::Master};
 use serde::Serialize;
@@ -64,7 +64,10 @@ impl SectionSeat {
 pub struct Section {
     pub index: usize,
     pub mission: i32,
+    /// The latest settlement frame among the seats in this section.
     pub time_ms: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seat_times_ms: Option<Vec<i32>>,
     pub seats: Vec<SectionSeat>,
 }
 
@@ -81,66 +84,101 @@ pub fn replay<'a>(
     seats: impl AsRef<[Seat<'a>]>,
 ) -> Result<Replay, String> {
     let seats = seats.as_ref();
-    if !(2..=5).contains(&seats.len()) {
-        return Err("a cooperative room requires two to five seats".into());
-    }
-    if chart.setup.fevers.len() != 3 || chart.setup.missions.len() != 3 {
-        return Err("a room replay requires three Gekiso sections".into());
-    }
-    let mut models = seats
-        .iter()
-        .map(|seat| seat.start(master, chart))
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut standings = Vec::with_capacity(seats.len());
-    let mut sections = Vec::with_capacity(3);
-    let generation = crate::cancellation_generation();
-    for (frame, &dt) in chart.play.frames.iter().zip(&chart.play.dt) {
-        if generation != crate::cancellation_generation() {
-            return Err("cancelled".into());
-        }
-        let index = sections.len();
-        for model in &mut models {
-            if let Some((range, own)) =
-                model.frame_to_section_rank(frame.time_ms, &frame.judged, dt)?
+    replay_mixed(master, &vec![chart; seats.len()], seats)
+}
+
+struct PlayingSeat<'m, 'c> {
+    model: super::Model<'m>,
+    chart: &'c Chart,
+    next_frame: usize,
+}
+
+impl PlayingSeat<'_, '_> {
+    /// Stop on the native settlement frame. Its award must be supplied before the next frame.
+    fn until_rank(&mut self, generation: u64) -> Result<Option<(usize, i32, Standing)>, String> {
+        while let Some(frame) = self.chart.play.frames.get(self.next_frame) {
+            if generation != crate::cancellation_generation() {
+                return Err("cancelled".into());
+            }
+            let dt = self.chart.play.dt[self.next_frame];
+            self.next_frame += 1;
+            if let Some((index, standing)) =
+                self.model
+                    .frame_to_section_rank(frame.time_ms, &frame.judged, dt)?
             {
-                if range != index || range >= chart.setup.missions.len() {
-                    return Err(format!("inconsistent room section at {} ms", frame.time_ms));
-                }
-                standings.push(own);
+                return Ok(Some((index, frame.time_ms, standing)));
             }
         }
-        if standings.is_empty() {
-            continue;
+        Ok(None)
+    }
+}
+
+pub fn replay_mixed(
+    master: &Master,
+    charts: &[&Chart],
+    seats: &[Seat<'_>],
+) -> Result<Replay, String> {
+    if !(2..=5).contains(&seats.len()) || charts.len() != seats.len() {
+        return Err("a cooperative room requires two to five seats".into());
+    }
+    let missions = &charts[0].setup.missions;
+    if missions.len() != 3
+        || charts
+            .iter()
+            .any(|chart| chart.setup.fevers.len() != 3 || chart.setup.missions != *missions)
+    {
+        return Err("a room replay requires the same three Gekiso missions on every chart".into());
+    }
+    let mut players = seats
+        .iter()
+        .zip(charts)
+        .map(|(seat, &chart)| {
+            Ok(PlayingSeat {
+                model: seat.start(master, chart)?,
+                chart,
+                next_frame: 0,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let mut sections = Vec::with_capacity(3);
+    let generation = crate::cancellation_generation();
+    for (index, &mission) in missions.iter().enumerate() {
+        let mut standings = Vec::with_capacity(seats.len());
+        let mut times = Vec::with_capacity(seats.len());
+        for (s, player) in players.iter_mut().enumerate() {
+            let Some((range, time, own)) = player.until_rank(generation)? else {
+                return Err(format!("seat {} ended before section {}", s + 1, index + 1));
+            };
+            if range != index {
+                return Err(format!("inconsistent room section at {time} ms"));
+            }
+            standings.push(own);
+            times.push(time);
         }
-        if standings.len() != seats.len() {
-            return Err(format!("inconsistent room section at {} ms", frame.time_ms));
-        }
-        let settled = models
+        let settled = players
             .iter_mut()
             .zip(&standings)
-            .map(|(model, own)| {
+            .map(|(player, own)| {
                 let rank = 1 + standings.iter().filter(|other| other.beats(own)).count() as i32;
-                SectionSeat::finish(model, index, *own, rank)
+                SectionSeat::finish(&mut player.model, index, *own, rank)
             })
             .collect();
+        let time_ms = *times.iter().max().unwrap();
         sections.push(Section {
             index,
-            mission: chart.setup.missions[index],
-            time_ms: frame.time_ms,
+            mission,
+            time_ms,
+            seat_times_ms: times.iter().any(|&time| time != time_ms).then_some(times),
             seats: settled,
         });
-        standings.clear();
     }
-    if sections.len() != 3 {
-        return Err(format!(
-            "room replay settled {} of 3 sections",
-            sections.len()
-        ));
+    let mut scores = Vec::with_capacity(seats.len());
+    for mut player in players {
+        if player.until_rank(generation)?.is_some() {
+            return Err("room replay produced an extra section".into());
+        }
+        scores.push(player.model.score.score.score);
     }
-    let scores: Vec<_> = models
-        .iter()
-        .map(|player| player.score.score.score)
-        .collect();
     let total = scores.iter().map(|&score| i64::from(score)).sum();
     Ok(Replay {
         scores,

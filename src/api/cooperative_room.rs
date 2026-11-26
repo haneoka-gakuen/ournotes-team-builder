@@ -1,5 +1,10 @@
+mod sampling;
 use super::{
-    room_search::{fixed_candidate, solver::Search, Cursor, Visit},
+    room_search::{
+        fixed_candidate,
+        solver::{Draw, Objective, Search},
+        Cursor, Visit,
+    },
     room_ss_reference::{parse_accuracy, SongKey},
     Engine,
 };
@@ -9,15 +14,14 @@ use crate::{
     gekiso::{ss_reference::ss_room_threshold, Chart},
     master::Master,
 };
+use sampling::Sampling;
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 
 pub(super) struct Run {
     id: u64,
-    key: SongKey,
-    accuracy: Accuracy,
-    orders: Vec<usize>,
-    seeds: Vec<i32>,
+    conditions: Value,
+    validation: bool,
     ss: Result<i64, String>,
     search: Search,
     inventories: Vec<Option<Cursor>>,
@@ -52,23 +56,63 @@ impl Budget {
     }
 }
 
-fn judgement(input: &Value, players: &[Value]) -> Result<Accuracy, String> {
-    let mut shared = parse_accuracy(input.get("accuracy"))?;
-    for player in players {
-        if let Some(own) = parse_accuracy(player.get("accuracy"))? {
-            if shared.is_some_and(|a| {
-                (a.just, a.great, a.miss_every) != (own.just, own.great, own.miss_every)
-            }) {
-                return Err("room seats must share one judgement profile".into());
-            }
-            shared = Some(own);
-        }
-    }
-    let a = shared.unwrap_or_default();
-    if !(0.0..=1.0).contains(&a.just) || !(0.0..=1.0).contains(&a.great) || a.miss_every < 0 {
+fn checked_accuracy(raw: Option<&Value>) -> Result<Option<Accuracy>, String> {
+    let parsed = parse_accuracy(raw)?;
+    if parsed.is_some_and(|a| {
+        !(0.0..=1.0).contains(&a.just) || !(0.0..=1.0).contains(&a.great) || a.miss_every < 0
+    }) {
         return Err("invalid room accuracy".into());
     }
-    Ok(a)
+    Ok(parsed)
+}
+
+struct SeatConditions {
+    difficulty: i32,
+    profiles: Vec<Accuracy>,
+}
+
+impl SeatConditions {
+    fn read(
+        player: &Value,
+        fallback: i32,
+        accuracy: Accuracy,
+        sampled: bool,
+    ) -> Result<Self, String> {
+        let difficulty = player
+            .get("difficulty")
+            .map(|v| serde_json::from_value(v.clone()))
+            .transpose()
+            .map_err(|e| format!("difficulty: {e}"))?
+            .unwrap_or(fallback);
+        if let Some(allowed) = player.get("allowedDifficulties") {
+            let allowed: Vec<i32> =
+                serde_json::from_value(allowed.clone()).map_err(|e| e.to_string())?;
+            if !allowed.contains(&difficulty) {
+                return Err("cannot play the selected difficulty".into());
+            }
+        }
+        let profiles = match player.get("accuracyProfiles") {
+            Some(v) => {
+                if !sampled || player.get("accuracy").is_some() {
+                    return Err(
+                        "accuracyProfiles requires sampling and replaces seat accuracy".into(),
+                    );
+                }
+                let rows = v
+                    .as_array()
+                    .filter(|v| (1..=16).contains(&v.len()))
+                    .ok_or("supply 1 to 16 equally weighted accuracyProfiles")?;
+                rows.iter()
+                    .map(|row| checked_accuracy(Some(row)).map(|a| a.unwrap()))
+                    .collect::<Result<Vec<_>, _>>()?
+            }
+            None => vec![checked_accuracy(player.get("accuracy"))?.unwrap_or(accuracy)],
+        };
+        Ok(Self {
+            difficulty,
+            profiles,
+        })
+    }
 }
 
 fn seat_values<T: Copy + Default + PartialEq + DeserializeOwned>(
@@ -124,6 +168,9 @@ impl Engine {
                         | "budgetMs"
                         | "maxWork"
                         | "charts"
+                        | "sampling"
+                        | "includeSamples"
+                        | "objective"
                 )
             })
         }) {
@@ -135,9 +182,37 @@ impl Engine {
             .as_array()
             .filter(|rows| (2..=5).contains(&rows.len()))
             .ok_or("a cooperative room requires two to five players")?;
-        let accuracy = judgement(input, players)?;
+        let accuracy = checked_accuracy(input.get("accuracy"))?.unwrap_or_default();
+        let sampling: Option<Sampling> = input
+            .get("sampling")
+            .map(|v| serde_json::from_value(v.clone()))
+            .transpose()
+            .map_err(|e| format!("sampling: {e}"))?;
+        if sampling.is_some_and(|s| !(1..=4096).contains(&s.count)) {
+            return Err("sampling.count must be between 1 and 4096".into());
+        }
+        let validation = sampling.is_some_and(Sampling::validation);
+        if validation && players.iter().any(|p| p["lockedTeam"].is_null()) {
+            return Err("independent validation requires every team to be locked".into());
+        }
+        let include_samples = input
+            .get("includeSamples")
+            .map(|v| v.as_bool().ok_or("includeSamples must be boolean"))
+            .transpose()?
+            .unwrap_or(false);
+        let objective_name = input
+            .get("objective")
+            .map(|v| v.as_str().ok_or("invalid room objective"))
+            .transpose()?
+            .unwrap_or("meanScore");
+        let objective = match objective_name {
+            "meanScore" => Objective::MeanScore,
+            "ssRate" => Objective::SsRate,
+            _ => return Err("objective must be meanScore or ssRate".into()),
+        };
         let orders = seat_values::<usize>(input, players, "orderIndices", "orderIndex")?;
         let seeds = seat_values::<i32>(input, players, "seeds", "seed")?;
+        let mut conditions = Vec::with_capacity(players.len());
         for (i, player) in players.iter().enumerate() {
             let fields = player.as_object().ok_or("expected a room seat object")?;
             if let Some(field) = fields.keys().find(|k| {
@@ -152,28 +227,29 @@ impl Engine {
                         | "orderIndex"
                         | "seed"
                         | "allowedDifficulties"
+                        | "difficulty"
+                        | "accuracyProfiles"
                         | "accuracy"
                 )
             }) {
                 return Err(format!("unsupported room seat {} field: {field}", i + 1));
             }
-            if let Some(allowed) = player.get("allowedDifficulties") {
-                let allowed: Vec<i32> =
-                    serde_json::from_value(allowed.clone()).map_err(|e| e.to_string())?;
-                if !allowed.contains(&key.difficulty) {
-                    return Err(format!(
-                        "seat {} cannot play the selected difficulty",
-                        i + 1
-                    ));
-                }
-            }
+            conditions.push(
+                SeatConditions::read(player, key.difficulty, accuracy, sampling.is_some())
+                    .map_err(|e| format!("seat {} {e}", i + 1))?,
+            );
             if orders[i] >= crate::live::orders().len() {
                 return Err(format!("seat {} skill order out of range", i + 1));
             }
         }
-        self.load_source(input, &input["song"])?;
-        let cache_key = (key.song_id, key.difficulty);
-        let cached = &self.charts[&cache_key];
+        let mut loaded = std::collections::BTreeSet::new();
+        for c in &conditions {
+            if loaded.insert(c.difficulty) {
+                let song = json!({"songId":key.song_id,"difficulty":c.difficulty});
+                self.load_source(input, &song)?;
+            }
+        }
+        let cached = &self.charts[&(key.song_id, conditions[0].difficulty)];
         let &[a, b, c] = cached.song.missions.as_slice() else {
             return Err("a cooperative room requires three section missions".into());
         };
@@ -191,17 +267,65 @@ impl Engine {
                 )?;
             }
         }
-        let mut chart = Chart::new(
-            &self.master,
-            &self.sources[&cache_key],
-            cached.difficulty.play_level,
-            cached.song.missions.clone(),
-            accuracy,
-            vec![1; 3],
-        )?;
-        chart.music_type = cached.song.music_type;
         let ss = ss_room_threshold(&self.master, &cached.song, players.len());
-        let mut search = Search::new(chart, orders.clone(), seeds.clone())?;
+        let mut chart_keys = Vec::new();
+        let mut charts = Vec::new();
+        let mut seat_charts = Vec::new();
+        for seat in &conditions {
+            let cache_key = (key.song_id, seat.difficulty);
+            let cached = &self.charts[&cache_key];
+            let mut indices = Vec::new();
+            for &profile in &seat.profiles {
+                let profile_key = (seat.difficulty, profile);
+                let index = match chart_keys.iter().position(|k| *k == profile_key) {
+                    Some(index) => index,
+                    None => {
+                        let mut chart = Chart::new(
+                            &self.master,
+                            &self.sources[&cache_key],
+                            cached.difficulty.play_level,
+                            cached.song.missions.clone(),
+                            profile,
+                            vec![1; 3],
+                        )?;
+                        chart.music_type = cached.song.music_type;
+                        chart_keys.push(profile_key);
+                        charts.push(chart);
+                        charts.len() - 1
+                    }
+                };
+                indices.push(index);
+            }
+            seat_charts.push(indices);
+        }
+        let samples = match sampling {
+            Some(plan) => plan.draws(&seat_charts, &orders, &seeds),
+            None => vec![(0..players.len())
+                .map(|i| Draw {
+                    chart: seat_charts[i][0],
+                    order: orders[i],
+                    seed: seeds[i],
+                })
+                .collect()],
+        };
+        let sample_draws = include_samples.then(|| samples.iter().map(|sample| {
+            sample.iter().map(|draw| {
+                let (difficulty, accuracy) = chart_keys[draw.chart];
+                json!({"difficulty":difficulty,"accuracy":accuracy,"orderIndex":draw.order,"seed":draw.seed})
+            }).collect::<Vec<_>>()
+        }).collect::<Vec<_>>());
+        let metadata = json!({
+            "songId":key.song_id,
+            "difficulty":(loaded.len()==1).then_some(conditions[0].difficulty),
+            "accuracy":chart_keys.iter().all(|k| k.1==chart_keys[0].1).then_some(chart_keys[0].1),
+            "seatConditions":conditions.iter().enumerate().map(|(i,c)|
+                json!({"difficulty":c.difficulty,"accuracyProfiles":c.profiles,"orderIndex":orders[i],"seed":seeds[i]})
+            ).collect::<Vec<_>>(),
+            "orderIndices":samples[0].iter().map(|d| d.order).collect::<Vec<_>>(),
+            "seeds":samples[0].iter().map(|d| d.seed).collect::<Vec<_>>(),
+            "sampling":sampling, "objective":objective_name,
+        });
+        let mut search = Search::new(charts, samples, objective, ss.as_ref().ok().copied())?;
         let mut inventories = Vec::new();
         let mut discovered = Vec::new();
         for (i, player) in players.iter().enumerate() {
@@ -226,10 +350,8 @@ impl Engine {
         })?;
         let mut run = Run {
             id,
-            key,
-            accuracy,
-            orders,
-            seeds,
+            conditions: metadata,
+            validation,
             ss,
             search,
             inventories,
@@ -238,7 +360,10 @@ impl Engine {
             collecting: true,
             failure: None,
         };
-        let out = run.advance(&self.master, budget, started, generation)?;
+        let mut out = run.advance(&self.master, budget, started, generation)?;
+        if let Some(draws) = sample_draws {
+            out["sampleDraws"] = json!(draws);
+        }
         self.cooperative_room = Some(Box::new(run));
         Ok(out)
     }
@@ -344,12 +469,16 @@ impl Run {
         };
         let mut out = self.search.response();
         out["searchId"] = json!(self.id);
-        out["songId"] = json!(self.key.song_id);
-        out["difficulty"] = json!(self.key.difficulty);
+        out.as_object_mut()
+            .unwrap()
+            .extend(self.conditions.as_object().unwrap().clone());
         out["release"] = json!(master.release_id);
-        out["accuracy"] = json!(self.accuracy);
-        out["orderIndices"] = json!(self.orders);
-        out["seeds"] = json!(self.seeds);
+        if self.validation {
+            if let Some(hits) = out["statistics"]["ssHits"].as_u64() {
+                let n = out["statistics"]["sampleCount"].as_u64().unwrap();
+                out["statistics"]["ssRateWilson95"] = json!(sampling::wilson95(hits, n));
+            }
+        }
         out["stopReason"] = json!(stop);
         out["stepWork"] = json!(work);
         out["ss"] = match self.ss {

@@ -138,6 +138,7 @@ pub fn reconcile(a: &Histories, b: &Histories, missions: &[i32]) -> Result<Repla
                         index,
                         mission: missions[index],
                         time_ms: *t,
+                        seat_times_ms: None,
                         seats: vec![*x, *y],
                     }
                 })

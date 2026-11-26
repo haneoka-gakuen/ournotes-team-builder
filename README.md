@@ -56,7 +56,7 @@ cargo run --release --example bench -- input.json
 | `growth` | Rank card upgrades by how much each one gains |
 | `rates` | Report each song's scoring weights, rank thresholds and skill windows |
 | `roomSsReference` | Estimate five players' individual contributions to the multiplayer SS line on one chart |
-| `roomSearchStart`, `roomSearchStep` | Find the highest combined score for 2–5 owned teams, with locked and freely built seats in the same room |
+| `roomSearchStart`, `roomSearchStep` | Optimize the mean room score or SS frequency for 2–5 owned teams with individual charts and judgement profiles |
 | `evaluateAll` | Score one fixed team on each of several songs |
 | `eventGrowthStart`, `eventGrowthStep`, `eventGrowthPage` | Infer character and band growth from recorded event decks |
 
@@ -86,6 +86,13 @@ cargo run --release --locked --example gekiso_room_search -- target/room-five.js
 ```
 
 The example drives the same reusable session operations as a web worker. Use `--steps 1 --budget-ms 16` for one time slice. An application can pause between slices and continue the same search by ID. Partial results keep the best room found so far. See [search conditions and proof](docs/engine.md#cooperative-room-search).
+
+For the mixed-difficulty example, use the international release master and its chart catalogue. The three players in `mixed_room.json` have separate inventories and judgement settings. This example compares formations on 32 shared LUCK and skill-order draws, then tests the selected teams on a fresh validation stream. Set `objective` to `ssRate` to prioritize reaching the room SS threshold.
+
+```sh
+python examples/gekiso_room/make_sampled_room.py master.json catalog/catalog.json target/mixed-room.json
+cargo run --release --locked --example gekiso_room_search -- target/mixed-room.json --validation-samples 1024
+```
 
 ### Five-player SS reference
 
