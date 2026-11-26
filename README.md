@@ -60,6 +60,18 @@ cargo run --release --example bench -- input.json
 
 `cancel()` stops running searches. For other languages, the same engine is exposed as C functions that take and return JSON strings, such as `haneoka_context_json`.
 
+### Two-player Gekiso prototype
+
+The native example reads two owned inventories and finds the pair with the highest combined final score on one chart. Each team's power, leader, equipped snapshots, and skills come from its own inventory and player bonuses. The example returns both formations, both final scores, and a breakdown of the three sections.
+
+```sh
+cargo run --release --locked --example gekiso_room -- examples/gekiso_room/fixture.json --verify
+```
+
+Both seats play one difficulty with a shared judgement profile. Each seat has a fixed ordinary skill order and random seed. The leader occupies the first slot. The remaining slots follow character ID order. Equal mission value, section score, and Perfect count give both players first place. The search checks every legal pair in the supplied small inventories. The maximum applies to that play scenario.
+
+With `--verify`, the example also runs each team through the original single-player simulator with all eight possible first/second-place histories. It finds the unique pair of histories that matches both players' standings, checks the exhaustive maximum, and prints the nine sample pairs when the input supplies them. The [sample and its data sources](examples/gekiso_room/FIXTURE.md) describe the inventories and individual-score comparison.
+
 ## Build
 
 ```sh

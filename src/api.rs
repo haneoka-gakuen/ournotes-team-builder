@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex};
 mod gekiso_result_cache;
 mod arena;
 mod arena_sections;
+pub mod room_search;
 mod shared;
 mod reward_plan;
 mod planner;
@@ -695,12 +696,15 @@ fn constraints(
             }).collect(),
     }
 }
-fn search_box(master: &Master, request: &Value) -> Result<power::BoxCards, String> {
+fn owned_box(master: &Master, request: &Value) -> Result<power::BoxCards, String> {
     let members: Vec<MemberInput> =
         serde::Deserialize::deserialize(&request["members"]).map_err(|e| e.to_string())?;
     let snaps: Vec<SnapInput> =
         serde::Deserialize::deserialize(&request["snaps"]).map_err(|e| e.to_string())?;
-    let mut cards = power::resolve_box(master, &members, &snaps, request["unknownPolicy"] != "min");
+    Ok(power::resolve_box(master, &members, &snaps, request["unknownPolicy"] != "min"))
+}
+fn search_box(master: &Master, request: &Value) -> Result<power::BoxCards, String> {
+    let mut cards = owned_box(master, request)?;
     let c = &request["constraints"];
     fn keys(rows: &Value) -> std::collections::BTreeSet<&str> {
         master::rows(rows)
